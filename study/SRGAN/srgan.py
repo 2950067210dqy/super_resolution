@@ -1,7 +1,3 @@
-import torch
-import torch.nn as nn
-import torchvision
-
 import copy
 import time
 from os import mkdir
@@ -18,311 +14,279 @@ from matplotlib.animation import FuncAnimation, PillowWriter
 from torch.nn import BatchNorm1d
 from torchvision.utils import save_image
 from d2l import torch as d2l   # 或 from d2l import mxnet as d2l
-name = "v1"
-image_size = [1,28,28]
-#学习率
-g_lr = 0.0003
-d_lr = 0.0003
-#epoch
-num_epochs =100
-#batch_size
-batch_size = 64
-#随机维度
-latent_dim = 64
-#正则项
-weight_decay=0.0001
-#优化器 betas
-g_optimizer_betas = (0.5,0.999)
-d_optimizer_betas = (0.5,0.999)
-#数据路径
-data_dir = 'D:\BaiduSyncdisk\AYanJiuSheng\data\sr_dataset\class_1\data\cylinder\cylinder'
-#如果路径不存在则创建路径
-out_put_dir = "./train_data/"
-loss_dir = "./train_loss/"
-model_dir = "./train_model/"
-predict_dir = "./predict/"
-use_gpu = torch.cuda.is_available()
-if not exists(out_put_dir):
-    mkdir(out_put_dir)
-if not exists(f"{out_put_dir}/{loss_dir}"):
-    mkdir(f"{out_put_dir}/{loss_dir}")
-if not exists(f"{out_put_dir}/{model_dir}"):
-    mkdir(f"{out_put_dir}/{model_dir}")
-if not exists(f"{out_put_dir}/{predict_dir}"):
-    mkdir(f"{out_put_dir}/{predict_dir}")
-class Accumulator:
-    """在n个变量上累加"""
-    def __init__(self, n):
-        self.data = [0.0] * n
+epoch_num = 50
+class ResidualBlock(nn.Module):
+    """
+    残差块
 
-    def add(self, *args):
-        self.data = [a + float(b) for a, b in zip(self.data, args)]
+    设计原则：
+    1. 残差连接要求输入和输出形状完全一致，才能做 x + F(x)
+    2. 所以这里通道数保持不变：64 -> 64
+    3. 卷积使用 kernel_size=3, stride=1, padding=1，这样高宽不变
 
-    def reset(self):
-        self.data = [0.0] * len(self.data)
+    输入:
+        x: [B, 64, H, W]
 
-    def __getitem__(self, idx):
-        return self.data[idx]
-def _in_notebook():
-    try:
-        from IPython import get_ipython
-        ip = get_ipython()
-        if ip is None:
-            return False
-        return ip.__class__.__name__ in ("ZMQInteractiveShell", "Shell")
-    except Exception:
-        return False
+    输出:
+        out: [B, 64, H, W]
+    """
+    def __init__(self, channels=64):
+        super(ResidualBlock, self).__init__()
+        self.block = nn.Sequential(
+            # 第1个卷积:
+            # in_channel = 64
+            # out_channel = 64
+            # kernel_size = 3
+            # stride = 1
+            # padding = 1
+            # 输出尺寸不变: H x W -> H x W
+            nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(channels),
+            nn.PReLU(),
 
-
-class Animator:
-    """Docker/.py 可用：记录数据，最后导出 GIF"""
-    def __init__(self, xlabel=None, ylabel=None, legend=None, xlim=None, ylim=None,
-                 xscale="linear", yscale="linear",
-                 fmts=("-", "m--", "g-.", "r:"), figsize=(6, 4)):
-        self.fig, self.ax = plt.subplots(figsize=figsize)
-        self.xlabel = xlabel
-        self.ylabel = ylabel
-        self.legend = legend or []
-        self.xlim = xlim
-        self.ylim = ylim
-        self.xscale = xscale
-        self.yscale = yscale
-        self.fmts = fmts
-
-        self.X = None
-        self.Y = None
-        self.frames = []  # 每一帧保存一次快照
-
-    def add(self, x, y):
-        if not hasattr(y, "__len__"):
-            y = [y]
-        n = len(y)
-
-        if not hasattr(x, "__len__"):
-            x = [x] * n
-
-        if self.X is None:
-            self.X = [[] for _ in range(n)]
-        if self.Y is None:
-            self.Y = [[] for _ in range(n)]
-
-        for i, (a, b) in enumerate(zip(x, y)):
-            if a is not None and b is not None:
-                self.X[i].append(a)
-                self.Y[i].append(b)
-
-        # 记录当前帧数据（深拷贝）
-        self.frames.append(([row[:] for row in self.X], [row[:] for row in self.Y]))
-
-    def _config_axes(self, current_y=None):
-        self.ax.set_xlabel(self.xlabel if self.xlabel else "")
-        self.ax.set_ylabel(self.ylabel if self.ylabel else "")
-        if self.xlim is not None:
-            self.ax.set_xlim(self.xlim)
-
-        if self.ylim is not None:
-            ymin, ymax = self.ylim[0],self.ylim[1]
-            if current_y:
-                data_max = max(
-                    max(series) for series in current_y if series
-                )
-                ymax = max(ymax, data_max)  # 数据更大时，自动扩展上限
-            self.ax.set_ylim((ymin, ymax))
-
-        self.ax.set_xscale(self.xscale)
-        self.ax.set_yscale(self.yscale)
-        if self.legend:
-            self.ax.legend(self.legend, loc='upper right', bbox_to_anchor=(1.15, 1), fontsize=9)
-
-    def _draw_frame(self,frame_idx):
-        self.ax.cla()
-        Xf, Yf = self.frames[frame_idx]
-        for i, (xx, yy) in enumerate(zip(Xf, Yf)):
-            fmt = self.fmts[i % len(self.fmts)]
-            self.ax.plot(xx, yy, fmt)
-        self._config_axes(current_y=Yf)
-    def save(self, gif_path="train.gif", png_path="train.png", fps=20):
-        if not self.frames:
-            raise ValueError("没有可保存的帧，请先调用 add().")
-
-
-
-        def update(frame_idx):
-            self._draw_frame(frame_idx)
-            return self.ax.lines
-
-        # 1) 保存 GIF
-        ani = FuncAnimation(
-            self.fig, update, frames=len(self.frames), interval=1000 / fps, blit=False
+            # 第2个卷积:
+            # 仍然保持 64 -> 64，方便和输入直接相加
+            nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(channels),
         )
-        ani.save(gif_path, writer=PillowWriter(fps=fps))
+
+    def forward(self, x):
+        # 残差连接
+        return x + self.block(x)
 
 
-
-        plt.close(self.fig)
-    def save_png(self, png_path="train.png"):
-        # 2) 保存 PNG（最后一帧）
-        self._draw_frame(len(self.frames) - 1)
-        self.fig.savefig(png_path, dpi=200, bbox_inches="tight")
 class Generator(nn.Module):
-    """生成器"""
-    def __init__(self,in_channel):
+    """
+    SRGAN 生成器
+
+    当前版本: 4x 超分
+    输入:
+        x: [B, 3, 64, 64]
+
+    输出:
+        out: [B, 3, 256, 256]
+
+    整体结构:
+    1. 浅层特征提取
+    2. 16个残差块
+    3. 全局残差连接
+    4. 两次 2x 上采样，总共 4x
+    5. 输出 RGB 图像
+    """
+    def __init__(self, num_residual_blocks=16, scale=2):
         super(Generator, self).__init__()
-        self.model = nn.Sequential(
-            nn.Linear(in_features=in_channel,out_features=128),
-            nn.BatchNorm1d(num_features=128),
-            nn.GELU(),
-            nn.Linear(in_features=128,out_features=256),
-            nn.BatchNorm1d(num_features=256),
-            nn.GELU(),
-            nn.Linear(in_features=256,out_features=512),
-            nn.BatchNorm1d(num_features=512),
-            nn.GELU(),
-            nn.Linear(in_features=512,out_features=1024),
-            nn.BatchNorm1d(num_features=1024),
-            nn.GELU(),
-            nn.Linear(in_features=1024,out_features=torch.prod(torch.tensor(image_size),dtype=torch.int32)),
-            #  nn.Tanh(),
-            nn.Sigmoid(),
+
+
+        self.scale = scale
+
+        # 第一层卷积:
+        # 输入是 RGB 图像，所以 in_channel=3
+        # 输出 64 个特征图，所以 out_channel=64
+        # kernel_size=9 是 SRGAN 经典设计，感受野更大
+        # stride=1 不下采样
+        # padding=4 保证尺寸不变
+        #
+        # 尺寸计算公式:
+        # out = floor((W + 2P - K) / S) + 1
+        # 对 64x64 来说:
+        # (64 + 2*4 - 9) / 1 + 1 = 64
+        #
+        # 所以:
+        # [B, 3, 64, 64] -> [B, 64, 64, 64]
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=9, stride=1, padding=4),
+            nn.PReLU()
         )
 
-    def forward(self, z):
-        """
-        shape of z:(batch_size,z_dim) (batch_size,latent_dim)(batch_size,latent_dim)
-        """
-        output = self.model(z)
-        image = output.reshape(z.shape[0],*image_size)
-        return image
+        # 残差块堆叠
+        # 每个残差块都保持 [B, 64, H, W] 不变
+        self.residual_blocks = nn.Sequential(
+            *[ResidualBlock(64) for _ in range(num_residual_blocks)]
+        )
+
+        # 残差块之后的融合卷积
+        # 这里仍然保持 64 -> 64
+        # 目的是把残差块提取到的特征再融合一下
+        #
+        # [B, 64, 64, 64] -> [B, 64, 64, 64]
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(64)
+        )
+
+        # 上采样模块
+        # PixelShuffle(2) 的作用:
+        # 把通道数除以 4，同时把高宽各扩大 2 倍
+        #
+        # 所以如果想上采样 2 倍:
+        # 先把通道升到 64 * 2^2 = 256
+        # 再 PixelShuffle(2) -> 回到 64 通道，尺寸扩大 2 倍
+
+
+
+        self.upsample = nn.Sequential(
+                # 64 -> 256
+                # 为什么是 256?
+                # 因为 PixelShuffle(2) 需要输出通道数能被 2^2=4 整除
+                # 并且 PixelShuffle 后希望仍然得到 64 通道
+                # 所以卷积输出通道 = 64 * 4 = 256
+                nn.Conv2d(64, 64*self.scale*self.scale, kernel_size=3, stride=1, padding=1),
+
+                # [B, 256, H, W] -> [B, 64, 2H, 2W]
+                nn.PixelShuffle(self.scale),
+                nn.PReLU(),
+
+                nn.Conv2d(64, 64*self.scale*self.scale, kernel_size=3, stride=1, padding=1),
+                # [B, 256, H, W] -> [B, 64, 2H, 2W]
+                nn.PixelShuffle(self.scale),
+                nn.PReLU()
+        )
+
+        # 最后一层输出 RGB 图像
+        # 64 -> 3
+        # kernel_size=9, padding=4 保持尺寸不变
+        #
+        # 若 scale=4:
+        # [B, 64, 256, 256] -> [B, 3, 256, 256]
+        self.conv_out = nn.Conv2d(64, 3, kernel_size=9, stride=1, padding=4)
+
+    def forward(self, x):
+        # x: [B, 3, 64, 64]
+
+        x1 = self.conv1(x)
+        # x1: [B, 64, 64, 64]
+
+        x2 = self.residual_blocks(x1)
+        # x2: [B, 64, 64, 64]
+
+        x3 = self.conv2(x2)
+        # x3: [B, 64, 64, 64]
+
+        # 全局残差连接
+        x4 = x1 + x3
+        # x4: [B, 64, 64, 64]
+
+        x5 = self.upsample(x4)
+        # 如果 scale=2:
+        # x5: [B, 64, 128, 128]
+        #
+        # 如果 scale=4:
+        # x5: [B, 64, 256, 256]
+
+        out = self.conv_out(x5)
+        # scale=2 时: [B, 3, 128, 128]
+        # scale=4 时: [B, 3, 256, 256]
+
+        return out
+
+
+class DownSample(nn.Module):
+    """
+    判别器中的下采样块
+
+    常见设计:
+    Conv -> BN -> LeakyReLU
+
+    这里通过 stride 控制是否下采样:
+    - stride=1: 高宽不变
+    - stride=2: 高宽减半
+    """
+    def __init__(self, input_channel, output_channel, stride, kernel_size=3, padding=1):
+        super(DownSample, self).__init__()
+        self.layer = nn.Sequential(
+            nn.Conv2d(input_channel, output_channel, kernel_size, stride, padding),
+            nn.BatchNorm2d(output_channel),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+
+    def forward(self, x):
+        return self.layer(x)
+
+
 class Discriminator(nn.Module):
-    """判别器"""
-    def __init__(self,in_channel):
+    """
+    SRGAN 判别器
+
+    如果生成器做的是 4x 超分:
+        输入图像尺寸通常是 [B, 3, 256, 256]
+
+    判别器任务:
+        判断输入图像是真实高分辨率图像，还是生成器生成的图像
+    """
+    def __init__(self):
         super(Discriminator, self).__init__()
-        self.model = nn.Sequential(
-            nn.Linear(in_features=in_channel, out_features=1024),
-            nn.GELU(),
-            nn.Linear(in_features=1024, out_features=512),
-            nn.GELU(),
-            nn.Linear(in_features=512, out_features=256),
-            nn.GELU(),
-            nn.Linear(in_features=256, out_features=128),
-            nn.GELU(),
-            nn.Linear(in_features=128, out_features=64),
-            nn.GELU(),
-            nn.Linear(in_features=64, out_features=32),
-            nn.GELU(),
-            nn.Linear(in_features=32, out_features=16),
-            nn.GELU(),
-            nn.Linear(in_features=16, out_features=1),
-            nn.Sigmoid(),
+
+        # 第一层通常不加 BN，这是 GAN 里较常见的写法
+        # [B, 3, 256, 256] -> [B, 64, 256, 256]
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1),
+            nn.LeakyReLU(0.2, inplace=True)
         )
-    def forward(self, image):
-        """
-        shape of image:(batch_size,z_dim) (batch_size,1*28*28)
-        """
-        prob = self.model(image.reshape(image.shape[0],-1))
 
-        return prob
+        # 尺寸变化过程（假设输入是 256x256）:
+        #
+        # 1. 64 -> 64, stride=2:   256 -> 128
+        # 2. 64 -> 128, stride=1:  128 -> 128
+        # 3. 128 -> 128, stride=2: 128 -> 64
+        # 4. 128 -> 256, stride=1: 64 -> 64
+        # 5. 256 -> 256, stride=2: 64 -> 32
+        # 6. 256 -> 512, stride=1: 32 -> 32
+        # 7. 512 -> 512, stride=2: 32 -> 16
+        self.down = nn.Sequential(
+            DownSample(64, 64, stride=2, kernel_size=3, padding=1),
+            DownSample(64, 128, stride=1, kernel_size=3, padding=1),
+            DownSample(128, 128, stride=2, kernel_size=3, padding=1),
+            DownSample(128, 256, stride=1, kernel_size=3, padding=1),
+            DownSample(256, 256, stride=2, kernel_size=3, padding=1),
+            DownSample(256, 512, stride=1, kernel_size=3, padding=1),
+            DownSample(512, 512, stride=2, kernel_size=3, padding=1),
+        )
+
+        # 最后把空间信息压缩到 1x1，再输出真假概率
+        #
+        # AdaptiveAvgPool2d(1):
+        # [B, 512, 16, 16] -> [B, 512, 1, 1]
+        #
+        # 1x1 Conv 相当于全连接层的卷积写法
+        self.dense = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(512, 1024, kernel_size=1, stride=1, padding=0),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(1024, 1, kernel_size=1, stride=1, padding=0),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.down(x)
+        x = self.dense(x)
+        return x
+
+
 def train():
-    #导入数据集
-    dataset = torchvision.datasets.MNIST(root=data_dir,train=True,transform=torchvision.transforms.Compose([
-        torchvision.transforms.Resize((28,28)), #x in [0,255]
-        torchvision.transforms.ToTensor(), #x/255 [0,1]
-        # #归一化 (x-0.5)/0.5  x->[-1,1]
-        # torchvision.transforms.Normalize((0.5,), (0.5,))
-        ]),
-                                         download=True)
-    #数据装载器
-    dataloader = torch.utils.data.DataLoader(dataset=dataset,batch_size=32,shuffle=True,num_workers=2)
-    #实例化generator
-    generator = Generator(in_channel=latent_dim)
-    #实例化Discriminator
-    discriminator = Discriminator(in_channel=torch.prod(torch.tensor(image_size),dtype=torch.int32))
-    #优化器
-    g_optimizer = torch.optim.Adam(generator.parameters(),lr=g_lr,betas=g_optimizer_betas,weight_decay=weight_decay)
-    d_optimizer = torch.optim.Adam(discriminator.parameters(),lr=d_lr,betas=d_optimizer_betas,weight_decay=weight_decay)
-    #损失函数 二叉交叉熵loss
-    loss_func = nn.BCELoss()
-    labels_one = torch.ones(batch_size, 1)
-    labels_zero = torch.zeros(batch_size, 1)
+    """
+    训练
+    :return:
+    """
+    # 1.拿上数据
+    pass
+def evaluate():
+    """
+    测试 评价
+    :return:
+    """
+    pass
+if __name__ =="__main__":
+    # 测试生成器
+    lr = torch.randn(2, 3, 64, 64)
 
-    if use_gpu:
-        print("use gpu for training")
-        generator = generator.cuda()
-        discriminator = discriminator.cuda()
-        loss_func = loss_func.cuda()
-        labels_one = labels_one.to("cuda")
-        labels_zero = labels_zero.to("cuda")
-    #训练
-    loss_label = ['recons_loss', 'g_loss', 'd_loss','real_loss','fake_loss']
-    animator = Animator(xlabel='ste', xlim=[1, num_epochs], ylim=[0, 2],
-                            legend=loss_label)
-    start_time =time.time()
-    for epoch in range(num_epochs):
-        # 算每轮epoch的总体loss
-        metric = Accumulator(len(loss_label))
-        for i,(gt_images,labels) in enumerate(dataloader):
-            #生成噪声z
-            z =torch.randn(batch_size,latent_dim)
-            if use_gpu:
-                gt_images = gt_images.to("cuda")
-                z = z.to("cuda")
-            # 根据z生成器生成图像
-            pred_images = generator(z)
+    # 4x 超分: 64x64 -> 256x256
+    G = Generator(scale=2)
+    sr = G(lr)
+    print("Generator output shape:", sr.shape)
 
-
-
-            #优化判别器
-            d_optimizer.zero_grad()
-            # 判别器判别真实图片之后将概率结果放入损失函数并且优化生成器   pred_images.detach()是因为这时候pred_image不需要计算梯度，所以让它从计算图中分离出来
-            real_loss = loss_func(discriminator(gt_images), copy.deepcopy(labels_one))
-            fake_loss = loss_func(discriminator(pred_images.detach()), copy.deepcopy(labels_zero))
-            d_loss = (real_loss + fake_loss)
-            d_loss.backward()
-            d_optimizer.step()
-
-            # 优化生成器
-            g_optimizer.zero_grad()
-            # 适当引入重构loss，计算像素值的L1误差
-            recons_loss = torch.abs(pred_images - gt_images).mean()
-            # 判别器判别生成器生成的图片之后将概率结果放入损失函数并且优化生成器    这里的size 是Discriminator的(batch_size,1*28*28)
-            g_loss = recons_loss * 0.05 + loss_func(discriminator(pred_images), copy.deepcopy(labels_one))
-            g_loss.backward()
-            g_optimizer.step()
-
-            #需要和loss_label对应
-            metric.add(recons_loss.item(),g_loss.item(),d_loss.item(),real_loss.item(),fake_loss.item())
-
-
-
-            if i % 400 == 0:
-                image = pred_images.data
-                #save_image中的normalize设置成True，目的是将像素值min-max自动归一到【0,1】范围内，如果已经预测了【0,1】之间，则可以不用设置True
-                torchvision.utils.save_image(image, f"{out_put_dir}/image_{len(dataloader)*epoch+i}_{name}.png", nrow=4,normalize=True)
-        #保存模型
-        torch.save(discriminator,f"{out_put_dir}/{model_dir}/discriminator_{name}.pth")
-        torch.save(generator,f"{out_put_dir}/{model_dir}/generator_{name}.pth")
-        current_time = time.time()
-        print(
-            f"running time:{int(current_time - start_time)}s,epoch:{epoch + 1},step:{len(dataloader) * (epoch+1) },",end="")
-        loss_str ="".join([loss_label[index] + ':' + str(metric[index] / len(dataloader)) +"," for index in range(len(loss_label))])
-        print(loss_str)
-        animator.add(epoch + 1, [metric[index]/len(dataloader) for index in range(len(loss_label))])
-        animator.save_png(f"{out_put_dir}/{loss_dir}/train_loss_epoch_{epoch+1}_{name}.png")
-
-    animator.save(f"{out_put_dir}/{loss_dir}/train_loss_{name}.gif", f"{out_put_dir}/{loss_dir}/train_loss_{name}.png",fps=20)
-train()
-# 生成图像(预测)
-model_generator =torch.load(f"{out_put_dir}/{model_dir}/generator_{name}.pth", weights_only=False)
-model_discriminator=torch.load(f"{out_put_dir}/{model_dir}/discriminator_{name}.pth", weights_only=False)
-fake_z = torch.normal(0,1,size=(batch_size,latent_dim))
-print(fake_z.shape)
-if use_gpu:
-    print("use gpu for prediction")
-    model_generator = model_generator.cuda()
-    model_discriminator = model_discriminator.cuda()
-    fake_z =fake_z.to("cuda")
-pred_images_gener=model_generator(fake_z)
-print(pred_images_gener.shape)
-image = pred_images_gener.data
-#save_image中的normalize设置成True，目的是将像素值min-max自动归一到【0,1】范围内，如果已经预测了【0,1】之间，则可以不用设置True
-torchvision.utils.save_image(image, f"{out_put_dir}/{predict_dir}/pre_image_{name}.png", nrow=4,normalize=True)
+    # 判别器输入应该和 HR / SR 图像尺寸一致
+    D = Discriminator()
+    out = D(sr)
+    print("Discriminator output shape:", out.shape)
+    pass
