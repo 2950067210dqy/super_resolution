@@ -1,3 +1,7 @@
+import torch
+import torch.nn as nn
+import torchvision
+
 import copy
 import time
 from os import mkdir
@@ -22,7 +26,7 @@ d_lr = 0.0003
 #epoch
 num_epochs =100
 #batch_size
-batch_size = 32
+batch_size = 64
 #随机维度
 latent_dim = 64
 #正则项
@@ -31,7 +35,7 @@ weight_decay=0.0001
 g_optimizer_betas = (0.5,0.999)
 d_optimizer_betas = (0.5,0.999)
 #数据路径
-data_dir = './data/mnist_data'
+data_dir = 'D:\BaiduSyncdisk\AYanJiuSheng\data\sr_dataset\class_1\data\cylinder\cylinder'
 #如果路径不存在则创建路径
 out_put_dir = "./train_data/"
 loss_dir = "./train_loss/"
@@ -249,7 +253,7 @@ def train():
         labels_one = labels_one.to("cuda")
         labels_zero = labels_zero.to("cuda")
     #训练
-    loss_label = [ 'g_loss', 'd_loss','real_loss','fake_loss']
+    loss_label = ['recons_loss', 'g_loss', 'd_loss','real_loss','fake_loss']
     animator = Animator(xlabel='ste', xlim=[1, num_epochs], ylim=[0, 2],
                             legend=loss_label)
     start_time =time.time()
@@ -278,14 +282,15 @@ def train():
 
             # 优化生成器
             g_optimizer.zero_grad()
-
+            # 适当引入重构loss，计算像素值的L1误差
+            recons_loss = torch.abs(pred_images - gt_images).mean()
             # 判别器判别生成器生成的图片之后将概率结果放入损失函数并且优化生成器    这里的size 是Discriminator的(batch_size,1*28*28)
-            g_loss =  loss_func(discriminator(pred_images), copy.deepcopy(labels_one))
+            g_loss = recons_loss * 0.05 + loss_func(discriminator(pred_images), copy.deepcopy(labels_one))
             g_loss.backward()
             g_optimizer.step()
 
             #需要和loss_label对应
-            metric.add(g_loss.item(),d_loss.item(),real_loss.item(),fake_loss.item())
+            metric.add(recons_loss.item(),g_loss.item(),d_loss.item(),real_loss.item(),fake_loss.item())
 
 
 
