@@ -4,6 +4,7 @@ import os
 import time
 from os import mkdir
 from os.path import exists
+from pathlib import Path
 
 import matplotlib
 import torch.nn.functional as F
@@ -23,7 +24,7 @@ from study.SRGAN.data_load import get_class_names, load_data
 name = "v1"
 device = torch.device("cuda")
 #轮次
-EPOCH_NUMS = 50
+EPOCH_NUMS = 2
 #批量大小
 BATCH_SIZE = 32
 #是否打乱训练集
@@ -95,12 +96,11 @@ LR_DATA_ROOT_DIR = rf"/study_datas/sr_dataset/class_1_lr/x{SCALE*SCALE}/data"
 
 #如果路径不存在则创建路径
 out_put_dir = f"./train_data/{name}"
-loss_dir = "./train_loss/"
-model_dir = "./train_model/"
-predict_dir = "./predict/"
+loss_dir = "/train_loss"
+model_dir = "/train_model"
+predict_dir = "/predict"
 use_gpu = torch.cuda.is_available()
-if not exists(out_put_dir):
-    mkdir(out_put_dir)
+Path(out_put_dir).mkdir(parents=True, exist_ok=True)
 
 
 """
@@ -324,7 +324,7 @@ class Generator(nn.Module):
     4. 两次 2x 上采样，总共 4x
     5. 输出 RGB 图像
     """
-    def __init__(self, num_residual_blocks=16, scale=2):
+    def __init__(self,inner_chanel=3, num_residual_blocks=16, scale=2):
         super(Generator, self).__init__()
 
 
@@ -345,7 +345,7 @@ class Generator(nn.Module):
         # 所以:
         # [B, 3, 64, 64] -> [B, 64, 64, 64]
         self.conv1 = nn.Sequential(
-            nn.Conv2d(3, 64, kernel_size=9, stride=1, padding=4),
+            nn.Conv2d(inner_chanel, 64, kernel_size=9, stride=1, padding=4),
             nn.PReLU()
         )
 
@@ -399,7 +399,7 @@ class Generator(nn.Module):
         #
         # 若 scale=4:
         # [B, 64, 256, 256] -> [B, 3, 256, 256]
-        self.conv_out = nn.Conv2d(64, 3, kernel_size=9, stride=1, padding=4)
+        self.conv_out = nn.Conv2d(64, inner_chanel, kernel_size=9, stride=1, padding=4)
 
     def forward(self, x):
         # x: [B, 3, 64, 64]
@@ -464,13 +464,13 @@ class Discriminator(nn.Module):
     判别器任务:
         判断输入图像是真实高分辨率图像，还是生成器生成的图像
     """
-    def __init__(self):
+    def __init__(self,inner_chanel=3):
         super(Discriminator, self).__init__()
 
         # 第一层通常不加 BN，这是 GAN 里较常见的写法
         # [B, 3, 256, 256] -> [B, 64, 256, 256]
         self.conv1 = nn.Sequential(
-            nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(inner_chanel, 64, kernel_size=3, stride=1, padding=1),
             nn.LeakyReLU(0.2, inplace=True)
         )
 
@@ -546,9 +546,22 @@ class ContentLoss(nn.Module):
 
     def forward(self, fake, real):
         # 使用 VGG 提取高层特征
-        fake_features = self.vgg(fake)
-        real_features = self.vgg(real)
-        return self.criterion(fake_features, real_features)
+        #通道为3则默认 通道为6则拆开
+        channels = fake.shape[1]
+        if channels ==6:
+            real1, real2 = real[:, :3, :, :], real[:, 3:, :, :]
+            fake1, fake2 = fake[:, :3, :, :], fake[:, 3:, :, :]
+            feat_real1 = vgg(real1)
+            feat_fake1 = vgg(fake1).detach()
+            feat_real2 = vgg(real2)
+            feat_fake2 = vgg(fake2).detach()
+
+            return (self.criterion( feat_real1, feat_fake1) + self.criterion(feat_real2, feat_fake2))/2
+
+        else:
+            fake_features = self.vgg(fake).detach()
+            real_features = self.vgg(real)
+            return self.criterion(fake_features, real_features)
 class AdversarialLoss(nn.Module):
     """
     对抗损失
@@ -665,15 +678,8 @@ if __name__ =="__main__":
     print(f"一共{len(available_class_names)}个类别：{available_class_names}")
     #每个类别读取数据并且训练验证和保存模型
     for class_name in available_class_names:
-        # 创建文件夹
-        if not exists(f"{out_put_dir}/{class_name}/scale_{SCALE*SCALE}/{loss_dir}"):
-            mkdir(f"{out_put_dir}/{class_name}/scale_{SCALE*SCALE}/{loss_dir}")
-        if not exists(f"{out_put_dir}/{class_name}/scale_{SCALE*SCALE}/{model_dir}"):
-            mkdir(f"{out_put_dir}/{class_name}/scale_{SCALE*SCALE}/{model_dir}")
-        if not exists(f"{out_put_dir}/{class_name}/scale_{SCALE*SCALE}/{predict_dir}"):
-            mkdir(f"{out_put_dir}/{class_name}/scale_{SCALE*SCALE}/{predict_dir}")
-        animator = Animator(xlabel='ste', xlim=[1, EPOCH_NUMS], ylim=[0, 2],
-                            legend=loss_label+validate_label)
+
+
         #根据类别读取数据
         train_loader, validate_loader, class_names, samples = load_data(
             gr_data_root_dir=GR_DATA_ROOT_DIR,
@@ -686,116 +692,159 @@ if __name__ =="__main__":
             random_seed=RANDOM_SEED,
             selected_classes=available_class_names[:1] if available_class_names else None,
         )
-        # 实例化generator
-        generator = Generator().to(device)
-        # 实例化Discriminator
-        discriminator = Discriminator().to(device)
-        # 加载预训练模型
-        if os.path.exists(f"{out_put_dir}/{class_name}/scale_{SCALE*SCALE}/{model_dir}"):
-            generator_save_path = f"{out_put_dir}/{class_name}/scale_{SCALE * SCALE}/{model_dir}/discriminator_{name}.pth"
-            discriminator_save_path = f"{out_put_dir}/{class_name}/scale_{SCALE * SCALE}/{model_dir}/generator_{name}.pth"
-            generator.load_state_dict(torch.load(generator_save_path, map_location=device))
-            discriminator.load_state_dict(torch.load(discriminator_save_path, map_location=device))
-            print(f"Loaded pretrained model from {generator_save_path},{discriminator_save_path}")
-        else:
-            print("No pretrained model found. Starting training from scratch.")
+        # 每个类别的图像对和flo文件分别训练验证和保存模型
+        for data_type in ['image_pair','flo']:
+            # 创建文件夹
+            Path(f"{out_put_dir}/{class_name}/{data_type}/scale_{SCALE * SCALE}/{loss_dir}").mkdir(parents=True, exist_ok=True)
+            Path(f"{out_put_dir}/{class_name}/{data_type}/scale_{SCALE * SCALE}/{model_dir}").mkdir(parents=True, exist_ok=True)
+            Path(f"{out_put_dir}/{class_name}/{data_type}/scale_{SCALE * SCALE}/{predict_dir}").mkdir(parents=True, exist_ok=True)
+
+            animator = Animator(xlabel='ste', xlim=[1, EPOCH_NUMS], ylim=[0, 2],
+                                legend=loss_label + validate_label)
+            # 实例化generator
+            generator = Generator(inner_chanel=3 if data_type=='flo' else 6).to(device)
+            # 实例化Discriminator
+            discriminator = Discriminator(inner_chanel=3 if data_type=='flo' else 6).to(device)
+            # 加载预训练模型
+            generator_save_path = f"{out_put_dir}/{class_name}/{data_type}/scale_{SCALE * SCALE}/{model_dir}/discriminator_{name}.pth"
+            if os.path.exists(generator_save_path):
+                generator.load_state_dict(torch.load(generator_save_path, map_location=device))
+                print(f"Loaded pretrained model generator from {generator_save_path},{discriminator_save_path}")
+            else:
+                print("No pretrained model generator found. Starting training from scratch.")
+            discriminator_save_path = f"{out_put_dir}/{class_name}/{data_type}/scale_{SCALE * SCALE}/{model_dir}/generator_{name}.pth"
+            if os.path.exists(discriminator_save_path):
+                discriminator.load_state_dict(torch.load(discriminator_save_path, map_location=device))
+                print(f"Loaded pretrained model discriminator from {generator_save_path},{discriminator_save_path}")
+            else:
+                print("No pretrained model discriminator found. Starting training from scratch.")
+            # 优化器
+            g_optimizer = torch.optim.Adam(generator.parameters(), lr=g_lr, betas=g_optimizer_betas,
+                                           weight_decay=weight_decay)
+            d_optimizer = torch.optim.Adam(discriminator.parameters(), lr=d_lr, betas=d_optimizer_betas,
+                                           weight_decay=weight_decay)
+
+            start_time = time.time()
+            #轮数
+            for epoch in range(EPOCH_NUMS):
+                generator.train()# 确保生成器在训练模式
+                discriminator.train()# 确保判别器在训练模式
+                # 算每轮epoch的总体loss
+                metric = Accumulator(len(loss_label))
+                # 拿batch——size数据
+                train_progress_bar = tqdm(train_loader, desc=f"Epoch [{epoch + 1}/{EPOCH_NUMS}] {class_name} {data_type} Training", unit="batch")
+                for i,batch in enumerate(train_progress_bar):
+                    # 低分辨率图像
+                    lr_images = batch[data_type]['lr_data'].to(device)
+                    # 真实图像
+                    gr_images=batch[data_type]['gr_data'].to(device)
+
+                    real_labels = torch.ones((len(lr_images), 1, 1, 1)).to(device)
+                    fake_labels = torch.zeros((len(lr_images), 1, 1, 1)).to(device)
+
+                    # 生成器生成图像
+                    pred_images = generator(lr_images)
+                    #判别器判别图像 pred_images.detach()是因为这时候pred_image不需要计算梯度，所以让它从计算图中分离出来
+                    probability = discriminator(pred_images.detach())
+
+                    """生成器训练 start"""
+                    # 感知损失
+                    perceptual_loss_value = perceptual_loss(pred_images, gr_images, probability)
+                    # 像素损失
+                    g_loss_pixel = pixel_loss(pred_images, gr_images)
+                    #正则损失
+                    regularization_loss_value= regularization_loss(pred_images)
+                    #生成器总损失
+                    g_loss = perceptual_loss_value + LAMBDA_regularization_loss *regularization_loss_value +LAMBDA_loss_pixel*g_loss_pixel  # 这里的percuptual_loss包含了vgg_loss和对抗损失
+                    # 优化生成器
+                    g_optimizer.zero_grad()
+                    g_loss.backward()
+                    g_optimizer.step()
+                    """生成器训练 end"""
 
 
-        # 优化器
-        g_optimizer = torch.optim.Adam(generator.parameters(), lr=g_lr, betas=g_optimizer_betas,
-                                       weight_decay=weight_decay)
-        d_optimizer = torch.optim.Adam(discriminator.parameters(), lr=d_lr, betas=d_optimizer_betas,
-                                       weight_decay=weight_decay)
+                    #因为判别器太强了，让它弱一点，每两次训练一次
+                    if i % 2 == 0:
+                        """判别器训练 start"""
+                        # 判别器判别真实图片之后将概率结果放入损失函数并且优化生成器   pred_images.detach()是因为这时候pred_image不需要计算梯度，所以让它从计算图中分离出来
+                        real_loss = loss_d(discriminator(gr_images), copy.deepcopy(real_labels))
+                        fake_loss = loss_d(discriminator(pred_images.detach()), copy.deepcopy(fake_labels))
+                        d_loss = (real_loss + fake_loss)
+                        # 优化判别器
+                        d_optimizer.zero_grad()
+                        d_loss.backward()
+                        d_optimizer.step()
+                        """判别器训练 end"""
+                        # 在进度条上显示损失
+                        train_progress_bar.set_postfix({
+                            "class":class_name,
+                            "D Loss": d_loss.item(),
+                            "G Loss": g_loss.item()
+                        })
 
-        start_time = time.time()
-        #轮数
-        for epoch in range(EPOCH_NUMS):
-            generator.train()# 确保生成器在训练模式
-            discriminator.train()# 确保判别器在训练模式
-            # 算每轮epoch的总体loss
-            metric = Accumulator(len(loss_label))
-            # 拿batch——size数据
-            train_progress_bar = tqdm(train_loader, desc=f"Epoch [{epoch + 1}/{EPOCH_NUMS}] Training", unit="batch")
-            for i,batch in enumerate(train_progress_bar):
-                # 低分辨率图像
-                lr_images = batch['lr_data'].to(device)
-                # 真实图像
-                gr_images=['gr_data'].to(device)
+                        # 需要和loss_label对应
+                        metric.add(g_loss.item(),perceptual_loss_value.item(),regularization_loss_value.item(),g_loss_pixel.item() ,d_loss.item(), real_loss.item(), fake_loss.item())
+                    if i % 400 == 0:
+                        image = pred_images.detach()
+                        # save_image中的normalize设置成True，目的是将像素值min-max自动归一到【0,1】范围内，如果已经预测了【0,1】之间，则可以不用设置True
+                        save_dir = f"{out_put_dir}/{class_name}/{data_type}/scale_{SCALE * SCALE}"
+                        os.makedirs(save_dir, exist_ok=True)
 
-                real_labels = torch.ones((len(lr_images), 1, 1, 1)).to(device)
-                fake_labels = torch.zeros((len(lr_images), 1, 1, 1)).to(device)
+                        save_prefix = f"{save_dir}/image_{len(train_loader) * epoch + i}_{name}"
 
-                # 生成器生成图像
-                pred_images = generator(lr_images)
-                #判别器判别图像 pred_images.detach()是因为这时候pred_image不需要计算梯度，所以让它从计算图中分离出来
-                probability = discriminator(pred_images.detach())
+                        if image.dim() == 3:
+                            image = image.unsqueeze(0)  # [C,H,W] -> [1,C,H,W]
 
-                """生成器训练 start"""
-                # 感知损失
-                perceptual_loss_value = perceptual_loss(pred_images, gr_images, probability)
-                # 像素损失
-                g_loss_pixel = pixel_loss(pred_images, gr_images)
-                #正则损失
-                regularization_loss_value= regularization_loss(pred_images)
-                #生成器总损失
-                g_loss = perceptual_loss_value + LAMBDA_regularization_loss *regularization_loss_value +LAMBDA_loss_pixel*g_loss_pixel  # 这里的percuptual_loss包含了vgg_loss和对抗损失
-                # 优化生成器
-                g_optimizer.zero_grad()
-                g_loss.backward()
-                g_optimizer.step()
-                """生成器训练 end"""
+                        channels = image.shape[1]
 
+                        # save_image 中 normalize=True 会把像素值自动归一化到 [0, 1]
+                        if channels == 3:
+                            torchvision.utils.save_image(
+                                image,
+                                f"{save_prefix}.png",
+                                nrow=4,
+                                normalize=True
+                            )
+                        elif channels == 6:
+                            torchvision.utils.save_image(
+                                image[:, :3, :, :],
+                                f"{save_prefix}_img1.png",
+                                nrow=4,
+                                normalize=True
+                            )
+                            torchvision.utils.save_image(
+                                image[:, 3:, :, :],
+                                f"{save_prefix}_img2.png",
+                                nrow=4,
+                                normalize=True
+                            )
+                        else:
+                            raise ValueError(f"Unsupported image channels: {channels}")
+                # 每轮训练结束后进行验证
+                val_loss, avg_psnr = validate(generator, validate_loader, device)
+                wandb.log({"classname":class_name,"data_type":data_type,"Validation Loss": val_loss, "avg_psnr":avg_psnr,"Epoch": epoch}+{loss_label[index] : str(metric[index] / len(train_loader)) + "," for index in
+                                    range(len(loss_label))})
+                current_time = time.time()
+                print(
+                    f"Epoch [{epoch + 1}/{EPOCH_NUMS}] |{class_name} {data_type} |running time:{int(current_time - start_time)}s | "
+                    f"Val Loss: {val_loss:.4f} | Avg PSNR: {avg_psnr:.2f}",end=""
+                )
+                loss_str = "".join([loss_label[index] + ':' + str(metric[index] / len(train_loader)) + "," for index in
+                                    range(len(loss_label))])
+                print(loss_str)
 
-                #因为判别器太强了，让它弱一点，每两次训练一次
-                if i % 2 == 0:
-                    """判别器训练 start"""
-                    # 判别器判别真实图片之后将概率结果放入损失函数并且优化生成器   pred_images.detach()是因为这时候pred_image不需要计算梯度，所以让它从计算图中分离出来
-                    real_loss = loss_d(discriminator(gr_images), copy.deepcopy(real_labels))
-                    fake_loss = loss_d(discriminator(pred_images.detach()), copy.deepcopy(fake_labels))
-                    d_loss = (real_loss + fake_loss)
-                    # 优化判别器
-                    d_optimizer.zero_grad()
-                    d_loss.backward()
-                    d_optimizer.step()
-                    """判别器训练 end"""
-                    # 在进度条上显示损失
-                    train_progress_bar.set_postfix({
-                        "class":class_name,
-                        "D Loss": d_loss.item(),
-                        "G Loss": g_loss.item()
-                    })
+                # 每轮训练结束后进行验证，并保存最后一批图像
+                validate_and_save(f"{out_put_dir}/{class_name}/{data_type}/scale_{SCALE*SCALE}/{predict_dir}", generator, validate_loader, device, epoch)
+                # 保存模型
+                generator_save_path=f"{out_put_dir}/{class_name}/{data_type}/scale_{SCALE*SCALE}/{model_dir}/discriminator_{name}.pth"
+                discriminator_save_path=f"{out_put_dir}/{class_name}/{data_type}/scale_{SCALE*SCALE}/{model_dir}/generator_{name}.pth"
+                torch.save(discriminator.state_dict(),generator_save_path )
+                torch.save(generator.state_dict(), discriminator_save_path)
+                print(f"{class_name} {data_type} |Models saved: Generator -> {generator_save_path}, Discriminator -> {discriminator_save_path}")
 
-                    # 需要和loss_label对应
-                    metric.add(g_loss.item(),perceptual_loss_value.item(),regularization_loss_value.item(),g_loss_pixel.item() ,d_loss.item(), real_loss.item(), fake_loss.item())
-                if i % 400 == 0:
-                    image = pred_images.data
-                    # save_image中的normalize设置成True，目的是将像素值min-max自动归一到【0,1】范围内，如果已经预测了【0,1】之间，则可以不用设置True
-                    torchvision.utils.save_image(image, f"{out_put_dir}/{class_name}/scale_{SCALE*SCALE}/image_{len(train_loader) * epoch + i}_{name}.png",
-                                                 nrow=4, normalize=True)
-            # 每轮训练结束后进行验证
-            val_loss, avg_psnr = validate(generator, validate_loader, device)
-            wandb.log({"Validation Loss": val_loss, "Epoch": epoch})
-            current_time = time.time()
-            print(
-                f"Epoch [{epoch + 1}/{EPOCH_NUMS}] | running time:{int(current_time - start_time)}s | "
-                f"Val Loss: {val_loss:.4f} | Avg PSNR: {avg_psnr:.2f}",end=""
-            )
-            loss_str = "".join([loss_label[index] + ':' + str(metric[index] / len(train_loader)) + "," for index in
-                                range(len(loss_label))])
-            print(loss_str)
-
-            # 每轮训练结束后进行验证，并保存最后一批图像
-            validate_and_save(f"{out_put_dir}/{class_name}/scale_{SCALE*SCALE}/{predict_dir}", generator, validate_loader, device, epoch)
-            # 保存模型
-            generator_save_path=f"{out_put_dir}/{class_name}/scale_{SCALE*SCALE}/{model_dir}/discriminator_{name}.pth"
-            discriminator_save_path=f"{out_put_dir}/{class_name}/scale_{SCALE*SCALE}/{model_dir}/generator_{name}.pth"
-            torch.save(discriminator.state_dict(),generator_save_path )
-            torch.save(generator.state_dict(), discriminator_save_path)
-            print(f"Models saved: Generator -> {generator_save_path}, Discriminator -> {discriminator_save_path}")
-
-            #保存每一epoch的损失
-            animator.add(epoch + 1, [metric[index] / len(train_loader) for index in range(len(loss_label))]+[val_loss,avg_psnr])
-            animator.save_png(f"{out_put_dir}/{class_name}/scale_{SCALE*SCALE}/{loss_dir}/train_loss_epoch_{epoch + 1}_{name}.png")
+                #保存每一epoch的损失
+                animator.add(epoch + 1, [metric[index] / len(train_loader) for index in range(len(loss_label))]+[val_loss,avg_psnr])
+                animator.save_png(f"{out_put_dir}/{class_name}/{data_type}/scale_{SCALE*SCALE}/{loss_dir}/train_loss_epoch_{epoch + 1}_{name}.png")
 
     # # 测试生成器
     # lr = torch.randn(2, 3, 64, 64)
