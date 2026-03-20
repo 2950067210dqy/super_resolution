@@ -26,7 +26,7 @@ device = torch.device("cuda")
 #轮次
 EPOCH_NUMS = 20
 #批量大小
-BATCH_SIZE = 32
+BATCH_SIZE = 16
 #是否打乱训练集
 SHUFFLE = True
 #将数据的图像和光流统一到该尺寸 tuple[int, int]
@@ -1131,7 +1131,12 @@ if __name__ =="__main__":
 
                 #保存每一epoch的损失
                 animator.add(epoch + 1, [metric[index] / len(train_loader) for index in range(len(loss_label))]+[val_loss,avg_psnr])
-                animator.save_png(f"{out_put_dir}/{class_name}/{data_type}/scale_{SCALE*SCALE}/{loss_dir}/train_loss_epoch_{epoch + 1}_{name}.png", exclude_legends=[loss_label[2]])
+                animator.save_png(f"{out_put_dir}/{class_name}/{data_type}/scale_{SCALE*SCALE}/{loss_dir}/train_loss_epoch_{epoch + 1}_{name}.png", fixed_groups=[
+                    [loss_label[0],loss_label[4],validate_label[0]],
+                    [loss_label[1], loss_label[2], loss_label[3]],
+                    [loss_label[5], loss_label[6]],
+                    [validate_label[1]]
+                ])
 
     # # 测试生成器
     # lr = torch.randn(2, 3, 64, 64)
