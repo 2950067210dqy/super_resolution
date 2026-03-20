@@ -3,7 +3,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import pickle
 import re
+from functools import lru_cache
 from collections import defaultdict
 from pathlib import Path
 
@@ -20,7 +23,7 @@ except ImportError:  # pragma: no cover
 
 
 """
-训练时的 batch 使用方式：
+训练时 batch 的读取方式：
 
 for batch in train_dataloader:
     lr_img = batch["image_pair"]["lr_data"]
@@ -40,11 +43,21 @@ GR_DATA_ROOT_DIR = r"/study_datas/sr_dataset/class_1/data"
 # 低分辨率数据根路径
 LR_DATA_ROOT_DIR = rf"/study_datas/sr_dataset/class_1_lr/x{4}/data"
 
-# Middlebury .flo 文件头标识
+# Middlebury `.flo` 文件的 magic number。
 FLO_MAGIC = 202021.25
 
-# 支持的图像扩展名
+# 认为是图像的扩展名集合。
 IMAGE_EXTENSIONS = {".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp"}
+
+PAIR_KEY_PATTERNS = (
+    re.compile(r"^(.*?)(?:[_-]?ti[_-]?\d+)$"),
+    re.compile(r"^(.*?)(?:[_-]?t[_-]?i[_-]?\d+)$"),
+    re.compile(r"^(.*?)(?:[_-]?(?:img|image|frame)[_-]?\d+)$"),
+    re.compile(r"^(.*?)(?:[_-]?\d+)$"),
+)
+LR_SUFFIX_PATTERN = re.compile(r"([_-]lr)+$")
+FLOW_LR_SUFFIX_PATTERN = re.compile(r"([_-]flow)+([_-]lr)+$")
+FLOW_SUFFIX_PATTERN = re.compile(r"([_-]flow)+$")
 
 
 # ==============================
@@ -53,7 +66,10 @@ IMAGE_EXTENSIONS = {".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp"}
 
 def progress_iter(iterable, desc: str, total: int | None = None):
     """
-    统一包装进度显示。
+    给迭代器包一层进度显示。
+
+    - 如果环境中安装了 `tqdm`，显示进度条
+    - 否则退化成普通迭代，同时打印提示信息
     """
     if tqdm is not None:
         return tqdm(iterable, desc=desc, total=total, leave=False)
@@ -62,9 +78,181 @@ def progress_iter(iterable, desc: str, total: int | None = None):
     return iterable
 
 
+def log_info(message: str, verbose: bool) -> None:
+    """
+    按需打印日志，避免大数据集下逐文件输出拖慢速度。
+    """
+    if verbose:
+        print(message)
+
+
+def _normalize_image_array(image: np.ndarray, image_path: str) -> np.ndarray:
+    """
+    把读取出的图像统一整理成 H x W x 3 的 numpy 数组。
+    """
+    if image.ndim == 2:
+        image = np.repeat(image[..., None], 3, axis=-1)
+    elif image.ndim == 3 and image.shape[0] in (3, 4) and image.shape[-1] not in (3, 4):
+        image = np.moveaxis(image, 0, -1)
+
+    if image.ndim != 3:
+        raise ValueError(f"Unsupported image shape: {image.shape}, file: {image_path}")
+
+    if image.shape[-1] == 1:
+        image = np.repeat(image, 3, axis=-1)
+    elif image.shape[-1] >= 4:
+        image = image[..., :3]
+
+    return np.ascontiguousarray(image)
+
+
+@lru_cache(maxsize=512)
+def _read_rgb_image_cached(path_str: str) -> np.ndarray:
+    return _normalize_image_array(tifffile.imread(path_str), path_str)
+
+
+@lru_cache(maxsize=512)
+def _read_flo_cached(path_str: str) -> np.ndarray:
+    path = Path(path_str)
+    header = np.fromfile(path, dtype=np.float32, count=1)
+    if header.size != 1:
+        raise ValueError(f"Incomplete .flo file header: {path}")
+
+    magic = float(header[0])
+    if abs(magic - FLO_MAGIC) > 1e-4:
+        raise ValueError(f"Invalid .flo magic number: {path}")
+
+    dims = np.fromfile(path, dtype=np.int32, count=2, offset=4)
+    if dims.size != 2:
+        raise ValueError(f"Failed to read width/height from .flo file: {path}")
+
+    width, height = int(dims[0]), int(dims[1])
+    flow_uv = np.fromfile(path, dtype=np.float32, offset=12)
+    expected_size = 2 * width * height
+    if flow_uv.size != expected_size:
+        raise ValueError(
+            f"Incomplete .flo data: {path}, expected {expected_size}, got {flow_uv.size}"
+        )
+
+    flow_uv = flow_uv.reshape(height, width, 2)
+    flow_magnitude = np.linalg.norm(flow_uv, axis=2, keepdims=True)
+    return np.concatenate([flow_uv, flow_magnitude], axis=2)
+
+
+def build_metadata_cache_path(
+    cache_dir: Path,
+    gr_root: Path,
+    lr_root: Path,
+    class_names: list[str],
+) -> Path:
+    """
+    为当前数据配置生成稳定的元数据缓存文件路径。
+    """
+    fingerprint_parts = [str(gr_root), str(lr_root)]
+    for class_name in class_names:
+        gr_class_dir = gr_root / class_name / class_name
+        lr_class_dir = lr_root / class_name / class_name
+        gr_mtime = gr_class_dir.stat().st_mtime_ns if gr_class_dir.exists() else 0
+        lr_mtime = lr_class_dir.stat().st_mtime_ns if lr_class_dir.exists() else 0
+        fingerprint_parts.append(f"{class_name}:{gr_mtime}:{lr_mtime}")
+
+    digest = hashlib.md5("|".join(fingerprint_parts).encode("utf-8")).hexdigest()
+    return cache_dir / f"sr_samples_{digest}.pkl"
+
+
+def build_tensor_cache_root(
+    cache_dir: Path,
+    gr_root: Path,
+    lr_root: Path,
+    class_names: list[str],
+    target_size: tuple[int, int] | None,
+) -> Path:
+    """
+    为当前数据配置生成张量缓存目录。
+    """
+    fingerprint = hashlib.md5(
+        "|".join(
+            [
+                str(gr_root),
+                str(lr_root),
+                ",".join(class_names),
+                str(target_size),
+            ]
+        ).encode("utf-8")
+    ).hexdigest()
+    return cache_dir / f"tensor_cache_{fingerprint}"
+
+
+def build_sample_tensor_cache_path(
+    cache_root: Path,
+    sample: dict,
+) -> Path:
+    """
+    为单个样本生成稳定的张量缓存文件路径。
+    """
+    path_parts = [sample["class_name"], sample["sample_key"]]
+    for path in sample["image_pair"]["gr_paths"]:
+        path_parts.append(f"gri:{path.stat().st_mtime_ns}:{path}")
+    for path in sample["image_pair"]["lr_paths"]:
+        path_parts.append(f"lri:{path.stat().st_mtime_ns}:{path}")
+    for path in sample["flo"]["gr_paths"]:
+        path_parts.append(f"grf:{path.stat().st_mtime_ns}:{path}")
+    for path in sample["flo"]["lr_paths"]:
+        path_parts.append(f"lrf:{path.stat().st_mtime_ns}:{path}")
+
+    digest = hashlib.md5("|".join(path_parts).encode("utf-8")).hexdigest()
+    return cache_root / sample["class_name"] / f"{digest}.pt"
+
+
+def dump_samples_cache(cache_path: Path, samples: list[dict]) -> None:
+    serializable_samples = []
+    for sample in samples:
+        serializable_samples.append(
+            {
+                "class_name": sample["class_name"],
+                "sample_key": sample["sample_key"],
+                "image_pair": {
+                    "gr_paths": [str(path) for path in sample["image_pair"]["gr_paths"]],
+                    "lr_paths": [str(path) for path in sample["image_pair"]["lr_paths"]],
+                },
+                "flo": {
+                    "gr_paths": [str(path) for path in sample["flo"]["gr_paths"]],
+                    "lr_paths": [str(path) for path in sample["flo"]["lr_paths"]],
+                },
+            }
+        )
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    with cache_path.open("wb") as file:
+        pickle.dump(serializable_samples, file, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def load_samples_cache(cache_path: Path) -> list[dict]:
+    with cache_path.open("rb") as file:
+        cached_samples = pickle.load(file)
+
+    samples: list[dict] = []
+    for sample in cached_samples:
+        samples.append(
+            {
+                "class_name": sample["class_name"],
+                "sample_key": sample["sample_key"],
+                "image_pair": {
+                    "gr_paths": [Path(path) for path in sample["image_pair"]["gr_paths"]],
+                    "lr_paths": [Path(path) for path in sample["image_pair"]["lr_paths"]],
+                },
+                "flo": {
+                    "gr_paths": [Path(path) for path in sample["flo"]["gr_paths"]],
+                    "lr_paths": [Path(path) for path in sample["flo"]["lr_paths"]],
+                },
+            }
+        )
+    return samples
+
+
 def ensure_valid_root_dir(root_dir: str, root_name: str) -> Path:
     """
-    校验根目录是否合法，并返回绝对路径。
+    校验根目录是否合法，并统一转换成绝对路径。
     """
     if not root_dir:
         raise ValueError(f"Please pass {root_name}.")
@@ -82,47 +270,23 @@ def ensure_valid_root_dir(root_dir: str, root_name: str) -> Path:
 
 def read_flo(path: Path) -> np.ndarray:
     """
-    使用 numpy 直接读取 .flo 光流文件，返回 H x W x 3。
+    读取 `.flo` 光流文件。
 
-    3 个通道分别是：
-    - u
-    - v
+    原始 `.flo` 通常只有 2 个通道：
+    - u: 水平方向分量
+    - v: 垂直方向分量
+
+    这里额外补 1 个物理量通道：
     - magnitude = sqrt(u^2 + v^2)
+
+    最终返回形状为 `H x W x 3` 的数组。
     """
-    print(f"[Read] Loading flow file: {path}")
-
-    # 先按 float32 读取第一个数，用于校验 magic
-    header_float = np.fromfile(path, dtype=np.float32, count=1)
-    if header_float.size != 1:
-        raise ValueError(f"Incomplete .flo file header: {path}")
-
-    magic = float(header_float[0])
-    if abs(magic - FLO_MAGIC) > 1e-4:
-        raise ValueError(f"Invalid .flo magic number: {path}")
-
-    # 宽高位于偏移 4 字节之后，按 int32 读取
-    dims = np.fromfile(path, dtype=np.int32, count=2, offset=4)
-    if dims.size != 2:
-        raise ValueError(f"Failed to read width/height from .flo file: {path}")
-
-    width, height = int(dims[0]), int(dims[1])
-
-    # 从偏移 12 字节后读取真正的光流数据
-    flow_uv = np.fromfile(path, dtype=np.float32, offset=12)
-    expected_size = 2 * width * height
-    if flow_uv.size != expected_size:
-        raise ValueError(
-            f"Incomplete .flo data: {path}, expected {expected_size}, got {flow_uv.size}"
-        )
-
-    flow_uv = flow_uv.reshape(height, width, 2)
-    flow_magnitude = np.linalg.norm(flow_uv, axis=2, keepdims=True)
-    return np.concatenate([flow_uv, flow_magnitude], axis=2)
+    return _read_flo_cached(str(path))
 
 
 class FloToTensor:
     """
-    把 H x W x 3 的 flo 数组转成 3 x H x W 张量。
+    把 `H x W x 3` 的光流数组转换为 `3 x H x W` 张量。
     """
 
     def __call__(self, flow: np.ndarray) -> torch.Tensor:
@@ -135,7 +299,7 @@ class FloToTensor:
 
 class FlowResize:
     """
-    对 flo 数据做 resize。
+    使用双线性插值把 flo 数据 resize 到目标尺寸。
     """
 
     def __init__(self, target_size: tuple[int, int]) -> None:
@@ -159,6 +323,12 @@ class FlowResize:
 def discover_class_names(data_root: Path) -> list[str]:
     """
     从单个根目录中发现类别名。
+
+    目录结构要求是：
+    root/
+        class_name/
+            class_name/
+                data files...
     """
     class_names: list[str] = []
     print(f"[Scan] Discovering class folders under: {data_root}")
@@ -173,7 +343,9 @@ def discover_class_names(data_root: Path) -> list[str]:
 
 def get_class_names(gr_data_root_dir: str, lr_data_root_dir: str) -> list[str]:
     """
-    获取 GR 和 LR 根目录共同拥有的类别名。
+    对外公开的类别名获取函数。
+
+    返回 GR 和 LR 根目录共同拥有的类别名交集。
     """
     gr_root = ensure_valid_root_dir(gr_data_root_dir, "gr_data_root_dir")
     lr_root = ensure_valid_root_dir(lr_data_root_dir, "lr_data_root_dir")
@@ -198,6 +370,11 @@ def normalize_selected_classes(
 ) -> list[str]:
     """
     标准化外部传入的类别筛选参数。
+
+    支持：
+    - None
+    - 单个类名字符串
+    - 类名列表 / 元组
     """
     if selected_classes is None:
         return available_class_names
@@ -220,29 +397,21 @@ def normalize_selected_classes(
 
 
 # ==============================
-# 文件名到样本键的归一化
+# 样本键标准化
 # ==============================
 
 def infer_image_pair_key(file_stem: str) -> str:
     """
-    从图像文件名里提取样本主键。
+    从图像文件名里提取图像对的“样本主键”。
 
     例如：
-    - backstep_Re800_00001_img1 -> backstep_re800_00001
-    - backstep_Re800_00001_img2_lr -> backstep_re800_00001
+    - `sample_ti0`, `sample_ti1` -> `sample`
+    - `sample-ti-0`, `sample-ti-1` -> `sample`
     """
     stem = file_stem.lower()
-    stem = re.sub(r"([_-]lr)+$", "", stem)
-
-    patterns = [
-        r"^(.*?)(?:[_-]?img[_-]?\d+)$",
-        r"^(.*?)(?:[_-]?image[_-]?\d+)$",
-        r"^(.*?)(?:[_-]?frame[_-]?\d+)$",
-        r"^(.*?)(?:[_-]?ti[_-]?\d+)$",
-        r"^(.*?)(?:[_-]?\d+)$",
-    ]
-    for pattern in patterns:
-        match = re.match(pattern, stem)
+    stem = LR_SUFFIX_PATTERN.sub("", stem)
+    for pattern in PAIR_KEY_PATTERNS:
+        match = pattern.match(stem)
         if match and match.group(1):
             return match.group(1)
     return stem
@@ -250,24 +419,34 @@ def infer_image_pair_key(file_stem: str) -> str:
 
 def normalize_pair_key(sample_key: str) -> str:
     """
-    统一样本键，去掉末尾的 _lr 和 _flow。
+    统一配对时使用的样本键。
+
+    主要处理几类常见尾缀：
+    - `_lr`
+    - `_flow`
+    - `_flow_lr`
     """
     normalized_key = sample_key.lower()
-    normalized_key = re.sub(r"([_-]lr)+$", "", normalized_key)
-    normalized_key = re.sub(r"([_-]flow)+$", "", normalized_key)
+    normalized_key = FLOW_LR_SUFFIX_PATTERN.sub("", normalized_key)
+    normalized_key = LR_SUFFIX_PATTERN.sub("", normalized_key)
+    normalized_key = FLOW_SUFFIX_PATTERN.sub("", normalized_key)
     return normalized_key
 
 
 # ==============================
-# 单个根目录内部样本打包
+# 单根目录样本收集
 # ==============================
 
-def collect_root_class_samples(class_name: str, class_dir: Path, domain_name: str) -> list[dict]:
+def collect_root_class_samples(
+    class_name: str,
+    class_dir: Path,
+    domain_name: str,
+    verbose: bool = False,
+) -> list[dict]:
     """
-    在单个根目录内部先把同一个 sample_key 的 3 个文件打包成完整样本：
-    - img1
-    - img2
-    - flow
+    ????????????? sample_key ???????????
+    - 2 ????img1 / img2
+    - 1 ? flo?flow
     """
     image_groups: dict[str, list[Path]] = defaultdict(list)
     flo_map: dict[str, Path] = {}
@@ -287,19 +466,25 @@ def collect_root_class_samples(class_name: str, class_dir: Path, domain_name: st
 
         if suffix == ".flo":
             sample_key = normalize_pair_key(file_path.stem)
+            log_info(
+                f"[Collect] {domain_name}:{class_name} flo -> {file_path.name}, key={sample_key}",
+                verbose,
+            )
             flo_map[sample_key] = file_path
-            print(f"[Collect] {domain_name}:{class_name} flo -> {file_path.name}, key={sample_key}")
             continue
 
         if suffix in IMAGE_EXTENSIONS:
             sample_key = normalize_pair_key(infer_image_pair_key(file_path.stem))
             image_groups[sample_key].append(file_path)
-            print(f"[Collect] {domain_name}:{class_name} image -> {file_path.name}, key={sample_key}")
+            log_info(
+                f"[Collect] {domain_name}:{class_name} image -> {file_path.name}, key={sample_key}",
+                verbose,
+            )
 
     samples: list[dict] = []
     all_keys = sorted(set(image_groups.keys()) | set(flo_map.keys()))
-
     incomplete_keys: list[tuple[str, str]] = []
+
     for sample_key in all_keys:
         image_paths = sorted(image_groups.get(sample_key, []))
         flo_path = flo_map.get(sample_key)
@@ -312,9 +497,10 @@ def collect_root_class_samples(class_name: str, class_dir: Path, domain_name: st
             incomplete_keys.append((sample_key, "missing_flo"))
             continue
 
-        print(
+        log_info(
             f"[Pack] {domain_name}:{class_name} sample_key={sample_key} "
-            f"-> images={[path.name for path in image_paths]}, flo={flo_path.name}"
+            f"-> images={[path.name for path in image_paths]}, flo={flo_path.name}",
+            verbose,
         )
         samples.append(
             {
@@ -336,15 +522,20 @@ def collect_root_class_samples(class_name: str, class_dir: Path, domain_name: st
 
 
 # ==============================
-# GR / LR 成对配对
+# GR/LR 配对与模态对齐
 # ==============================
 
-def pair_sr_class_samples(class_name: str, gr_class_dir: Path, lr_class_dir: Path) -> list[dict]:
+def pair_sr_class_samples(
+    class_name: str,
+    gr_class_dir: Path,
+    lr_class_dir: Path,
+    verbose: bool = False,
+) -> list[dict]:
     """
-    先在 GR 和 LR 内部分别组完整样本，再按 sample_key 做 GR/LR 配对。
+    ?? GR ? LR ???????????? sample_key ? GR/LR ???
     """
-    gr_samples = collect_root_class_samples(class_name, gr_class_dir, "GR")
-    lr_samples = collect_root_class_samples(class_name, lr_class_dir, "LR")
+    gr_samples = collect_root_class_samples(class_name, gr_class_dir, "GR", verbose=verbose)
+    lr_samples = collect_root_class_samples(class_name, lr_class_dir, "LR", verbose=verbose)
 
     gr_map = {sample["sample_key"]: sample for sample in gr_samples}
     lr_map = {sample["sample_key"]: sample for sample in lr_samples}
@@ -384,6 +575,7 @@ def pair_sr_class_samples(class_name: str, gr_class_dir: Path, lr_class_dir: Pat
 
     print(f"[Done] Class '{class_name}' paired {len(paired_samples)} aligned SR samples")
     return paired_samples
+
 
 
 # ==============================
@@ -439,16 +631,18 @@ def split_samples_by_class(
 
 
 # ==============================
-# Dataset
+# Dataset / collate
 # ==============================
 
 class SRPairedDataset(Dataset):
     """
     超分辨率成对数据集。
 
-    每个样本包含：
-    - image_pair: 两张 RGB 图像，拼接后是 6 x H x W
-    - flo: 3 通道光流，3 x H x W
+    每个样本包含两种模态：
+    - image_pair
+    - flo
+
+    并且二者在样本级别严格一一对应。
     """
 
     def __init__(
@@ -457,52 +651,119 @@ class SRPairedDataset(Dataset):
         class_to_idx: dict[str, int],
         image_transform: transforms.Compose,
         flow_transform: transforms.Compose,
+        verbose: bool = False,
+        cache_file_reads: bool = True,
+        cache_transformed_samples: bool = False,
+        tensor_cache_root: Path | None = None,
     ) -> None:
         self.samples = samples
         self.class_to_idx = class_to_idx
         self.image_transform = image_transform
         self.flow_transform = flow_transform
+        self.verbose = verbose
+        self.cache_file_reads = cache_file_reads
+        self.cache_transformed_samples = cache_transformed_samples
+        self.tensor_cache_root = tensor_cache_root
+        self._sample_cache: dict[int, dict] = {}
+        self._sample_metadata = [
+            {
+                "label": self.class_to_idx[sample["class_name"]],
+                "class_name": sample["class_name"],
+                "sample_key": sample["sample_key"],
+                "image_pair_lr_paths": " | ".join(str(path) for path in sample["image_pair"]["lr_paths"]),
+                "image_pair_gr_paths": " | ".join(str(path) for path in sample["image_pair"]["gr_paths"]),
+                "flo_lr_paths": " | ".join(str(path) for path in sample["flo"]["lr_paths"]),
+                "flo_gr_paths": " | ".join(str(path) for path in sample["flo"]["gr_paths"]),
+            }
+            for sample in samples
+        ]
 
     def __len__(self) -> int:
         return len(self.samples)
 
-    def _read_tif_as_rgb(self, path: Path) -> np.ndarray:
-        """
-        使用 tifffile 读取 tif，并整理成 H x W x 3。
-        """
-        image = tifffile.imread(str(path))
-
-        if image.ndim == 2:
-            image = np.stack([image, image, image], axis=-1)
-        elif image.ndim == 3 and image.shape[0] in (3, 4) and image.shape[-1] not in (3, 4):
-            image = np.moveaxis(image, 0, -1)
-
-        if image.ndim != 3:
-            raise ValueError(f"Unsupported tif shape: {image.shape}, file: {path}")
-
-        if image.shape[-1] == 1:
-            image = np.repeat(image, 3, axis=-1)
-        elif image.shape[-1] >= 4:
-            image = image[..., :3]
-
-        return image
-
     def _load_image_pair(self, paths: list[Path]) -> torch.Tensor:
         """
-        读取两张 RGB 图像并沿通道维拼接。
+        读取两张 RGB 图像，并沿通道维拼接。
+
+        每张图是 `3 x H x W`，两张拼接后变成 `6 x H x W`。
         """
-        print(f"[Read] Loading image pair: {paths[0].name}, {paths[1].name}")
+        log_info(f"[Read] Loading image pair: {paths[0].name}, {paths[1].name}", self.verbose)
         image_tensors = []
         for image_path in paths:
-            image = self._read_tif_as_rgb(image_path)
+            if self.cache_file_reads:
+                image = _read_rgb_image_cached(str(image_path))
+            else:
+                image = _normalize_image_array(tifffile.imread(str(image_path)), str(image_path))
+
             image_tensors.append(self.image_transform(image))
         return torch.cat(image_tensors, dim=0)
 
     def __getitem__(self, index: int) -> dict:
-        sample = self.samples[index]
-        label = self.class_to_idx[sample["class_name"]]
+        if self.cache_transformed_samples and index in self._sample_cache:
+            cached = self._sample_cache[index]
+            return {
+                "image_pair": {
+                    "lr_data": cached["image_pair"]["lr_data"].clone(),
+                    "gr_data": cached["image_pair"]["gr_data"].clone(),
+                },
+                "flo": {
+                    "lr_data": cached["flo"]["lr_data"].clone(),
+                    "gr_data": cached["flo"]["gr_data"].clone(),
+                },
+                "label": cached["label"],
+                "class_name": cached["class_name"],
+                "sample_key": cached["sample_key"],
+                "image_pair_lr_paths": cached["image_pair_lr_paths"],
+                "image_pair_gr_paths": cached["image_pair_gr_paths"],
+                "flo_lr_paths": cached["flo_lr_paths"],
+                "flo_gr_paths": cached["flo_gr_paths"],
+            }
 
-        return {
+        sample = self.samples[index]
+        metadata = self._sample_metadata[index]
+        tensor_cache_path = None
+        if self.tensor_cache_root is not None:
+            tensor_cache_path = build_sample_tensor_cache_path(self.tensor_cache_root, sample)
+            if tensor_cache_path.exists():
+                cached = torch.load(tensor_cache_path, map_location="cpu")
+                item = {
+                    "image_pair": {
+                        "lr_data": cached["image_pair"]["lr_data"],
+                        "gr_data": cached["image_pair"]["gr_data"],
+                    },
+                    "flo": {
+                        "lr_data": cached["flo"]["lr_data"],
+                        "gr_data": cached["flo"]["gr_data"],
+                    },
+                    "label": metadata["label"],
+                    "class_name": metadata["class_name"],
+                    "sample_key": metadata["sample_key"],
+                    "image_pair_lr_paths": metadata["image_pair_lr_paths"],
+                    "image_pair_gr_paths": metadata["image_pair_gr_paths"],
+                    "flo_lr_paths": metadata["flo_lr_paths"],
+                    "flo_gr_paths": metadata["flo_gr_paths"],
+                }
+                if self.cache_transformed_samples:
+                    self._sample_cache[index] = {
+                        "image_pair": {
+                            "lr_data": item["image_pair"]["lr_data"].clone(),
+                            "gr_data": item["image_pair"]["gr_data"].clone(),
+                        },
+                        "flo": {
+                            "lr_data": item["flo"]["lr_data"].clone(),
+                            "gr_data": item["flo"]["gr_data"].clone(),
+                        },
+                        "label": item["label"],
+                        "class_name": item["class_name"],
+                        "sample_key": item["sample_key"],
+                        "image_pair_lr_paths": item["image_pair_lr_paths"],
+                        "image_pair_gr_paths": item["image_pair_gr_paths"],
+                        "flo_lr_paths": item["flo_lr_paths"],
+                        "flo_gr_paths": item["flo_gr_paths"],
+                    }
+                return item
+
+        item = {
             "image_pair": {
                 "lr_data": self._load_image_pair(sample["image_pair"]["lr_paths"]),
                 "gr_data": self._load_image_pair(sample["image_pair"]["gr_paths"]),
@@ -511,23 +772,56 @@ class SRPairedDataset(Dataset):
                 "lr_data": self.flow_transform(read_flo(sample["flo"]["lr_paths"][0])),
                 "gr_data": self.flow_transform(read_flo(sample["flo"]["gr_paths"][0])),
             },
-            "label": label,
-            "class_name": sample["class_name"],
-            "sample_key": sample["sample_key"],
-            "image_pair_lr_paths": " | ".join(str(path) for path in sample["image_pair"]["lr_paths"]),
-            "image_pair_gr_paths": " | ".join(str(path) for path in sample["image_pair"]["gr_paths"]),
-            "flo_lr_paths": " | ".join(str(path) for path in sample["flo"]["lr_paths"]),
-            "flo_gr_paths": " | ".join(str(path) for path in sample["flo"]["gr_paths"]),
+            "label": metadata["label"],
+            "class_name": metadata["class_name"],
+            "sample_key": metadata["sample_key"],
+            "image_pair_lr_paths": metadata["image_pair_lr_paths"],
+            "image_pair_gr_paths": metadata["image_pair_gr_paths"],
+            "flo_lr_paths": metadata["flo_lr_paths"],
+            "flo_gr_paths": metadata["flo_gr_paths"],
         }
 
+        if tensor_cache_path is not None and not tensor_cache_path.exists():
+            tensor_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {
+                    "image_pair": {
+                        "lr_data": item["image_pair"]["lr_data"],
+                        "gr_data": item["image_pair"]["gr_data"],
+                    },
+                    "flo": {
+                        "lr_data": item["flo"]["lr_data"],
+                        "gr_data": item["flo"]["gr_data"],
+                    },
+                },
+                tensor_cache_path,
+            )
 
-# ==============================
-# collate_fn
-# ==============================
+        if self.cache_transformed_samples:
+            self._sample_cache[index] = {
+                "image_pair": {
+                    "lr_data": item["image_pair"]["lr_data"].clone(),
+                    "gr_data": item["image_pair"]["gr_data"].clone(),
+                },
+                "flo": {
+                    "lr_data": item["flo"]["lr_data"].clone(),
+                    "gr_data": item["flo"]["gr_data"].clone(),
+                },
+                "label": item["label"],
+                "class_name": item["class_name"],
+                "sample_key": item["sample_key"],
+                "image_pair_lr_paths": item["image_pair_lr_paths"],
+                "image_pair_gr_paths": item["image_pair_gr_paths"],
+                "flo_lr_paths": item["flo_lr_paths"],
+                "flo_gr_paths": item["flo_gr_paths"],
+            }
+
+        return item
+
 
 def build_aligned_batch(samples: list[dict]) -> dict | None:
     """
-    把一组样本整理成对齐 batch。
+    把一组已经一一对应的多模态样本整理成 batch。
     """
     if not samples:
         return None
@@ -553,7 +847,15 @@ def build_aligned_batch(samples: list[dict]) -> dict | None:
 
 def sr_paired_collate_fn(batch: list[dict]) -> dict | None:
     """
-    返回对齐后的 batch 结构。
+    collate 后返回一个对齐 batch：
+
+    batch["image_pair"]["lr_data"]
+    batch["image_pair"]["gr_data"]
+    batch["flo"]["lr_data"]
+    batch["flo"]["gr_data"]
+
+    对于同一个 batch 下的第 i 个样本，
+    `image_pair` 和 `flo` 一定对应同一个 `sample_key`。
     """
     return build_aligned_batch(batch)
 
@@ -564,7 +866,7 @@ def sr_paired_collate_fn(batch: list[dict]) -> dict | None:
 
 def print_batch_debug_info(batch: dict | None, batch_name: str = "batch") -> None:
     """
-    打印一个 batch 的结构、shape、sample_key 和路径信息。
+    打印一个 batch 的完整结构，方便调试。
     """
     print("=" * 80)
     print(f"[Debug] {batch_name} structure")
@@ -582,11 +884,15 @@ def print_batch_debug_info(batch: dict | None, batch_name: str = "batch") -> Non
         print("[Debug] image_pair sub-batch:")
         print(f"  lr_data shape: {tuple(image_pair['lr_data'].shape)}")
         print(f"  gr_data shape: {tuple(image_pair['gr_data'].shape)}")
+    else:
+        print("[Debug] image_pair sub-batch: None")
 
     if flo is not None:
         print("[Debug] flo sub-batch:")
         print(f"  lr_data shape: {tuple(flo['lr_data'].shape)}")
         print(f"  gr_data shape: {tuple(flo['gr_data'].shape)}")
+    else:
+        print("[Debug] flo sub-batch: None")
 
     sample_keys = batch.get("sample_key", [])
     class_names = batch.get("class_name", [])
@@ -597,11 +903,17 @@ def print_batch_debug_info(batch: dict | None, batch_name: str = "batch") -> Non
 
     print(f"[Debug] aligned sample count: {len(sample_keys)}")
     for index, sample_key in enumerate(sample_keys):
-        print(f"[Debug] sample[{index}] key={sample_key}, class={class_names[index]}")
-        print(f"  image_pair lr_paths: {image_pair_lr_paths[index]}")
-        print(f"  image_pair gr_paths: {image_pair_gr_paths[index]}")
-        print(f"  flo lr_paths: {flo_lr_paths[index]}")
-        print(f"  flo gr_paths: {flo_gr_paths[index]}")
+        class_name = class_names[index] if index < len(class_names) else "UNKNOWN"
+        image_pair_lr_path = image_pair_lr_paths[index] if index < len(image_pair_lr_paths) else "N/A"
+        image_pair_gr_path = image_pair_gr_paths[index] if index < len(image_pair_gr_paths) else "N/A"
+        flo_lr_path = flo_lr_paths[index] if index < len(flo_lr_paths) else "N/A"
+        flo_gr_path = flo_gr_paths[index] if index < len(flo_gr_paths) else "N/A"
+
+        print(f"[Debug] sample[{index}] key={sample_key}, class={class_name}")
+        print(f"  image_pair lr_paths: {image_pair_lr_path}")
+        print(f"  image_pair gr_paths: {image_pair_gr_path}")
+        print(f"  flo lr_paths: {flo_lr_path}")
+        print(f"  flo gr_paths: {flo_gr_path}")
 
     print("=" * 80)
 
@@ -621,9 +933,27 @@ def load_data(
     train_nums_rate: float = 0.8,
     validate_nums_rate: float | None = None,
     random_seed: int = 42,
+    verbose: bool = False,
+    use_metadata_cache: bool = True,
+    cache_file_reads: bool = True,
+    cache_transformed_samples: bool = False,
+    use_disk_tensor_cache: bool = False,
 ):
     """
     加载超分辨率 GR/LR 成对数据集。
+
+    保留的全部需求：
+    1. 两个根目录：GR / LR
+    2. 自动获取类别名，支持按指定类别加载
+    3. 每个类别内分成 `image_pair` 和 `flo`
+    4. image_pair 和 flo 在样本级别严格一一对应
+    5. image_pair 保持 RGB，不转灰度
+    6. flo 输出 3 通道：u / v / magnitude
+    7. 训练集与验证集按类别分别划分
+    8. batch 输出结构中同时包含：
+       - batch["image_pair"]["lr_data"], batch["image_pair"]["gr_data"]
+       - batch["flo"]["lr_data"], batch["flo"]["gr_data"]
+    9. 提供详细日志和 batch 调试函数
     """
     gr_root = ensure_valid_root_dir(gr_data_root_dir, "gr_data_root_dir")
     lr_root = ensure_valid_root_dir(lr_data_root_dir, "lr_data_root_dir")
@@ -634,6 +964,13 @@ def load_data(
     print(f"[Start] LR root: {lr_root}")
     print(f"[Start] batch_size={batch_size}, num_workers={num_workers}, shuffle={shuffle}")
     print(f"[Start] target_size={target_size}, random_seed={random_seed}")
+    print(f"[Start] verbose={verbose}")
+    print(
+        f"[Start] use_metadata_cache={use_metadata_cache}, "
+        f"cache_file_reads={cache_file_reads}, "
+        f"cache_transformed_samples={cache_transformed_samples}, "
+        f"use_disk_tensor_cache={use_disk_tensor_cache}"
+    )
     print("=" * 80)
 
     available_class_names = get_class_names(gr_data_root_dir, lr_data_root_dir)
@@ -644,8 +981,7 @@ def load_data(
     print(f"[Info] class_to_idx mapping: {class_to_idx}")
 
     image_transform = transforms.Compose(
-        [transforms.ToTensor()]
-        + ([transforms.Resize(target_size)] if target_size else [])
+        [transforms.ToTensor()] + ([transforms.Resize(target_size)] if target_size else [])
     )
     flow_transform = transforms.Compose(
         ([FlowResize(target_size)] if target_size else []) + [FloToTensor()]
@@ -654,13 +990,37 @@ def load_data(
     print(f"[Transform] Image transform: {image_transform}")
     print(f"[Transform] Flow transform: {flow_transform}")
 
-    samples: list[dict] = []
-    for class_name in progress_iter(class_names, desc="Collect SR samples", total=len(class_names)):
-        gr_class_dir = gr_root / class_name / class_name
-        lr_class_dir = lr_root / class_name / class_name
-        class_samples = pair_sr_class_samples(class_name, gr_class_dir, lr_class_dir)
-        samples.extend(class_samples)
-        print(f"[Summary] Class '{class_name}' contributes {len(class_samples)} paired samples")
+    cache_dir = Path(__file__).resolve().parent / ".sr_cache"
+    cache_path = build_metadata_cache_path(cache_dir, gr_root, lr_root, class_names)
+    tensor_cache_root = build_tensor_cache_root(
+        cache_dir,
+        gr_root,
+        lr_root,
+        class_names,
+        target_size,
+    ) if use_disk_tensor_cache else None
+
+    samples: list[dict]
+    if use_metadata_cache and cache_path.exists():
+        print(f"[Cache] Loading paired sample metadata from: {cache_path}")
+        samples = load_samples_cache(cache_path)
+    else:
+        samples = []
+        for class_name in progress_iter(class_names, desc="Collect SR samples", total=len(class_names)):
+            gr_class_dir = gr_root / class_name / class_name
+            lr_class_dir = lr_root / class_name / class_name
+            class_samples = pair_sr_class_samples(
+                class_name,
+                gr_class_dir,
+                lr_class_dir,
+                verbose=verbose,
+            )
+            samples.extend(class_samples)
+            log_info(f"[Summary] Class '{class_name}' contributes {len(class_samples)} paired samples", verbose)
+
+        if use_metadata_cache:
+            dump_samples_cache(cache_path, samples)
+            print(f"[Cache] Saved paired sample metadata to: {cache_path}")
 
     if not samples:
         raise ValueError("No paired GR/LR samples found.")
@@ -688,7 +1048,6 @@ def load_data(
     train_size = len(train_samples)
     val_size = len(validate_samples)
     total_samples = len(samples)
-
     if train_size == 0:
         raise ValueError("Per-class split produced an empty training set.")
     if val_size == 0:
@@ -699,12 +1058,20 @@ def load_data(
         class_to_idx=class_to_idx,
         image_transform=image_transform,
         flow_transform=flow_transform,
+        verbose=verbose,
+        cache_file_reads=cache_file_reads,
+        cache_transformed_samples=cache_transformed_samples,
+        tensor_cache_root=tensor_cache_root,
     )
     validate_dataset = SRPairedDataset(
         samples=validate_samples,
         class_to_idx=class_to_idx,
         image_transform=image_transform,
         flow_transform=flow_transform,
+        verbose=verbose,
+        cache_file_reads=cache_file_reads,
+        cache_transformed_samples=cache_transformed_samples,
+        tensor_cache_root=tensor_cache_root,
     )
 
     train_dataloader = DataLoader(
@@ -732,7 +1099,6 @@ def load_data(
     )
     print(f"[Done] Train samples: {train_size}")
     print(f"[Done] Validate samples: {val_size}")
-
     for class_name in class_names:
         class_summary = split_summary.get(class_name, {"total": 0, "train": 0, "val": 0})
         print(
@@ -741,8 +1107,8 @@ def load_data(
             f"train={class_summary['train']}, "
             f"val={class_summary['val']}"
         )
-
     print("=" * 80)
+
     return train_dataloader, validate_dataloader, class_names, samples
 
 
@@ -759,7 +1125,6 @@ if __name__ == "__main__":
         lr_data_root_dir=LR_DATA_ROOT_DIR,
         selected_classes=available_class_names[:1] if available_class_names else None,
     )
-
     print(f"class_names: {class_names}")
     print(f"num_samples: {len(samples)}")
 

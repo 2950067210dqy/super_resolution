@@ -24,7 +24,7 @@ from study.SRGAN.data_load import get_class_names, load_data
 name = "v1"
 device = torch.device("cuda")
 #轮次
-EPOCH_NUMS = 2
+EPOCH_NUMS = 20
 #批量大小
 BATCH_SIZE = 32
 #是否打乱训练集
@@ -48,8 +48,8 @@ weight_decay=0.0001
 g_optimizer_betas = (0.5,0.999)
 d_optimizer_betas = (0.5,0.999)
 #学习率
-g_lr = 0.001
-d_lr = 0.0001
+g_lr = 0.002
+d_lr = 0.00009
 
 #训练数据集和验证集合比例
 Train_nums_rate=0.8
@@ -131,11 +131,18 @@ def _in_notebook():
 
 
 class Animator:
-    """Docker/.py 可用：记录数据，最后导出 GIF"""
-    def __init__(self, xlabel=None, ylabel=None, legend=None, xlim=None, ylim=None,
-                 xscale="linear", yscale="linear",
-                 fmts=("-", "m--", "g-.", "r:"), figsize=(6, 4)):
-        self.fig, self.ax = plt.subplots(figsize=figsize)
+    def __init__(
+        self,
+        xlabel=None,
+        ylabel=None,
+        legend=None,
+        xlim=None,
+        ylim=None,
+        xscale="linear",
+        yscale="linear",
+        fmts=None,
+        figsize=(6, 4),
+    ):
         self.xlabel = xlabel
         self.ylabel = ylabel
         self.legend = legend or []
@@ -143,11 +150,33 @@ class Animator:
         self.ylim = ylim
         self.xscale = xscale
         self.yscale = yscale
-        self.fmts = fmts
+        self.base_figsize = figsize
 
         self.X = None
         self.Y = None
-        self.frames = []  # 每一帧保存一次快照
+        self.frames = []
+
+        self.fmts = fmts if fmts is not None else self._build_auto_fmts()
+
+        self.fig = None
+        self.axes = None
+
+    def _build_auto_fmts(self):
+        colors = ["b", "g", "r", "c", "m", "y", "k"]
+        linestyles = ["-", "--", "-.", ":"]
+        markers = ["", "o", "s", "d", "^", "v", "x", "*"]
+
+        n = len(self.legend) if self.legend else 8
+        fmts = []
+
+        for linestyle in linestyles:
+            for marker in markers:
+                for color in colors:
+                    fmts.append(f"{color}{linestyle}{marker}")
+                    if len(fmts) >= n:
+                        return fmts
+
+        return fmts
 
     def add(self, x, y):
         if not hasattr(y, "__len__"):
@@ -167,97 +196,327 @@ class Animator:
                 self.X[i].append(a)
                 self.Y[i].append(b)
 
-        # 记录当前帧数据（深拷贝）
         self.frames.append(([row[:] for row in self.X], [row[:] for row in self.Y]))
 
-    def _config_axes(self, current_y=None):
-        self.ax.set_xlabel(self.xlabel if self.xlabel else "")
-        self.ax.set_ylabel(self.ylabel if self.ylabel else "")
-        if self.xlim is not None:
-            self.ax.set_xlim(self.xlim)
+    def _filter_series(self, Xf, Yf, exclude_legends=None):
+        exclude_legends = set(exclude_legends or [])
+        filtered = []
 
-        if self.ylim is not None:
-            ymin, ymax = self.ylim[0],self.ylim[1]
-            if current_y:
-                data_max = max(
-                    max(series) for series in current_y if series
-                )
-                ymax = max(ymax, data_max)  # 数据更大时，自动扩展上限
-            self.ax.set_ylim((ymin, ymax))
-
-        self.ax.set_xscale(self.xscale)
-        self.ax.set_yscale(self.yscale)
-        if self.legend:
-            self.ax.legend(self.legend, loc='upper right', bbox_to_anchor=(1.15, 1), fontsize=9)
-
-    def _draw_frame(self,frame_idx):
-        self.ax.cla()
-        Xf, Yf = self.frames[frame_idx]
         for i, (xx, yy) in enumerate(zip(Xf, Yf)):
-            fmt = self.fmts[i % len(self.fmts)]
-            self.ax.plot(xx, yy, fmt)
-        self._config_axes(current_y=Yf)
-    def save(self, gif_path="train.gif", png_path="train.png", fps=20):
+            name = self.legend[i] if i < len(self.legend) else f"series_{i}"
+            if name in exclude_legends:
+                continue
+            filtered.append({
+                "idx": i,
+                "name": name,
+                "x": xx,
+                "y": yy,
+                "fmt": self.fmts[i % len(self.fmts)],
+            })
+        return filtered
+
+    def _series_scale(self, y):
+        if not y:
+            return 0.0
+        return max(abs(v) for v in y)
+
+    def _group_series_by_scale(self, series_list, split_ratio=8.0):
+        non_empty = []
+        empty = []
+
+        for s in series_list:
+            scale = self._series_scale(s["y"])
+            item = {**s, "scale": scale}
+            if scale == 0:
+                empty.append(item)
+            else:
+                non_empty.append(item)
+
+        non_empty.sort(key=lambda s: s["scale"])
+
+        groups = []
+        current_group = []
+
+        for s in non_empty:
+            if not current_group:
+                current_group.append(s)
+                continue
+
+            current_max = max(item["scale"] for item in current_group)
+            if current_max == 0 or s["scale"] / current_max <= split_ratio:
+                current_group.append(s)
+            else:
+                groups.append(current_group)
+                current_group = [s]
+
+        if current_group:
+            groups.append(current_group)
+
+        if empty:
+            if groups:
+                groups[0].extend(empty)
+            else:
+                groups = [empty]
+
+        return groups if groups else [[]]
+
+    def _apply_fixed_groups(self, series_list, fixed_groups=None, split_ratio=8.0):
+        """
+        fixed_groups 示例:
+        [
+            ["G_loss", "D_loss"],
+            ["PSNR", "SSIM"]
+        ]
+        """
+        fixed_groups = fixed_groups or []
+        name_to_series = {s["name"]: s for s in series_list}
+
+        used_names = set()
+        final_groups = []
+
+        for group in fixed_groups:
+            current_group = []
+            for name in group:
+                if name in name_to_series:
+                    current_group.append(name_to_series[name])
+                    used_names.add(name)
+            if current_group:
+                final_groups.append(current_group)
+
+        remaining_series = [s for s in series_list if s["name"] not in used_names]
+        dynamic_groups = self._group_series_by_scale(remaining_series, split_ratio=split_ratio)
+        final_groups.extend([g for g in dynamic_groups if g])
+
+        return final_groups if final_groups else [[]]
+
+    def _build_figure(self, n_subplots):
+        if self.fig is not None:
+            plt.close(self.fig)
+
+        width, height = self.base_figsize
+        self.fig, axes = plt.subplots(
+            n_subplots,
+            1,
+            figsize=(width, height * n_subplots),
+            squeeze=False
+        )
+        self.axes = [ax[0] for ax in axes]
+
+    def _config_axis(self, ax, series_group):
+        ax.set_xlabel(self.xlabel or "")
+        ax.set_ylabel(self.ylabel or "")
+
+        if self.xlim is not None:
+            ax.set_xlim(self.xlim)
+
+        y_values = [v for s in series_group for v in s["y"]]
+        if y_values:
+            data_min = min(y_values)
+            data_max = max(y_values)
+
+            if self.ylim is not None:
+                ymin, ymax = self.ylim
+                ymax = max(ymax, data_max)
+                ymin = min(ymin, data_min)
+            else:
+                ymin, ymax = data_min, data_max
+
+            if ymin == ymax:
+                pad = 1.0 if ymin == 0 else abs(ymin) * 0.05
+                ymin -= pad
+                ymax += pad
+
+            ax.set_ylim((ymin, ymax+0.2))
+
+        ax.set_xscale(self.xscale)
+        ax.set_yscale(self.yscale)
+
+        if series_group:
+            ax.legend([s["name"] for s in series_group], loc="upper right", fontsize=9)
+
+        ax.grid(True, alpha=0.3)
+
+    def _draw_frame(self, frame_idx, exclude_legends=None, split_ratio=8.0, fixed_groups=None):
+        Xf, Yf = self.frames[frame_idx]
+        filtered_series = self._filter_series(Xf, Yf, exclude_legends=exclude_legends)
+        groups = self._apply_fixed_groups(
+            filtered_series,
+            fixed_groups=fixed_groups,
+            split_ratio=split_ratio
+        )
+
+        self._build_figure(len(groups))
+
+        for ax, group in zip(self.axes, groups):
+            ax.cla()
+            for s in group:
+                ax.plot(s["x"], s["y"], s["fmt"])
+            self._config_axis(ax, group)
+
+        self.fig.tight_layout()
+
+    def save(self, gif_path="train.gif", fps=20, exclude_legends=None, split_ratio=8.0, fixed_groups=None):
         if not self.frames:
             raise ValueError("没有可保存的帧，请先调用 add().")
 
-
+        self._draw_frame(
+            0,
+            exclude_legends=exclude_legends,
+            split_ratio=split_ratio,
+            fixed_groups=fixed_groups,
+        )
 
         def update(frame_idx):
-            self._draw_frame(frame_idx)
-            return self.ax.lines
+            self._draw_frame(
+                frame_idx,
+                exclude_legends=exclude_legends,
+                split_ratio=split_ratio,
+                fixed_groups=fixed_groups,
+            )
+            lines = []
+            for ax in self.axes:
+                lines.extend(ax.lines)
+            return lines
 
-        # 1) 保存 GIF
         ani = FuncAnimation(
-            self.fig, update, frames=len(self.frames), interval=1000 / fps, blit=False
+            self.fig,
+            update,
+            frames=len(self.frames),
+            interval=1000 / fps,
+            blit=False
         )
         ani.save(gif_path, writer=PillowWriter(fps=fps))
-
-
-
         plt.close(self.fig)
-    def save_png(self, png_path="train.png"):
-        # 2) 保存 PNG（最后一帧）
-        self._draw_frame(len(self.frames) - 1)
-        self.fig.savefig(png_path, dpi=200, bbox_inches="tight")
-def validate_and_save(result_dir, generator, val_dataloader, device, epoch):
-    generator.eval()  # 设置生成器为评估模式
-    with torch.no_grad():
-        for batch_idx, (lr_images, hr_images) in enumerate(val_dataloader):
-            lr_images, hr_images = lr_images.to(device), hr_images.to(device)
+        self.fig = None
+        self.axes = None
 
-            # 生成超分辨率图像
+    def save_png(self, png_path="train.png", exclude_legends=None, split_ratio=8.0, fixed_groups=None):
+        if not self.frames:
+            raise ValueError("没有可保存的帧，请先调用 add().")
+
+        self._draw_frame(
+            len(self.frames) - 1,
+            exclude_legends=exclude_legends,
+            split_ratio=split_ratio,
+            fixed_groups=fixed_groups,
+        )
+        self.fig.savefig(png_path, dpi=200, bbox_inches="tight")
+def add_vertical_separator(tensor, sep_width=8, value=1.0):
+    b, c, h, _ = tensor.shape
+    return torch.full((b, c, h, sep_width), value, device=tensor.device, dtype=tensor.dtype)
+
+
+def add_horizontal_separator(width, channels=3, sep_height=8, value=1.0, device="cpu", dtype=torch.float32):
+    return torch.full((1, channels, sep_height, width), value, device=device, dtype=dtype)
+
+
+def build_triplet_row(lr, fake, hr, sep_width=6):
+    sep = add_vertical_separator(lr, sep_width=sep_width, value=1.0)
+    return torch.cat([lr, sep, fake, sep, hr], dim=3)
+
+
+def to_gray_3ch(x):
+    """
+    x: [B, 3, H, W]
+    先压成灰度 [B,1,H,W]，再复制成 [B,3,H,W] 方便可视化拼接
+    """
+    gray = x.mean(dim=1, keepdim=True)
+    return gray.repeat(1, 3, 1, 1)
+
+
+def convert_fake_for_display(fake, fake_mode="rgb"):
+    """
+    fake: [B, 3, H, W]
+    fake_mode:
+        - rgb: 原图显示
+        - gray: 压成灰度显示
+    """
+    if fake_mode == "rgb":
+        return fake
+    if fake_mode == "gray":
+        return to_gray_3ch(fake)
+    raise ValueError(f"Unsupported fake_mode: {fake_mode}")
+
+
+def validate_and_save(result_dir, generator, val_dataloader, device, epoch, data_type, fake_mode="gray"):
+    """
+    3 通道：
+        LR | Fake | HR
+    6 通道：
+        LR1 | Fake1 | HR1 || LR2 | Fake2 | HR2
+
+    参数:
+        fake_mode:
+            - "rgb": fake 保持彩色
+            - "gray": fake 压成灰度后显示
+    """
+    generator.eval()
+    os.makedirs(result_dir, exist_ok=True)
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(val_dataloader):
+            lr_images = batch[data_type]["lr_data"].to(device)
+            hr_images = batch[data_type]["gr_data"].to(device)
             fake_images = generator(lr_images)
 
-            # 使用双三次插值将低分辨率图像调整到与高分辨率图像相同的大小
             resized_lr_images = F.interpolate(
                 lr_images,
-                size=hr_images.shape[2:],  # 调整到高分辨率图像的大小
-                mode='bicubic',           # 使用双三次插值
-                align_corners=False       # 推荐设置为 False，避免插值误差
+                size=hr_images.shape[2:],
+                mode="bicubic",
+                align_corners=False,
             )
 
-            # 按行拼接一批图像
-            batch_combined = []
-            for i in range(lr_images.size(0)):  # 遍历 batch 中的每张图片
-                # 获取单张图像
-                single_lr = resized_lr_images[i].unsqueeze(0)  # 调整后的低分辨率图像
-                single_fake = fake_images[i].unsqueeze(0)      # 生成的高分辨率图像
-                single_hr = hr_images[i].unsqueeze(0)          # 高分辨率图像
+            channels = hr_images.shape[1]
+            if channels not in (3, 6):
+                raise ValueError(f"Unsupported channel count: {channels}")
 
-                # 按列拼接单张图片的三种结果
-                combined = torch.cat([single_lr, single_fake, single_hr], dim=3)  # 按列（宽度方向）拼接
-                batch_combined.append(combined)
+            sample_rows = []
 
-            # 将一批图片按行拼接
-            batch_combined = torch.cat(batch_combined, dim=2)  # 按高度方向（行）拼接整个 batch
+            for i in range(lr_images.size(0)):
+                single_lr = resized_lr_images[i].unsqueeze(0)
+                single_fake = fake_images[i].unsqueeze(0)
+                single_hr = hr_images[i].unsqueeze(0)
 
-            # 保存结果
-            save_path = os.path.join(result_dir, f"epoch_{epoch+1}_batch_{batch_idx}_results.png")
-            save_image(batch_combined, save_path)
+                if channels == 3:
+                    display_fake = convert_fake_for_display(single_fake, fake_mode=fake_mode)
+                    row = build_triplet_row(single_lr, display_fake, single_hr, sep_width=6)
+                    sample_rows.append(row)
+
+                else:
+                    lr_1, lr_2 = single_lr[:, :3], single_lr[:, 3:]
+                    fake_1, fake_2 = single_fake[:, :3], single_fake[:, 3:]
+                    hr_1, hr_2 = single_hr[:, :3], single_hr[:, 3:]
+
+                    display_fake_1 = convert_fake_for_display(fake_1, fake_mode=fake_mode)
+                    display_fake_2 = convert_fake_for_display(fake_2, fake_mode=fake_mode)
+
+                    left_group = build_triplet_row(lr_1, display_fake_1, hr_1, sep_width=6)
+                    right_group = build_triplet_row(lr_2, display_fake_2, hr_2, sep_width=6)
+
+                    group_sep = add_vertical_separator(left_group, sep_width=16, value=1.0)
+                    row = torch.cat([left_group, group_sep, right_group], dim=3)
+                    sample_rows.append(row)
+
+            batch_combined = sample_rows[0]
+            for row in sample_rows[1:]:
+                h_sep = add_horizontal_separator(
+                    width=batch_combined.shape[3],
+                    channels=batch_combined.shape[1],
+                    sep_height=10,
+                    value=1.0,
+                    device=batch_combined.device,
+                    dtype=batch_combined.dtype,
+                )
+                batch_combined = torch.cat([batch_combined, h_sep, row], dim=2)
+
+            save_path = os.path.join(
+                result_dir,
+                f"epoch_{epoch + 1}_batch_{batch_idx}_results.png"
+            )
+
+            save_image(batch_combined.cpu(), save_path, normalize=True)
             print(f"Saved validation image: {save_path}")
-
-            break  # 只保存一个 batch 的结果
+            break
 
 """
 工具 end
@@ -639,7 +898,11 @@ def validate(generator, dataloader, device):
     total_psnr = 0
     num_images = 0
     with torch.no_grad():
-        for lr_images, hr_images in dataloader:
+        for batch in dataloader:
+            # 低分辨率图像
+            lr_images = batch[data_type]['lr_data'].to(device)
+            # 真实图像
+            hr_images = batch[data_type]['gr_data'].to(device)
             lr_images, hr_images = lr_images.to(device), hr_images.to(device)
             fake_images = generator(lr_images)
             val_loss += pixel_loss(fake_images, hr_images).item()
@@ -699,7 +962,7 @@ if __name__ =="__main__":
             Path(f"{out_put_dir}/{class_name}/{data_type}/scale_{SCALE * SCALE}/{model_dir}").mkdir(parents=True, exist_ok=True)
             Path(f"{out_put_dir}/{class_name}/{data_type}/scale_{SCALE * SCALE}/{predict_dir}").mkdir(parents=True, exist_ok=True)
 
-            animator = Animator(xlabel='ste', xlim=[1, EPOCH_NUMS], ylim=[0, 2],
+            animator = Animator(xlabel='epoch', xlim=[1, EPOCH_NUMS], ylim=[0, 0.5],
                                 legend=loss_label + validate_label)
             # 实例化generator
             generator = Generator(inner_chanel=3 if data_type=='flo' else 6).to(device)
@@ -733,13 +996,19 @@ if __name__ =="__main__":
                 metric = Accumulator(len(loss_label))
                 # 拿batch——size数据
                 train_progress_bar = tqdm(train_loader, desc=f"Epoch [{epoch + 1}/{EPOCH_NUMS}] {class_name} {data_type} Training", unit="batch")
+                #1600/32 =50
                 for i,batch in enumerate(train_progress_bar):
                     # 低分辨率图像
                     lr_images = batch[data_type]['lr_data'].to(device)
                     # 真实图像
                     gr_images=batch[data_type]['gr_data'].to(device)
-
-                    real_labels = torch.ones((len(lr_images), 1, 1, 1)).to(device)
+                    """
+                    给真实标签做一点平滑
+                    不要让判别器太容易自信到极致，比如：
+                    real label: 1.0 -> 0.9
+                    """
+                    real_labels_out = torch.ones((len(lr_images), 1, 1, 1)).to(device)
+                    real_labels = torch.full_like(real_labels_out, 0.9).to(device)
                     fake_labels = torch.zeros((len(lr_images), 1, 1, 1)).to(device)
 
                     # 生成器生成图像
@@ -753,9 +1022,16 @@ if __name__ =="__main__":
                     # 像素损失
                     g_loss_pixel = pixel_loss(pred_images, gr_images)
                     #正则损失
+                    """
+                    这是很常见的现象，这个 RegularizationLoss 本质上是在惩罚图像相邻像素差，也就是一种平滑约束。
+                    它一开始很大、随后迅速掉到很小，通常不代表代码错了，更多说明生成器输出很快变“更平滑”了。
+                    也就是说，图像越抖、越噪、局部变化越剧烈，这个值越大；图像越平滑，这个值越小
+                    """
                     regularization_loss_value= regularization_loss(pred_images)
                     #生成器总损失
-                    g_loss = perceptual_loss_value + LAMBDA_regularization_loss *regularization_loss_value +LAMBDA_loss_pixel*g_loss_pixel  # 这里的percuptual_loss包含了vgg_loss和对抗损失
+                    # g_loss = perceptual_loss_value + LAMBDA_regularization_loss *regularization_loss_value +LAMBDA_loss_pixel*g_loss_pixel  # 这里的percuptual_loss包含了vgg_loss和对抗损失
+                    g_loss= perceptual_loss_value
+
                     # 优化生成器
                     g_optimizer.zero_grad()
                     g_loss.backward()
@@ -763,7 +1039,7 @@ if __name__ =="__main__":
                     """生成器训练 end"""
 
 
-                    #因为判别器太强了，让它弱一点，每两次训练一次
+                    # #因为判别器太强了，让它弱一点，每两次训练一次
                     if i % 2 == 0:
                         """判别器训练 start"""
                         # 判别器判别真实图片之后将概率结果放入损失函数并且优化生成器   pred_images.detach()是因为这时候pred_image不需要计算梯度，所以让它从计算图中分离出来
@@ -784,7 +1060,8 @@ if __name__ =="__main__":
 
                         # 需要和loss_label对应
                         metric.add(g_loss.item(),perceptual_loss_value.item(),regularization_loss_value.item(),g_loss_pixel.item() ,d_loss.item(), real_loss.item(), fake_loss.item())
-                    if i % 400 == 0:
+                    # end if i % 2 == 0:
+                    if i % 10 == 0:
                         image = pred_images.detach()
                         # save_image中的normalize设置成True，目的是将像素值min-max自动归一到【0,1】范围内，如果已经预测了【0,1】之间，则可以不用设置True
                         save_dir = f"{out_put_dir}/{class_name}/{data_type}/scale_{SCALE * SCALE}"
@@ -803,27 +1080,37 @@ if __name__ =="__main__":
                                 image,
                                 f"{save_prefix}.png",
                                 nrow=4,
-                                normalize=True
+                                # normalize=True
                             )
                         elif channels == 6:
                             torchvision.utils.save_image(
-                                image[:, :3, :, :],
+                                # 彩色就不需要取均值压成灰度图
+                                image[:, :3, :, :].mean(dim=1, keepdim=True),
                                 f"{save_prefix}_img1.png",
                                 nrow=4,
-                                normalize=True
+                                # normalize=True
                             )
                             torchvision.utils.save_image(
-                                image[:, 3:, :, :],
+                                image[:, 3:, :, :].mean(dim=1, keepdim=True),
                                 f"{save_prefix}_img2.png",
                                 nrow=4,
-                                normalize=True
+                                # normalize=True
                             )
                         else:
                             raise ValueError(f"Unsupported image channels: {channels}")
                 # 每轮训练结束后进行验证
                 val_loss, avg_psnr = validate(generator, validate_loader, device)
-                wandb.log({"classname":class_name,"data_type":data_type,"Validation Loss": val_loss, "avg_psnr":avg_psnr,"Epoch": epoch}+{loss_label[index] : str(metric[index] / len(train_loader)) + "," for index in
-                                    range(len(loss_label))})
+                wandb.log({
+                    "classname": class_name,
+                    "data_type": data_type,
+                    "Validation Loss": val_loss,
+                    "avg_psnr": avg_psnr,
+                    "Epoch": epoch,
+                    **{
+                        loss_label[index]: metric[index] / len(train_loader)
+                        for index in range(len(loss_label))
+                    }
+                })
                 current_time = time.time()
                 print(
                     f"Epoch [{epoch + 1}/{EPOCH_NUMS}] |{class_name} {data_type} |running time:{int(current_time - start_time)}s | "
@@ -834,7 +1121,7 @@ if __name__ =="__main__":
                 print(loss_str)
 
                 # 每轮训练结束后进行验证，并保存最后一批图像
-                validate_and_save(f"{out_put_dir}/{class_name}/{data_type}/scale_{SCALE*SCALE}/{predict_dir}", generator, validate_loader, device, epoch)
+                validate_and_save(f"{out_put_dir}/{class_name}/{data_type}/scale_{SCALE*SCALE}/{predict_dir}", generator, validate_loader, device, epoch,data_type=data_type)
                 # 保存模型
                 generator_save_path=f"{out_put_dir}/{class_name}/{data_type}/scale_{SCALE*SCALE}/{model_dir}/discriminator_{name}.pth"
                 discriminator_save_path=f"{out_put_dir}/{class_name}/{data_type}/scale_{SCALE*SCALE}/{model_dir}/generator_{name}.pth"
@@ -844,7 +1131,7 @@ if __name__ =="__main__":
 
                 #保存每一epoch的损失
                 animator.add(epoch + 1, [metric[index] / len(train_loader) for index in range(len(loss_label))]+[val_loss,avg_psnr])
-                animator.save_png(f"{out_put_dir}/{class_name}/{data_type}/scale_{SCALE*SCALE}/{loss_dir}/train_loss_epoch_{epoch + 1}_{name}.png")
+                animator.save_png(f"{out_put_dir}/{class_name}/{data_type}/scale_{SCALE*SCALE}/{loss_dir}/train_loss_epoch_{epoch + 1}_{name}.png", exclude_legends=[loss_label[2]])
 
     # # 测试生成器
     # lr = torch.randn(2, 3, 64, 64)
