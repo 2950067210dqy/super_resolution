@@ -1,0 +1,5 @@
+edit by dqy 2026-03-23
+1.添加单张图片 非两张图片 finished
+2.添加超参数 控制是否使用之前的模型继续训练 finished
+3.flo文件显示图片出现问题 finished
+4.添加控制彩色或者黑白图片的选择超参数 finished

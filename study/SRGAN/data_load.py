@@ -639,7 +639,7 @@ class SRPairedDataset(Dataset):
     超分辨率成对数据集。
 
     每个样本包含两种模态：
-    - image_pair
+    - image_pair (previous / next)
     - flo
 
     并且二者在样本级别严格一一对应。
@@ -681,11 +681,13 @@ class SRPairedDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def _load_image_pair(self, paths: list[Path]) -> torch.Tensor:
+    def _load_image_pair(self, paths: list[Path]) -> dict:
         """
-        读取两张 RGB 图像，并沿通道维拼接。
+        读取两张 RGB 图像，拆成 previous / next 两部分。
 
-        每张图是 `3 x H x W`，两张拼接后变成 `6 x H x W`。
+        每张图是 `3 x H x W`：
+        - previous: 第一张
+        - next: 第二张
         """
         log_info(f"[Read] Loading image pair: {paths[0].name}, {paths[1].name}", self.verbose)
         image_tensors = []
@@ -694,18 +696,96 @@ class SRPairedDataset(Dataset):
                 image = _read_rgb_image_cached(str(image_path))
             else:
                 image = _normalize_image_array(tifffile.imread(str(image_path)), str(image_path))
-
             image_tensors.append(self.image_transform(image))
-        return torch.cat(image_tensors, dim=0)
+
+        if len(image_tensors) != 2:
+            raise ValueError(f"Expected exactly 2 images, got {len(image_tensors)}")
+
+        return {
+            "previous": image_tensors[0],
+            "next": image_tensors[1],
+        }
+
+    def _split_old_6ch_image_pair(self, tensor_or_dict) -> dict:
+        """
+        兼容旧缓存：
+        - 旧格式可能是 6xHxW tensor（两张图通道拼接）
+        - 也可能已是 {"previous": ..., "next": ...}
+        """
+        if isinstance(tensor_or_dict, dict):
+            if "previous" in tensor_or_dict and "next" in tensor_or_dict:
+                return {
+                    "previous": tensor_or_dict["previous"],
+                    "next": tensor_or_dict["next"],
+                }
+            raise ValueError("Unsupported cached image pair dict format.")
+
+        if not isinstance(tensor_or_dict, torch.Tensor):
+            raise ValueError(f"Unsupported cached image pair type: {type(tensor_or_dict)}")
+
+        if tensor_or_dict.ndim != 3 or tensor_or_dict.shape[0] != 6:
+            raise ValueError(f"Expected cached 6xHxW tensor, got {tuple(tensor_or_dict.shape)}")
+
+        return {
+            "previous": tensor_or_dict[:3, ...],
+            "next": tensor_or_dict[3:, ...],
+        }
+
+    def _normalize_cached_image_pair(self, cached_image_pair: dict) -> dict:
+        """
+        统一把缓存里的 image_pair 转成新结构：
+        {
+          "previous": {"lr_data":..., "gr_data":...},
+          "next": {"lr_data":..., "gr_data":...},
+        }
+        """
+        # 新格式
+        if (
+            "previous" in cached_image_pair
+            and "next" in cached_image_pair
+            and isinstance(cached_image_pair["previous"], dict)
+            and isinstance(cached_image_pair["next"], dict)
+            and "lr_data" in cached_image_pair["previous"]
+            and "gr_data" in cached_image_pair["previous"]
+            and "lr_data" in cached_image_pair["next"]
+            and "gr_data" in cached_image_pair["next"]
+        ):
+            return cached_image_pair
+
+        # 旧格式: {"lr_data": <6ch or dict>, "gr_data": <6ch or dict>}
+        if "lr_data" in cached_image_pair and "gr_data" in cached_image_pair:
+            lr_pair = self._split_old_6ch_image_pair(cached_image_pair["lr_data"])
+            gr_pair = self._split_old_6ch_image_pair(cached_image_pair["gr_data"])
+            return {
+                "previous": {
+                    "lr_data": lr_pair["previous"],
+                    "gr_data": gr_pair["previous"],
+                },
+                "next": {
+                    "lr_data": lr_pair["next"],
+                    "gr_data": gr_pair["next"],
+                },
+            }
+
+        raise ValueError("Unsupported cached image_pair format.")
+
+    def _clone_image_pair(self, image_pair: dict) -> dict:
+        return {
+            "previous": {
+                "lr_data": image_pair["previous"]["lr_data"].clone(),
+                "gr_data": image_pair["previous"]["gr_data"].clone(),
+            },
+            "next": {
+                "lr_data": image_pair["next"]["lr_data"].clone(),
+                "gr_data": image_pair["next"]["gr_data"].clone(),
+            },
+        }
 
     def __getitem__(self, index: int) -> dict:
         if self.cache_transformed_samples and index in self._sample_cache:
             cached = self._sample_cache[index]
             return {
-                "image_pair": {
-                    "lr_data": cached["image_pair"]["lr_data"].clone(),
-                    "gr_data": cached["image_pair"]["gr_data"].clone(),
-                },
+                "image_pair": self._clone_image_pair(cached["image_pair"]),
                 "flo": {
                     "lr_data": cached["flo"]["lr_data"].clone(),
                     "gr_data": cached["flo"]["gr_data"].clone(),
@@ -722,15 +802,15 @@ class SRPairedDataset(Dataset):
         sample = self.samples[index]
         metadata = self._sample_metadata[index]
         tensor_cache_path = None
+
         if self.tensor_cache_root is not None:
             tensor_cache_path = build_sample_tensor_cache_path(self.tensor_cache_root, sample)
             if tensor_cache_path.exists():
                 cached = torch.load(tensor_cache_path, map_location="cpu")
+                normalized_image_pair = self._normalize_cached_image_pair(cached["image_pair"])
+
                 item = {
-                    "image_pair": {
-                        "lr_data": cached["image_pair"]["lr_data"],
-                        "gr_data": cached["image_pair"]["gr_data"],
-                    },
+                    "image_pair": normalized_image_pair,
                     "flo": {
                         "lr_data": cached["flo"]["lr_data"],
                         "gr_data": cached["flo"]["gr_data"],
@@ -743,12 +823,10 @@ class SRPairedDataset(Dataset):
                     "flo_lr_paths": metadata["flo_lr_paths"],
                     "flo_gr_paths": metadata["flo_gr_paths"],
                 }
+
                 if self.cache_transformed_samples:
                     self._sample_cache[index] = {
-                        "image_pair": {
-                            "lr_data": item["image_pair"]["lr_data"].clone(),
-                            "gr_data": item["image_pair"]["gr_data"].clone(),
-                        },
+                        "image_pair": self._clone_image_pair(item["image_pair"]),
                         "flo": {
                             "lr_data": item["flo"]["lr_data"].clone(),
                             "gr_data": item["flo"]["gr_data"].clone(),
@@ -763,10 +841,19 @@ class SRPairedDataset(Dataset):
                     }
                 return item
 
+        lr_image_pair = self._load_image_pair(sample["image_pair"]["lr_paths"])
+        gr_image_pair = self._load_image_pair(sample["image_pair"]["gr_paths"])
+
         item = {
             "image_pair": {
-                "lr_data": self._load_image_pair(sample["image_pair"]["lr_paths"]),
-                "gr_data": self._load_image_pair(sample["image_pair"]["gr_paths"]),
+                "previous": {
+                    "lr_data": lr_image_pair["previous"],
+                    "gr_data": gr_image_pair["previous"],
+                },
+                "next": {
+                    "lr_data": lr_image_pair["next"],
+                    "gr_data": gr_image_pair["next"],
+                },
             },
             "flo": {
                 "lr_data": self.flow_transform(read_flo(sample["flo"]["lr_paths"][0])),
@@ -785,10 +872,7 @@ class SRPairedDataset(Dataset):
             tensor_cache_path.parent.mkdir(parents=True, exist_ok=True)
             torch.save(
                 {
-                    "image_pair": {
-                        "lr_data": item["image_pair"]["lr_data"],
-                        "gr_data": item["image_pair"]["gr_data"],
-                    },
+                    "image_pair": item["image_pair"],
                     "flo": {
                         "lr_data": item["flo"]["lr_data"],
                         "gr_data": item["flo"]["gr_data"],
@@ -799,10 +883,7 @@ class SRPairedDataset(Dataset):
 
         if self.cache_transformed_samples:
             self._sample_cache[index] = {
-                "image_pair": {
-                    "lr_data": item["image_pair"]["lr_data"].clone(),
-                    "gr_data": item["image_pair"]["gr_data"].clone(),
-                },
+                "image_pair": self._clone_image_pair(item["image_pair"]),
                 "flo": {
                     "lr_data": item["flo"]["lr_data"].clone(),
                     "gr_data": item["flo"]["gr_data"].clone(),
@@ -818,7 +899,6 @@ class SRPairedDataset(Dataset):
 
         return item
 
-
 def build_aligned_batch(samples: list[dict]) -> dict | None:
     """
     把一组已经一一对应的多模态样本整理成 batch。
@@ -828,8 +908,22 @@ def build_aligned_batch(samples: list[dict]) -> dict | None:
 
     return {
         "image_pair": {
-            "lr_data": torch.stack([sample["image_pair"]["lr_data"] for sample in samples], dim=0),
-            "gr_data": torch.stack([sample["image_pair"]["gr_data"] for sample in samples], dim=0),
+            "previous": {
+                "lr_data": torch.stack(
+                    [sample["image_pair"]["previous"]["lr_data"] for sample in samples], dim=0
+                ),
+                "gr_data": torch.stack(
+                    [sample["image_pair"]["previous"]["gr_data"] for sample in samples], dim=0
+                ),
+            },
+            "next": {
+                "lr_data": torch.stack(
+                    [sample["image_pair"]["next"]["lr_data"] for sample in samples], dim=0
+                ),
+                "gr_data": torch.stack(
+                    [sample["image_pair"]["next"]["gr_data"] for sample in samples], dim=0
+                ),
+            },
         },
         "flo": {
             "lr_data": torch.stack([sample["flo"]["lr_data"] for sample in samples], dim=0),
@@ -849,15 +943,21 @@ def sr_paired_collate_fn(batch: list[dict]) -> dict | None:
     """
     collate 后返回一个对齐 batch：
 
-    batch["image_pair"]["lr_data"]
-    batch["image_pair"]["gr_data"]
+    batch["image_pair"]["previous"]["lr_data"]
+    batch["image_pair"]["previous"]["gr_data"]
+    batch["image_pair"]["next"]["lr_data"]
+    batch["image_pair"]["next"]["gr_data"]
+
     batch["flo"]["lr_data"]
     batch["flo"]["gr_data"]
 
     对于同一个 batch 下的第 i 个样本，
-    `image_pair` 和 `flo` 一定对应同一个 `sample_key`。
+    image_pair 和 flo 一定对应同一个 sample_key。
     """
     return build_aligned_batch(batch)
+
+
+
 
 
 # ==============================
@@ -882,8 +982,10 @@ def print_batch_debug_info(batch: dict | None, batch_name: str = "batch") -> Non
 
     if image_pair is not None:
         print("[Debug] image_pair sub-batch:")
-        print(f"  lr_data shape: {tuple(image_pair['lr_data'].shape)}")
-        print(f"  gr_data shape: {tuple(image_pair['gr_data'].shape)}")
+        print(f"  previous lr_data shape: {tuple(image_pair['previous']['lr_data'].shape)}")
+        print(f"  previous gr_data shape: {tuple(image_pair['previous']['gr_data'].shape)}")
+        print(f"  next lr_data shape: {tuple(image_pair['next']['lr_data'].shape)}")
+        print(f"  next gr_data shape: {tuple(image_pair['next']['gr_data'].shape)}")
     else:
         print("[Debug] image_pair sub-batch: None")
 
@@ -1130,15 +1232,22 @@ if __name__ == "__main__":
 
     first_train_batch = next(iter(train_loader))
     print_batch_debug_info(first_train_batch, batch_name="train_batch")
-    print(f"train image_pair lr_data shape: {first_train_batch['image_pair']['lr_data'].shape}")
-    print(f"train image_pair gr_data shape: {first_train_batch['image_pair']['gr_data'].shape}")
+    # __main__ 里这几行也改一下
+    print(f"train image_pair previous lr_data shape: {first_train_batch['image_pair']['previous']['lr_data'].shape}")
+    print(f"train image_pair previous gr_data shape: {first_train_batch['image_pair']['previous']['gr_data'].shape}")
+    print(f"train image_pair next lr_data shape: {first_train_batch['image_pair']['next']['lr_data'].shape}")
+    print(f"train image_pair next gr_data shape: {first_train_batch['image_pair']['next']['gr_data'].shape}")
     print(f"train flo lr_data shape: {first_train_batch['flo']['lr_data'].shape}")
     print(f"train flo gr_data shape: {first_train_batch['flo']['gr_data'].shape}")
 
     if len(validate_loader.dataset) > 0:
         first_validate_batch = next(iter(validate_loader))
         print_batch_debug_info(first_validate_batch, batch_name="validate_batch")
-        print(f"validate image_pair lr_data shape: {first_validate_batch['image_pair']['lr_data'].shape}")
-        print(f"validate image_pair gr_data shape: {first_validate_batch['image_pair']['gr_data'].shape}")
+        print(
+            f"validate image_pair previous lr_data shape: {first_validate_batch['image_pair']['previous']['lr_data'].shape}")
+        print(
+            f"validate image_pair previous gr_data shape: {first_validate_batch['image_pair']['previous']['gr_data'].shape}")
+        print(f"validate image_pair next lr_data shape: {first_validate_batch['image_pair']['next']['lr_data'].shape}")
+        print(f"validate image_pair next gr_data shape: {first_validate_batch['image_pair']['next']['gr_data'].shape}")
         print(f"validate flo lr_data shape: {first_validate_batch['flo']['lr_data'].shape}")
         print(f"validate flo gr_data shape: {first_validate_batch['flo']['gr_data'].shape}")
