@@ -443,7 +443,61 @@ def convert_fake_for_display(fake, fake_mode="rgb"):
     if fake_mode == "gray":
         return to_gray_3ch(fake)
     raise ValueError(f"Unsupported fake_mode: {fake_mode}")
+def _hsv_to_rgb_torch(h: torch.Tensor, s: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    i = torch.floor(h * 6.0).to(torch.int64)
+    f = h * 6.0 - i
+    p = v * (1.0 - s)
+    q = v * (1.0 - f * s)
+    t = v * (1.0 - (1.0 - f) * s)
+    i = i % 6
 
+    r = torch.zeros_like(h)
+    g = torch.zeros_like(h)
+    b = torch.zeros_like(h)
+
+    m = i == 0
+    r[m], g[m], b[m] = v[m], t[m], p[m]
+    m = i == 1
+    r[m], g[m], b[m] = q[m], v[m], p[m]
+    m = i == 2
+    r[m], g[m], b[m] = p[m], v[m], t[m]
+    m = i == 3
+    r[m], g[m], b[m] = p[m], q[m], v[m]
+    m = i == 4
+    r[m], g[m], b[m] = t[m], p[m], v[m]
+    m = i == 5
+    r[m], g[m], b[m] = v[m], p[m], q[m]
+
+    return torch.stack([r, g, b], dim=1)  # [B,3,H,W]
+
+
+def flow_to_color_tensor(flow: torch.Tensor, ref_max_rad: float | None = None) -> tuple[torch.Tensor, float]:
+    """
+    flow: [B,C,H,W], C>=2（可为2或3，若3则第3通道会被忽略）
+    返回: rgb [B,3,H,W] in [0,1], max_rad
+    """
+    if flow.ndim != 4 or flow.shape[1] < 2:
+        raise ValueError(f"flow shape must be [B,C,H,W] and C>=2, got {tuple(flow.shape)}")
+
+    # 只使用 uv，忽略可能存在的 magnitude 第三通道
+    u = flow[:, 0]
+    v = flow[:, 1]
+
+    mag = torch.sqrt(u * u + v * v)
+    ang = torch.atan2(v, u)  # [-pi, pi]
+
+    h = (ang + torch.pi) / (2.0 * torch.pi)
+    s = torch.ones_like(h)
+
+    if ref_max_rad is None:
+        max_rad = torch.quantile(mag.flatten(), 0.99).item()
+    else:
+        max_rad = float(ref_max_rad)
+    max_rad = max(max_rad, 1e-6)
+
+    val = torch.clamp(mag / max_rad, 0.0, 1.0)
+    rgb = _hsv_to_rgb_torch(h, s, val)
+    return rgb, max_rad
 def validate_and_save(result_dir, generator, val_dataloader, device, epoch, data_type):
     """
     flo:
@@ -473,10 +527,10 @@ def validate_and_save(result_dir, generator, val_dataloader, device, epoch, data
     with torch.no_grad():
         for batch_idx, batch in enumerate(val_dataloader):
             if data_type == "flo":
-                lr_images = batch["flo"]["lr_data"].to(device)
-                hr_images = batch["flo"]["gr_data"].to(device)
+                lr_images = batch[data_type]["lr_data"].to(device)  # [B,3,H,W] -> (u,v,mag)
+                hr_images = batch[data_type]["gr_data"].to(device)  # [B,3,H,W]
+                fake_images = generator(lr_images)  # [B,3,H,W]
 
-                fake_images = generator(lr_images)
                 resizeD_LR_images = F.interpolate(
                     lr_images,
                     size=hr_images.shape[2:],
@@ -484,18 +538,28 @@ def validate_and_save(result_dir, generator, val_dataloader, device, epoch, data
                     align_corners=False,
                 )
 
-                channels = hr_images.shape[1]
-                if channels != 3:
-                    raise ValueError(f"Unsupported channel count for flo: {channels}")
+                if lr_images.shape[1] < 2 or fake_images.shape[1] < 2 or hr_images.shape[1] < 2:
+                    raise ValueError("flo 可视化至少需要前两通道(u,v)")
+
+                # 统一颜色尺度：用 HR 的 uv 计算全局 ref_max_rad
+                hr_u = hr_images[:, 0]
+                hr_v = hr_images[:, 1]
+                hr_mag_uv = torch.sqrt(hr_u * hr_u + hr_v * hr_v)
+                ref_max_rad = max(torch.quantile(hr_mag_uv.flatten(), 0.99).item(), 1e-6)
+
+                # 只取 uv 上色（不使用第3通道）
+                lr_color, _ = flow_to_color_tensor(resizeD_LR_images[:, :2], ref_max_rad=ref_max_rad)
+                fake_color, _ = flow_to_color_tensor(fake_images[:, :2], ref_max_rad=ref_max_rad)
+                hr_color, _ = flow_to_color_tensor(hr_images[:, :2], ref_max_rad=ref_max_rad)
 
                 sample_rows = []
                 for i in range(lr_images.size(0)):
-                    single_lr = resizeD_LR_images[i].unsqueeze(0)
-                    single_fake = fake_images[i].unsqueeze(0)
-                    single_hr = hr_images[i].unsqueeze(0)
-
-                    display_fake = single_fake
-                    row = build_triplet_row(single_lr, display_fake, single_hr, sep_width=6)
+                    row = build_triplet_row(
+                        lr_color[i].unsqueeze(0),
+                        fake_color[i].unsqueeze(0),
+                        hr_color[i].unsqueeze(0),
+                        sep_width=6
+                    )
                     sample_rows.append(row)
 
             elif data_type == "image_pair":
@@ -565,7 +629,7 @@ def validate_and_save(result_dir, generator, val_dataloader, device, epoch, data
                 f"epoch_{epoch + 1}_batch_{batch_idx}_results.png"
             )
 
-            save_image(batch_combined.cpu(), save_path, normalize=True)
+            save_image(batch_combined.to(device).clamp(0, 1), save_path, normalize=False)
             print(f"Saved validation image: {save_path}")
             break
 """
