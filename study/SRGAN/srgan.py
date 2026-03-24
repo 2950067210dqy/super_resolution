@@ -8,12 +8,13 @@ from os.path import exists
 from pathlib import Path
 
 import matplotlib
+import numpy as np
 import torch.nn.functional as F
 import torch
 import torch.nn as nn
 import torchvision
 import torchvision.models as models
-from matplotlib import pyplot as plt
+from matplotlib import pyplot as plt, cm
 from matplotlib.animation import FuncAnimation, PillowWriter
 from torchvision.models import vgg19
 from tqdm import tqdm
@@ -91,7 +92,8 @@ PREDICT_DIR = "/predict"
 use_gpu = torch.cuda.is_available()
 Path(OUT_PUT_DIR).mkdir(parents=True, exist_ok=True)
 
-DATA_TYPES =['image_pair','flo']
+# DATA_TYPES =['image_pair','flo']
+DATA_TYPES =['flo']
 IMAGE_PAIR_TYPES = ['previous','next']
 """
 超参数 end
@@ -369,39 +371,70 @@ class Animator:
 
     def _apply_fixed_groups(self, series_list, fixed_groups=None, split_ratio=8.0):
         """
-        fixed_groups 示例:
-        [
-            ["G_loss", "D_loss"],
-            ["PSNR", "SSIM"],
-            ["G_loss", "content_loss"]  # 允许重复
-        ]
+        fixed_groups 支持:
+        - 按名字: "g_loss"
+        - 按名字+序号: "g_loss#0" / "g_loss#1"（同名序列时可精确指定）
+        - 按索引: 0, 1, 2 ...
         """
         fixed_groups = fixed_groups or []
-        name_to_series = {s["name"]: s for s in series_list}
+
+        def clone_series(src):
+            return {
+                "idx": src["idx"],
+                "name": src["name"],
+                "x": list(src["x"]),
+                "y": list(src["y"]),
+                "fmt": src["fmt"],
+            }
+
+        # name -> [series...]
+        by_name = {}
+        for s in series_list:
+            by_name.setdefault(s["name"], []).append(s)
 
         final_groups = []
+        used_positions = set()
 
-        # 1) 固定分组：允许重复引用同一个 name
         for group in fixed_groups:
-            current_group = []
-            for name in group:
-                if name in name_to_series:
-                    src = name_to_series[name]
-                    # 复制一份，避免同一对象被多子图共享时的潜在副作用
-                    current_group.append({
-                        "idx": src["idx"],
-                        "name": src["name"],
-                        "x": list(src["x"]),
-                        "y": list(src["y"]),
-                        "fmt": src["fmt"],
-                    })
-            if current_group:
-                final_groups.append(current_group)
+            cur = []
+            for item in group:
+                src = None
 
-        # 2) 剩余未在 fixed_groups 出现过的序列，再做动态分组
-        used_in_fixed = {name for group in fixed_groups for name in group}
-        remaining_series = [s for s in series_list if s["name"] not in used_in_fixed]
-        dynamic_groups = self._group_series_by_scale(remaining_series, split_ratio=split_ratio)
+                # 1) 整数索引
+                if isinstance(item, int):
+                    if 0 <= item < len(series_list):
+                        src = series_list[item]
+                        used_positions.add(item)
+
+                # 2) 字符串：name 或 name#k
+                elif isinstance(item, str):
+                    if "#" in item:
+                        name, k = item.rsplit("#", 1)
+                        if k.isdigit():
+                            k = int(k)
+                            candidates = by_name.get(name, [])
+                            if candidates:
+                                src = candidates[min(k, len(candidates) - 1)]
+                    else:
+                        candidates = by_name.get(item, [])
+                        if candidates:
+                            src = candidates[0]
+
+                    if src is not None:
+                        for pos, s in enumerate(series_list):
+                            if s is src:
+                                used_positions.add(pos)
+                                break
+
+                if src is not None:
+                    cur.append(clone_series(src))
+
+            if cur:
+                final_groups.append(cur)
+
+        # 剩余未固定的再动态分组
+        remaining = [s for i, s in enumerate(series_list) if i not in used_positions]
+        dynamic_groups = self._group_series_by_scale(remaining, split_ratio=split_ratio)
         final_groups.extend([g for g in dynamic_groups if g])
 
         return final_groups if final_groups else [[]]
@@ -449,7 +482,9 @@ class Animator:
         ax.set_yscale(self.yscale)
 
         if series_group:
-            ax.legend([s["name"] for s in series_group], loc="upper right", fontsize=9)
+            handles = ax.lines
+            labels = [s["name"] for s in series_group]
+            ax.legend(handles, labels, loc="upper right", fontsize=9)
 
         ax.grid(True, alpha=0.3)
 
@@ -608,7 +643,188 @@ def flow_to_color_tensor(flow: torch.Tensor, ref_max_rad: float | None = None) -
     val = torch.clamp(mag / max_rad, 0.0, 1.0)
     rgb = _hsv_to_rgb_torch(h, s, val)
     return rgb, max_rad
+def scalar_to_jet(x01: torch.Tensor) -> torch.Tensor:
+    """
+    x01: [B,1,H,W] in [0,1]
+    return: [B,3,H,W] in [0,1], jet colormap
+    """
+    x = x01.clamp(0, 1)
+    x_np = x.detach().cpu().numpy()  # [B,1,H,W]
+    rgba = cm.get_cmap("jet")(x_np[:, 0])  # [B,H,W,4]
+    rgb = torch.from_numpy(rgba[..., :3]).to(x.device, dtype=x.dtype)  # [B,H,W,3]
+    return rgb.permute(0, 3, 1, 2).contiguous()  # [B,3,H,W]
+def build_flo_uvw_fake_panel(fake_bchw, col_sep=8):
+    """
+    只显示 fake，按三列排列：
+    U* | V* | S*
+    """
+    if fake_bchw.ndim != 4 or fake_bchw.shape[1] < 3:
+        raise ValueError(f"Need [B,>=3,H,W], got {tuple(fake_bchw.shape)}")
 
+    cmin = fake_bchw[:, :3].amin(dim=(0, 2, 3), keepdim=True)
+    cmax = fake_bchw[:, :3].amax(dim=(0, 2, 3), keepdim=True)
+    den = (cmax - cmin).clamp_min(1e-8)
+    x = (fake_bchw[:, :3] - cmin) / den  # [B,3,H,W]
+
+    col_u = scalar_to_jet(x[:, 0:1])# [B,3,H,W]
+    col_v = scalar_to_jet(x[:, 1:2])
+    col_s = scalar_to_jet(x[:, 2:3])
+
+    B, C, H, _ = col_u.shape
+    v_sep = torch.full((B, C, H, col_sep), 1.0, device=x.device, dtype=x.dtype)  # 竖向分隔条
+
+    # 关键：dim=3 左右拼接 -> 三列
+    out = torch.cat([col_u, v_sep, col_v, v_sep, col_s], dim=3)
+    return out.clamp(0, 1)
+
+
+def build_flo_uvw_compare_panel(lr_bchw, fake_bchw, hr_bchw, sep_width=6, row_sep=8, sample_sep=10):
+    """
+    validate用：每个样本三行
+    U*: LR|Fake|HR
+    V*: LR|Fake|HR
+    S*: LR|Fake|HR
+    """
+    for t in (lr_bchw, fake_bchw, hr_bchw):
+        if t.shape[1] < 3:
+            raise ValueError("Need 3 channels (U,V,S).")
+
+    # 统一用 HR 做每通道 min-max，保证可比
+    cmin = hr_bchw[:, :3].amin(dim=(0, 2, 3), keepdim=True)
+    cmax = hr_bchw[:, :3].amax(dim=(0, 2, 3), keepdim=True)
+    den = (cmax - cmin).clamp_min(1e-8)
+
+    lr_n = (lr_bchw[:, :3] - cmin) / den
+    fk_n = (fake_bchw[:, :3] - cmin) / den
+    hr_n = (hr_bchw[:, :3] - cmin) / den
+
+    sample_rows = []
+    for i in range(lr_n.size(0)):
+        ch_rows = []
+        for ch in range(3):  # U,V,S
+            lr_ch = scalar_to_jet(lr_n[i:i+1, ch:ch+1])
+            fk_ch = scalar_to_jet(fk_n[i:i+1, ch:ch+1])
+            hr_ch = scalar_to_jet(hr_n[i:i+1, ch:ch+1])
+            # lr_ch = lr_n[i:i+1, ch:ch+1].repeat(1, 3, 1, 1)
+            # fk_ch = fk_n[i:i+1, ch:ch+1].repeat(1, 3, 1, 1)
+            # hr_ch = hr_n[i:i+1, ch:ch+1].repeat(1, 3, 1, 1)
+            ch_rows.append(build_triplet_row(lr_ch, fk_ch, hr_ch, sep_width=sep_width))
+
+        one = ch_rows[0]
+        for r in ch_rows[1:]:
+            h_sep = add_horizontal_separator(
+                width=one.shape[3], channels=one.shape[1], sep_height=row_sep,
+                value=1.0, device=one.device, dtype=one.dtype
+            )
+            one = torch.cat([one, h_sep, r], dim=2)
+        sample_rows.append(one)
+
+    out = sample_rows[0]
+    for r in sample_rows[1:]:
+        h_sep = add_horizontal_separator(
+            width=out.shape[3], channels=out.shape[1], sep_height=sample_sep,
+            value=1.0, device=out.device, dtype=out.dtype
+        )
+        out = torch.cat([out, h_sep, r], dim=2)
+    return out.clamp(0, 1)
+
+
+#瞬时涡流速度场 start
+def _to_np_2d(x: torch.Tensor) -> np.ndarray:
+    # x: [H,W] or [1,H,W]
+    if x.ndim == 3:
+        x = x.squeeze(0)
+    return x.detach().float().cpu().numpy()
+
+def _omega_star_from_uv(u: np.ndarray, v: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    # omega = dv/dx - du/dy
+    dv_dy, dv_dx = np.gradient(v)
+    du_dy, du_dx = np.gradient(u)
+    omega = dv_dx - du_dy
+
+    omin = omega.min()
+    omax = omega.max()
+    omega01 = (omega - omin) / (omax - omin + eps)   # [0,1]
+    omega_star = omega01 * 4.0 - 2.0                 # [-2,2]
+    return omega_star
+
+def save_vorticity_quiver_single(fake_bchw: torch.Tensor, save_path: str, stride: int = 8):
+    """
+    batch_train: 只看生成图效果（fake）
+    fake_bchw: [B,3,H,W], channel0=u, channel1=v, channel2=s
+    """
+    u = _to_np_2d(fake_bchw[0, 0])
+    v = _to_np_2d(fake_bchw[0, 1])
+    omega_star = _omega_star_from_uv(u, v)
+
+    H, W = u.shape
+    yy, xx = np.mgrid[0:H, 0:W]
+
+    fig, ax = plt.subplots(1, 1, figsize=(4.2, 3.4), dpi=160)
+    vmin = float(omega_star.min())
+    vmax = float(omega_star.max())
+
+    im = ax.imshow(omega_star, origin="lower", cmap="RdBu_r", vmin=vmin, vmax=vmax)
+    ax.quiver(
+        xx[::stride, ::stride], yy[::stride, ::stride],
+        u[::stride, ::stride], v[::stride, ::stride],
+        color="k",
+        pivot="mid",
+        angles="xy",
+        scale_units="xy",
+        scale=0.25,  # 原来1.8太短，越小越长
+        width=0.004,  # 箭杆加粗
+
+    )
+    ax.set_xticks([]); ax.set_yticks([])
+    ax.set_title(r"$\omega^\ast$")
+
+    cb = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cb.set_ticks(np.linspace(vmin, vmax, 5))
+
+    plt.tight_layout()
+    plt.savefig(save_path, bbox_inches="tight")
+    plt.close(fig)
+
+def save_vorticity_quiver_compare(lr_bchw: torch.Tensor, fake_bchw: torch.Tensor, hr_bchw: torch.Tensor,
+                                  save_path: str, stride: int = 8):
+    """
+    validate_and_save: LR / Fake / HR 对比
+    输入: [B,3,H,W]
+    """
+    triplet = [("LR", lr_bchw), ("Fake", fake_bchw), ("HR", hr_bchw)]
+
+    fig, axes = plt.subplots(1, 3, figsize=(11.0, 3.4), dpi=160)
+    for ax, (title, t) in zip(axes, triplet):
+        u = _to_np_2d(t[0, 0])
+        v = _to_np_2d(t[0, 1])
+        omega_star = _omega_star_from_uv(u, v)
+
+        H, W = u.shape
+        yy, xx = np.mgrid[0:H, 0:W]
+        vmin = float(omega_star.min())
+        vmax = float(omega_star.max())
+
+        im = ax.imshow(omega_star, origin="lower", cmap="RdBu_r", vmin=vmin, vmax=vmax)
+        ax.quiver(
+            xx[::stride, ::stride], yy[::stride, ::stride],
+            u[::stride, ::stride], v[::stride, ::stride],
+            color="k",
+            pivot="mid",
+            angles="xy",
+            scale_units="xy",
+            scale=0.25,  # 原来1.8太短，越小越长
+            width=0.004,  # 箭杆加粗
+
+        )
+        ax.set_title(title)
+        ax.set_xticks([]); ax.set_yticks([])
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
+
+    plt.tight_layout()
+    plt.savefig(save_path, bbox_inches="tight")
+    plt.close(fig)
+#瞬时涡流速度场 end
 """
 工具 end
 """
@@ -771,7 +987,7 @@ class Generator(nn.Module):
         # [B, 64, 256, 256] -> [B, 3, 256, 256]
         self.conv_out = nn.Sequential(
             nn.Conv2d(64, inner_chanel, kernel_size=9, stride=1, padding=4),
-            nn.Sigmoid(),
+
         )
 
         #ICNR 初始化
@@ -1050,16 +1266,10 @@ def validate_and_save(result_dir, generator, val_dataloader, device, epoch, data
     """
 
     def _convert_fake_for_display_by_hparam(fake_tensor: torch.Tensor) -> torch.Tensor:
-        """
-        转成 灰度图 只影响图像对 flo文件不受影响
-        :param fake_tensor:
-        :return:
-        """
         if not SAVE_AS_GRAY:
             return fake_tensor
         if fake_tensor.shape[1] != 3:
             raise ValueError(f"SAVE_AS_GRAY=True requires 3 channels, got {fake_tensor.shape[1]}")
-        # 用“灰度<->RGB复制通道”对应逻辑：取一个通道作为灰度，再repeat回3通道用于拼图显示
         gray = fake_tensor[:, 0:1, :, :]
         return gray.repeat(1, 3, 1, 1)
 
@@ -1069,28 +1279,42 @@ def validate_and_save(result_dir, generator, val_dataloader, device, epoch, data
     with torch.no_grad():
         for batch_idx, batch in enumerate(val_dataloader):
             if data_type == "flo":
-                lr_images = batch[data_type]["lr_data"].to(device)  # [B,3,H,W] -> (u,v,mag)
-                hr_images = batch[data_type]["gr_data"].to(device)  # [B,3,H,W]
-                fake_images = generator(lr_images)  # [B,3,H,W]
-
-                resizeD_LR_images = F.interpolate(
-                    lr_images,
-                    size=hr_images.shape[2:],
-                    mode="bicubic",
-                    align_corners=False,
-                )
+                lr_images = batch[data_type]["lr_data"].to(device)   # [B,3,H,W] (u,v,mag)
+                hr_images = batch[data_type]["gr_data"].to(device)   # [B,3,H,W]
+                fake_images = generator(lr_images)                   # [B,3,H,W] (去掉Sigmoid后可超出[0,1])
+                H, W = hr_images.shape[2:]
+                h, w = lr_images.shape[-2],lr_images.shape[-1]
+                # 如果是整数倍，直接像素复制，最“原汁原味”
+                if H % h == 0 and W % w == 0:
+                    sh, sw = H // h, W // w
+                    resize_lr_images= lr_images.repeat_interleave(sh, dim=2).repeat_interleave(sw, dim=3)
+                else:
+                    resize_lr_images = F.interpolate(
+                        lr_images,
+                        size=hr_images.shape[2:],
+                        mode="nearest",# linear | bilinear | bicubic | trilinear
+                        # align_corners=False,
+                    )
 
                 if lr_images.shape[1] < 2 or fake_images.shape[1] < 2 or hr_images.shape[1] < 2:
                     raise ValueError("flo 可视化至少需要前两通道(u,v)")
 
-                # 统一颜色尺度：用 HR 的 uv 计算全局 ref_max_rad
+                # # 仅打印一次数值差异
+                # print(
+                #     "flo diff:",
+                #     "lr-hr", (resize_lr_images[:, :2] - hr_images[:, :2]).abs().mean().item(),
+                #     "fake-hr", (fake_images[:, :2] - hr_images[:, :2]).abs().mean().item(),
+                #     "fake-lr", (fake_images[:, :2] - resize_lr_images[:, :2]).abs().mean().item(),
+                # )
+
+                # 统一颜色尺度：用 HR 的 uv 计算 ref_max_rad
                 hr_u = hr_images[:, 0]
                 hr_v = hr_images[:, 1]
                 hr_mag_uv = torch.sqrt(hr_u * hr_u + hr_v * hr_v)
                 ref_max_rad = max(torch.quantile(hr_mag_uv.flatten(), 0.99).item(), 1e-6)
 
-                # 只取 uv 上色（不使用第3通道）
-                lr_color, _ = flow_to_color_tensor(resizeD_LR_images[:, :2], ref_max_rad=ref_max_rad)
+                # flo 统一用 uv 转彩色可视化（不直接 save 原3通道）
+                lr_color, _ = flow_to_color_tensor(resize_lr_images[:, :2], ref_max_rad=ref_max_rad)
                 fake_color, _ = flow_to_color_tensor(fake_images[:, :2], ref_max_rad=ref_max_rad)
                 hr_color, _ = flow_to_color_tensor(hr_images[:, :2], ref_max_rad=ref_max_rad)
 
@@ -1103,6 +1327,10 @@ def validate_and_save(result_dir, generator, val_dataloader, device, epoch, data
                         sep_width=6
                     )
                     sample_rows.append(row)
+                uvs_compare_panel = build_flo_uvw_compare_panel(
+                    resize_lr_images, fake_images, hr_images
+                )
+
 
             elif data_type == "image_pair":
                 lr_prev = batch["image_pair"]["previous"]["lr_data"].to(device)
@@ -1116,14 +1344,14 @@ def validate_and_save(result_dir, generator, val_dataloader, device, epoch, data
                 resize_lr_prev = F.interpolate(
                     lr_prev,
                     size=hr_prev.shape[2:],
-                    mode="bicubic",
-                    align_corners=False,
+                    mode="nearest",  # linear | bilinear | bicubic | trilinear
+                    # align_corners=False,
                 )
                 resize_lr_next = F.interpolate(
                     lr_next,
                     size=hr_next.shape[2:],
-                    mode="bicubic",
-                    align_corners=False,
+                    mode="nearest",  # linear | bilinear | bicubic | trilinear
+                    # align_corners=False,
                 )
 
                 if hr_prev.shape[1] != 3:
@@ -1141,8 +1369,9 @@ def validate_and_save(result_dir, generator, val_dataloader, device, epoch, data
                     single_fake_next = fake_next[i].unsqueeze(0)
                     single_hr_next = hr_next[i].unsqueeze(0)
 
-                    display_fake_prev = _convert_fake_for_display_by_hparam(single_fake_prev)
-                    display_fake_next = _convert_fake_for_display_by_hparam(single_fake_next)
+                    # 去掉Sigmoid后，显示前先裁剪，避免可视化异常
+                    display_fake_prev = _convert_fake_for_display_by_hparam(single_fake_prev.clamp(0, 1))
+                    display_fake_next = _convert_fake_for_display_by_hparam(single_fake_next.clamp(0, 1))
 
                     left_group = build_triplet_row(single_lr_prev, display_fake_prev, single_hr_prev, sep_width=6)
                     right_group = build_triplet_row(single_lr_next, display_fake_next, single_hr_next, sep_width=6)
@@ -1170,8 +1399,20 @@ def validate_and_save(result_dir, generator, val_dataloader, device, epoch, data
                 result_dir,
                 f"epoch_{epoch + 1}_batch_{batch_idx}_results.png"
             )
-
-            save_image(batch_combined.to(device).clamp(0, 1), save_path, normalize=False)
+            if data_type == "flo":
+                #在保存一张u v s通道的图
+                save_image(
+                    uvs_compare_panel,
+                    os.path.join(result_dir, f"epoch_{epoch + 1}_batch_{batch_idx}_results_uvs.png"),
+                    normalize=False
+                )
+                #瞬时涡流速度场
+                save_vorticity_quiver_compare(
+                    resize_lr_images, fake_images, hr_images,
+                    os.path.join(result_dir, f"epoch_{epoch + 1}_batch_{batch_idx}_vorticity_quiver.png"),
+                    stride=8
+                )
+            save_image(batch_combined.clamp(0, 1), save_path, normalize=False)
             print(f"Saved validation image: {save_path}")
             break
 # 计算 PSNR 函数
@@ -1192,9 +1433,9 @@ def validate_flow(generator, dataloader, device):
     with torch.no_grad():
         for batch in dataloader:
             # 低分辨率图像
-            lr_images = batch[DATA_TYPES[1]]['lr_data'].to(device)
+            lr_images = batch["flo"]['lr_data'].to(device)
             # 真实图像
-            hr_images = batch[DATA_TYPES[1]]['gr_data'].to(device)
+            hr_images = batch["flo"]['gr_data'].to(device)
             lr_images, hr_images = lr_images.to(device), hr_images.to(device)
             fake_images = generator(lr_images)
             pixel_total, _, _ = pixel_loss(fake_images, hr_images, False)
@@ -1218,9 +1459,9 @@ def validate_image_pair(generator, dataloader, device):
         for batch in dataloader:
             for image_pair_type in IMAGE_PAIR_TYPES:
                 # 低分辨率图像
-                lr_images = batch[DATA_TYPES[0]][image_pair_type]['lr_data'].to(device)
+                lr_images = batch["image_pair"][image_pair_type]['lr_data'].to(device)
                 # 真实图像
-                hr_images = batch[DATA_TYPES[0]][image_pair_type]['gr_data'].to(device)
+                hr_images = batch["image_pair"][image_pair_type]['gr_data'].to(device)
 
                 lr_images, hr_images = lr_images.to(device), hr_images.to(device)
                 fake_images = generator(lr_images)
@@ -1343,7 +1584,7 @@ def batch_train(lr_images,gr_images, i, data_type, device, generator, discrimina
     # 感知损失
     perceptual_loss_value,content_loss,adversarial_loss = perceptual_loss(pred_images, gr_images, probability)
     # 像素损失（灰白数据可开加权，flo 默认不开）
-    gray_triplet = (SAVE_AS_GRAY and data_type == DATA_TYPES[0])  # 仅 image_pair 且设置为灰度复制模式
+    gray_triplet = (SAVE_AS_GRAY and data_type == "image_pair")  # 仅 image_pair 且设置为灰度复制模式
     g_loss_pixel, g_loss_l1, g_loss_mse = pixel_loss(pred_images, gr_images, gray_triplet=gray_triplet)
     # 正则损失
     """
@@ -1387,7 +1628,7 @@ def batch_train(lr_images,gr_images, i, data_type, device, generator, discrimina
                g_loss_pixel.item(),g_loss_l1.item(),g_loss_mse.item(),
                d_loss.item(), real_loss.item(), fake_loss.item())
     # end if i % 2 == 0:
-    if i % 10 == 0:
+    if i % 20 == 0:
         image = pred_images.detach()
         save_dir = f"{OUT_PUT_DIR}/{class_name}/{data_type}/scale_{SCALE * SCALE}"
         os.makedirs(save_dir, exist_ok=True)
@@ -1397,29 +1638,48 @@ def batch_train(lr_images,gr_images, i, data_type, device, generator, discrimina
         if image.dim() == 3:
             image = image.unsqueeze(0)  # [C,H,W] -> [1,C,H,W]
 
-        channels = image.shape[1]
+        if image.shape[1] >= 2 and data_type == "flo":
+            # flo: 先把 uv 转成可视化彩色图，再保存
+            # 用当前 batch 的 GT 作为统一尺度，避免每张图颜色漂移
+            hr_u = gr_images[:, 0]
+            hr_v = gr_images[:, 1]
+            hr_mag_uv = torch.sqrt(hr_u * hr_u + hr_v * hr_v)
+            ref_max_rad = max(torch.quantile(hr_mag_uv.flatten(), 0.99).item(), 1e-6)
 
-        if channels == 3:
+            pred_color, _ = flow_to_color_tensor(image[:, :2], ref_max_rad=ref_max_rad)  # [N,3,H,W] in [0,1]
+            torchvision.utils.save_image(
+                pred_color.clamp(0, 1),
+                f"{save_prefix}.png",
+                nrow=4,
+                normalize=False
+            )
+
+            #u v s 通道图
+            fake_uvw_panel = build_flo_uvw_fake_panel(image)  # image=pred_images.detach()
+            torchvision.utils.save_image(
+                fake_uvw_panel,
+                f"{save_prefix}_uvs.png",
+                nrow=1,
+                normalize=False
+            )
+            #瞬时涡流速度场
+            save_vorticity_quiver_single(
+                image,  # pred_images.detach()
+                f"{save_prefix}_vorticity_quiver.png",
+                stride=8
+            )
+        elif image.shape[1] == 3:
+            # image_pair: 若去掉了 Sigmoid，保存前裁剪到 [0,1]
             image_to_save = image
-            #只影响图像对 flo文件还是原通道
-            if SAVE_AS_GRAY and data_type != DATA_TYPES[1]:
-                # 与“灰度图读取后repeat成3通道”相对应：直接取单通道还原灰度
+            if SAVE_AS_GRAY and data_type != "flo":
                 image_to_save = image[:, 0:1, :, :]  # [N,1,H,W]
 
-            if image_pair_type:
-                torchvision.utils.save_image(
-                    image_to_save,
-                    f"{save_prefix}_{image_pair_type}.png",
-                    nrow=4,
-                    # normalize=True
-                )
-            else:
-                torchvision.utils.save_image(
-                    image_to_save,
-                    f"{save_prefix}.png",
-                    nrow=4,
-                    # normalize=True
-                )
+            torchvision.utils.save_image(
+                image_to_save.clamp(0, 1),
+                f"{save_prefix}_{image_pair_type}.png" if image_pair_type else f"{save_prefix}.png",
+                nrow=4,
+                normalize=False
+            )
 def evaluate(epoch,class_name,data_type,device,
              generator,discriminator,animator,
              validate_loader,loss_label,validate_label):
@@ -1441,9 +1701,9 @@ def evaluate(epoch,class_name,data_type,device,
 
     val_loss,avg_psnr = 0,0
 
-    if data_type ==DATA_TYPES[0]:
+    if data_type =="image_pair":
         val_loss, avg_psnr = validate_image_pair(generator, validate_loader, device)
-    elif data_type ==DATA_TYPES[1]:
+    elif data_type =="flo":
         val_loss, avg_psnr = validate_flow(generator, validate_loader, device)
     wandb.log({
         "classname": class_name,
@@ -1559,14 +1819,14 @@ if __name__ =="__main__":
                 #1600/32 =50
                 for i,batch in enumerate(train_progress_bar):
                     """ 图片对训练"""
-                    if data_type ==DATA_TYPES[0]:
+                    if data_type == "image_pair":
                         image_pair_train(
                             batch=batch, i=i, g_optimizer=g_optimizer,
                             d_optimizer=d_optimizer, generator=generator,
                             discriminator=discriminator, train_progress_bar=train_progress_bar,
                             metric=metric, data_type=data_type, device=device, class_name=class_name
                         )
-                    elif data_type ==DATA_TYPES[1]:
+                    elif data_type == "flo":
                         """flo文件训练"""
                         flow_train( batch=batch, i=i, g_optimizer=g_optimizer,
                             d_optimizer=d_optimizer, generator=generator,
