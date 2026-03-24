@@ -23,10 +23,7 @@ from d2l import torch as d2l   # 或 from d2l import mxnet as d2l
 import wandb
 from study.SRGAN.data_load import get_class_names, load_data
 """
-分类别去训练
-"""
-"""
-超参数 start
+统一去训练
 """
 name = "v3"
 DESCRIPTION = ""
@@ -34,7 +31,7 @@ device = torch.device("cuda")
 #是否加载之前的模型
 IS_LOAD_EXISTS_MODEL = False
 
-SAVE_AS_GRAY = True  # True: 保存为灰度图(1通道)；False: 按原通道保存 只影响图片对，不影响flo文件,同时处理相关损失函数也会按照这个
+SAVE_AS_GRAY = True  # True: 保存为灰度图(1通道)；False: 按原通道保存 只影响图片对，不影响flo文件
 
 #轮次
 EPOCH_NUMS = 20
@@ -50,19 +47,11 @@ RANDOM_SEED = 42
 SCALE = 2
 
 #生成器感知损失里面的系数 其实就是对抗损失的参数
-LAMBDA_PERCEPTION =5e-4
-#生成器正则损失的系数 ！弃用
+LAMBDA_PERCEPTION =1e-4
+#生成器正则损失的系数
 LAMBDA_regularization_loss=2e-8
 #生成器像素损失的系数
-LAMBDA_loss_pixel =1
-
-# 组合像素损失参数
-LAMBDA_PIXEL_L1 = 1e-2
-LAMBDA_PIXEL_MSE = 1e-3
-PIXEL_WHITE_ALPHA = 1.0       # 白点区域权重
-LAMBDA_GRAY_CONS = 1e-2       # 灰度复制RGB时通道一致性，别太
-
-
+LAMBDA_loss_pixel =0.0001
 #正则项
 weight_decay=0
 #优化器 betas
@@ -93,14 +82,10 @@ Path(OUT_PUT_DIR).mkdir(parents=True, exist_ok=True)
 
 DATA_TYPES =['image_pair','flo']
 IMAGE_PAIR_TYPES = ['previous','next']
-"""
-超参数 end
-"""
-loss_label = ['g_loss', 'g_perceptual_loss', "g_content_loss",
-              "g_adversarial_loss", 'g_regularization_loss', 'g_loss_pixel',
-                "g_loss_pixel_l1", "g_loss_pixel_mse",
-              'd_loss', 'd_real_loss', 'd_fake_loss']
-validate_label = ['Validation_Loss', 'Avg_PSNR']
+
+
+
+
 # 使用wandb可视化训练过程
 # 初始化 WandB
 wandb.login(key="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")
@@ -123,19 +108,13 @@ wandb.init(
         "LAMBDA_PERCEPTION":LAMBDA_PERCEPTION,
         "LAMBDA_regularization_loss":LAMBDA_regularization_loss,
         "LAMBDA_loss_pixel":LAMBDA_loss_pixel,
-
-
-        "LAMBDA_PIXEL_L1":LAMBDA_PIXEL_L1,
-        "LAMBDA_PIXEL_MSE" :LAMBDA_PIXEL_MSE,
-        "PIXEL_WHITE_ALPHA" :PIXEL_WHITE_ALPHA,       # 白点区域权重
-        "LAMBDA_GRAY_CONS" : LAMBDA_GRAY_CONS  ,    # 灰度复制RGB时通道一致性，别太
-        "SAVE_AS_GRAY" :SAVE_AS_GRAY,
         "weight_decay":weight_decay,
         "g_optimizer_betas":g_optimizer_betas,
         "d_optimizer_betas":d_optimizer_betas,
         "Train_nums_rate":Train_nums_rate
     },
 )
+wandb.init(project="SRGAN",)
 # 配置超参数
 wandb.config = {
 
@@ -167,12 +146,6 @@ def save_hyper_parameters_txt(file_path="hyper_parameter.txt"):
         f"LAMBDA_PERCEPTION = {LAMBDA_PERCEPTION}",
         f"LAMBDA_regularization_loss = {LAMBDA_regularization_loss}",
         f"LAMBDA_loss_pixel = {LAMBDA_loss_pixel}",
-        f"PIXEL_WHITE_ALPHA:{PIXEL_WHITE_ALPHA}",
-        f"LAMBDA_GRAY_CONS:{LAMBDA_GRAY_CONS}",
-        f"LAMBDA_PIXEL_L1 = {LAMBDA_PIXEL_L1}",
-        f"LAMBDA_PIXEL_MSE = {LAMBDA_PIXEL_MSE}",
-
-
         f"weight_decay = {weight_decay}",
         f"g_optimizer_betas = {g_optimizer_betas}",
         f"d_optimizer_betas = {d_optimizer_betas}",
@@ -272,23 +245,10 @@ class Animator:
     def add(self, x, y):
         if not hasattr(y, "__len__"):
             y = [y]
-        y = list(y)
-
-        n = len(self.legend) if self.legend else len(y)
+        n = len(y)
 
         if not hasattr(x, "__len__"):
             x = [x] * n
-        else:
-            x = list(x)
-            if len(x) < n:
-                x = x + [x[-1] if x else None] * (n - len(x))
-            else:
-                x = x[:n]
-
-        if len(y) < n:
-            y = y + [None] * (n - len(y))
-        else:
-            y = y[:n]
 
         if self.X is None:
             self.X = [[] for _ in range(n)]
@@ -306,10 +266,7 @@ class Animator:
         exclude_legends = set(exclude_legends or [])
         filtered = []
 
-        n = max(len(self.legend), len(Xf), len(Yf))
-        for i in range(n):
-            xx = Xf[i] if i < len(Xf) else []
-            yy = Yf[i] if i < len(Yf) else []
+        for i, (xx, yy) in enumerate(zip(Xf, Yf)):
             name = self.legend[i] if i < len(self.legend) else f"series_{i}"
             if name in exclude_legends:
                 continue
@@ -608,7 +565,140 @@ def flow_to_color_tensor(flow: torch.Tensor, ref_max_rad: float | None = None) -
     val = torch.clamp(mag / max_rad, 0.0, 1.0)
     rgb = _hsv_to_rgb_torch(h, s, val)
     return rgb, max_rad
+def validate_and_save(result_dir, generator, val_dataloader, device, epoch, data_type):
+    """
+    flo:
+        LR | Fake | HR
 
+    image_pair:
+        (previous: LR|Fake|HR) || (next: LR|Fake|HR)
+    """
+
+    def _convert_fake_for_display_by_hparam(fake_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        转成 灰度图 只影响图像对 flo文件不受影响
+        :param fake_tensor:
+        :return:
+        """
+        if not SAVE_AS_GRAY:
+            return fake_tensor
+        if fake_tensor.shape[1] != 3:
+            raise ValueError(f"SAVE_AS_GRAY=True requires 3 channels, got {fake_tensor.shape[1]}")
+        # 用“灰度<->RGB复制通道”对应逻辑：取一个通道作为灰度，再repeat回3通道用于拼图显示
+        gray = fake_tensor[:, 0:1, :, :]
+        return gray.repeat(1, 3, 1, 1)
+
+    generator.eval()
+    os.makedirs(result_dir, exist_ok=True)
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(val_dataloader):
+            if data_type == "flo":
+                lr_images = batch[data_type]["lr_data"].to(device)  # [B,3,H,W] -> (u,v,mag)
+                hr_images = batch[data_type]["gr_data"].to(device)  # [B,3,H,W]
+                fake_images = generator(lr_images)  # [B,3,H,W]
+
+                resizeD_LR_images = F.interpolate(
+                    lr_images,
+                    size=hr_images.shape[2:],
+                    mode="bicubic",
+                    align_corners=False,
+                )
+
+                if lr_images.shape[1] < 2 or fake_images.shape[1] < 2 or hr_images.shape[1] < 2:
+                    raise ValueError("flo 可视化至少需要前两通道(u,v)")
+
+                # 统一颜色尺度：用 HR 的 uv 计算全局 ref_max_rad
+                hr_u = hr_images[:, 0]
+                hr_v = hr_images[:, 1]
+                hr_mag_uv = torch.sqrt(hr_u * hr_u + hr_v * hr_v)
+                ref_max_rad = max(torch.quantile(hr_mag_uv.flatten(), 0.99).item(), 1e-6)
+
+                # 只取 uv 上色（不使用第3通道）
+                lr_color, _ = flow_to_color_tensor(resizeD_LR_images[:, :2], ref_max_rad=ref_max_rad)
+                fake_color, _ = flow_to_color_tensor(fake_images[:, :2], ref_max_rad=ref_max_rad)
+                hr_color, _ = flow_to_color_tensor(hr_images[:, :2], ref_max_rad=ref_max_rad)
+
+                sample_rows = []
+                for i in range(lr_images.size(0)):
+                    row = build_triplet_row(
+                        lr_color[i].unsqueeze(0),
+                        fake_color[i].unsqueeze(0),
+                        hr_color[i].unsqueeze(0),
+                        sep_width=6
+                    )
+                    sample_rows.append(row)
+
+            elif data_type == "image_pair":
+                lr_prev = batch["image_pair"]["previous"]["lr_data"].to(device)
+                hr_prev = batch["image_pair"]["previous"]["gr_data"].to(device)
+                lr_next = batch["image_pair"]["next"]["lr_data"].to(device)
+                hr_next = batch["image_pair"]["next"]["gr_data"].to(device)
+
+                fake_prev = generator(lr_prev)
+                fake_next = generator(lr_next)
+
+                resize_lr_prev = F.interpolate(
+                    lr_prev,
+                    size=hr_prev.shape[2:],
+                    mode="bicubic",
+                    align_corners=False,
+                )
+                resize_lr_next = F.interpolate(
+                    lr_next,
+                    size=hr_next.shape[2:],
+                    mode="bicubic",
+                    align_corners=False,
+                )
+
+                if hr_prev.shape[1] != 3:
+                    raise ValueError(f"Unsupported previous channel count: {hr_prev.shape[1]}")
+                if hr_next.shape[1] != 3:
+                    raise ValueError(f"Unsupported next channel count: {hr_next.shape[1]}")
+
+                sample_rows = []
+                for i in range(lr_prev.size(0)):
+                    single_lr_prev = resize_lr_prev[i].unsqueeze(0)
+                    single_fake_prev = fake_prev[i].unsqueeze(0)
+                    single_hr_prev = hr_prev[i].unsqueeze(0)
+
+                    single_lr_next = resize_lr_next[i].unsqueeze(0)
+                    single_fake_next = fake_next[i].unsqueeze(0)
+                    single_hr_next = hr_next[i].unsqueeze(0)
+
+                    display_fake_prev = _convert_fake_for_display_by_hparam(single_fake_prev)
+                    display_fake_next = _convert_fake_for_display_by_hparam(single_fake_next)
+
+                    left_group = build_triplet_row(single_lr_prev, display_fake_prev, single_hr_prev, sep_width=6)
+                    right_group = build_triplet_row(single_lr_next, display_fake_next, single_hr_next, sep_width=6)
+
+                    group_sep = add_vertical_separator(left_group, sep_width=16, value=1.0)
+                    row = torch.cat([left_group, group_sep, right_group], dim=3)
+                    sample_rows.append(row)
+
+            else:
+                raise ValueError(f"Unsupported data_type: {data_type}")
+
+            batch_combined = sample_rows[0]
+            for row in sample_rows[1:]:
+                h_sep = add_horizontal_separator(
+                    width=batch_combined.shape[3],
+                    channels=batch_combined.shape[1],
+                    sep_height=10,
+                    value=1.0,
+                    device=batch_combined.device,
+                    dtype=batch_combined.dtype,
+                )
+                batch_combined = torch.cat([batch_combined, h_sep, row], dim=2)
+
+            save_path = os.path.join(
+                result_dir,
+                f"epoch_{epoch + 1}_batch_{batch_idx}_results.png"
+            )
+
+            save_image(batch_combined.to(device).clamp(0, 1), save_path, normalize=False)
+            print(f"Saved validation image: {save_path}")
+            break
 """
 工具 end
 """
@@ -616,26 +706,6 @@ def flow_to_color_tensor(flow: torch.Tensor, ref_max_rad: float | None = None) -
 """
 模型 start
 """
-def icnr_(tensor: torch.Tensor, scale: int = 2, initializer=nn.init.kaiming_normal_) -> torch.Tensor:
-    """
-    ICNR init for sub-pixel convolution weights.
-    tensor shape: [out_channels, in_channels, kH, kW]
-    """
-    out_channels, in_channels, kH, kW = tensor.shape
-    if out_channels % (scale ** 2) != 0:
-        raise ValueError(f"out_channels({out_channels}) must be divisible by scale^2({scale**2})")
-
-    subkernel = torch.zeros(
-        [out_channels // (scale ** 2), in_channels, kH, kW],
-        device=tensor.device,
-        dtype=tensor.dtype,
-    )
-    initializer(subkernel)
-    subkernel = subkernel.repeat_interleave(scale ** 2, dim=0)
-
-    with torch.no_grad():
-        tensor.copy_(subkernel)
-    return tensor
 class ResidualBlock(nn.Module):
     """
     残差块
@@ -753,14 +823,15 @@ class Generator(nn.Module):
 
             # [B, 256, H, W] -> [B, 64, 2H, 2W]
             nn.PixelShuffle(self.scale),
-            nn.Conv2d(64, 64, 3, 1, 1),
             nn.PReLU(),
+            nn.Conv2d(64, 64, 3, 1, 1),
 
             nn.Conv2d(64, 64 * self.scale * self.scale, kernel_size=3, stride=1, padding=1),
             # [B, 256, H, W] -> [B, 64, 2H, 2W]
             nn.PixelShuffle(self.scale),
-            nn.Conv2d(64, 64, 3, 1, 1),
             nn.PReLU(),
+            nn.Conv2d(64, 64, 3, 1, 1),
+
         )
 
         # 最后一层输出 RGB 图像
@@ -769,21 +840,9 @@ class Generator(nn.Module):
         #
         # 若 scale=4:
         # [B, 64, 256, 256] -> [B, 3, 256, 256]
-        self.conv_out = nn.Sequential(
-            nn.Conv2d(64, inner_chanel, kernel_size=9, stride=1, padding=4),
-            nn.Sigmoid(),
-        )
+        self.conv_out = nn.Conv2d(64, inner_chanel, kernel_size=9, stride=1, padding=4)
 
-        #ICNR 初始化
-        self._init_subpixel_weights()
 
-    def _init_subpixel_weights(self):
-        #对 PixelShuffle 前的 Conv2d(64, 64*scale*scale, ...) 做了 ICNR，能明显减轻棋盘纹。
-        for m in self.upsample:
-            if isinstance(m, nn.Conv2d) and m.out_channels == 64 * self.scale * self.scale:
-                icnr_(m.weight, scale=self.scale, initializer=nn.init.kaiming_normal_)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
     def forward(self, x):
         # x: [B, 3, 64, 64]
 
@@ -971,61 +1030,12 @@ class RegularizationLoss(nn.Module):
         loss = torch.sum(torch.pow(a+b, 1.25))
         return loss
 
-
-
-class CombinedPixelLoss(nn.Module):
-    """
-    SAVE_AS_GRAY=True 且 image_pair 时:
-      - 用 target 亮度做加权，提升白点召回
-      - 加轻量通道一致性约束（防伪彩）
-    其余情况:
-      - 普通 RGB L1 + MSE
-    返回: total, l1_term, mse_term
-    """
-    def __init__(self, lambda_l1=2e-2, lambda_mse=1e-3, white_alpha=4.0, lambda_cons=1e-2):
-        super().__init__()
-        self.lambda_l1 = lambda_l1
-        self.lambda_mse = lambda_mse
-        self.white_alpha = white_alpha
-        self.lambda_cons = lambda_cons
-        self.l1 = nn.L1Loss()
-        self.mse = nn.MSELoss()
-
-    def forward(self, pred, target, gray_triplet=False):
-        if gray_triplet:
-            pred_gray = pred[:, 0:1]
-            target_gray = target[:, 0:1]
-
-            # 白点加权
-            weight = 1.0 + self.white_alpha * target_gray
-            l1_term = (weight * (pred_gray - target_gray).abs()).mean()
-            mse_term = self.mse(pred_gray, target_gray)
-
-            # 灰度复制RGB一致性（不要太大）
-            cons = (
-                self.l1(pred[:, 0:1], pred[:, 1:2]) +
-                self.l1(pred[:, 1:2], pred[:, 2:3]) +
-                self.l1(pred[:, 0:1], pred[:, 2:3])
-            ) / 3.0
-
-            total = self.lambda_l1 * l1_term + self.lambda_mse * mse_term + self.lambda_cons * cons
-            return total, l1_term, mse_term
-
-        l1_term = self.l1(pred, target)
-        mse_term = self.mse(pred, target)
-        total = self.lambda_l1 * l1_term + self.lambda_mse * mse_term
-        return total, l1_term, mse_term
 """
 损失函数 end
 """
 
 # 定义像素损失函数
-pixel_loss = CombinedPixelLoss(
-    lambda_l1=LAMBDA_PIXEL_L1,
-    lambda_mse=LAMBDA_PIXEL_MSE,
-    white_alpha=PIXEL_WHITE_ALPHA,
-    lambda_cons=LAMBDA_GRAY_CONS,
-).to(device)
+pixel_loss = nn.MSELoss()
 # 这里vgg是针对三通道RGB图的
 vgg = vgg19(pretrained=True).features[:16].eval()  # 提取 VGG 特征
 # vgg模型预测模式
@@ -1040,140 +1050,6 @@ regularization_loss = RegularizationLoss()
 """
 验证函数 start
 """
-def validate_and_save(result_dir, generator, val_dataloader, device, epoch, data_type):
-    """
-    flo:
-        LR | Fake | HR
-
-    image_pair:
-        (previous: LR|Fake|HR) || (next: LR|Fake|HR)
-    """
-
-    def _convert_fake_for_display_by_hparam(fake_tensor: torch.Tensor) -> torch.Tensor:
-        """
-        转成 灰度图 只影响图像对 flo文件不受影响
-        :param fake_tensor:
-        :return:
-        """
-        if not SAVE_AS_GRAY:
-            return fake_tensor
-        if fake_tensor.shape[1] != 3:
-            raise ValueError(f"SAVE_AS_GRAY=True requires 3 channels, got {fake_tensor.shape[1]}")
-        # 用“灰度<->RGB复制通道”对应逻辑：取一个通道作为灰度，再repeat回3通道用于拼图显示
-        gray = fake_tensor[:, 0:1, :, :]
-        return gray.repeat(1, 3, 1, 1)
-
-    generator.eval()
-    os.makedirs(result_dir, exist_ok=True)
-
-    with torch.no_grad():
-        for batch_idx, batch in enumerate(val_dataloader):
-            if data_type == "flo":
-                lr_images = batch[data_type]["lr_data"].to(device)  # [B,3,H,W] -> (u,v,mag)
-                hr_images = batch[data_type]["gr_data"].to(device)  # [B,3,H,W]
-                fake_images = generator(lr_images)  # [B,3,H,W]
-
-                resizeD_LR_images = F.interpolate(
-                    lr_images,
-                    size=hr_images.shape[2:],
-                    mode="bicubic",
-                    align_corners=False,
-                )
-
-                if lr_images.shape[1] < 2 or fake_images.shape[1] < 2 or hr_images.shape[1] < 2:
-                    raise ValueError("flo 可视化至少需要前两通道(u,v)")
-
-                # 统一颜色尺度：用 HR 的 uv 计算全局 ref_max_rad
-                hr_u = hr_images[:, 0]
-                hr_v = hr_images[:, 1]
-                hr_mag_uv = torch.sqrt(hr_u * hr_u + hr_v * hr_v)
-                ref_max_rad = max(torch.quantile(hr_mag_uv.flatten(), 0.99).item(), 1e-6)
-
-                # 只取 uv 上色（不使用第3通道）
-                lr_color, _ = flow_to_color_tensor(resizeD_LR_images[:, :2], ref_max_rad=ref_max_rad)
-                fake_color, _ = flow_to_color_tensor(fake_images[:, :2], ref_max_rad=ref_max_rad)
-                hr_color, _ = flow_to_color_tensor(hr_images[:, :2], ref_max_rad=ref_max_rad)
-
-                sample_rows = []
-                for i in range(lr_images.size(0)):
-                    row = build_triplet_row(
-                        lr_color[i].unsqueeze(0),
-                        fake_color[i].unsqueeze(0),
-                        hr_color[i].unsqueeze(0),
-                        sep_width=6
-                    )
-                    sample_rows.append(row)
-
-            elif data_type == "image_pair":
-                lr_prev = batch["image_pair"]["previous"]["lr_data"].to(device)
-                hr_prev = batch["image_pair"]["previous"]["gr_data"].to(device)
-                lr_next = batch["image_pair"]["next"]["lr_data"].to(device)
-                hr_next = batch["image_pair"]["next"]["gr_data"].to(device)
-
-                fake_prev = generator(lr_prev)
-                fake_next = generator(lr_next)
-
-                resize_lr_prev = F.interpolate(
-                    lr_prev,
-                    size=hr_prev.shape[2:],
-                    mode="bicubic",
-                    align_corners=False,
-                )
-                resize_lr_next = F.interpolate(
-                    lr_next,
-                    size=hr_next.shape[2:],
-                    mode="bicubic",
-                    align_corners=False,
-                )
-
-                if hr_prev.shape[1] != 3:
-                    raise ValueError(f"Unsupported previous channel count: {hr_prev.shape[1]}")
-                if hr_next.shape[1] != 3:
-                    raise ValueError(f"Unsupported next channel count: {hr_next.shape[1]}")
-
-                sample_rows = []
-                for i in range(lr_prev.size(0)):
-                    single_lr_prev = resize_lr_prev[i].unsqueeze(0)
-                    single_fake_prev = fake_prev[i].unsqueeze(0)
-                    single_hr_prev = hr_prev[i].unsqueeze(0)
-
-                    single_lr_next = resize_lr_next[i].unsqueeze(0)
-                    single_fake_next = fake_next[i].unsqueeze(0)
-                    single_hr_next = hr_next[i].unsqueeze(0)
-
-                    display_fake_prev = _convert_fake_for_display_by_hparam(single_fake_prev)
-                    display_fake_next = _convert_fake_for_display_by_hparam(single_fake_next)
-
-                    left_group = build_triplet_row(single_lr_prev, display_fake_prev, single_hr_prev, sep_width=6)
-                    right_group = build_triplet_row(single_lr_next, display_fake_next, single_hr_next, sep_width=6)
-
-                    group_sep = add_vertical_separator(left_group, sep_width=16, value=1.0)
-                    row = torch.cat([left_group, group_sep, right_group], dim=3)
-                    sample_rows.append(row)
-
-            else:
-                raise ValueError(f"Unsupported data_type: {data_type}")
-
-            batch_combined = sample_rows[0]
-            for row in sample_rows[1:]:
-                h_sep = add_horizontal_separator(
-                    width=batch_combined.shape[3],
-                    channels=batch_combined.shape[1],
-                    sep_height=10,
-                    value=1.0,
-                    device=batch_combined.device,
-                    dtype=batch_combined.dtype,
-                )
-                batch_combined = torch.cat([batch_combined, h_sep, row], dim=2)
-
-            save_path = os.path.join(
-                result_dir,
-                f"epoch_{epoch + 1}_batch_{batch_idx}_results.png"
-            )
-
-            save_image(batch_combined.to(device).clamp(0, 1), save_path, normalize=False)
-            print(f"Saved validation image: {save_path}")
-            break
 # 计算 PSNR 函数
 def calculate_psnr(fake_image, hr_image):
     mse = torch.mean((fake_image - hr_image) ** 2)
@@ -1192,13 +1068,12 @@ def validate_flow(generator, dataloader, device):
     with torch.no_grad():
         for batch in dataloader:
             # 低分辨率图像
-            lr_images = batch[DATA_TYPES[1]]['lr_data'].to(device)
+            lr_images = batch[data_type]['lr_data'].to(device)
             # 真实图像
-            hr_images = batch[DATA_TYPES[1]]['gr_data'].to(device)
+            hr_images = batch[data_type]['gr_data'].to(device)
             lr_images, hr_images = lr_images.to(device), hr_images.to(device)
             fake_images = generator(lr_images)
-            pixel_total, _, _ = pixel_loss(fake_images, hr_images, False)
-            val_loss += pixel_total.item()
+            val_loss += pixel_loss(fake_images, hr_images).item()
 
             for fake_image, hr_image in zip(fake_images, hr_images):
                 total_psnr += calculate_psnr(fake_image, hr_image)
@@ -1218,15 +1093,14 @@ def validate_image_pair(generator, dataloader, device):
         for batch in dataloader:
             for image_pair_type in IMAGE_PAIR_TYPES:
                 # 低分辨率图像
-                lr_images = batch[DATA_TYPES[0]][image_pair_type]['lr_data'].to(device)
+                lr_images = batch[data_type][image_pair_type]['lr_data'].to(device)
                 # 真实图像
-                hr_images = batch[DATA_TYPES[0]][image_pair_type]['gr_data'].to(device)
+                hr_images = batch[data_type][image_pair_type]['gr_data'].to(device)
 
                 lr_images, hr_images = lr_images.to(device), hr_images.to(device)
                 fake_images = generator(lr_images)
+                val_loss += pixel_loss(fake_images, hr_images).item()
 
-                pixel_total, _, _ = pixel_loss(fake_images, hr_images, SAVE_AS_GRAY)
-                val_loss += pixel_total.item()
                 for fake_image, hr_image in zip(fake_images, hr_images):
                     total_psnr += calculate_psnr(fake_image, hr_image)
                     num_images += 1
@@ -1328,23 +1202,20 @@ def batch_train(lr_images,gr_images, i, data_type, device, generator, discrimina
     不要让判别器太容易自信到极致，比如：
     real label: 1.0 -> 0.9
     """
-    # real_labels_out = torch.ones((len(lr_images), 1, 1, 1)).to(device)
-    # real_labels = torch.full_like(real_labels_out, 0.9).to(device)
-    real_labels = torch.ones((len(lr_images), 1, 1, 1)).to(device)
+    real_labels_out = torch.ones((len(lr_images), 1, 1, 1)).to(device)
+    real_labels = torch.full_like(real_labels_out, 0.9).to(device)
     fake_labels = torch.zeros((len(lr_images), 1, 1, 1)).to(device)
 
     # 生成器生成图像
     pred_images = generator(lr_images)
-    # print(f"pred_images:min,max,mean:{pred_images.min().data,pred_images.max().data,pred_images.mean().data} | lr_images:min,max,mean:{lr_images.min().data,lr_images.max().data,lr_images.mean().data} | gr_images:min,max,mean:{gr_images.min().data,gr_images.max().data,gr_images.mean().data} | ")
     # 判别器判别图像
     probability = discriminator(pred_images)
 
     """生成器训练 start"""
     # 感知损失
     perceptual_loss_value,content_loss,adversarial_loss = perceptual_loss(pred_images, gr_images, probability)
-    # 像素损失（灰白数据可开加权，flo 默认不开）
-    gray_triplet = (SAVE_AS_GRAY and data_type == DATA_TYPES[0])  # 仅 image_pair 且设置为灰度复制模式
-    g_loss_pixel, g_loss_l1, g_loss_mse = pixel_loss(pred_images, gr_images, gray_triplet=gray_triplet)
+    # 像素损失
+    g_loss_pixel = pixel_loss(pred_images, gr_images)
     # 正则损失
     """
     这是很常见的现象，这个 RegularizationLoss 本质上是在惩罚图像相邻像素差，也就是一种平滑约束。
@@ -1383,8 +1254,7 @@ def batch_train(lr_images,gr_images, i, data_type, device, generator, discrimina
     })
 
     # 需要和loss_label对应
-    metric.add(g_loss.item(), perceptual_loss_value.item(),content_loss.item(),adversarial_loss.item(), regularization_loss_value.item(),
-               g_loss_pixel.item(),g_loss_l1.item(),g_loss_mse.item(),
+    metric.add(g_loss.item(), perceptual_loss_value.item(),content_loss.item(),adversarial_loss.item(), regularization_loss_value.item(), g_loss_pixel.item(),
                d_loss.item(), real_loss.item(), fake_loss.item())
     # end if i % 2 == 0:
     if i % 10 == 0:
@@ -1402,7 +1272,7 @@ def batch_train(lr_images,gr_images, i, data_type, device, generator, discrimina
         if channels == 3:
             image_to_save = image
             #只影响图像对 flo文件还是原通道
-            if SAVE_AS_GRAY and data_type != DATA_TYPES[1]:
+            if SAVE_AS_GRAY and data_type is not DATA_TYPES[1]:
                 # 与“灰度图读取后repeat成3通道”相对应：直接取单通道还原灰度
                 image_to_save = image[:, 0:1, :, :]  # [N,1,H,W]
 
@@ -1471,8 +1341,8 @@ def evaluate(epoch,class_name,data_type,device,
     # 保存模型
     generator_save_path = f"{OUT_PUT_DIR}/{class_name}/{data_type}/scale_{SCALE * SCALE}/{MODEL_DIR}/discriminator_{name}.pth"
     discriminator_save_path = f"{OUT_PUT_DIR}/{class_name}/{data_type}/scale_{SCALE * SCALE}/{MODEL_DIR}/generator_{name}.pth"
-    torch.save(discriminator.state_dict(),discriminator_save_path )
-    torch.save(generator.state_dict(), generator_save_path)
+    torch.save(discriminator.state_dict(), generator_save_path)
+    torch.save(generator.state_dict(), discriminator_save_path)
     print(
         f"{class_name} {data_type} |Models saved: Generator -> {generator_save_path}, Discriminator -> {discriminator_save_path}")
 
@@ -1482,11 +1352,10 @@ def evaluate(epoch,class_name,data_type,device,
     animator.save_png(
         f"{OUT_PUT_DIR}/{class_name}/{data_type}/scale_{SCALE * SCALE}/{LOSS_DIR}/train_loss_epoch_{epoch + 1}_{name}.png",
         fixed_groups=[
-            [loss_label[0], loss_label[8], validate_label[0]],
+            [loss_label[0], loss_label[6], validate_label[0]],
             [loss_label[1], loss_label[2], loss_label[3]],
             [loss_label[1], loss_label[4], loss_label[5]],
-            [loss_label[5], loss_label[6], loss_label[7]],
-            [loss_label[8],loss_label[9], loss_label[10]],
+            [loss_label[6],loss_label[7], loss_label[8]],
             [validate_label[1]]
         ])
     pass
@@ -1496,7 +1365,10 @@ if __name__ =="__main__":
     #获取类别名
     #获取数据 自动根据类别划分数据集并读取，每个类别都安装比例划分训练集和验证集
     available_class_names = get_class_names(GR_DATA_ROOT_DIR, LR_DATA_ROOT_DIR)
-
+    loss_label = ['g_loss','g_perceptual_loss',"g_content_loss",
+                  "g_adversarial_loss",'g_regularization_loss','g_loss_pixel',
+                  'd_loss', 'd_real_loss', 'd_fake_loss']
+    validate_label = ['Validation_Loss', 'Avg_PSNR']
     print(f"一共{len(available_class_names)}个类别：{available_class_names}")
     #每个类别读取数据并且训练验证和保存模型
     for class_name in available_class_names:
