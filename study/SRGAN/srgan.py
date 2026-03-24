@@ -680,7 +680,7 @@ def build_flo_uvw_fake_panel(fake_bchw, col_sep=8):
 
 def build_flo_uvw_compare_panel(lr_bchw, fake_bchw, hr_bchw, sep_width=6, row_sep=8, sample_sep=10):
     """
-    validate用：每个样本三行
+    validate用：每个样本三列
     U*: LR|Fake|HR
     V*: LR|Fake|HR
     S*: LR|Fake|HR
@@ -786,40 +786,67 @@ def save_vorticity_quiver_single(fake_bchw: torch.Tensor, save_path: str, stride
     plt.savefig(save_path, bbox_inches="tight")
     plt.close(fig)
 
-def save_vorticity_quiver_compare(lr_bchw: torch.Tensor, fake_bchw: torch.Tensor, hr_bchw: torch.Tensor,
-                                  save_path: str, stride: int = 8):
+def save_vorticity_quiver_compare(
+    lr_bchw: torch.Tensor,
+    fake_bchw: torch.Tensor,
+    hr_bchw: torch.Tensor,
+    save_path: str,
+    stride: int = 8
+):
     """
-    validate_and_save: LR / Fake / HR 对比
+    把一个 batch 画成一张图：
+    每个样本一行，三列 LR | Fake | HR
     输入: [B,3,H,W]
     """
-    triplet = [("LR", lr_bchw), ("Fake", fake_bchw), ("HR", hr_bchw)]
+    B = min(lr_bchw.shape[0], fake_bchw.shape[0], hr_bchw.shape[0])
+    titles = ["LR", "Fake", "HR"]
 
-    fig, axes = plt.subplots(1, 3, figsize=(11.0, 3.4), dpi=160)
-    for ax, (title, t) in zip(axes, triplet):
-        u = _to_np_2d(t[0, 0])
-        v = _to_np_2d(t[0, 1])
-        omega_star = _omega_star_from_uv(u, v)
+    fig, axes = plt.subplots(B, 3, figsize=(11.0, 3.2 * B), dpi=160, squeeze=False)
 
-        H, W = u.shape
-        yy, xx = np.mgrid[0:H, 0:W]
-        vmin = float(omega_star.min())
-        vmax = float(omega_star.max())
+    for i in range(B):
+        triplet = [lr_bchw[i:i+1], fake_bchw[i:i+1], hr_bchw[i:i+1]]
 
-        im = ax.imshow(omega_star, origin="lower", cmap="RdBu_r", vmin=vmin, vmax=vmax)
-        ax.quiver(
-            xx[::stride, ::stride], yy[::stride, ::stride],
-            u[::stride, ::stride], v[::stride, ::stride],
-            color="k",
-            pivot="mid",
-            angles="xy",
-            scale_units="xy",
-            scale=0.25,  # 原来1.8太短，越小越长
-            width=0.004,  # 箭杆加粗
+        # 同一行共用色标范围，方便比较
+        row_omegas = []
+        for t in triplet:
+            u = _to_np_2d(t[0, 0])
+            v = _to_np_2d(t[0, 1])
+            row_omegas.append(_omega_star_from_uv(u, v))
+        row_vmin = min(float(w.min()) for w in row_omegas)
+        row_vmax = max(float(w.max()) for w in row_omegas)
 
-        )
-        ax.set_title(title)
-        ax.set_xticks([]); ax.set_yticks([])
-        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
+        for j, (title, t, omega_star) in enumerate(zip(titles, triplet, row_omegas)):
+            ax = axes[i, j]
+            u = _to_np_2d(t[0, 0])
+            v = _to_np_2d(t[0, 1])
+
+            H, W = u.shape
+            yy, xx = np.mgrid[0:H, 0:W]
+
+            im = ax.imshow(
+                omega_star,
+                origin="lower",
+                cmap="RdBu_r",
+                vmin=row_vmin,
+                vmax=row_vmax
+            )
+            ax.quiver(
+                xx[::stride, ::stride], yy[::stride, ::stride],
+                u[::stride, ::stride], v[::stride, ::stride],
+                color="k",
+                pivot="mid",
+                angles="xy",
+                scale_units="xy",
+                scale=0.25,
+                width=0.004,
+            )
+            if i == 0:
+                ax.set_title(title)
+            ax.set_xticks([])
+            ax.set_yticks([])
+
+        # 每行只放一个 colorbar（挂在 HR 子图右边）
+        plt.colorbar(im, ax=axes[i, 2], fraction=0.046, pad=0.02)
 
     plt.tight_layout()
     plt.savefig(save_path, bbox_inches="tight")
@@ -1263,6 +1290,8 @@ def validate_and_save(result_dir, generator, val_dataloader, device, epoch, data
 
     image_pair:
         (previous: LR|Fake|HR) || (next: LR|Fake|HR)
+
+
     """
 
     def _convert_fake_for_display_by_hparam(fake_tensor: torch.Tensor) -> torch.Tensor:
