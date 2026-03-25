@@ -39,7 +39,8 @@ INPUT_DIRS = [
     r"D:\BaiduSyncdisk\AYanJiuSheng\data\sr_dataset\class_2",
 ]
 
-FACTORS = [ 8, 16]
+#下采样倍数
+FACTORS = [4, 8, 16]
 
 # "maxpool" 或 "interpolate"
 DOWNSAMPLE_METHOD = "interpolate"
@@ -66,6 +67,7 @@ COMPARE_DIR_NAME = "compare_artifacts"
 
 
 def crop_to_multiple_hw(arr: np.ndarray, factor: int) -> np.ndarray:
+    """将数组最后两维(H,W)裁剪为factor的整数倍，避免下采样维度不整除。"""
     h, w = arr.shape[-2], arr.shape[-1]
     hh = (h // factor) * factor
     ww = (w // factor) * factor
@@ -75,6 +77,7 @@ def crop_to_multiple_hw(arr: np.ndarray, factor: int) -> np.ndarray:
 
 
 def max_pool_last2(arr: np.ndarray, factor: int) -> np.ndarray:
+    """对最后两维做factor×factor最大池化下采样。"""
     h, w = arr.shape[-2], arr.shape[-1]
     if h % factor != 0 or w % factor != 0:
         raise ValueError(f"形状 (...,{h},{w}) 不能被 factor={factor} 整除")
@@ -83,6 +86,7 @@ def max_pool_last2(arr: np.ndarray, factor: int) -> np.ndarray:
 
 
 def expand_back_with_repeat(arr: np.ndarray, factor: int, out_h: int, out_w: int) -> np.ndarray:
+    """将下采样结果用最近邻repeat放大回指定尺寸(out_h,out_w)。"""
     expanded = np.repeat(np.repeat(arr, factor, axis=-2), factor, axis=-1)
     hh, ww = expanded.shape[-2], expanded.shape[-1]
 
@@ -102,6 +106,7 @@ def expand_back_with_repeat(arr: np.ndarray, factor: int, out_h: int, out_w: int
 
 
 def _pil_resample(interpolation_mode: str) -> int:
+    """把字符串插值模式映射为Pillow的重采样常量。"""
     interpolation_mode = interpolation_mode.lower()
     if interpolation_mode == "bilinear":
         return Image.Resampling.BILINEAR
@@ -111,6 +116,7 @@ def _pil_resample(interpolation_mode: str) -> int:
 
 
 def resize_2d_with_pillow(arr2d: np.ndarray, out_hw: tuple[int, int], interpolation_mode: str) -> np.ndarray:
+    """使用Pillow对单通道2D数组按指定插值方式缩放到目标尺寸。"""
     out_h, out_w = out_hw
     if out_h <= 0 or out_w <= 0:
         raise ValueError(f"非法输出尺寸：{out_hw}")
@@ -130,6 +136,8 @@ def resize_2d_with_pillow(arr2d: np.ndarray, out_hw: tuple[int, int], interpolat
 
 
 def interpolate_last2(arr: np.ndarray, factor: int, interpolation_mode: str) -> np.ndarray:
+    """对数组最后两维按factor插值下采样，支持多通道/多批次展平处理。"""
+
     h, w = arr.shape[-2], arr.shape[-1]
     out_h = h // factor
     out_w = w // factor
@@ -142,6 +150,7 @@ def interpolate_last2(arr: np.ndarray, factor: int, interpolation_mode: str) -> 
 
 
 def downsample_hw(arr_hw_or_chw: np.ndarray, factor: int, expand_to_original: bool, method: str, interpolation_mode: str) -> np.ndarray:
+    """按method(maxpool/interpolate)对最后两维下采样，可选再放大回原尺寸。"""
     h, w = arr_hw_or_chw.shape[-2], arr_hw_or_chw.shape[-1]
     method = method.lower()
 
@@ -159,16 +168,19 @@ def downsample_hw(arr_hw_or_chw: np.ndarray, factor: int, expand_to_original: bo
 
 
 def read_tif(path: Path) -> np.ndarray:
+    """读取.tif/.tiff图像为numpy数组。"""
     with Image.open(path) as img:
         return np.array(img)
 
 
 def write_tif(path: Path, arr: np.ndarray) -> None:
+    """将numpy数组写入tif文件，自动创建父目录。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray(arr).save(path)
 
 
 def read_flo(path: Path) -> np.ndarray:
+    """读取Middlebury .flo文件，返回HxWx2(float32)光流数组。"""
     with path.open("rb") as f:
         magic = struct.unpack("f", f.read(4))[0]
         if abs(magic - FLO_MAGIC) > 1e-4:
@@ -183,6 +195,7 @@ def read_flo(path: Path) -> np.ndarray:
 
 
 def write_flo(path: Path, flow: np.ndarray) -> None:
+    """将HxWx2光流数组按.flo格式写盘。"""
     if flow.ndim != 3 or flow.shape[2] != 2:
         raise ValueError("flow 必须是 HxWx2")
     h, w, _ = flow.shape
@@ -195,6 +208,7 @@ def write_flo(path: Path, flow: np.ndarray) -> None:
 
 
 def downsample_tif(arr: np.ndarray, factor: int, expand_to_original: bool, method: str, interpolation_mode: str) -> np.ndarray:
+    """对2D或3D图像执行下采样并保持原dtype。"""
     if arr.ndim == 2:
         lr = downsample_hw(arr, factor, expand_to_original, method, interpolation_mode)
         return lr.astype(arr.dtype, copy=False)
@@ -209,6 +223,7 @@ def downsample_tif(arr: np.ndarray, factor: int, expand_to_original: bool, metho
 
 
 def downsample_flo(flow: np.ndarray, factor: int, expand_to_original: bool, method: str, interpolation_mode: str) -> np.ndarray:
+    """对HxWx2光流执行下采样并返回float32。"""
     chw = np.moveaxis(flow, -1, 0)
     lr_chw = downsample_hw(chw, factor, expand_to_original, method, interpolation_mode)
     lr = np.moveaxis(lr_chw, 0, -1)
@@ -216,6 +231,7 @@ def downsample_flo(flow: np.ndarray, factor: int, expand_to_original: bool, meth
 
 
 def iter_target_files(input_dirs: Iterable[Path]) -> Iterable[Path]:
+    """递归遍历输入目录，产出.tif/.tiff/.flo文件路径。"""
     exts = {".tif", ".tiff", ".flo"}
     for root in input_dirs:
         for p in root.rglob("*"):
@@ -224,6 +240,7 @@ def iter_target_files(input_dirs: Iterable[Path]) -> Iterable[Path]:
 
 
 def output_path_for(src: Path, input_root: Path, factor: int) -> Path:
+    """生成下采样结果输出路径：<root>_lr/x{factor}/.../<stem>_lr<suffix>。"""
     output_root = input_root.parent / f"{input_root.name}_lr"
     rel_parent = src.parent.relative_to(input_root)
     target_dir = output_root / f"x{factor}" / rel_parent
@@ -232,6 +249,7 @@ def output_path_for(src: Path, input_root: Path, factor: int) -> Path:
 
 
 def compare_dir_for(src: Path, input_root: Path, factor: int) -> Path:
+    """生成对比产物目录路径：.../compare_artifacts/x{factor}/...。"""
     output_root = input_root.parent / f"{input_root.name}_lr"
     rel_parent = src.parent.relative_to(input_root)
     safe_suffix = src.suffix.lower().replace(".", "")
@@ -239,6 +257,7 @@ def compare_dir_for(src: Path, input_root: Path, factor: int) -> Path:
 
 
 def resize_nearest_image(arr: np.ndarray, out_hw: tuple[int, int]) -> np.ndarray:
+    """用最近邻插值缩放2D/3D图像到目标尺寸。"""
     out_h, out_w = out_hw
     if arr.ndim == 2:
         pil = Image.fromarray(arr)
@@ -280,6 +299,7 @@ def to_uint8_preview(arr: np.ndarray) -> np.ndarray:
 
 def hsv_to_rgb(h: np.ndarray, s: np.ndarray, v: np.ndarray) -> np.ndarray:
     """
+    将HSV(0~1)转换为RGB(0~1)。
     h,s,v in [0,1], return rgb in [0,1], shape HxWx3
     """
     h = np.mod(h, 1.0)
@@ -312,6 +332,7 @@ def hsv_to_rgb(h: np.ndarray, s: np.ndarray, v: np.ndarray) -> np.ndarray:
 
 def flow_to_color(flow: np.ndarray, mag_clip_percentile: float = 99.0) -> np.ndarray:
     """
+    将HxWx2光流转换为HSV色轮可视化RGB图(uint8)。
     将 HxWx2 光流可视化为 RGB(uint8)
     """
     if flow.ndim != 3 or flow.shape[2] != 2:
@@ -334,6 +355,8 @@ def flow_to_color(flow: np.ndarray, mag_clip_percentile: float = 99.0) -> np.nda
 
 
 def save_pair_png(left_rgb: np.ndarray, right_rgb: np.ndarray, out_path: Path) -> None:
+    """左右拼接两张RGB图并保存为PNG。"""
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if left_rgb.shape[0] != right_rgb.shape[0]:
         right_rgb = resize_nearest_image(right_rgb, (left_rgb.shape[0], right_rgb.shape[1]))
@@ -342,6 +365,7 @@ def save_pair_png(left_rgb: np.ndarray, right_rgb: np.ndarray, out_path: Path) -
 
 
 def save_flo_matrix_txt(path: Path, flow: np.ndarray, title: str) -> None:
+    """将光流U/V通道完整矩阵以文本形式保存，便于核对数值。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         f.write(f"{title}\n")
@@ -356,6 +380,7 @@ def save_flo_matrix_txt(path: Path, flow: np.ndarray, title: str) -> None:
 
 def save_flo_artifacts(src: Path, in_root: Path, factor: int, hr_flow: np.ndarray, lr_flow: np.ndarray) -> None:
     """
+    保存flo对比产物：HR/LR可视化、配对图、矩阵txt与npy及说明文件。
     保存 flo 对比产物：
     - HR/LR 可视化图
     - HR vs LR(上采样到HR尺寸) 配对图
@@ -393,6 +418,7 @@ def save_flo_artifacts(src: Path, in_root: Path, factor: int, hr_flow: np.ndarra
 
 def save_image_pair_artifacts(src: Path, in_root: Path, factor: int, hr_img: np.ndarray, lr_img: np.ndarray) -> None:
     """
+    保存图像对比产物：HR预览、LR预览、以及HR vs 上采样LR配对图
     保存图像对配对图（HR vs LR上采样到HR尺寸）
     """
     cdir = compare_dir_for(src, in_root, factor)
@@ -414,6 +440,7 @@ def process_one_file(
     save_flo_compare: bool,
     save_img_compare: bool,
 ) -> None:
+    """按文件类型(tif/tiff/flo)执行多倍率下采样与可选对比产物保存。"""
     ext = src.suffix.lower()
 
     if ext in {".tif", ".tiff"}:
@@ -444,6 +471,7 @@ def process_one_file(
 
 
 def _validate_config() -> tuple[list[Path], list[int]]:
+    """校验配置有效性并返回规范化后的输入目录列表与倍率列表。"""
     if not INPUT_DIRS:
         raise ValueError("请在脚本里设置 INPUT_DIRS（至少一个文件夹路径）")
 
@@ -470,6 +498,7 @@ def _validate_config() -> tuple[list[Path], list[int]]:
 
 
 def main() -> None:
+    """主流程：遍历输入目录、处理文件、统计并打印汇总结果。"""
     input_dirs, factors = _validate_config()
 
     total = 0

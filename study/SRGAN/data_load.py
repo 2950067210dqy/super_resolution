@@ -1,14 +1,17 @@
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 from __future__ import annotations
 
 import hashlib
+import json
 import pickle
 import re
 from functools import lru_cache
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import tifffile
@@ -48,13 +51,14 @@ FLO_MAGIC = 202021.25
 
 # 认为是图像的扩展名集合。
 IMAGE_EXTENSIONS = {".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp"}
-
+# 从文件名提取样本主键的正则规则
 PAIR_KEY_PATTERNS = (
     re.compile(r"^(.*?)(?:[_-]?ti[_-]?\d+)$"),
     re.compile(r"^(.*?)(?:[_-]?t[_-]?i[_-]?\d+)$"),
     re.compile(r"^(.*?)(?:[_-]?(?:img|image|frame)[_-]?\d+)$"),
     re.compile(r"^(.*?)(?:[_-]?\d+)$"),
 )
+# 统一样本键时剥离后缀的规则
 LR_SUFFIX_PATTERN = re.compile(r"([_-]lr)+$")
 FLOW_LR_SUFFIX_PATTERN = re.compile(r"([_-]flow)+([_-]lr)+$")
 FLOW_SUFFIX_PATTERN = re.compile(r"([_-]flow)+$")
@@ -80,7 +84,7 @@ def progress_iter(iterable, desc: str, total: int | None = None):
 
 def log_info(message: str, verbose: bool) -> None:
     """
-    按需打印日志，避免大数据集下逐文件输出拖慢速度。
+    按需打印日志，避免大数据集下逐文件输出拖慢速度。减少非必要 I/O。
     """
     if verbose:
         print(message)
@@ -88,7 +92,7 @@ def log_info(message: str, verbose: bool) -> None:
 
 def _normalize_image_array(image: np.ndarray, image_path: str) -> np.ndarray:
     """
-    把读取出的图像统一整理成 H x W x 3 的 numpy 数组。
+    把读取出的图像统一整理成 H x W x 3 的 numpy 数组。处理灰度/通道前置/带 alpha 等情况。
     """
     if image.ndim == 2:
         image = np.repeat(image[..., None], 3, axis=-1)
@@ -108,11 +112,13 @@ def _normalize_image_array(image: np.ndarray, image_path: str) -> np.ndarray:
 
 @lru_cache(maxsize=512)
 def _read_rgb_image_cached(path_str: str) -> np.ndarray:
+    """带 LRU 缓存的 RGB 图像读取。"""
     return _normalize_image_array(tifffile.imread(path_str), path_str)
 
 
 @lru_cache(maxsize=512)
 def _read_flo_cached(path_str: str) -> np.ndarray:
+    """带 LRU 缓存的 .flo 读取，并补第三通道 magnitude。"""
     path = Path(path_str)
     header = np.fromfile(path, dtype=np.float32, count=1)
     if header.size != 1:
@@ -146,7 +152,7 @@ def build_metadata_cache_path(
     class_names: list[str],
 ) -> Path:
     """
-    为当前数据配置生成稳定的元数据缓存文件路径。
+    为当前数据配置生成稳定的元数据缓存文件路径。根据根目录、类别及目录时间戳生成稳定元数据缓存路径。
     """
     fingerprint_parts = [str(gr_root), str(lr_root)]
     for class_name in class_names:
@@ -168,7 +174,7 @@ def build_tensor_cache_root(
     target_size: tuple[int, int] | None,
 ) -> Path:
     """
-    为当前数据配置生成张量缓存目录。
+    为当前数据配置生成张量缓存目录。根据数据配置生成样本张量缓存根目录。
     """
     fingerprint = hashlib.md5(
         "|".join(
@@ -205,6 +211,7 @@ def build_sample_tensor_cache_path(
 
 
 def dump_samples_cache(cache_path: Path, samples: list[dict]) -> None:
+    """将样本元数据序列化保存到 pkl。"""
     serializable_samples = []
     for sample in samples:
         serializable_samples.append(
@@ -228,6 +235,7 @@ def dump_samples_cache(cache_path: Path, samples: list[dict]) -> None:
 
 
 def load_samples_cache(cache_path: Path) -> list[dict]:
+    """从 pkl 反序列化样本元数据并恢复 Path 对象。"""
     with cache_path.open("rb") as file:
         cached_samples = pickle.load(file)
 
@@ -341,27 +349,24 @@ def discover_class_names(data_root: Path) -> list[str]:
     return class_names
 
 
-def get_class_names(gr_data_root_dir: str, lr_data_root_dir: str) -> list[str]:
+def get_class_names(gr_data_root_dir: str) -> list[str]:
     """
-    对外公开的类别名获取函数。
+    对外公开的类别名获取函数（已弃用 lr_data_root_dir）。
 
-    返回 GR 和 LR 根目录共同拥有的类别名交集。
+    当前行为：
+    - 仅扫描 GR 根目录
+    - 返回 GR 拥有的类别名（按字典序）
     """
     gr_root = ensure_valid_root_dir(gr_data_root_dir, "gr_data_root_dir")
-    lr_root = ensure_valid_root_dir(lr_data_root_dir, "lr_data_root_dir")
 
-    gr_class_names = discover_class_names(gr_root)
-    lr_class_names = discover_class_names(lr_root)
-    class_names = sorted(set(gr_class_names) & set(lr_class_names))
+
+
+    class_names = discover_class_names(gr_root)
 
     if not class_names:
-        raise ValueError(
-            f"No shared class folders found.\n"
-            f"GR classes: {gr_class_names}\n"
-            f"LR classes: {lr_class_names}"
-        )
+        raise ValueError(f"No class folders found under GR root: {gr_root}")
 
-    return class_names
+    return sorted(class_names)
 
 
 def normalize_selected_classes(
@@ -369,7 +374,7 @@ def normalize_selected_classes(
     selected_classes: str | list[str] | tuple[str, ...] | None,
 ) -> list[str]:
     """
-    标准化外部传入的类别筛选参数。
+    标准化外部传入的类别筛选参数。标准化并校验 selected_classes 参数。
 
     支持：
     - None
@@ -419,7 +424,7 @@ def infer_image_pair_key(file_stem: str) -> str:
 
 def normalize_pair_key(sample_key: str) -> str:
     """
-    统一配对时使用的样本键。
+    统一配对时使用的样本键。统一样本键格式并去除 lr/flow 等后缀。
 
     主要处理几类常见尾缀：
     - `_lr`
@@ -444,9 +449,7 @@ def collect_root_class_samples(
     verbose: bool = False,
 ) -> list[dict]:
     """
-    ????????????? sample_key ???????????
-    - 2 ????img1 / img2
-    - 1 ? flo?flow
+    在单个类别目录收集完整样本（2张图+1个flo）。
     """
     image_groups: dict[str, list[Path]] = defaultdict(list)
     flo_map: dict[str, Path] = {}
@@ -531,9 +534,7 @@ def pair_sr_class_samples(
     lr_class_dir: Path,
     verbose: bool = False,
 ) -> list[dict]:
-    """
-    ?? GR ? LR ???????????? sample_key ? GR/LR ???
-    """
+    """按 sample_key 对齐 GR 与 LR 样本，形成多模态配对样本。"""
     gr_samples = collect_root_class_samples(class_name, gr_class_dir, "GR", verbose=verbose)
     lr_samples = collect_root_class_samples(class_name, lr_class_dir, "LR", verbose=verbose)
 
@@ -577,22 +578,24 @@ def pair_sr_class_samples(
     return paired_samples
 
 
-
 # ==============================
-# 按类别划分 train / val
+# 按类别划分 train / val / test
 # ==============================
 
-def split_samples_by_class(
+def split_samples_by_class_three_way(
     samples: list[dict],
     class_names: list[str],
     train_nums_rate: float,
+    validate_nums_rate: float,
+    test_nums_rate: float,
     random_seed: int,
-) -> tuple[list[dict], list[dict], dict[str, dict[str, int]]]:
+) -> tuple[list[dict], list[dict], list[dict], dict[str, dict[str, int]]]:
     """
-    按类别分别划分训练集和验证集。
+    按类别分别随机划分 train/val/test，避免类分布偏移。
     """
     train_samples: list[dict] = []
     validate_samples: list[dict] = []
+    test_samples: list[dict] = []
     split_summary: dict[str, dict[str, int]] = {}
 
     for class_offset, class_name in enumerate(class_names):
@@ -606,28 +609,77 @@ def split_samples_by_class(
         shuffled_samples = [class_samples[index] for index in shuffled_indices]
 
         class_train_size = int(class_total * train_nums_rate)
-        class_val_size = class_total - class_train_size
+        class_val_size = int(class_total * validate_nums_rate)
+        class_test_size = class_total - class_train_size - class_val_size
 
-        if class_total >= 2:
-            if class_train_size == 0:
+        # 兜底：当样本够多时，比例>0 的集合尽量不为空
+        if class_total >= 3:
+            if train_nums_rate > 0 and class_train_size == 0:
                 class_train_size = 1
-                class_val_size = class_total - class_train_size
-            if class_val_size == 0:
+            if validate_nums_rate > 0 and class_val_size == 0:
                 class_val_size = 1
-                class_train_size = class_total - class_val_size
-        elif class_total == 1:
-            class_train_size = 1
-            class_val_size = 0
+            class_test_size = class_total - class_train_size - class_val_size
+            if test_nums_rate > 0 and class_test_size <= 0:
+                class_test_size = 1
+                if class_val_size > 1:
+                    class_val_size -= 1
+                else:
+                    class_train_size = max(1, class_train_size - 1)
 
         train_samples.extend(shuffled_samples[:class_train_size])
-        validate_samples.extend(shuffled_samples[class_train_size:])
+        validate_samples.extend(shuffled_samples[class_train_size: class_train_size + class_val_size])
+        test_samples.extend(shuffled_samples[class_train_size + class_val_size:])
+
         split_summary[class_name] = {
             "total": class_total,
             "train": class_train_size,
             "val": class_val_size,
+            "test": class_test_size,
         }
 
-    return train_samples, validate_samples, split_summary
+    return train_samples, validate_samples, test_samples, split_summary
+
+
+def split_samples_global(
+    samples: list[dict],
+    train_nums_rate: float,
+    validate_nums_rate: float,
+    test_nums_rate: float,
+    random_seed: int,
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """
+    全局随机三划分：先打乱所有类别样本，再按 train/val/test 切分。
+    """
+    total = len(samples)
+    if total == 0:
+        return [], [], []
+
+    g = torch.Generator().manual_seed(random_seed)
+    indices = torch.randperm(total, generator=g).tolist()
+    shuffled = [samples[i] for i in indices]
+
+    n_train = int(total * train_nums_rate)
+    n_val = int(total * validate_nums_rate)
+    n_test = total - n_train - n_val
+
+    if total >= 3:
+        if train_nums_rate > 0 and n_train == 0:
+            n_train = 1
+        if validate_nums_rate > 0 and n_val == 0:
+            n_val = 1
+        n_test = total - n_train - n_val
+        if test_nums_rate > 0 and n_test <= 0:
+            n_test = 1
+            if n_val > 1:
+                n_val -= 1
+            else:
+                n_train = max(1, n_train - 1)
+
+    train_samples = shuffled[:n_train]
+    validate_samples = shuffled[n_train:n_train + n_val]
+    test_samples = shuffled[n_train + n_val:]
+
+    return train_samples, validate_samples, test_samples
 
 
 # ==============================
@@ -636,8 +688,7 @@ def split_samples_by_class(
 
 class SRPairedDataset(Dataset):
     """
-    超分辨率成对数据集。
-
+    返回样本级对齐的 image_pair + flo 多模态数据集。
     每个样本包含两种模态：
     - image_pair (previous / next)
     - flo
@@ -770,6 +821,7 @@ class SRPairedDataset(Dataset):
         raise ValueError("Unsupported cached image_pair format.")
 
     def _clone_image_pair(self, image_pair: dict) -> dict:
+        """深拷贝 image_pair 张量，避免原地修改污染缓存。"""
         return {
             "previous": {
                 "lr_data": image_pair["previous"]["lr_data"].clone(),
@@ -782,6 +834,7 @@ class SRPairedDataset(Dataset):
         }
 
     def __getitem__(self, index: int) -> dict:
+        """获取单样本：优先缓存，缺失时读取并变换后返回。"""
         if self.cache_transformed_samples and index in self._sample_cache:
             cached = self._sample_cache[index]
             return {
@@ -899,8 +952,10 @@ class SRPairedDataset(Dataset):
 
         return item
 
+
 def build_aligned_batch(samples: list[dict]) -> dict | None:
     """
+    把样本列表堆叠为对齐 batch（image_pair/flo/标签/路径）。
     把一组已经一一对应的多模态样本整理成 batch。
     """
     if not samples:
@@ -941,6 +996,7 @@ def build_aligned_batch(samples: list[dict]) -> dict | None:
 
 def sr_paired_collate_fn(batch: list[dict]) -> dict | None:
     """
+    DataLoader 的 collate_fn，返回对齐后的多模态 batch。
     collate 后返回一个对齐 batch：
 
     batch["image_pair"]["previous"]["lr_data"]
@@ -957,9 +1013,6 @@ def sr_paired_collate_fn(batch: list[dict]) -> dict | None:
     return build_aligned_batch(batch)
 
 
-
-
-
 # ==============================
 # 调试工具
 # ==============================
@@ -967,6 +1020,7 @@ def sr_paired_collate_fn(batch: list[dict]) -> dict | None:
 def print_batch_debug_info(batch: dict | None, batch_name: str = "batch") -> None:
     """
     打印一个 batch 的完整结构，方便调试。
+    打印 batch 结构、形状、路径和 sample_key 对齐信息。
     """
     print("=" * 80)
     print(f"[Debug] {batch_name} structure")
@@ -1020,6 +1074,287 @@ def print_batch_debug_info(batch: dict | None, batch_name: str = "batch") -> Non
     print("=" * 80)
 
 
+"""
+loader 序列化存储和读取 start
+
+# 1) 单独保存 train_loader
+save_loader_paths(train_loader, "splits.json", "train")
+
+# 2) 批量保存 train + test
+save_loaders_paths("splits.json", train_loader=train_loader, test_loader=test_loader)
+
+# 3) 单独读取 validate_loader
+validate_loader = load_loader_paths(
+    split_json_path="splits.json",
+    split_name="validate",
+    class_to_idx=class_to_idx,
+    image_transform=image_transform,
+    flow_transform=flow_transform,
+    batch_size=16,
+)
+
+# 4) 批量读取 train + test
+loaded = load_loaders_paths(
+    split_json_path="splits.json",
+    class_to_idx=class_to_idx,
+    image_transform=image_transform,
+    flow_transform=flow_transform,
+    splits=("train", "test"),
+    batch_size=16,
+    train_shuffle=True,
+)
+train_loader = loaded["train"]
+test_loader = loaded["test"]
+"""
+def _serialize_samples(samples: list[dict]) -> list[dict[str, Any]]:
+    """
+    将样本列表转换为可 JSON 序列化结构（Path -> str）。
+
+    参数:
+    - samples: SRPairedDataset.samples 列表
+
+    返回:
+    - list[dict]: 可直接写入 JSON 的样本信息
+    """
+    data = []
+    for s in samples:
+        data.append({
+            "class_name": s["class_name"],
+            "sample_key": s["sample_key"],
+            "image_pair": {
+                "gr_paths": [str(p) for p in s["image_pair"]["gr_paths"]],
+                "lr_paths": [str(p) for p in s["image_pair"]["lr_paths"]],
+            },
+            "flo": {
+                "gr_paths": [str(p) for p in s["flo"]["gr_paths"]],
+                "lr_paths": [str(p) for p in s["flo"]["lr_paths"]],
+            },
+        })
+    return data
+
+
+def _deserialize_samples(data: list[dict[str, Any]]) -> list[dict]:
+    """
+    将 JSON 结构恢复为样本列表（str -> Path）。
+
+    参数:
+    - data: 从 JSON 读取出的样本结构
+
+    返回:
+    - list[dict]: 可用于 SRPairedDataset 的 samples
+    """
+    samples = []
+    for s in data:
+        samples.append({
+            "class_name": s["class_name"],
+            "sample_key": s["sample_key"],
+            "image_pair": {
+                "gr_paths": [Path(x) for x in s["image_pair"]["gr_paths"]],
+                "lr_paths": [Path(x) for x in s["image_pair"]["lr_paths"]],
+            },
+            "flo": {
+                "gr_paths": [Path(x) for x in s["flo"]["gr_paths"]],
+                "lr_paths": [Path(x) for x in s["flo"]["lr_paths"]],
+            },
+        })
+    return samples
+
+
+def _build_loader_from_samples(
+    samples: list[dict],
+    class_to_idx: dict[str, int],
+    image_transform,
+    flow_transform,
+    batch_size: int,
+    shuffle: bool,
+    num_workers: int,
+    verbose: bool = False,
+):
+    """
+    根据样本列表构建 DataLoader。
+
+    参数:
+    - samples: 样本列表
+    - class_to_idx: 类别映射
+    - image_transform: 图像变换
+    - flow_transform: 光流变换
+    - batch_size: 批大小
+    - shuffle: 是否打乱
+    - num_workers: 子进程数
+    - verbose: 数据集日志开关
+
+    返回:
+    - DataLoader
+    """
+    dataset = SRPairedDataset(
+        samples=samples,
+        class_to_idx=class_to_idx,
+        image_transform=image_transform,
+        flow_transform=flow_transform,
+        verbose=verbose,
+        cache_file_reads=True,
+        cache_transformed_samples=False,
+        tensor_cache_root=None,
+    )
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        collate_fn=sr_paired_collate_fn,
+    )
+
+
+def save_loader_paths(loader, out_path: str, split_name: str):
+    """
+    单独保存某一个 loader 的样本路径。
+
+    参数:
+    - loader: train/validate/test 任一 DataLoader
+    - out_path: 输出 JSON 文件路径
+    - split_name: split 名称（如 "train"/"validate"/"test"）
+    """
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    payload = {}
+    if out.exists():
+        payload = json.loads(out.read_text(encoding="utf-8"))
+
+    payload[split_name] = _serialize_samples(loader.dataset.samples) if loader is not None else []
+    out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def save_loaders_paths(
+    out_path: str,
+    train_loader=None,
+    validate_loader=None,
+    test_loader=None,
+):
+    """
+    批量保存多个 loader（可任意组合）。
+
+    参数:
+    - out_path: 输出 JSON 文件路径
+    - train_loader/validate_loader/test_loader: 传入哪个就保存哪个
+    """
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    payload = {}
+    if train_loader is not None:
+        payload["train"] = _serialize_samples(train_loader.dataset.samples)
+    if validate_loader is not None:
+        payload["validate"] = _serialize_samples(validate_loader.dataset.samples)
+    if test_loader is not None:
+        payload["test"] = _serialize_samples(test_loader.dataset.samples)
+
+    out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_loader_paths(
+    split_json_path: str,
+    split_name: str,
+    class_to_idx: dict[str, int],
+    image_transform,
+    flow_transform,
+    batch_size: int = 4,
+    num_workers: int = 0,
+    shuffle: bool = False,
+    verbose: bool = False,
+):
+    """
+    单独读取某个 split 并重建一个 loader。
+
+    参数:
+    - split_json_path: 保存路径 JSON 文件
+    - split_name: "train"/"validate"/"test"
+    - class_to_idx: 类别映射
+    - image_transform: 图像变换
+    - flow_transform: 光流变换
+    - batch_size: 批大小
+    - num_workers: 子进程数
+    - shuffle: 是否打乱
+    - verbose: 数据集日志开关
+
+    返回:
+    - DataLoader | None: split 不存在或为空时返回 None
+    """
+    p = Path(split_json_path)
+    payload = json.loads(p.read_text(encoding="utf-8"))
+    samples_data = payload.get(split_name, [])
+    if not samples_data:
+        return None
+
+    samples = _deserialize_samples(samples_data)
+    return _build_loader_from_samples(
+        samples=samples,
+        class_to_idx=class_to_idx,
+        image_transform=image_transform,
+        flow_transform=flow_transform,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        verbose=verbose,
+    )
+
+
+def load_loaders_paths(
+    split_json_path: str,
+    class_to_idx: dict[str, int],
+    image_transform,
+    flow_transform,
+    batch_size: int = 4,
+    num_workers: int = 0,
+    train_shuffle: bool = True,
+    verbose: bool = False,
+    splits: tuple[str, ...] = ("train", "validate", "test"),
+):
+    """
+    批量读取多个 split 并重建 loader（可任意组合）。
+
+    参数:
+    - split_json_path: 保存路径 JSON 文件
+    - class_to_idx: 类别映射
+    - image_transform: 图像变换
+    - flow_transform: 光流变换
+    - batch_size: 批大小
+    - num_workers: 子进程数
+    - train_shuffle: train 是否打乱
+    - verbose: 数据集日志开关
+    - splits: 要读取的 split 名称元组，如 ("train","test")
+
+    返回:
+    - dict[str, DataLoader | None]:
+      例如 {"train": train_loader, "validate": None, "test": test_loader}
+    """
+    p = Path(split_json_path)
+    payload = json.loads(p.read_text(encoding="utf-8"))
+
+    result: dict[str, DataLoader | None] = {}
+    for split_name in splits:
+        samples_data = payload.get(split_name, [])
+        if not samples_data:
+            result[split_name] = None
+            continue
+
+        samples = _deserialize_samples(samples_data)
+        split_shuffle = train_shuffle if split_name == "train" else False
+        result[split_name] = _build_loader_from_samples(
+            samples=samples,
+            class_to_idx=class_to_idx,
+            image_transform=image_transform,
+            flow_transform=flow_transform,
+            batch_size=batch_size,
+            shuffle=split_shuffle,
+            num_workers=num_workers,
+            verbose=verbose,
+        )
+    return result
+"""
+loader 序列化存储和读取 end
+"""
+
 # ==============================
 # 主加载接口
 # ==============================
@@ -1034,12 +1369,14 @@ def load_data(
     target_size: tuple[int, int] | None = None,
     train_nums_rate: float = 0.8,
     validate_nums_rate: float | None = None,
+    test_nums_rate: float = 0.0,
     random_seed: int = 42,
     verbose: bool = False,
     use_metadata_cache: bool = True,
     cache_file_reads: bool = True,
     cache_transformed_samples: bool = False,
     use_disk_tensor_cache: bool = False,
+    return_test_loader: bool = False,
 ):
     """
     加载超分辨率 GR/LR 成对数据集。
@@ -1051,14 +1388,35 @@ def load_data(
     4. image_pair 和 flo 在样本级别严格一一对应
     5. image_pair 保持 RGB，不转灰度
     6. flo 输出 3 通道：u / v / magnitude
-    7. 训练集与验证集按类别分别划分
+    7. 训练集与验证集按类别分别划分（selected_classes=None 时全局随机三划分）
     8. batch 输出结构中同时包含：
-       - batch["image_pair"]["lr_data"], batch["image_pair"]["gr_data"]
+       - batch["image_pair"]["previous"]["lr_data"], batch["image_pair"]["previous"]["gr_data"]
+       - batch["image_pair"]["next"]["lr_data"], batch["image_pair"]["next"]["gr_data"]
        - batch["flo"]["lr_data"], batch["flo"]["gr_data"]
     9. 提供详细日志和 batch 调试函数
+
+    参数说明（超参数）:
+        - gr_data_root_dir/lr_data_root_dir: GR/LR 数据根目录
+        - selected_classes: 只加载指定类别，None 表示全部类别
+        - batch_size: DataLoader 批大小
+        - num_workers: DataLoader 并行加载进程数
+        - shuffle: 是否打乱训练集
+        - target_size: 统一 resize 尺寸 (H, W)，None 表示保持原尺寸
+        - train_nums_rate: 训练集比例（按类内划分或全局划分）
+        - validate_nums_rate: 验证集比例，None 时自动=1-train_nums_rate-test_nums_rate
+        - test_nums_rate: 测试集比例
+        - random_seed: 划分随机种子
+        - verbose: 是否输出详细逐文件日志
+        - use_metadata_cache: 是否启用样本元数据缓存
+        - cache_file_reads: 是否启用文件读取级缓存（lru）
+        - cache_transformed_samples: 是否缓存变换后的样本到内存
+        - use_disk_tensor_cache: 是否将样本张量缓存到磁盘
+        - return_test_loader: 是否在返回值中包含 test_loader
     """
     gr_root = ensure_valid_root_dir(gr_data_root_dir, "gr_data_root_dir")
     lr_root = ensure_valid_root_dir(lr_data_root_dir, "lr_data_root_dir")
+
+    is_global_mix_split = selected_classes is None
 
     print("=" * 80)
     print("[Start] Begin loading SR dataset")
@@ -1066,6 +1424,8 @@ def load_data(
     print(f"[Start] LR root: {lr_root}")
     print(f"[Start] batch_size={batch_size}, num_workers={num_workers}, shuffle={shuffle}")
     print(f"[Start] target_size={target_size}, random_seed={random_seed}")
+    print(f"[Start] selected_classes={selected_classes}")
+    print(f"[Start] split_mode={'global_mix' if is_global_mix_split else 'per_class'}")
     print(f"[Start] verbose={verbose}")
     print(
         f"[Start] use_metadata_cache={use_metadata_cache}, "
@@ -1075,7 +1435,7 @@ def load_data(
     )
     print("=" * 80)
 
-    available_class_names = get_class_names(gr_data_root_dir, lr_data_root_dir)
+    available_class_names = get_class_names(gr_data_root_dir)
     class_names = normalize_selected_classes(available_class_names, selected_classes)
 
     print(f"[Info] Selected {len(class_names)} classes: {class_names}")
@@ -1128,32 +1488,67 @@ def load_data(
         raise ValueError("No paired GR/LR samples found.")
 
     if validate_nums_rate is None:
-        validate_nums_rate = 1 - train_nums_rate
+        validate_nums_rate = 1 - train_nums_rate - test_nums_rate
 
     if not 0 < train_nums_rate < 1:
         raise ValueError(f"train_nums_rate must be between 0 and 1, got {train_nums_rate}")
     if not 0 <= validate_nums_rate < 1:
         raise ValueError(f"validate_nums_rate must be between 0 and 1, got {validate_nums_rate}")
-    if abs((train_nums_rate + validate_nums_rate) - 1.0) > 1e-8:
+    if not 0 <= test_nums_rate < 1:
+        raise ValueError(f"test_nums_rate must be between 0 and 1, got {test_nums_rate}")
+    if abs((train_nums_rate + validate_nums_rate + test_nums_rate) - 1.0) > 1e-8:
         raise ValueError(
-            "train_nums_rate + validate_nums_rate must equal 1.0, "
-            f"got {train_nums_rate + validate_nums_rate}"
+            "train_nums_rate + validate_nums_rate + test_nums_rate must equal 1.0, "
+            f"got {train_nums_rate + validate_nums_rate + test_nums_rate}"
         )
 
-    train_samples, validate_samples, split_summary = split_samples_by_class(
-        samples=samples,
-        class_names=class_names,
-        train_nums_rate=train_nums_rate,
-        random_seed=random_seed,
-    )
+    # 关键修改：
+    # 1) selected_classes is None -> 全局混合三划分
+    # 2) selected_classes is not None -> 按类别三划分（你要求的新逻辑）
+    if is_global_mix_split:
+        train_samples, validate_samples, test_samples = split_samples_global(
+            samples=samples,
+            train_nums_rate=train_nums_rate,
+            validate_nums_rate=validate_nums_rate,
+            test_nums_rate=test_nums_rate,
+            random_seed=random_seed,
+        )
+        # 用统计方式生成每类汇总，保持打印信息完整
+        train_counter = Counter([s["class_name"] for s in train_samples])
+        val_counter = Counter([s["class_name"] for s in validate_samples])
+        test_counter = Counter([s["class_name"] for s in test_samples])
+        total_counter = Counter([s["class_name"] for s in samples])
+
+        split_summary = {
+            c: {
+                "total": total_counter.get(c, 0),
+                "train": train_counter.get(c, 0),
+                "val": val_counter.get(c, 0),
+                "test": test_counter.get(c, 0),
+            }
+            for c in class_names
+        }
+    else:
+        train_samples, validate_samples, test_samples, split_summary = split_samples_by_class_three_way(
+            samples=samples,
+            class_names=class_names,
+            train_nums_rate=train_nums_rate,
+            validate_nums_rate=validate_nums_rate,
+            test_nums_rate=test_nums_rate,
+            random_seed=random_seed,
+        )
 
     train_size = len(train_samples)
     val_size = len(validate_samples)
+    test_size = len(test_samples)
     total_samples = len(samples)
+
     if train_size == 0:
-        raise ValueError("Per-class split produced an empty training set.")
+        raise ValueError("Split produced an empty training set.")
     if val_size == 0:
-        print("[Warn] Per-class split produced an empty validation set. This usually means each class has only one sample.")
+        print("[Warn] Split produced an empty validation set.")
+    if test_nums_rate > 0 and test_size == 0:
+        print("[Warn] test_nums_rate > 0 but split produced an empty test set.")
 
     train_dataset = SRPairedDataset(
         samples=train_samples,
@@ -1176,6 +1571,17 @@ def load_data(
         tensor_cache_root=tensor_cache_root,
     )
 
+    test_dataset = SRPairedDataset(
+        samples=test_samples,
+        class_to_idx=class_to_idx,
+        image_transform=image_transform,
+        flow_transform=flow_transform,
+        verbose=verbose,
+        cache_file_reads=cache_file_reads,
+        cache_transformed_samples=cache_transformed_samples,
+        tensor_cache_root=tensor_cache_root,
+    ) if test_size > 0 else None
+
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -1190,6 +1596,13 @@ def load_data(
         num_workers=num_workers,
         collate_fn=sr_paired_collate_fn,
     )
+    test_dataloader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=sr_paired_collate_fn,
+    ) if test_dataset is not None else None
 
     print("=" * 80)
     print(f"[Done] Available classes: {available_class_names}")
@@ -1197,20 +1610,25 @@ def load_data(
     print(f"[Done] Total paired samples: {total_samples}")
     print(
         f"[Done] Split dataset with train_nums_rate={train_nums_rate}, "
-        f"validate_nums_rate={validate_nums_rate}"
+        f"validate_nums_rate={validate_nums_rate}, test_nums_rate={test_nums_rate}"
     )
     print(f"[Done] Train samples: {train_size}")
     print(f"[Done] Validate samples: {val_size}")
+    print(f"[Done] Test samples: {test_size}")
+
     for class_name in class_names:
-        class_summary = split_summary.get(class_name, {"total": 0, "train": 0, "val": 0})
+        class_summary = split_summary.get(class_name, {"total": 0, "train": 0, "val": 0, "test": 0})
         print(
             f"[Done] Class '{class_name}': "
             f"total={class_summary['total']}, "
             f"train={class_summary['train']}, "
-            f"val={class_summary['val']}"
+            f"val={class_summary['val']}, "
+            f"test={class_summary['test']}"
         )
     print("=" * 80)
 
+    if return_test_loader:
+        return train_dataloader, validate_dataloader, test_dataloader, class_names, samples
     return train_dataloader, validate_dataloader, class_names, samples
 
 
@@ -1222,17 +1640,33 @@ if __name__ == "__main__":
     available_class_names = get_class_names(GR_DATA_ROOT_DIR, LR_DATA_ROOT_DIR)
     print(f"available_class_names: {available_class_names}")
 
-    train_loader, validate_loader, class_names, samples = load_data(
+    # 示例1：selected_classes=None -> 全类别混合三划分
+    train_loader, validate_loader, test_loader, class_names, samples = load_data(
         gr_data_root_dir=GR_DATA_ROOT_DIR,
         lr_data_root_dir=LR_DATA_ROOT_DIR,
-        selected_classes=available_class_names[:1] if available_class_names else None,
+        selected_classes=None,
+        train_nums_rate=0.8,
+        validate_nums_rate=0.2,
+        test_nums_rate=0.0,
+        return_test_loader=True,
     )
+
+    # 示例2：selected_classes!=None -> 按类别三划分（新逻辑）
+    # train_loader, validate_loader, test_loader, class_names, samples = load_data(
+    #     gr_data_root_dir=GR_DATA_ROOT_DIR,
+    #     lr_data_root_dir=LR_DATA_ROOT_DIR,
+    #     selected_classes=available_class_names[:1],
+    #     train_nums_rate=0.7,
+    #     validate_nums_rate=0.2,
+    #     test_nums_rate=0.1,
+    #     return_test_loader=True,
+    # )
+
     print(f"class_names: {class_names}")
     print(f"num_samples: {len(samples)}")
 
     first_train_batch = next(iter(train_loader))
     print_batch_debug_info(first_train_batch, batch_name="train_batch")
-    # __main__ 里这几行也改一下
     print(f"train image_pair previous lr_data shape: {first_train_batch['image_pair']['previous']['lr_data'].shape}")
     print(f"train image_pair previous gr_data shape: {first_train_batch['image_pair']['previous']['gr_data'].shape}")
     print(f"train image_pair next lr_data shape: {first_train_batch['image_pair']['next']['lr_data'].shape}")
@@ -1243,11 +1677,13 @@ if __name__ == "__main__":
     if len(validate_loader.dataset) > 0:
         first_validate_batch = next(iter(validate_loader))
         print_batch_debug_info(first_validate_batch, batch_name="validate_batch")
-        print(
-            f"validate image_pair previous lr_data shape: {first_validate_batch['image_pair']['previous']['lr_data'].shape}")
-        print(
-            f"validate image_pair previous gr_data shape: {first_validate_batch['image_pair']['previous']['gr_data'].shape}")
+        print(f"validate image_pair previous lr_data shape: {first_validate_batch['image_pair']['previous']['lr_data'].shape}")
+        print(f"validate image_pair previous gr_data shape: {first_validate_batch['image_pair']['previous']['gr_data'].shape}")
         print(f"validate image_pair next lr_data shape: {first_validate_batch['image_pair']['next']['lr_data'].shape}")
         print(f"validate image_pair next gr_data shape: {first_validate_batch['image_pair']['next']['gr_data'].shape}")
         print(f"validate flo lr_data shape: {first_validate_batch['flo']['lr_data'].shape}")
         print(f"validate flo gr_data shape: {first_validate_batch['flo']['gr_data'].shape}")
+
+    if test_loader is not None and len(test_loader.dataset) > 0:
+        first_test_batch = next(iter(test_loader))
+        print_batch_debug_info(first_test_batch, batch_name="test_batch")

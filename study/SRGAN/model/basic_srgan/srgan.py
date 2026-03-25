@@ -1,4 +1,5 @@
 import copy
+import csv
 import math
 import os
 import time
@@ -6,6 +7,7 @@ from datetime import datetime
 from os import mkdir
 from os.path import exists
 from pathlib import Path
+from typing import Callable, Any
 
 import matplotlib
 import numpy as np
@@ -29,41 +31,55 @@ from study.SRGAN.data_load import get_class_names, load_data
 """
 超参数 start
 """
-name = "v3"
-DESCRIPTION = ""
-device = torch.device("cuda")
-#是否加载之前的模型
-IS_LOAD_EXISTS_MODEL = False
+# =========================
+# 训练任务标识
+# =========================
+name = "v3"                 # 当前实验名（用于输出目录/模型名/wandb run名）
+DESCRIPTION = ""            # 实验补充描述（可写损失配置、数据版本等）
+# 类别训练模式: "all" | "single" | "mixed"
+TRAIN_CLASS_MODE = "all"
+# 当 TRAIN_CLASS_MODE="single" 时可预设；为 None 则运行时让你输入选择
+SINGLE_CLASS_NAME = None
+# mixed 模式下的目录名/日志名
+MIXED_CLASS_TAG = "mixed_all_classes"
 
+
+# =========================
+# 设备与模型加载
+# =========================
+device = torch.device("cuda")   # 训练设备
+IS_LOAD_EXISTS_MODEL = False    # 是否从已保存模型断点继续训练
+# =========================
+# 可视化与保存相关
+# =========================
 SAVE_AS_GRAY = True  # True: 保存为灰度图(1通道)；False: 按原通道保存 只影响图片对，不影响flo文件,同时处理相关损失函数也会按照这个
-
-#轮次
-EPOCH_NUMS = 20
-#批量大小
-BATCH_SIZE = 16
-#是否打乱训练集
-SHUFFLE = True
-#将数据的图像和光流统一到该尺寸 tuple[int, int]
-TARGET_SIZE=None
-#随机划分时的随机种子，保证结果复现
-RANDOM_SEED = 42
-#上采样系数 SCALE^2
-SCALE = 2
-
-#生成器感知损失里面的系数 其实就是对抗损失的参数
-LAMBDA_PERCEPTION =5e-4
-#生成器正则损失的系数 ！弃用
-LAMBDA_regularization_loss=2e-8
-#生成器像素损失的系数
-LAMBDA_loss_pixel =1
-
-# 组合像素损失参数
-LAMBDA_PIXEL_L1 = 1e-2
-LAMBDA_PIXEL_MSE = 1e-3
-PIXEL_WHITE_ALPHA = 1.0       # 白点区域权重
-LAMBDA_GRAY_CONS = 1e-2       # 灰度复制RGB时通道一致性，别太
+# =========================
+# 训练主超参数
+# =========================
+EPOCH_NUMS = 20             # 训练轮数
+BATCH_SIZE = 16             # batch 大小
+SHUFFLE = True              # 训练集是否打乱
+TARGET_SIZE = None          # 数据加载时是否统一 resize 到该尺寸
+RANDOM_SEED = 42            # 数据划分随机种子
+# SCALES = [2,math.sqrt(8),4] # 生成器上采样倍率（内部两次 PixelShuffle）
+SCALES = [2] # 生成器上采样倍率（内部两次 PixelShuffle）
 
 
+# =========================
+# 损失项系数
+# =========================
+LAMBDA_PERCEPTION = 5e-4          # 感知损失中对抗项权重
+LAMBDA_regularization_loss = 2e-8 # 正则项权重（当前基本未启用）
+LAMBDA_loss_pixel = 1             # 像素损失总权重
+
+LAMBDA_PIXEL_L1 = 1e-2            # 像素L1权重
+LAMBDA_PIXEL_MSE = 1e-3           # 像素MSE权重
+PIXEL_WHITE_ALPHA = 1.0           # 灰度场白点区域加权系数
+LAMBDA_GRAY_CONS = 1e-2           # 灰度三通道一致性约束权重
+
+# =========================
+# 优化器超参数
+# =========================
 #正则项
 weight_decay=0
 #优化器 betas
@@ -72,29 +88,36 @@ d_optimizer_betas = (0.5,0.999)
 #学习率
 G_LR = 0.0001
 D_LR = 0.0001
-
+# =========================
+# 数据集划分比例
+# =========================
 #训练数据集和验证集合比例 测试集  比例
 Train_nums_rate=0.8
 Test_nums_rate=0.0
 Validate_nums_rate=1-Train_nums_rate-Test_nums_rate
 
-
+# =========================
+# 数据路径与输出路径
+# =========================
 #真实数据根路径
 GR_DATA_ROOT_DIR = rf"/study_datas/sr_dataset/class_1/data"
 #低分辨率数据根地址
-LR_DATA_ROOT_DIR = rf"/study_datas/sr_dataset/class_1_lr/x{SCALE*SCALE}/data"
+LR_DATA_ROOT_DIR = rf"/study_datas/sr_dataset/class_1_lr"
 
 #如果路径不存在则创建路径
-OUT_PUT_DIR = f"./train_data/{name}"
-LOSS_DIR = "/train_loss"
-MODEL_DIR = "/train_model"
-PREDICT_DIR = "/predict"
+OUT_PUT_DIR = f"./train_data/{name}"# 实验输出总目录
+LOSS_DIR = "/train_loss"  # 损失曲线目录
+MODEL_DIR = "/train_model" # 模型权重目录
+PREDICT_DIR = "/predict"   # 预测结果目录
+PREDICT_ALL_DIR = "/predict_all"   # 预测全部结果目录
+
 use_gpu = torch.cuda.is_available()
 Path(OUT_PUT_DIR).mkdir(parents=True, exist_ok=True)
 
-# DATA_TYPES =['image_pair','flo']
-DATA_TYPES =['flo']
-IMAGE_PAIR_TYPES = ['previous','next']
+#需要训练的数据类型  # 参与训练的数据模态
+DATA_TYPES =['image_pair','flo']
+# DATA_TYPES =['flo']
+IMAGE_PAIR_TYPES = ['previous','next'] # 图像对中的两个时刻/帧
 """
 超参数 end
 """
@@ -103,57 +126,168 @@ loss_label = ['g_loss', 'g_perceptual_loss', "g_content_loss",
                 "g_loss_pixel_l1", "g_loss_pixel_mse",
               'd_loss', 'd_real_loss', 'd_fake_loss']
 validate_label = ['Validation_Loss', 'Avg_PSNR']
+#存储数据至csv的列名
+CSV_COLUMNS = ['EPOCH'] +loss_label+validate_label+['time']
+#csv操作实例 CsvTable
+csvOperator= None
 # 使用wandb可视化训练过程
 # 初始化 WandB
 wandb.login(key="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")
-# Start a new wandb run to track this script.
-wandb.init(
-    # Set the wandb entity where your project will be logged (generally your team name).
-    entity="2950067210-usst",
-    # Set the wandb project where this run will be logged.
-    project="srgnn",
-    name=f"{name}_{DESCRIPTION}",
-    # Track hyperparameters and run metadata.
-    config={
-        "epochs": EPOCH_NUMS,
-        "batch_size": BATCH_SIZE,
-        "lr_G": G_LR,
-        "lr_D": D_LR,
-        "RANDOM_SEED":RANDOM_SEED,
-        "SCALE":SCALE,
-        "SHUFFLE":SHUFFLE,
-        "LAMBDA_PERCEPTION":LAMBDA_PERCEPTION,
-        "LAMBDA_regularization_loss":LAMBDA_regularization_loss,
-        "LAMBDA_loss_pixel":LAMBDA_loss_pixel,
 
 
-        "LAMBDA_PIXEL_L1":LAMBDA_PIXEL_L1,
-        "LAMBDA_PIXEL_MSE" :LAMBDA_PIXEL_MSE,
-        "PIXEL_WHITE_ALPHA" :PIXEL_WHITE_ALPHA,       # 白点区域权重
-        "LAMBDA_GRAY_CONS" : LAMBDA_GRAY_CONS  ,    # 灰度复制RGB时通道一致性，别太
-        "SAVE_AS_GRAY" :SAVE_AS_GRAY,
-        "weight_decay":weight_decay,
-        "g_optimizer_betas":g_optimizer_betas,
-        "d_optimizer_betas":d_optimizer_betas,
-        "Train_nums_rate":Train_nums_rate
-    },
-)
-# 配置超参数
-wandb.config = {
+"""
+CSV 操作 start
+"""
+class CsvTable:
+    """
+    基于固定列名(CSV_COLUMNS)的 CSV CRUD 工具类。
+    提供创建、读取、更新、删除与切换文件能力。
+    """
 
-}
+    def __init__(self, file_path: str | Path, columns: list[str]):
+        """
+        初始化 CSV 表对象。
 
+        功能：
+        - 记录当前操作的 CSV 文件路径和列名
+        - 自动创建父目录
+        - 若文件不存在，按当前列名创建空表（仅表头）
+        """
+        self.file_path = Path(file_path)
+        self.columns = columns
+        self.file_path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.file_path.exists():
+            self._write_all([])
 
+    def switch_file(self, file_path: str | Path) -> None:
+        """
+        切换到另一个 CSV 文件继续操作（列结构保持 self.columns）。
+
+        功能：
+        - 修改当前 file_path
+        - 自动创建新文件父目录
+        - 若目标文件不存在，创建带当前列名表头的空文件
+        """
+        self.file_path = Path(file_path)
+        self.file_path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.file_path.exists():
+            self._write_all([])
+
+    def _read_all(self) -> list[dict[str, str]]:
+        """
+        读取当前 CSV 文件全部数据并返回行列表。
+
+        功能：
+        - 使用 DictReader 按列名读取
+        - 校验文件表头与 self.columns 完全一致
+        - 返回 list[dict]（每行一个字典）
+        """
+        with self.file_path.open("r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            if reader.fieldnames != self.columns:
+                raise ValueError(f"CSV 列不匹配: {reader.fieldnames} != {self.columns}")
+            return list(reader)
+
+    def _write_all(self, rows: list[dict[str, Any]]) -> None:
+        """
+        覆盖写入当前 CSV 的全部数据。
+
+        功能：
+        - 先写表头（self.columns）
+        - 再逐行写入 rows
+        - 对缺失列自动补空字符串，保证列完整性
+        """
+        with self.file_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=self.columns)
+            writer.writeheader()
+            for row in rows:
+                safe_row = {col: row.get(col, "") for col in self.columns}
+                writer.writerow(safe_row)
+
+    def create(self, row: dict[str, Any]) -> None:
+        """
+        新增一行记录。
+
+        功能：
+        - 读取现有全部数据
+        - 将新行按 self.columns 对齐后追加
+        - 回写到 CSV 文件
+        """
+        rows = self._read_all()
+        rows.append({col: row.get(col, "") for col in self.columns})
+        self._write_all(rows)
+
+    def read(
+        self,
+        where: Callable[[dict[str, str]], bool] | None = None
+    ) -> list[dict[str, str]]:
+        """
+        查询记录。
+
+        功能：
+        - where=None：返回全部行
+        - where 不为 None：返回满足条件的行
+        """
+        rows = self._read_all()
+        if where is None:
+            return rows
+        return [r for r in rows if where(r)]
+
+    def update(
+        self,
+        where: Callable[[dict[str, str]], bool],
+        updates: dict[str, Any],
+    ) -> int:
+        """
+        更新满足条件的记录。
+
+        功能：
+        - 遍历所有行，命中 where 的行执行字段更新
+        - 仅更新在 self.columns 中存在的列
+        - 回写文件并返回更新行数
+        """
+        rows = self._read_all()
+        count = 0
+        for r in rows:
+            if where(r):
+                for k, v in updates.items():
+                    if k in self.columns:
+                        r[k] = str(v)
+                count += 1
+        self._write_all(rows)
+        return count
+
+    def delete(self, where: Callable[[dict[str, str]], bool]) -> int:
+        """
+        删除满足条件的记录。
+
+        功能：
+        - 过滤掉命中 where 的行
+        - 回写剩余数据
+        - 返回删除行数
+        """
+        rows = self._read_all()
+        new_rows = [r for r in rows if not where(r)]
+        deleted = len(rows) - len(new_rows)
+        self._write_all(new_rows)
+        return deleted
+"""
+CSV 操作 end
+"""
 """
 工具 start
 """
 def save_hyper_parameters_txt(file_path="hyper_parameter.txt"):
+    """将当前实验超参数写入文本文件，便于复现实验。"""
     created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     lines = [
         f"# created_at = {created_at}",
         f'name = "{name}"',
         f'DESCRIPTION = "{DESCRIPTION}"',
+        f'TRAIN_CLASS_MODE = {TRAIN_CLASS_MODE}',
+        f'SINGLE_CLASS_NAME = {SINGLE_CLASS_NAME}',
+        f'MIXED_CLASS_TAG = {MIXED_CLASS_TAG}',
         f'device = torch.device("{device.type}")',
         f"IS_LOAD_EXISTS_MODEL = {IS_LOAD_EXISTS_MODEL}",
         "",
@@ -164,7 +298,7 @@ def save_hyper_parameters_txt(file_path="hyper_parameter.txt"):
         f"SHUFFLE = {SHUFFLE}",
         f"TARGET_SIZE = {TARGET_SIZE}",
         f"RANDOM_SEED = {RANDOM_SEED}",
-        f"SCALE = {SCALE}",
+        f"SCALE = {SCALES}",
         "",
         f"LAMBDA_PERCEPTION = {LAMBDA_PERCEPTION}",
         f"LAMBDA_regularization_loss = {LAMBDA_regularization_loss}",
@@ -192,6 +326,7 @@ def save_hyper_parameters_txt(file_path="hyper_parameter.txt"):
         f'LOSS_DIR = r"{LOSS_DIR}"',
         f'MODEL_DIR = r"{MODEL_DIR}"',
         f'PREDICT_DIR = r"{PREDICT_DIR}"',
+        f'PREDICT_ALL_DIR = r"{PREDICT_ALL_DIR}"',
         f"use_gpu = {use_gpu}",
         f"DATA_TYPES = {DATA_TYPES}",
         f"IMAGE_PAIR_TYPES = {IMAGE_PAIR_TYPES}",
@@ -200,19 +335,24 @@ def save_hyper_parameters_txt(file_path="hyper_parameter.txt"):
     Path(file_path).write_text("\n".join(lines), encoding="utf-8")
     print(f"hyper_parameter Saved to {file_path}")
 class Accumulator:
-    """在n个变量上累加"""
+    """在n个变量上累加  通用累加器：用于在一个 epoch 内累计多个标量指标（如 G/D 各项 loss）。"""
     def __init__(self, n):
+        """初始化 n 个累加槽位。"""
         self.data = [0.0] * n
 
     def add(self, *args):
+        """逐项累加输入值到内部槽位。"""
         self.data = [a + float(b) for a, b in zip(self.data, args)]
 
     def reset(self):
+        """将所有槽位清零。"""
         self.data = [0.0] * len(self.data)
 
     def __getitem__(self, idx):
+        """按索引读取某个累计值。"""
         return self.data[idx]
 def _in_notebook():
+    """检测当前是否运行在 notebook 环境。"""
     try:
         from IPython import get_ipython
         ip = get_ipython()
@@ -224,6 +364,9 @@ def _in_notebook():
 
 
 class Animator:
+    """
+    损失函数折线图  训练曲线可视化器：支持多序列记录、分组绘图、导出静态 PNG/动态 GIF。
+    """
     def __init__(
         self,
         xlabel=None,
@@ -236,6 +379,8 @@ class Animator:
         fmts=None,
         figsize=(6, 4),
     ):
+        """初始化坐标轴配置、图例、样式以及帧缓存容器。"""
+
         self.xlabel = xlabel
         self.ylabel = ylabel
         self.legend = legend or []
@@ -255,6 +400,7 @@ class Animator:
         self.axes = None
 
     def _build_auto_fmts(self):
+        """自动生成足够数量的线型/颜色/标记组合。"""
         colors = ["b", "g", "r", "c", "m", "y", "k"]
         linestyles = ["-", "--", "-.", ":"]
         markers = ["", "o", "s", "d", "^", "v", "x", "*"]
@@ -272,6 +418,8 @@ class Animator:
         return fmts
 
     def add(self, x, y):
+        """追加一帧曲线数据到内部缓存（支持单值/多值输入）。"""
+
         if not hasattr(y, "__len__"):
             y = [y]
         y = list(y)
@@ -305,6 +453,8 @@ class Animator:
         self.frames.append(([row[:] for row in self.X], [row[:] for row in self.Y]))
 
     def _filter_series(self, Xf, Yf, exclude_legends=None):
+        """按图例过滤不需要显示的序列，并打包绘图元信息。"""
+
         exclude_legends = set(exclude_legends or [])
         filtered = []
 
@@ -325,11 +475,13 @@ class Animator:
         return filtered
 
     def _series_scale(self, y):
+        """计算单条序列的尺度（绝对值最大值），用于分组。"""
         if not y:
             return 0.0
         return max(abs(v) for v in y)
 
     def _group_series_by_scale(self, series_list, split_ratio=8.0):
+        """按量级自动分组，避免大/小量级曲线互相遮蔽。"""
         non_empty = []
         empty = []
 
@@ -371,6 +523,8 @@ class Animator:
 
     def _apply_fixed_groups(self, series_list, fixed_groups=None, split_ratio=8.0):
         """
+          应用用户指定分组（支持重复引用同一label），
+        其余序列再走自动分组逻辑。
         fixed_groups 支持:
         - 按名字: "g_loss"
         - 按名字+序号: "g_loss#0" / "g_loss#1"（同名序列时可精确指定）
@@ -440,6 +594,8 @@ class Animator:
         return final_groups if final_groups else [[]]
 
     def _build_figure(self, n_subplots):
+        """按子图数量创建/重建画布。"""
+
         if self.fig is not None:
             plt.close(self.fig)
 
@@ -453,6 +609,7 @@ class Animator:
         self.axes = [ax[0] for ax in axes]
 
     def _config_axis(self, ax, series_group):
+        """为单子图设置坐标轴范围、比例尺、图例和网格。"""
         ax.set_xlabel(self.xlabel or "")
         ax.set_ylabel(self.ylabel or "")
 
@@ -489,6 +646,7 @@ class Animator:
         ax.grid(True, alpha=0.3)
 
     def _draw_frame(self, frame_idx, exclude_legends=None, split_ratio=8.0, fixed_groups=None):
+        """渲染指定帧到画布。"""
         Xf, Yf = self.frames[frame_idx]
         filtered_series = self._filter_series(Xf, Yf, exclude_legends=exclude_legends)
         groups = self._apply_fixed_groups(
@@ -508,6 +666,7 @@ class Animator:
         self.fig.tight_layout()
 
     def save(self, gif_path="train.gif", fps=20, exclude_legends=None, split_ratio=8.0, fixed_groups=None):
+        """导出训练过程动态 GIF。"""
         if not self.frames:
             raise ValueError("没有可保存的帧，请先调用 add().")
 
@@ -543,6 +702,7 @@ class Animator:
         self.axes = None
 
     def save_png(self, png_path="train.png", exclude_legends=None, split_ratio=8.0, fixed_groups=None):
+        """导出最后一帧静态 PNG。"""
         if not self.frames:
             raise ValueError("没有可保存的帧，请先调用 add().")
 
@@ -554,21 +714,25 @@ class Animator:
         )
         self.fig.savefig(png_path, dpi=200, bbox_inches="tight")
 def add_vertical_separator(tensor, sep_width=8, value=1.0):
+    """生成竖向白色分隔条，用于拼图。"""
     b, c, h, _ = tensor.shape
     return torch.full((b, c, h, sep_width), value, device=tensor.device, dtype=tensor.dtype)
 
 
 def add_horizontal_separator(width, channels=3, sep_height=8, value=1.0, device="cpu", dtype=torch.float32):
+    """生成横向白色分隔条，用于拼图。"""
     return torch.full((1, channels, sep_height, width), value, device=device, dtype=dtype)
 
 
 def build_triplet_row(lr, fake, hr, sep_width=6):
+    """拼接一行对比图：LR | Fake | HR。"""
     sep = add_vertical_separator(lr, sep_width=sep_width, value=1.0)
     return torch.cat([lr, sep, fake, sep, hr], dim=3)
 
 
 def to_gray_3ch(x):
     """
+    把 3 通道图压成灰度后再复制为 3 通道，便于统一可视化接口。
     x: [B, 3, H, W]
     先压成灰度 [B,1,H,W]，再复制成 [B,3,H,W] 方便可视化拼接
     """
@@ -578,6 +742,7 @@ def to_gray_3ch(x):
 
 def convert_fake_for_display(fake, fake_mode="rgb"):
     """
+    根据显示模式返回 RGB 或灰度可视化版本。
     fake: [B, 3, H, W]
     fake_mode:
         - rgb: 原图显示
@@ -589,6 +754,8 @@ def convert_fake_for_display(fake, fake_mode="rgb"):
         return to_gray_3ch(fake)
     raise ValueError(f"Unsupported fake_mode: {fake_mode}")
 def _hsv_to_rgb_torch(h: torch.Tensor, s: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """将 HSV 张量转换为 RGB 张量。"""
+
     i = torch.floor(h * 6.0).to(torch.int64)
     f = h * 6.0 - i
     p = v * (1.0 - s)
@@ -618,6 +785,7 @@ def _hsv_to_rgb_torch(h: torch.Tensor, s: torch.Tensor, v: torch.Tensor) -> torc
 
 def flow_to_color_tensor(flow: torch.Tensor, ref_max_rad: float | None = None) -> tuple[torch.Tensor, float]:
     """
+    将光流 uv 通道映射为色轮可视化 RGB 图。
     flow: [B,C,H,W], C>=2（可为2或3，若3则第3通道会被忽略）
     返回: rgb [B,3,H,W] in [0,1], max_rad
     """
@@ -645,6 +813,7 @@ def flow_to_color_tensor(flow: torch.Tensor, ref_max_rad: float | None = None) -
     return rgb, max_rad
 def scalar_to_jet(x01: torch.Tensor) -> torch.Tensor:
     """
+    将单通道标量场映射为 jet 伪彩色图。
     x01: [B,1,H,W] in [0,1]
     return: [B,3,H,W] in [0,1], jet colormap
     """
@@ -655,6 +824,7 @@ def scalar_to_jet(x01: torch.Tensor) -> torch.Tensor:
     return rgb.permute(0, 3, 1, 2).contiguous()  # [B,3,H,W]
 def build_flo_uvw_fake_panel(fake_bchw, col_sep=8):
     """
+    仅对 fake 的 U/V/S 三通道做伪彩展示并横向拼接。
     只显示 fake，按三列排列：
     U* | V* | S*
     """
@@ -680,6 +850,7 @@ def build_flo_uvw_fake_panel(fake_bchw, col_sep=8):
 
 def build_flo_uvw_compare_panel(lr_bchw, fake_bchw, hr_bchw, sep_width=6, row_sep=8, sample_sep=10):
     """
+    对 LR/Fake/HR 的 U/V/S 三通道做对比拼图。
     validate用：每个样本三列
     U*: LR|Fake|HR
     V*: LR|Fake|HR
@@ -731,12 +902,14 @@ def build_flo_uvw_compare_panel(lr_bchw, fake_bchw, hr_bchw, sep_width=6, row_se
 
 #瞬时涡流速度场 start
 def _to_np_2d(x: torch.Tensor) -> np.ndarray:
+    """将 torch 2D/3D(单通道)张量转为 numpy 2D。"""
     # x: [H,W] or [1,H,W]
     if x.ndim == 3:
         x = x.squeeze(0)
     return x.detach().float().cpu().numpy()
 
 def _omega_star_from_uv(u: np.ndarray, v: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    """由 u,v 计算涡量并归一化到 [-2,2] 得到 omega*。"""
     # omega = dv/dx - du/dy
     dv_dy, dv_dx = np.gradient(v)
     du_dy, du_dx = np.gradient(u)
@@ -750,6 +923,7 @@ def _omega_star_from_uv(u: np.ndarray, v: np.ndarray, eps: float = 1e-8) -> np.n
 
 def save_vorticity_quiver_single(fake_bchw: torch.Tensor, save_path: str, stride: int = 8):
     """
+    保存单样本 fake 的涡量背景 + 速度矢量图。
     batch_train: 只看生成图效果（fake）
     fake_bchw: [B,3,H,W], channel0=u, channel1=v, channel2=s
     """
@@ -794,45 +968,71 @@ def save_vorticity_quiver_compare(
     stride: int = 8
 ):
     """
+    保存 batch 级对比图：每行一个样本，三列 LR/Fake/HR 的涡量+矢量。
     把一个 batch 画成一张图：
-    每个样本一行，三列 LR | Fake | HR
+    每个样本一行，三列 LR（原始 未扩充大小） | Fake | HR
     输入: [B,3,H,W]
+    自动处理三者分辨率不一致
     """
     B = min(lr_bchw.shape[0], fake_bchw.shape[0], hr_bchw.shape[0])
     titles = ["LR", "Fake", "HR"]
 
+    def _resize_np_nearest(arr, out_h, out_w):
+        # arr: [h,w]
+        t = torch.from_numpy(arr).float()[None, None]  # [1,1,h,w]
+        t = F.interpolate(t, size=(out_h, out_w), mode="nearest")
+        return t[0, 0].numpy()
+
     fig, axes = plt.subplots(B, 3, figsize=(11.0, 3.2 * B), dpi=160, squeeze=False)
 
     for i in range(B):
-        triplet = [lr_bchw[i:i+1], fake_bchw[i:i+1], hr_bchw[i:i+1]]
+        triplet = [lr_bchw[i:i + 1], fake_bchw[i:i + 1], hr_bchw[i:i + 1]]
 
-        # 同一行共用色标范围，方便比较
-        row_omegas = []
+        # 当前样本三图目标画布尺寸：取最大
+        hs = [int(t.shape[-2]) for t in triplet]
+        ws = [int(t.shape[-1]) for t in triplet]
+        Ht, Wt = max(hs), max(ws)
+
+        row_items = []
         for t in triplet:
-            u = _to_np_2d(t[0, 0])
-            v = _to_np_2d(t[0, 1])
-            row_omegas.append(_omega_star_from_uv(u, v))
-        row_vmin = min(float(w.min()) for w in row_omegas)
-        row_vmax = max(float(w.max()) for w in row_omegas)
+            u = _to_np_2d(t[0, 0])  # [h,w]
+            v = _to_np_2d(t[0, 1])  # [h,w]
+            omega_star = _omega_star_from_uv(u, v)  # 原分辨率算涡量
+            row_items.append((u, v, omega_star))
 
-        for j, (title, t, omega_star) in enumerate(zip(titles, triplet, row_omegas)):
+        # 同一行共用色标范围
+        row_vmin = min(float(w.min()) for _, _, w in row_items)
+        row_vmax = max(float(w.max()) for _, _, w in row_items)
+
+        for j, (title, (u, v, omega_star)) in enumerate(zip(titles, row_items)):
             ax = axes[i, j]
-            u = _to_np_2d(t[0, 0])
-            v = _to_np_2d(t[0, 1])
+            h, w = u.shape
 
-            H, W = u.shape
-            yy, xx = np.mgrid[0:H, 0:W]
+            # 背景统一到目标尺寸，便于三列视觉一致
+            if (h, w) != (Ht, Wt):
+                omega_show = _resize_np_nearest(omega_star, Ht, Wt)
+            else:
+                omega_show = omega_star
 
             im = ax.imshow(
-                omega_star,
+                omega_show,
                 origin="lower",
                 cmap="RdBu_r",
                 vmin=row_vmin,
                 vmax=row_vmax
             )
+
+            # 矢量坐标从原网格映射到目标画布（保持“原始稀疏度”）
+            yy, xx = np.mgrid[0:h, 0:w]
+            sx = Wt / float(w)
+            sy = Ht / float(h)
+
+            cur_stride = stride
             ax.quiver(
-                xx[::stride, ::stride], yy[::stride, ::stride],
-                u[::stride, ::stride], v[::stride, ::stride],
+                (xx * sx)[::cur_stride, ::cur_stride],
+                (yy * sy)[::cur_stride, ::cur_stride],
+                u[::cur_stride, ::cur_stride],
+                v[::cur_stride, ::cur_stride],
                 color="k",
                 pivot="mid",
                 angles="xy",
@@ -840,12 +1040,14 @@ def save_vorticity_quiver_compare(
                 scale=0.25,
                 width=0.004,
             )
+
+            ax.set_xlim(0, Wt - 1)
+            ax.set_ylim(0, Ht - 1)
             if i == 0:
                 ax.set_title(title)
             ax.set_xticks([])
             ax.set_yticks([])
 
-        # 每行只放一个 colorbar（挂在 HR 子图右边）
         plt.colorbar(im, ax=axes[i, 2], fraction=0.046, pad=0.02)
 
     plt.tight_layout()
@@ -861,6 +1063,7 @@ def save_vorticity_quiver_compare(
 """
 def icnr_(tensor: torch.Tensor, scale: int = 2, initializer=nn.init.kaiming_normal_) -> torch.Tensor:
     """
+    对 PixelShuffle 前卷积层执行 ICNR 初始化，减轻棋盘格伪影。
     ICNR init for sub-pixel convolution weights.
     tensor shape: [out_channels, in_channels, kH, kW]
     """
@@ -1017,8 +1220,8 @@ class Generator(nn.Module):
 
         )
 
-        #ICNR 初始化
-        self._init_subpixel_weights()
+        #ICNR 初始化 srgan不应该有这个
+        # self._init_subpixel_weights()
 
     def _init_subpixel_weights(self):
         #对 PixelShuffle 前的 Conv2d(64, 64*scale*scale, ...) 做了 ICNR，能明显减轻棋盘纹。
@@ -1060,7 +1263,7 @@ class Generator(nn.Module):
 class DownSample(nn.Module):
     """
     判别器中的下采样块
-
+    判别器基础下采样块：Conv + BN + LeakyReLU。
     常见设计:
     Conv -> BN -> LeakyReLU
 
@@ -1088,7 +1291,7 @@ class Discriminator(nn.Module):
         输入图像尺寸通常是 [B, 3, 256, 256]
 
     判别器任务:
-        判断输入图像是真实高分辨率图像，还是生成器生成的图像
+        判断输入图像是真实高分辨率图像，还是生成器生成的图像 输出真假概率。
     """
     def __init__(self,inner_chanel=3):
         super(Discriminator, self).__init__()
@@ -1134,6 +1337,8 @@ class Discriminator(nn.Module):
         )
 
     def forward(self, x):
+        """输入图像，输出真假置信度。"""
+
         x = self.conv1(x)
         x = self.down(x)
         x = self.dense(x)
@@ -1160,7 +1365,12 @@ class Discriminator(nn.Module):
 #         return out
 
 class ContentLoss(nn.Module):
+    """
+        内容损失（VGG特征空间MSE）：约束生成图在感知特征上接近真值图。
+        """
+
     def __init__(self, vgg):
+        """冻结 VGG 特征提取器并初始化 MSE 损失。"""
         super().__init__()
         self.vgg = vgg.eval()
         for p in self.vgg.parameters():
@@ -1168,13 +1378,14 @@ class ContentLoss(nn.Module):
         self.criterion = nn.MSELoss()
 
     def forward(self, fake, real):
+        """计算 fake 与 real 的 VGG 特征 MSE。"""
         # 给 G 传梯度：fake 不 detach；real 可以 detach
         fake_features = self.vgg(fake)
         real_features = self.vgg(real).detach()
         return self.criterion(fake_features, real_features)
 class AdversarialLoss(nn.Module):
     """
-    对抗损失
+    对抗损失：鼓励生成图被判别器判为真实。
     """
     def __init__(self):
         super(AdversarialLoss,self).__init__()
@@ -1185,7 +1396,6 @@ class AdversarialLoss(nn.Module):
 class PerceptualLoss(nn.Module):
     """
     感知损失 = 内容损失+1e-3 * 对抗损失
-    也可以加正则化损失和像素损失
     """
     def __init__(self, vgg):
         super(PerceptualLoss,self).__init__()
@@ -1199,12 +1409,14 @@ class PerceptualLoss(nn.Module):
         return vgg_loss +LAMBDA_PERCEPTION*adversarial_loss,vgg_loss,adversarial_loss
 class RegularizationLoss(nn.Module):
     """
-    正则化损失
+    图像平滑正则：惩罚相邻像素突变，抑制高频噪声。
     """
+
     def __init__(self):
         super(RegularizationLoss,self).__init__()
 
     def forward(self, x):
+        """计算基于局部梯度的平滑正则损失。"""
         a = torch.square(
             x[:, :, :x.shape[2]-1, :x.shape[3]-1] - x[:, :, 1:x.shape[2], :x.shape[3]-1]
         )
@@ -1218,6 +1430,9 @@ class RegularizationLoss(nn.Module):
 
 class CombinedPixelLoss(nn.Module):
     """
+    组合像素损失：
+    - 常规模式：L1 + MSE
+    - 灰度增强模式：白点加权 + 通道一致性约束
     SAVE_AS_GRAY=True 且 image_pair 时:
       - 用 target 亮度做加权，提升白点召回
       - 加轻量通道一致性约束（防伪彩）
@@ -1285,6 +1500,7 @@ regularization_loss = RegularizationLoss()
 """
 def validate_and_save(result_dir, generator, val_dataloader, device, epoch, data_type):
     """
+    每轮验证时保存主对比图，并在 flo 模态下额外保存 U/V/S 与涡量矢量图。 只验证保存loader的第一个batch的图
     flo:
         LR | Fake | HR
 
@@ -1437,15 +1653,17 @@ def validate_and_save(result_dir, generator, val_dataloader, device, epoch, data
                 )
                 #瞬时涡流速度场
                 save_vorticity_quiver_compare(
-                    resize_lr_images, fake_images, hr_images,
+                    lr_images, fake_images, hr_images,
                     os.path.join(result_dir, f"epoch_{epoch + 1}_batch_{batch_idx}_vorticity_quiver.png"),
-                    stride=8
+                    stride=6
                 )
             save_image(batch_combined.clamp(0, 1), save_path, normalize=False)
             print(f"Saved validation image: {save_path}")
             break
 # 计算 PSNR 函数
 def calculate_psnr(fake_image, hr_image):
+    """计算单张图 PSNR。"""
+
     mse = torch.mean((fake_image - hr_image) ** 2)
     if mse == 0:
         return float('inf')
@@ -1454,6 +1672,7 @@ def calculate_psnr(fake_image, hr_image):
 
 # 验证函数  flo文件
 def validate_flow(generator, dataloader, device):
+    """在 flo 验证集上计算平均像素损失与平均 PSNR。 验证所有的验证集"""
     #设置模型为评估模式
     generator.eval()
     val_loss = 0
@@ -1479,6 +1698,7 @@ def validate_flow(generator, dataloader, device):
     return val_loss, avg_psnr
 # 验证函数 图像对
 def validate_image_pair(generator, dataloader, device):
+    """在 image_pair 验证集上计算平均像素损失与平均 PSNR。 验证所有的验证集"""
     # 设置模型为评估模式
     generator.eval()
     val_loss = 0
@@ -1517,8 +1737,9 @@ def train():
 def image_pair_train(batch,i, data_type, device, generator, discriminator,
                 g_optimizer, d_optimizer,
                 train_progress_bar,
-                metric,class_name):
+                metric,class_name,SCALE):
     """
+    执行 image_pair 的一个 batch 训练（previous/next 各训练一次）。
     图片对训练 ，因为是有两张图片所以训练两次
     :param batch: batch数据块
     :param i:  第几个batch
@@ -1531,6 +1752,7 @@ def image_pair_train(batch,i, data_type, device, generator, discriminator,
     :param train_progress_bar:训练进度条
     :param metric:loss等数据累加器
     :param class_name 类型名
+    :param SCALE:上采样因子 具体放大平方倍
     :return:
     """
     for image_pair_type in IMAGE_PAIR_TYPES:
@@ -1541,13 +1763,14 @@ def image_pair_train(batch,i, data_type, device, generator, discriminator,
         batch_train(lr_images=lr_images, gr_images=gr_images, i=i, g_optimizer=g_optimizer,
                     d_optimizer=d_optimizer, generator=generator,
                     discriminator=discriminator, train_progress_bar=train_progress_bar,
-                    metric=metric, data_type=data_type, device=device, class_name=class_name,image_pair_type = image_pair_type)
+                    metric=metric, data_type=data_type, device=device, class_name=class_name,image_pair_type = image_pair_type,SCALE=SCALE)
     pass
 def flow_train(batch,i, data_type, device, generator, discriminator,
                 g_optimizer, d_optimizer,
                 train_progress_bar,
-                metric,class_name):
+                metric,class_name,SCALE):
     """
+    执行 flo 的一个 batch 训练。
     flo数据训练
     :param batch: batch数据块
     :param i:  第几个batch
@@ -1560,6 +1783,7 @@ def flow_train(batch,i, data_type, device, generator, discriminator,
     :param train_progress_bar:训练进度条
     :param metric:loss等数据累加器
     :param class_name 类型名
+    :param SCALE:上采样因子 具体放大平方倍
     :return:
     """
     # 低分辨率图像
@@ -1569,13 +1793,14 @@ def flow_train(batch,i, data_type, device, generator, discriminator,
     batch_train(lr_images=lr_images, gr_images=gr_images, i=i, g_optimizer=g_optimizer,
                 d_optimizer=d_optimizer, generator=generator,
                 discriminator=discriminator, train_progress_bar=train_progress_bar,
-                metric=metric, data_type=data_type, device=device, class_name=class_name)
+                metric=metric, data_type=data_type, device=device, class_name=class_name,SCALE=SCALE)
     pass
 def batch_train(lr_images,gr_images, i, data_type, device, generator, discriminator,
                 g_optimizer, d_optimizer,
                 train_progress_bar,
-                metric,class_name,image_pair_type=None) -> None:
+                metric,class_name,image_pair_type=None,SCALE=2) -> None:
     """
+    单 batch 的 G/D 训练、损失统计与中间可视化保存。
     每一个batch的训练过程
     :param lr_images: 低分辨率图像
     :param gr_images: 真实图像
@@ -1590,6 +1815,7 @@ def batch_train(lr_images,gr_images, i, data_type, device, generator, discrimina
     :param metric:loss等数据累加器
     :param class_name: 类型名
     :param image_pair_type : 图像对类别 previous next  如果是flo文件则为None
+    :param SCALE:上采样因子 具体放大平方倍
     :return:
     """
 
@@ -1624,8 +1850,8 @@ def batch_train(lr_images,gr_images, i, data_type, device, generator, discrimina
     regularization_loss_value = regularization_loss(pred_images)
     # 生成器总损失
     # g_loss = perceptual_loss_value + LAMBDA_regularization_loss *regularization_loss_value +LAMBDA_loss_pixel*g_loss_pixel  # 这里的percuptual_loss包含了vgg_loss和对抗损失
-    # g_loss = perceptual_loss_value
-    g_loss = perceptual_loss_value+LAMBDA_loss_pixel*g_loss_pixel
+    g_loss = perceptual_loss_value #最原始的srgan
+    # g_loss = perceptual_loss_value+LAMBDA_loss_pixel*g_loss_pixel
 
     # 优化生成器
     g_optimizer.zero_grad()
@@ -1653,13 +1879,14 @@ def batch_train(lr_images,gr_images, i, data_type, device, generator, discrimina
     })
 
     # 需要和loss_label对应
-    metric.add(g_loss.item(), perceptual_loss_value.item(),content_loss.item(),adversarial_loss.item(), regularization_loss_value.item(),
-               g_loss_pixel.item(),g_loss_l1.item(),g_loss_mse.item(),
+    metric.add(g_loss.item(), perceptual_loss_value.item(),content_loss.item(),
+               adversarial_loss.item(), regularization_loss_value.item(), g_loss_pixel.item(),
+               g_loss_l1.item(),g_loss_mse.item(),
                d_loss.item(), real_loss.item(), fake_loss.item())
     # end if i % 2 == 0:
-    if i % 20 == 0:
+    if i % 100 == 0:
         image = pred_images.detach()
-        save_dir = f"{OUT_PUT_DIR}/{class_name}/{data_type}/scale_{SCALE * SCALE}"
+        save_dir = f"{OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}"
         os.makedirs(save_dir, exist_ok=True)
 
         save_prefix = f"{save_dir}/image_{len(train_loader) * epoch + i}_{name}"
@@ -1695,7 +1922,7 @@ def batch_train(lr_images,gr_images, i, data_type, device, generator, discrimina
             save_vorticity_quiver_single(
                 image,  # pred_images.detach()
                 f"{save_prefix}_vorticity_quiver.png",
-                stride=8
+                stride=6
             )
         elif image.shape[1] == 3:
             # image_pair: 若去掉了 Sigmoid，保存前裁剪到 [0,1]
@@ -1711,9 +1938,9 @@ def batch_train(lr_images,gr_images, i, data_type, device, generator, discrimina
             )
 def evaluate(epoch,class_name,data_type,device,
              generator,discriminator,animator,
-             validate_loader,loss_label,validate_label):
+             validate_loader,loss_label,validate_label,SCALE,csvOperator):
     """
-
+   每轮结束后执行验证、记录日志、保存模型与损失曲线。
     :param epoch: 轮次
     :param class_name:类别
     :param data_type: 数据类型 data_tyoes:[image_pair,flo]
@@ -1724,6 +1951,8 @@ def evaluate(epoch,class_name,data_type,device,
     :param validate_loader: 验证集数据加载器
     :param loss_label: 损失函数描述label
     :param validate_label:  验证参数的label
+    :param SCALE:上采样因子 具体放大平方倍
+    :param csvOperator:loss等数据 存储csv
     :return:
     """
     # 每轮训练结束后进行验证
@@ -1755,21 +1984,23 @@ def evaluate(epoch,class_name,data_type,device,
     print(loss_str)
 
     # 每轮训练结束后进行验证，并保存最后一批图像
-    validate_and_save(f"{OUT_PUT_DIR}/{class_name}/{data_type}/scale_{SCALE * SCALE}/{PREDICT_DIR}", generator,
+    validate_and_save(f"{OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{PREDICT_DIR}", generator,
                       validate_loader, device, epoch, data_type=data_type)
     # 保存模型
-    generator_save_path = f"{OUT_PUT_DIR}/{class_name}/{data_type}/scale_{SCALE * SCALE}/{MODEL_DIR}/discriminator_{name}.pth"
-    discriminator_save_path = f"{OUT_PUT_DIR}/{class_name}/{data_type}/scale_{SCALE * SCALE}/{MODEL_DIR}/generator_{name}.pth"
+    generator_save_path = f"{OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{MODEL_DIR}/discriminator_{name}.pth"
+    discriminator_save_path = f"{OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{MODEL_DIR}/generator_{name}.pth"
     torch.save(discriminator.state_dict(),discriminator_save_path )
     torch.save(generator.state_dict(), generator_save_path)
     print(
         f"{class_name} {data_type} |Models saved: Generator -> {generator_save_path}, Discriminator -> {discriminator_save_path}")
 
     # 保存每一epoch的损失
-    animator.add(epoch + 1,
-                 [metric[index] / len(train_loader) for index in range(len(loss_label))] + [val_loss, avg_psnr])
+    all_loss_and_val_Datas = [metric[index] / len(train_loader) for index in range(len(loss_label))] + [val_loss, avg_psnr]
+    animator.add(epoch + 1,all_loss_and_val_Datas )
+    # 保存到csv文件中
+    csvOperator.create(dict(zip(CSV_COLUMNS,[epoch + 1]+all_loss_and_val_Datas+[datetime.now().strftime("%Y-%m-%d %H:%M:%S")])))
     animator.save_png(
-        f"{OUT_PUT_DIR}/{class_name}/{data_type}/scale_{SCALE * SCALE}/{LOSS_DIR}/train_loss_epoch_{epoch + 1}_{name}.png",
+        f"{OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{LOSS_DIR}/train_loss_epoch_{epoch + 1}_{name}.png",
         fixed_groups=[
             [loss_label[0], loss_label[8], validate_label[0]],
             [loss_label[1], loss_label[2], loss_label[3]],
@@ -1779,101 +2010,223 @@ def evaluate(epoch,class_name,data_type,device,
             [validate_label[1]]
         ])
     pass
+def evaluate_all(generator,data_loader,class_name,data_type,SCALE):
+    """
+    验证所有的验证集
+    :param generator:生成器
+    :param data_loader: 验证集
+    :param class_name:数据类型
+    :param data_type:数据元 flo or image_pair
+    :param SCALE : 上采样因子
+    :return:
+    """
+    # 设置模型为评估模式
+    generator.eval()
+    with torch.no_grad():
+        validate_progress_bar = tqdm(data_loader,
+                                  desc=f"{class_name} {data_type}  scale_{int(SCALE * SCALE)} Validating",
+                                  unit="batch")
+        for i, batch in enumerate(validate_progress_bar):
+            if data_type == "flo":
+                # 1.先计算相关的计算量
+                lr_images = batch[data_type]["lr_data"].to(device)  # [B,3,H,W] (u,v,mag)
+                hr_images = batch[data_type]["gr_data"].to(device)  # [B,3,H,W]
+                fake_images = generator(lr_images)  # [B,3,H,W] (去掉Sigmoid后可超出[0,1])
+
+
+                pass
+            elif data_type == "image_pair":
+                lr_prevs = batch["image_pair"]["previous"]["lr_data"].to(device)
+                hr_prevs = batch["image_pair"]["previous"]["gr_data"].to(device)
+                lr_nexts = batch["image_pair"]["next"]["lr_data"].to(device)
+                hr_nexts = batch["image_pair"]["next"]["gr_data"].to(device)
+
+                fake_prevs = generator(lr_prevs)
+                fake_nexts = generator(lr_nexts)
+                pass
+            else:
+                raise ValueError(f"Unsupported data_type: {data_type}")
+
+        pass
+def select_single_class(available_class_names, preset_name=None):
+    """
+    单类别训练时选择类别：
+    - preset_name 非空且合法：直接用它
+    - 否则：终端交互选择
+    """
+    if preset_name is not None:
+        if preset_name not in available_class_names:
+            raise ValueError(
+                f"SINGLE_CLASS_NAME='{preset_name}' 不在可用类别中: {available_class_names}"
+            )
+        return preset_name
+
+    print("请选择单类别训练目标：")
+    for idx, cname in enumerate(available_class_names):
+        print(f"  [{idx}] {cname}")
+
+    while True:
+        raw = input("输入类别序号: ").strip()
+        if raw.isdigit():
+            i = int(raw)
+            if 0 <= i < len(available_class_names):
+                return available_class_names[i]
+        print("输入无效，请重新输入。")
 if __name__ =="__main__":
     #保存超参数
     save_hyper_parameters_txt(f"{OUT_PUT_DIR}/hyper_parameters.txt")
     #获取类别名
-    #获取数据 自动根据类别划分数据集并读取，每个类别都安装比例划分训练集和验证集
-    available_class_names = get_class_names(GR_DATA_ROOT_DIR, LR_DATA_ROOT_DIR)
+    available_class_names = get_class_names(GR_DATA_ROOT_DIR)
 
     print(f"一共{len(available_class_names)}个类别：{available_class_names}")
-    #每个类别读取数据并且训练验证和保存模型
-    for class_name in available_class_names:
 
+    # 训练模式: all | single | mixed
+    mode = TRAIN_CLASS_MODE.lower().strip()
+    if mode not in {"all", "single", "mixed"}:
+        raise ValueError(f"TRAIN_CLASS_MODE 仅支持 all/single/mixed，当前为: {TRAIN_CLASS_MODE}")
 
-        #根据类别读取数据
-        train_loader, validate_loader, class_names, samples = load_data(
-            gr_data_root_dir=GR_DATA_ROOT_DIR,
-            lr_data_root_dir=LR_DATA_ROOT_DIR,
-            batch_size=BATCH_SIZE,
-            shuffle=SHUFFLE,
-            target_size=TARGET_SIZE,
-            train_nums_rate=Train_nums_rate,
-            validate_nums_rate=Validate_nums_rate,
-            random_seed=RANDOM_SEED,
-            selected_classes=available_class_names[:1] if available_class_names else None,
-        )
-        # 每个类别的图像对和flo文件分别训练验证和保存模型
-        for data_type in DATA_TYPES:
-            # 创建文件夹
-            Path(f"{OUT_PUT_DIR}/{class_name}/{data_type}/scale_{SCALE * SCALE}/{LOSS_DIR}").mkdir(parents=True, exist_ok=True)
-            Path(f"{OUT_PUT_DIR}/{class_name}/{data_type}/scale_{SCALE * SCALE}/{MODEL_DIR}").mkdir(parents=True, exist_ok=True)
-            Path(f"{OUT_PUT_DIR}/{class_name}/{data_type}/scale_{SCALE * SCALE}/{PREDICT_DIR}").mkdir(parents=True, exist_ok=True)
+    run_jobs = []
+    if mode == "all":
+        #每个类别读取数据并且训练验证和保存模型
+        for class_name in available_class_names:
+            run_jobs.append({"run_class_name": class_name, "selected_classes": [class_name]})
+    elif mode == "single":
+        chosen = select_single_class(available_class_names, SINGLE_CLASS_NAME)
+        #每个类别读取数据并且训练验证和保存模型
+        run_jobs.append({"run_class_name": chosen, "selected_classes": [chosen]})
+    else:
+        #每个类别读取数据并且训练验证和保存模型
+        run_jobs.append({"run_class_name": MIXED_CLASS_TAG, "selected_classes": None})
 
-            animator = Animator(xlabel='epoch', xlim=[1, EPOCH_NUMS], ylim=[0, 0.5],
-                                legend=loss_label + validate_label)
-            # 实例化generator
-            generator = Generator(inner_chanel=3).to(device)
-            # 实例化Discriminator
-            discriminator = Discriminator(inner_chanel=3).to(device)
-            # 加载预训练模型
-            if IS_LOAD_EXISTS_MODEL:
-                generator_save_path = f"{OUT_PUT_DIR}/{class_name}/{data_type}/scale_{SCALE * SCALE}/{MODEL_DIR}/discriminator_{name}.pth"
-                if os.path.exists(generator_save_path):
-                    generator.load_state_dict(torch.load(generator_save_path, map_location=device))
-                    print(f"Loaded pretrained model generator from {generator_save_path}")
-                else:
-                    print("No pretrained model generator found. Starting training from scratch.")
-                discriminator_save_path = f"{OUT_PUT_DIR}/{class_name}/{data_type}/scale_{SCALE * SCALE}/{MODEL_DIR}/generator_{name}.pth"
-                if os.path.exists(discriminator_save_path):
-                    discriminator.load_state_dict(torch.load(discriminator_save_path, map_location=device))
-                    print(f"Loaded pretrained model discriminator from {discriminator_save_path}")
-                else:
-                    print("No pretrained model discriminator found. Starting training from scratch.")
-            # 优化器
-            g_optimizer = torch.optim.Adam(generator.parameters(), lr=G_LR, betas=g_optimizer_betas,
-                                           weight_decay=weight_decay)
-            d_optimizer = torch.optim.Adam(discriminator.parameters(), lr=D_LR, betas=d_optimizer_betas,
-                                           weight_decay=weight_decay)
+    for job in run_jobs:
+        class_name = job["run_class_name"]
+        selected_classes = job["selected_classes"]
 
-            start_time = time.time()
-            #轮数
-            for epoch in range(EPOCH_NUMS):
-                generator.train()# 确保生成器在训练模式
-                discriminator.train()# 确保判别器在训练模式
-                # 算每轮epoch的总体loss
-                metric = Accumulator(len(loss_label))
-                # 拿batch——size数据
-                train_progress_bar = tqdm(train_loader, desc=f"Epoch [{epoch + 1}/{EPOCH_NUMS}] {class_name} {data_type} Training", unit="batch")
-                #1600/32 =50
-                for i,batch in enumerate(train_progress_bar):
-                    """ 图片对训练"""
-                    if data_type == "image_pair":
-                        image_pair_train(
-                            batch=batch, i=i, g_optimizer=g_optimizer,
-                            d_optimizer=d_optimizer, generator=generator,
-                            discriminator=discriminator, train_progress_bar=train_progress_bar,
-                            metric=metric, data_type=data_type, device=device, class_name=class_name
-                        )
-                    elif data_type == "flo":
-                        """flo文件训练"""
-                        flow_train( batch=batch, i=i, g_optimizer=g_optimizer,
-                            d_optimizer=d_optimizer, generator=generator,
-                            discriminator=discriminator, train_progress_bar=train_progress_bar,
-                            metric=metric, data_type=data_type, device=device, class_name=class_name)
-                #每轮结束后评价一次
-                evaluate(epoch, class_name, data_type, device, generator, discriminator, animator, validate_loader, loss_label, validate_label)
+        # 几倍上采样倍率来训练
+        for SCALE in SCALES:
+            # 获取数据 自动根据类别划分数据集并读取，每个类别都安装比例划分训练集和验证集
+            # 根据类别和上采样读取数据
+            train_loader, validate_loader, test_loader, class_names, samples = load_data(
+                gr_data_root_dir=GR_DATA_ROOT_DIR,
+                lr_data_root_dir=f"{LR_DATA_ROOT_DIR}/x{int(SCALE * SCALE)}/data",
+                batch_size=BATCH_SIZE,
+                shuffle=SHUFFLE,
+                target_size=TARGET_SIZE,
+                train_nums_rate=Train_nums_rate,
+                validate_nums_rate=Validate_nums_rate,
+                test_nums_rate=Test_nums_rate,
+                random_seed=RANDOM_SEED,
+                selected_classes=selected_classes,
+                return_test_loader=True
+            )
+            # 每个类别的图像对和flo文件分别训练验证和保存模型
+            for data_type in DATA_TYPES:
+                # Start a new wandb run to track this script.
+                wandb.init(
+                    entity="2950067210-usst",
+                    project="srgnn",
+                    name=f"{name}_{DESCRIPTION}_{class_name}_{data_type}",
+                    config={
+                        "createTime":datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "epochs": EPOCH_NUMS,
+                        "batch_size": BATCH_SIZE,
+                        "lr_G": G_LR,
+                        "lr_D": D_LR,
+                        "RANDOM_SEED": RANDOM_SEED,
+                        "SCALE": SCALE,
+                        "SHUFFLE": SHUFFLE,
+                        "LAMBDA_PERCEPTION": LAMBDA_PERCEPTION,
+                        "LAMBDA_regularization_loss": LAMBDA_regularization_loss,
+                        "LAMBDA_loss_pixel": LAMBDA_loss_pixel,
+                        "LAMBDA_PIXEL_L1": LAMBDA_PIXEL_L1,
+                        "LAMBDA_PIXEL_MSE": LAMBDA_PIXEL_MSE,
+                        "PIXEL_WHITE_ALPHA": PIXEL_WHITE_ALPHA,
+                        "LAMBDA_GRAY_CONS": LAMBDA_GRAY_CONS,
+                        "SAVE_AS_GRAY": SAVE_AS_GRAY,
+                        "weight_decay": weight_decay,
+                        "g_optimizer_betas": g_optimizer_betas,
+                        "d_optimizer_betas": d_optimizer_betas,
+                        "Train_nums_rate": Train_nums_rate,
+                        "Validate_nums_rate": Validate_nums_rate,
+                        "Test_nums_rate": Test_nums_rate,
+                        "train_mode": mode,
+                        "selected_classes": selected_classes if selected_classes is not None else "ALL_MIXED",
+                    },
+                )
 
-    # # 测试生成器
-    # lr = torch.randn(2, 3, 64, 64)
-    #
-    # # 4x 超分: 64x64 -> 256x256
-    # G = Generator(scale=2)
-    # sr = G(lr)
-    # print("Generator output shape:", sr.shape)
-    #
-    # # 判别器输入应该和 HR / SR 图像尺寸一致
-    # D = Discriminator()
-    # out = D(sr)
-    # print("Discriminator output shape:", out.shape)
-    pass
+                # 创建文件夹
+                Path(f"{OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{LOSS_DIR}").mkdir(parents=True, exist_ok=True)
+                Path(f"{OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{MODEL_DIR}").mkdir(parents=True, exist_ok=True)
+                Path(f"{OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{PREDICT_DIR}").mkdir(parents=True, exist_ok=True)
+
+                animator = Animator(xlabel='epoch', xlim=[1, EPOCH_NUMS], ylim=[0, 0.5],
+                                    legend=loss_label + validate_label)
+
+                generator = Generator(inner_chanel=3).to(device)
+                discriminator = Discriminator(inner_chanel=3).to(device)
+                if csvOperator is None:
+                    csvOperator = CsvTable(file_path=f"{OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{LOSS_DIR}/loss_{class_name} _{data_type}_scale_{int(SCALE * SCALE)}.csv",columns=CSV_COLUMNS)
+                else :
+                    csvOperator.switch_file(file_path=f"{OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{LOSS_DIR}/loss_{class_name} _{data_type}_scale_{int(SCALE * SCALE)}.csv")
+                if IS_LOAD_EXISTS_MODEL:
+                    generator_save_path = f"{OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{MODEL_DIR}/discriminator_{name}.pth"
+                    if os.path.exists(generator_save_path):
+                        generator.load_state_dict(torch.load(generator_save_path, map_location=device))
+                        print(f"Loaded pretrained model generator from {generator_save_path}")
+                    else:
+                        print("No pretrained model generator found. Starting training from scratch.")
+
+                    discriminator_save_path = f"{OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{MODEL_DIR}/generator_{name}.pth"
+                    if os.path.exists(discriminator_save_path):
+                        discriminator.load_state_dict(torch.load(discriminator_save_path, map_location=device))
+                        print(f"Loaded pretrained model discriminator from {discriminator_save_path}")
+                    else:
+                        print("No pretrained model discriminator found. Starting training from scratch.")
+
+                g_optimizer = torch.optim.Adam(generator.parameters(), lr=G_LR, betas=g_optimizer_betas, weight_decay=weight_decay)
+                d_optimizer = torch.optim.Adam(discriminator.parameters(), lr=D_LR, betas=d_optimizer_betas, weight_decay=weight_decay)
+
+                start_time = time.time()
+                #轮数
+                """
+                训练 start
+                """
+                for epoch in range(EPOCH_NUMS):
+                    generator.train()# 确保生成器在训练模式
+                    discriminator.train()# 确保判别器在训练模式
+
+                    metric = Accumulator(len(loss_label))
+                    train_progress_bar = tqdm(train_loader, desc=f"Epoch [{epoch + 1}/{EPOCH_NUMS}] {class_name} {data_type} scale_{int(SCALE * SCALE)} Training", unit="batch")
+
+                    for i,batch in enumerate(train_progress_bar):
+                        """ 图片对训练"""
+                        if data_type == "image_pair":
+                            image_pair_train(
+                                batch=batch, i=i, g_optimizer=g_optimizer,
+                                d_optimizer=d_optimizer, generator=generator,
+                                discriminator=discriminator, train_progress_bar=train_progress_bar,
+                                metric=metric, data_type=data_type, device=device, class_name=class_name, SCALE=SCALE
+                            )
+                        elif data_type == "flo":
+                            """flo文件训练"""
+                            flow_train(
+                                batch=batch, i=i, g_optimizer=g_optimizer,
+                                d_optimizer=d_optimizer, generator=generator,
+                                discriminator=discriminator, train_progress_bar=train_progress_bar,
+                                metric=metric, data_type=data_type, device=device, class_name=class_name, SCALE=SCALE
+                            )
+                    #每轮结束后评价一次 验证集只取一轮batch
+                    evaluate(epoch, class_name, data_type, device, generator, discriminator, animator, validate_loader, loss_label, validate_label, SCALE=SCALE,csvOperator=csvOperator)
+
+                wandb.finish()
+                """
+                训练 end
+                """
+
+                """
+                验证集全部验证一遍 start
+                """
+
+                """
+                验证集全部验证一遍 end
+                """
