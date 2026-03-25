@@ -4,10 +4,11 @@ from model.basic_srgan import srgan_pipeline
 models = {"srgan":srgan_pipeline.main,}
 def main():
     keys = list(models.keys())
+    print("==="*10)
     print("可选模型：")
     for i, k in enumerate(keys, 1):
         print(f"{i}. {k}")
-
+    print("===" * 10)
     while True:
         raw = input("请输入序号: ").strip()
         if raw.isdigit():

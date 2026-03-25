@@ -26,7 +26,19 @@ from study.SRGAN.util.image_util import flow_to_color_tensor, build_triplet_row,
 """
 验证函数 start
 """
-def validate_and_save(result_dir, generator, val_dataloader, device, epoch, data_type,SAVE_AS_GRAY=True):
+def _select_metric_or_save_channels(x: torch.Tensor, data_type: str, save_as_gray: bool) -> torch.Tensor:
+    """
+    统一通道选择策略：
+    - image_pair 且 SAVE_AS_GRAY=True: 仅使用第一个通道
+    - 其他情况: 保持原通道
+    """
+    if data_type == "image_pair" and save_as_gray:
+        if x.shape[1] < 1:
+            raise ValueError(f"Expected at least 1 channel for image_pair, got {x.shape[1]}")
+        return x[:, 0:1, :, :]
+    return x
+
+def validate_and_save(result_dir, generator, val_dataloader, device, epoch, data_type, SAVE_AS_GRAY=None):
     """
     每轮验证时保存主对比图，并在 flo 模态下额外保存 U/V/S 与涡量矢量图。 只验证保存loader的第一个batch的图
     flo:
@@ -38,13 +50,8 @@ def validate_and_save(result_dir, generator, val_dataloader, device, epoch, data
 
     """
 
-    def _convert_fake_for_display_by_hparam(fake_tensor: torch.Tensor) -> torch.Tensor:
-        if not SAVE_AS_GRAY:
-            return fake_tensor
-        if fake_tensor.shape[1] != 3:
-            raise ValueError(f"SAVE_AS_GRAY=True requires 3 channels, got {fake_tensor.shape[1]}")
-        gray = fake_tensor[:, 0:1, :, :]
-        return gray.repeat(1, 3, 1, 1)
+    if SAVE_AS_GRAY is None:
+        SAVE_AS_GRAY = global_data.srgan.SAVE_AS_GRAY
 
     generator.eval()
     os.makedirs(result_dir, exist_ok=True)
@@ -127,27 +134,41 @@ def validate_and_save(result_dir, generator, val_dataloader, device, epoch, data
                     # align_corners=False,
                 )
 
-                if hr_prev.shape[1] != 3:
-                    raise ValueError(f"Unsupported previous channel count: {hr_prev.shape[1]}")
-                if hr_next.shape[1] != 3:
-                    raise ValueError(f"Unsupported next channel count: {hr_next.shape[1]}")
+                if SAVE_AS_GRAY:
+                    if hr_prev.shape[1] < 1:
+                        raise ValueError(f"Unsupported previous channel count: {hr_prev.shape[1]}")
+                    if hr_next.shape[1] < 1:
+                        raise ValueError(f"Unsupported next channel count: {hr_next.shape[1]}")
+                else:
+                    if hr_prev.shape[1] != 3:
+                        raise ValueError(f"Unsupported previous channel count: {hr_prev.shape[1]}")
+                    if hr_next.shape[1] != 3:
+                        raise ValueError(f"Unsupported next channel count: {hr_next.shape[1]}")
 
                 sample_rows = []
                 for i in range(lr_prev.size(0)):
-                    single_lr_prev = resize_lr_prev[i].unsqueeze(0)
-                    single_fake_prev = fake_prev[i].unsqueeze(0)
-                    single_hr_prev = hr_prev[i].unsqueeze(0)
+                    single_lr_prev = _select_metric_or_save_channels(
+                        resize_lr_prev[i].unsqueeze(0), "image_pair", SAVE_AS_GRAY
+                    ).clamp(0, 1)
+                    single_fake_prev = _select_metric_or_save_channels(
+                        fake_prev[i].unsqueeze(0), "image_pair", SAVE_AS_GRAY
+                    ).clamp(0, 1)
+                    single_hr_prev = _select_metric_or_save_channels(
+                        hr_prev[i].unsqueeze(0), "image_pair", SAVE_AS_GRAY
+                    ).clamp(0, 1)
 
-                    single_lr_next = resize_lr_next[i].unsqueeze(0)
-                    single_fake_next = fake_next[i].unsqueeze(0)
-                    single_hr_next = hr_next[i].unsqueeze(0)
+                    single_lr_next = _select_metric_or_save_channels(
+                        resize_lr_next[i].unsqueeze(0), "image_pair", SAVE_AS_GRAY
+                    ).clamp(0, 1)
+                    single_fake_next = _select_metric_or_save_channels(
+                        fake_next[i].unsqueeze(0), "image_pair", SAVE_AS_GRAY
+                    ).clamp(0, 1)
+                    single_hr_next = _select_metric_or_save_channels(
+                        hr_next[i].unsqueeze(0), "image_pair", SAVE_AS_GRAY
+                    ).clamp(0, 1)
 
-                    # 去掉Sigmoid后，显示前先裁剪，避免可视化异常
-                    display_fake_prev = _convert_fake_for_display_by_hparam(single_fake_prev.clamp(0, 1))
-                    display_fake_next = _convert_fake_for_display_by_hparam(single_fake_next.clamp(0, 1))
-
-                    left_group = build_triplet_row(single_lr_prev, display_fake_prev, single_hr_prev, sep_width=6)
-                    right_group = build_triplet_row(single_lr_next, display_fake_next, single_hr_next, sep_width=6)
+                    left_group = build_triplet_row(single_lr_prev, single_fake_prev, single_hr_prev, sep_width=6)
+                    right_group = build_triplet_row(single_lr_next, single_fake_next, single_hr_next, sep_width=6)
 
                     group_sep = add_vertical_separator(left_group, sep_width=16, value=1.0)
                     row = torch.cat([left_group, group_sep, right_group], dim=3)
@@ -245,7 +266,13 @@ def validate_image_pair(generator, dataloader, device):
 
                 pixel_total, _, _ = pixel_loss(fake_images, hr_images, global_data.srgan.SAVE_AS_GRAY)
                 val_loss += pixel_total.item()
-                for fake_image, hr_image in zip(fake_images, hr_images):
+                fake_images_for_metric = _select_metric_or_save_channels(
+                    fake_images, "image_pair", global_data.srgan.SAVE_AS_GRAY
+                )
+                hr_images_for_metric = _select_metric_or_save_channels(
+                    hr_images, "image_pair", global_data.srgan.SAVE_AS_GRAY
+                )
+                for fake_image, hr_image in zip(fake_images_for_metric, hr_images_for_metric):
                     total_psnr += calculate_psnr(fake_image, hr_image)
                     num_images += 1
 
@@ -421,9 +448,19 @@ def evaluate_all(
                         one_dir = output_root / sid
                         one_dir.mkdir(parents=True, exist_ok=True)
 
-                        lr_save = lr1_up.clamp(0, 1)
-                        fk_save = fk1.clamp(0, 1)
-                        hr_save = hr1.clamp(0, 1)
+                        lr_eval = _select_metric_or_save_channels(
+                            lr1_up, "image_pair", global_data.srgan.SAVE_AS_GRAY
+                        )
+                        fk_eval = _select_metric_or_save_channels(
+                            fk1, "image_pair", global_data.srgan.SAVE_AS_GRAY
+                        )
+                        hr_eval = _select_metric_or_save_channels(
+                            hr1, "image_pair", global_data.srgan.SAVE_AS_GRAY
+                        )
+
+                        lr_save = lr_eval.clamp(0, 1)
+                        fk_save = fk_eval.clamp(0, 1)
+                        hr_save = hr_eval.clamp(0, 1)
 
                         # 1) 自身图
                         save_image(lr_save, str(one_dir / "lr.png"), normalize=False)
@@ -432,7 +469,7 @@ def evaluate_all(
 
                         # 2) 差异图
                         diff = (fk_save - hr_save).abs()
-                        diff_gray = diff.mean(dim=1, keepdim=True)
+                        diff_gray = diff if diff.shape[1] == 1 else diff.mean(dim=1, keepdim=True)
                         save_image(diff, str(one_dir / "diff_abs.png"), normalize=False)
                         save_image(diff_gray, str(one_dir / "diff_abs_gray.png"), normalize=False)
                         save_image(diff_gray / (diff_gray.max() + 1e-8), str(one_dir / "diff_abs_gray_norm.png"), normalize=False)
@@ -441,8 +478,8 @@ def evaluate_all(
                         _save_triplet(lr_save, fk_save, hr_save, one_dir / "image_triplet.png")
 
                         # 4) 指标与能量谱
-                        p = _to_np_chw(fk1[0])
-                        g = _to_np_chw(hr1[0])
+                        p = _to_np_chw(fk_eval[0])
+                        g = _to_np_chw(hr_eval[0])
 
                         mse = _mse(p, g)
                         psnr = _psnr_from_mse(mse)
@@ -605,3 +642,5 @@ def evaluate_all(
     print(f"[evaluate_all] metrics csv: {metrics_csv_path}")
     print(f"[evaluate_all] sample outputs: {output_root}")
     return mean_row
+
+

@@ -205,7 +205,7 @@ def batch_train(epoch,lr_images,gr_images, i, data_type, device, generator, disc
                 stride=6
             )
         elif image.shape[1] == 3:
-            # image_pair: 若去掉了 Sigmoid，保存前裁剪到 [0,1]
+            # image_pair: 保存前裁剪到 [0,1] 且取第一个通道
             image_to_save = image
             if global_data.srgan.SAVE_AS_GRAY and data_type != "flo":
                 image_to_save = image[:, 0:1, :, :]  # [N,1,H,W]
