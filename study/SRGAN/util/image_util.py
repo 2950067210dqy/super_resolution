@@ -1,3 +1,6 @@
+import torch
+from matplotlib import cm
+
 
 def add_vertical_separator(tensor, sep_width=8, value=1.0):
     """生成竖向白色分隔条，用于拼图。"""

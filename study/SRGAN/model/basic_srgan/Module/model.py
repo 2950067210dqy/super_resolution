@@ -1,6 +1,10 @@
 """
 模型 start
 """
+import torch
+from torch import nn
+
+
 def icnr_(tensor: torch.Tensor, scale: int = 2, initializer=nn.init.kaiming_normal_) -> torch.Tensor:
     """
     对 PixelShuffle 前卷积层执行 ICNR 初始化，减轻棋盘格伪影。

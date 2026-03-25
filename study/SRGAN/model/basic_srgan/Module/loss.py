@@ -1,6 +1,13 @@
 """
 损失函数 start
 """
+import torch
+from torch import nn
+from torchvision.models import vgg19
+
+from study.SRGAN.model.basic_srgan.global_class_srgan import global_data
+
+
 # class VGG(nn.Module):
 #     def __init__(self, device):
 #         super(VGG, self).__init__()
@@ -56,7 +63,7 @@ class PerceptualLoss(nn.Module):
         vgg_loss = self.vgg_loss(fake, real)
         adversarial_loss = self.adversarial(x)
 
-        return vgg_loss +LAMBDA_PERCEPTION*adversarial_loss,vgg_loss,adversarial_loss
+        return vgg_loss +global_data.srgan.LAMBDA_PERCEPTION*adversarial_loss,vgg_loss,adversarial_loss
 class RegularizationLoss(nn.Module):
     """
     图像平滑正则：惩罚相邻像素突变，抑制高频噪声。
@@ -126,3 +133,22 @@ class CombinedPixelLoss(nn.Module):
 """
 损失函数 end
 """
+# 实例化loss
+# 定义像素损失函数
+pixel_loss = CombinedPixelLoss(
+    lambda_l1=global_data.srgan.LAMBDA_PIXEL_L1,
+    lambda_mse=global_data.srgan.LAMBDA_PIXEL_MSE,
+    white_alpha=global_data.srgan.PIXEL_WHITE_ALPHA,
+    lambda_cons=global_data.srgan.LAMBDA_GRAY_CONS,
+).to(global_data.srgan.device)
+# 这里vgg是针对三通道RGB图的
+vgg = vgg19(pretrained=True).features[:16].eval()  # 提取 VGG 特征
+# vgg模型预测模式
+vgg = vgg.to(global_data.srgan.device).eval()
+
+# 感知损失
+perceptual_loss = PerceptualLoss(vgg=vgg)
+# 判别器的损失函数
+loss_d = nn.BCELoss()
+# 归一化损失 正则化损失
+regularization_loss = RegularizationLoss()

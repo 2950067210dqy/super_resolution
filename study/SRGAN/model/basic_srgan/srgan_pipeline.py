@@ -12,10 +12,10 @@ from torchvision.models import vgg19
 from tqdm import tqdm
 
 import wandb
-from study.SRGAN.data_load import get_class_names, load_data
+from study.SRGAN.data_load import get_class_names, load_data, save_loaders_paths
 from study.SRGAN.model.basic_srgan.Module.loss import CombinedPixelLoss, PerceptualLoss, RegularizationLoss
 from study.SRGAN.model.basic_srgan.Module.model import Generator, Discriminator
-from study.SRGAN.model.basic_srgan.evaluate import evaluate
+from study.SRGAN.model.basic_srgan.evaluate import evaluate, evaluate_all
 from study.SRGAN.model.basic_srgan.global_class_srgan import global_data
 from study.SRGAN.model.basic_srgan.train import image_pair_train, flow_train
 from study.SRGAN.util.CSV_operator import CsvTable
@@ -47,24 +47,9 @@ def select_single_class(available_class_names, preset_name=None):
             if 0 <= i < len(available_class_names):
                 return available_class_names[i]
         print("输入无效，请重新输入。")
-# 定义像素损失函数
-pixel_loss = CombinedPixelLoss(
-    lambda_l1=global_data.srgan.LAMBDA_PIXEL_L1,
-    lambda_mse=global_data.srgan.LAMBDA_PIXEL_MSE,
-    white_alpha=global_data.srgan.PIXEL_WHITE_ALPHA,
-    lambda_cons=global_data.srgan.LAMBDA_GRAY_CONS,
-).to(global_data.srgan.device)
-# 这里vgg是针对三通道RGB图的
-vgg = vgg19(pretrained=True).features[:16].eval()  # 提取 VGG 特征
-# vgg模型预测模式
-vgg = vgg.to(global_data.srgan.device).eval()
 
-# 感知损失
-perceptual_loss = PerceptualLoss(vgg=vgg)
-# 判别器的损失函数
-loss_d = nn.BCELoss()
-# 归一化损失 正则化损失
-regularization_loss = RegularizationLoss()
+
+
 def main():
 
 
@@ -156,6 +141,8 @@ def main():
                     parents=True, exist_ok=True)
                 Path(f"{global_data.srgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.srgan.PREDICT_DIR}").mkdir(
                     parents=True, exist_ok=True)
+                Path(f"{global_data.srgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.srgan.PREDICT_ALL_DIR}").mkdir(
+                    parents=True, exist_ok=True)
 
                 animator = Animator(xlabel='epoch', xlim=[1, global_data.srgan.EPOCH_NUMS], ylim=[0, 0.5],
                                     legend=global_data.srgan.loss_label + global_data.srgan.validate_label)
@@ -189,7 +176,7 @@ def main():
                 d_optimizer = torch.optim.Adam(discriminator.parameters(), lr=global_data.srgan.D_LR, betas=global_data.srgan.d_optimizer_betas,
                                                weight_decay=global_data.srgan.weight_decay)
 
-                start_time = time.time()
+                global_data.srgan.START_TIME = time.time()
                 # 轮数
                 """
                 训练 start
@@ -207,7 +194,7 @@ def main():
                         """ 图片对训练"""
                         if data_type == "image_pair":
                             image_pair_train(
-                                batch=batch, i=i, g_optimizer=g_optimizer,
+                                epoch=epoch,batch=batch, i=i, g_optimizer=g_optimizer,
                                 d_optimizer=d_optimizer, generator=generator,
                                 discriminator=discriminator, train_progress_bar=train_progress_bar,
                                 metric=metric, data_type=data_type, device=global_data.srgan.device, class_name=class_name, SCALE=SCALE
@@ -215,14 +202,16 @@ def main():
                         elif data_type == "flo":
                             """flo文件训练"""
                             flow_train(
-                                batch=batch, i=i, g_optimizer=g_optimizer,
+                                epoch=epoch,batch=batch, i=i, g_optimizer=g_optimizer,
                                 d_optimizer=d_optimizer, generator=generator,
                                 discriminator=discriminator, train_progress_bar=train_progress_bar,
                                 metric=metric, data_type=data_type, device=global_data.srgan.device, class_name=class_name, SCALE=SCALE
                             )
                     # 每轮结束后评价一次 验证集只取一轮batch
-                    evaluate(epoch, class_name, data_type, global_data.srgan.device, generator, discriminator, animator, validate_loader,
-                             global_data.srgan.loss_label,global_data.srgan. validate_label, SCALE=SCALE, csvOperator=global_data.srgan.csvOperator)
+                    evaluate(epoch=epoch, class_name=class_name, data_type=data_type, device=global_data.srgan.device,
+                             generator=generator, discriminator=discriminator, animator=animator, validate_loader=validate_loader,
+                             loss_label=global_data.srgan.loss_label,validate_label=global_data.srgan. validate_label, SCALE=SCALE,
+                             csvOperator=global_data.srgan.csvOperator,metric=metric,train_loader_lens=len(train_loader))
 
                 wandb.finish()
                 """
@@ -232,11 +221,27 @@ def main():
                 """
                 验证集全部验证一遍 start
                 """
-
+                evaluate_all(
+                    generator=generator,
+                    data_loader=validate_loader,
+                    class_name=class_name,
+                    data_type=data_type,
+                    SCALE=SCALE,
+                    output_root=f"{global_data.srgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.srgan.PREDICT_ALL_DIR}",
+                    metrics_csv_path=f"{global_data.srgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.srgan.PREDICT_ALL_DIR}/metrics_all.csv",
+                    stride=6,
+                )
                 """
                 验证集全部验证一遍 end
                 """
+                """
+                保存 训练集 验证集 测试集的引用地址json合集 方便查看用了哪些数据 而且也可以重新load 
+                """
+                save_loaders_paths(f"{global_data.srgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/datas_splits.json", train_loader=train_loader,validate_loader=validate_loader, test_loader=test_loader)
 
+
+    global_data.srgan.END_TIME = time.time()
+    print(f"一共运行：{global_data.srgan.END_TIME - global_data.srgan.START_TIME}秒")
 
 if __name__ =="__main__":
     main()

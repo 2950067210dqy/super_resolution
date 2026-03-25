@@ -1,4 +1,4 @@
-
+import time
 
 import wandb
 from datetime import datetime
@@ -10,56 +10,63 @@ class global_data:
         # =========================
         # 训练任务标识
         # =========================
-        name = "v3"
-        DESCRIPTION = ""
+        name = "srgan"  # 当前实验名（用于输出目录/模型名/wandb run名）
+        DESCRIPTION = "v1"  # 实验补充描述（可写损失配置、数据版本等）
+        name +=DESCRIPTION
+        # 类别训练模式: "all" | "single" | "mixed"
         TRAIN_CLASS_MODE = "all"
+        # 当 TRAIN_CLASS_MODE="single" 时可预设；为 None 则运行时让你输入选择
         SINGLE_CLASS_NAME = None
+        # mixed 模式下的目录名/日志名
         MIXED_CLASS_TAG = "mixed_all_classes"
 
         # =========================
         # 设备与模型加载
         # =========================
-        device = torch.device("cuda")
-        IS_LOAD_EXISTS_MODEL = False
-
+        device = torch.device("cuda")  # 训练设备
+        IS_LOAD_EXISTS_MODEL = False  # 是否从已保存模型断点继续训练
         # =========================
         # 可视化与保存相关
         # =========================
-        SAVE_AS_GRAY = True
-
+        SAVE_AS_GRAY = True  # True: 保存为灰度图(1通道)；False: 按原通道保存 只影响图片对，不影响flo文件,同时处理相关损失函数也会按照这个
         # =========================
         # 训练主超参数
         # =========================
-        EPOCH_NUMS = 20
-        BATCH_SIZE = 16
-        SHUFFLE = True
-        TARGET_SIZE = None
-        RANDOM_SEED = 42
-        SCALES = [2]
+        EPOCH_NUMS = 20  # 训练轮数
+        BATCH_SIZE = 16  # batch 大小
+        SHUFFLE = True  # 训练集是否打乱
+        TARGET_SIZE = None  # 数据加载时是否统一 resize 到该尺寸
+        RANDOM_SEED = 42  # 数据划分随机种子
+        # SCALES = [2,math.sqrt(8),4] # 生成器上采样倍率（内部两次 PixelShuffle）
+        SCALES = [2]  # 生成器上采样倍率（内部两次 PixelShuffle）
 
         # =========================
         # 损失项系数
         # =========================
-        LAMBDA_PERCEPTION = 5e-4
-        LAMBDA_regularization_loss = 2e-8
-        LAMBDA_loss_pixel = 1
-        LAMBDA_PIXEL_L1 = 1e-2
-        LAMBDA_PIXEL_MSE = 1e-3
-        PIXEL_WHITE_ALPHA = 1.0
-        LAMBDA_GRAY_CONS = 1e-2
+        LAMBDA_PERCEPTION = 5e-4  # 感知损失中对抗项权重
+        LAMBDA_regularization_loss = 2e-8  # 正则项权重（当前基本未启用）
+        LAMBDA_loss_pixel = 1  # 像素损失总权重
+
+        LAMBDA_PIXEL_L1 = 1e-2  # 像素L1权重
+        LAMBDA_PIXEL_MSE = 1e-3  # 像素MSE权重
+        PIXEL_WHITE_ALPHA = 1.0  # 灰度场白点区域加权系数
+        LAMBDA_GRAY_CONS = 1e-2  # 灰度三通道一致性约束权重
 
         # =========================
         # 优化器超参数
         # =========================
+        # 正则项
         weight_decay = 0
+        # 优化器 betas
         g_optimizer_betas = (0.5, 0.999)
         d_optimizer_betas = (0.5, 0.999)
-        G_LR = 1e-4
-        D_LR = 1e-4
-
+        # 学习率
+        G_LR = 0.0001
+        D_LR = 0.0001
         # =========================
         # 数据集划分比例
         # =========================
+        # 训练数据集和验证集合比例 测试集  比例
         Train_nums_rate = 0.8
         Test_nums_rate = 0.0
         Validate_nums_rate = 1 - Train_nums_rate - Test_nums_rate
@@ -67,33 +74,47 @@ class global_data:
         # =========================
         # 数据路径与输出路径
         # =========================
-        GR_DATA_ROOT_DIR = r"/study_datas/sr_dataset/class_1/data"
-        LR_DATA_ROOT_DIR = r"/study_datas/sr_dataset/class_1_lr"
+        # 真实数据根路径
+        GR_DATA_ROOT_DIR = rf"/study_datas/sr_dataset/class_1/data"
+        # 低分辨率数据根地址
+        LR_DATA_ROOT_DIR = rf"/study_datas/sr_dataset/class_1_lr"
 
-        OUT_PUT_DIR = f"./train_data/{name}"
-        LOSS_DIR = "/train_loss"
-        MODEL_DIR = "/train_model"
-        PREDICT_DIR = "/predict"
-        PREDICT_ALL_DIR = "/predict_all"
+        # 如果路径不存在则创建路径
+        OUT_PUT_DIR = f"/train_datas/{name}"  # 实验输出总目录
+        LOSS_DIR = "/train_loss"  # 损失曲线目录
+        MODEL_DIR = "/train_model"  # 模型权重目录
+        PREDICT_DIR = "/predict"  # 预测结果目录
+        PREDICT_ALL_DIR = "/predict_all"  # 预测全部结果目录
 
         use_gpu = torch.cuda.is_available()
+        Path(OUT_PUT_DIR).mkdir(parents=True, exist_ok=True)
+
+        # 需要训练的数据类型  # 参与训练的数据模态
         DATA_TYPES = ['image_pair', 'flo']
-        IMAGE_PAIR_TYPES = ['previous', 'next']
-
-        loss_label = [
-            'g_loss', 'g_perceptual_loss', "g_content_loss",
-            "g_adversarial_loss", 'g_regularization_loss', 'g_loss_pixel',
-            "g_loss_pixel_l1", "g_loss_pixel_mse",
-            'd_loss', 'd_real_loss', 'd_fake_loss'
-        ]
+        # DATA_TYPES =['flo']
+        IMAGE_PAIR_TYPES = ['previous', 'next']  # 图像对中的两个时刻/帧
+        """
+        超参数 end
+        """
+        loss_label = ['g_loss', 'g_perceptual_loss', "g_content_loss",
+                      "g_adversarial_loss", 'g_regularization_loss', 'g_loss_pixel',
+                      "g_loss_pixel_l1", "g_loss_pixel_mse",
+                      'd_loss', 'd_real_loss', 'd_fake_loss']
         validate_label = ['Validation_Loss', 'Avg_PSNR']
+        # 存储数据至csv的列名
         CSV_COLUMNS = ['EPOCH'] + loss_label + validate_label + ['time']
+        # csv操作实例 CsvTable
         csvOperator = None
-
+        # 使用wandb可视化训练过程
+        # 初始化 WandB
         # 防止重复 login
         _wandb_logged_in = False
-        wandb_key = "wandb_v1_xxx"
+        wandb_key = "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"
 
+        # 开始时间
+        START_TIME = time.time()
+        #结束时间
+        END_TIME = time.time()
         @classmethod
         def ensure_wandb_login(cls):
             if not cls._wandb_logged_in:

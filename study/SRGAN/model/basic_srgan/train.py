@@ -2,18 +2,23 @@ import copy
 import os
 
 import torch
+import torchvision
 
 from study.SRGAN.model.basic_srgan.global_class_srgan import global_data
-from study.SRGAN.model.basic_srgan.srgan import perceptual_loss, pixel_loss, regularization_loss, loss_d
+from study.SRGAN.model.basic_srgan.Module.loss import perceptual_loss, pixel_loss, regularization_loss, loss_d
+from study.SRGAN.model.basic_srgan.visual_plot_init import build_flo_uvw_fake_panel
+from study.SRGAN.model.basic_srgan.visual_plot_save import save_vorticity_quiver_single
+from study.SRGAN.util.image_util import flow_to_color_tensor
 
 
-def image_pair_train(batch,i, data_type, device, generator, discriminator,
+def image_pair_train(epoch,batch,i, data_type, device, generator, discriminator,
                 g_optimizer, d_optimizer,
                 train_progress_bar,
                 metric,class_name,SCALE):
     """
     执行 image_pair 的一个 batch 训练（previous/next 各训练一次）。
     图片对训练 ，因为是有两张图片所以训练两次
+    :param epoch:训练轮次
     :param batch: batch数据块
     :param i:  第几个batch
     :param data_type: 数据类型 data_tyoes:[image_pair,flo]
@@ -33,18 +38,19 @@ def image_pair_train(batch,i, data_type, device, generator, discriminator,
         lr_images = batch[data_type][image_pair_type]['lr_data'].to(device)
         # 真实图像
         gr_images = batch[data_type][image_pair_type]['gr_data'].to(device)
-        batch_train(lr_images=lr_images, gr_images=gr_images, i=i, g_optimizer=g_optimizer,
+        batch_train(epoch=epoch,lr_images=lr_images, gr_images=gr_images, i=i, g_optimizer=g_optimizer,
                     d_optimizer=d_optimizer, generator=generator,
                     discriminator=discriminator, train_progress_bar=train_progress_bar,
                     metric=metric, data_type=data_type, device=device, class_name=class_name,image_pair_type = image_pair_type,SCALE=SCALE)
     pass
-def flow_train(batch,i, data_type, device, generator, discriminator,
+def flow_train(epoch,batch,i, data_type, device, generator, discriminator,
                 g_optimizer, d_optimizer,
                 train_progress_bar,
                 metric,class_name,SCALE):
     """
     执行 flo 的一个 batch 训练。
     flo数据训练
+    :param epoch:训练轮次
     :param batch: batch数据块
     :param i:  第几个batch
     :param data_type: 数据类型 data_tyoes:[image_pair,flo]
@@ -63,18 +69,19 @@ def flow_train(batch,i, data_type, device, generator, discriminator,
     lr_images = batch[data_type]['lr_data'].to(device)
     # 真实图像
     gr_images = batch[data_type]['gr_data'].to(device)
-    batch_train(lr_images=lr_images, gr_images=gr_images, i=i, g_optimizer=g_optimizer,
+    batch_train(epoch=epoch,lr_images=lr_images, gr_images=gr_images, i=i, g_optimizer=g_optimizer,
                 d_optimizer=d_optimizer, generator=generator,
                 discriminator=discriminator, train_progress_bar=train_progress_bar,
                 metric=metric, data_type=data_type, device=device, class_name=class_name,SCALE=SCALE)
     pass
-def batch_train(lr_images,gr_images, i, data_type, device, generator, discriminator,
+def batch_train(epoch,lr_images,gr_images, i, data_type, device, generator, discriminator,
                 g_optimizer, d_optimizer,
                 train_progress_bar,
                 metric,class_name,image_pair_type=None,SCALE=2) -> None:
     """
     单 batch 的 G/D 训练、损失统计与中间可视化保存。
     每一个batch的训练过程
+    :param epoch:训练轮次
     :param lr_images: 低分辨率图像
     :param gr_images: 真实图像
     :param i:  第几个batch
@@ -162,7 +169,7 @@ def batch_train(lr_images,gr_images, i, data_type, device, generator, discrimina
         save_dir = f"{global_data.srgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}"
         os.makedirs(save_dir, exist_ok=True)
 
-        save_prefix = f"{save_dir}/image_{len(train_progress_bar) * epoch + i}_{name}"
+        save_prefix = f"{save_dir}/image_{len(train_progress_bar) * epoch + i}_{global_data.srgan.name}"
 
         if image.dim() == 3:
             image = image.unsqueeze(0)  # [C,H,W] -> [1,C,H,W]
@@ -200,7 +207,7 @@ def batch_train(lr_images,gr_images, i, data_type, device, generator, discrimina
         elif image.shape[1] == 3:
             # image_pair: 若去掉了 Sigmoid，保存前裁剪到 [0,1]
             image_to_save = image
-            if SAVE_AS_GRAY and data_type != "flo":
+            if global_data.srgan.SAVE_AS_GRAY and data_type != "flo":
                 image_to_save = image[:, 0:1, :, :]  # [N,1,H,W]
 
             torchvision.utils.save_image(

@@ -1,3 +1,7 @@
+from matplotlib import pyplot as plt
+from matplotlib.animation import FuncAnimation, PillowWriter
+
+
 class Animator:
     """
     损失函数折线图  训练曲线可视化器：支持多序列记录、分组绘图、导出静态 PNG/动态 GIF。

@@ -1,12 +1,28 @@
+import os
+import time
+from datetime import datetime
 from pathlib import Path
 import csv
 import math
 import numpy as np
 import torch
 import torch.nn.functional as F
+import wandb
 from torchvision.utils import save_image
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+
+from study.SRGAN.model.basic_srgan.global_class_srgan import global_data
+from study.SRGAN.model.basic_srgan.judge_delicators import _to_np_chw, _mse, _psnr_from_mse, _energy_spectrum_mse, \
+    _r2_score, _ssim_score, _tke_reconstruction_accuracy, _nrmse, _energy_spectrum_curves
+
+from study.SRGAN.model.basic_srgan.Module.loss import  pixel_loss
+from study.SRGAN.model.basic_srgan.visual_plot_init import build_flo_uvw_compare_panel
+from study.SRGAN.model.basic_srgan.visual_plot_save import save_vorticity_quiver_compare, _save_triplet, \
+    _save_energy_spectrum_plot
+from study.SRGAN.util.image_util import flow_to_color_tensor, build_triplet_row, add_vertical_separator, \
+    add_horizontal_separator
+
 """
 验证函数 start
 """
@@ -218,7 +234,7 @@ def validate_image_pair(generator, dataloader, device):
     num_images = 0
     with torch.no_grad():
         for batch in dataloader:
-            for image_pair_type in IMAGE_PAIR_TYPES:
+            for image_pair_type in global_data.srgan.IMAGE_PAIR_TYPES:
                 # 低分辨率图像
                 lr_images = batch["image_pair"][image_pair_type]['lr_data'].to(device)
                 # 真实图像
@@ -227,7 +243,7 @@ def validate_image_pair(generator, dataloader, device):
                 lr_images, hr_images = lr_images.to(device), hr_images.to(device)
                 fake_images = generator(lr_images)
 
-                pixel_total, _, _ = pixel_loss(fake_images, hr_images, SAVE_AS_GRAY)
+                pixel_total, _, _ = pixel_loss(fake_images, hr_images, global_data.srgan.SAVE_AS_GRAY)
                 val_loss += pixel_total.item()
                 for fake_image, hr_image in zip(fake_images, hr_images):
                     total_psnr += calculate_psnr(fake_image, hr_image)
@@ -241,7 +257,7 @@ def validate_image_pair(generator, dataloader, device):
 """
 def evaluate(epoch,class_name,data_type,device,
              generator,discriminator,animator,
-             validate_loader,loss_label,validate_label,SCALE,csvOperator):
+             validate_loader,loss_label,validate_label,SCALE,csvOperator,metric,train_loader_lens=1):
     """
    每轮结束后执行验证、记录日志、保存模型与损失曲线。
     :param epoch: 轮次
@@ -256,6 +272,8 @@ def evaluate(epoch,class_name,data_type,device,
     :param validate_label:  验证参数的label
     :param SCALE:上采样因子 具体放大平方倍
     :param csvOperator:loss等数据 存储csv
+    :param metric:累加器
+    :param train_loader_lens:训练数据长度
     :return:
     """
     # 每轮训练结束后进行验证
@@ -273,37 +291,37 @@ def evaluate(epoch,class_name,data_type,device,
         "avg_psnr": avg_psnr,
         "Epoch": epoch,
         **{
-            loss_label[index]: metric[index] / len(train_loader)
+            loss_label[index]: metric[index] / train_loader_lens
             for index in range(len(loss_label))
         }
     })
     current_time = time.time()
     print(
-        f"Epoch [{epoch + 1}/{EPOCH_NUMS}] |{class_name} {data_type} |running time:{int(current_time - start_time)}s | "
+        f"Epoch [{epoch + 1}/{global_data.srgan.EPOCH_NUMS}] |{class_name} {data_type} |running time:{int(current_time - global_data.srgan.START_TIME )}s | "
         f"Val Loss: {val_loss:.4f} | Avg PSNR: {avg_psnr:.2f}", end=""
     )
-    loss_str = "".join([loss_label[index] + ':' + str(metric[index] / len(train_loader)) + "," for index in
+    loss_str = "".join([loss_label[index] + ':' + str(metric[index] / train_loader_lens) + "," for index in
                         range(len(loss_label))])
     print(loss_str)
 
     # 每轮训练结束后进行验证，并保存最后一批图像
-    validate_and_save(f"{OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{PREDICT_DIR}", generator,
+    validate_and_save(f"{global_data.srgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.srgan.PREDICT_DIR}", generator,
                       validate_loader, device, epoch, data_type=data_type)
     # 保存模型
-    generator_save_path = f"{OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{MODEL_DIR}/discriminator_{name}.pth"
-    discriminator_save_path = f"{OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{MODEL_DIR}/generator_{name}.pth"
+    generator_save_path = f"{global_data.srgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.srgan.MODEL_DIR}/discriminator_{global_data.srgan.name}.pth"
+    discriminator_save_path = f"{global_data.srgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.srgan.MODEL_DIR}/generator_{global_data.srgan.name}.pth"
     torch.save(discriminator.state_dict(),discriminator_save_path )
     torch.save(generator.state_dict(), generator_save_path)
     print(
         f"{class_name} {data_type} |Models saved: Generator -> {generator_save_path}, Discriminator -> {discriminator_save_path}")
 
     # 保存每一epoch的损失
-    all_loss_and_val_Datas = [metric[index] / len(train_loader) for index in range(len(loss_label))] + [val_loss, avg_psnr]
+    all_loss_and_val_Datas = [metric[index] / train_loader_lens for index in range(len(loss_label))] + [val_loss, avg_psnr]
     animator.add(epoch + 1,all_loss_and_val_Datas )
     # 保存到csv文件中
-    csvOperator.create(dict(zip(CSV_COLUMNS,[epoch + 1]+all_loss_and_val_Datas+[datetime.now().strftime("%Y-%m-%d %H:%M:%S")])))
+    csvOperator.create(dict(zip(global_data.srgan.CSV_COLUMNS,[epoch + 1]+all_loss_and_val_Datas+[datetime.now().strftime("%Y-%m-%d %H:%M:%S")])))
     animator.save_png(
-        f"{OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{LOSS_DIR}/train_loss_epoch_{epoch + 1}_{name}.png",
+        f"{global_data.srgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.srgan.LOSS_DIR}/train_loss_epoch_{epoch + 1}_{global_data.srgan.name}.png",
         fixed_groups=[
             [loss_label[0], loss_label[8], validate_label[0]],
             [loss_label[1], loss_label[2], loss_label[3]],

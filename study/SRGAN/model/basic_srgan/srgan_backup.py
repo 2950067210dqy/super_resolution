@@ -1938,7 +1938,7 @@ def batch_train(lr_images,gr_images, i, data_type, device, generator, discrimina
             )
 def evaluate(epoch,class_name,data_type,device,
              generator,discriminator,animator,
-             validate_loader,loss_label,validate_label,SCALE,csvOperator):
+             validate_loader,loss_label,validate_label,SCALE,csvOperator,metric,train_loader_lens=1):
     """
    每轮结束后执行验证、记录日志、保存模型与损失曲线。
     :param epoch: 轮次
@@ -1953,6 +1953,8 @@ def evaluate(epoch,class_name,data_type,device,
     :param validate_label:  验证参数的label
     :param SCALE:上采样因子 具体放大平方倍
     :param csvOperator:loss等数据 存储csv
+    :param metric:累加器
+    :param train_loader_lens:训练数据长度
     :return:
     """
     # 每轮训练结束后进行验证
@@ -1970,7 +1972,7 @@ def evaluate(epoch,class_name,data_type,device,
         "avg_psnr": avg_psnr,
         "Epoch": epoch,
         **{
-            loss_label[index]: metric[index] / len(train_loader)
+            loss_label[index]: metric[index] / train_loader_lens
             for index in range(len(loss_label))
         }
     })
@@ -1979,7 +1981,7 @@ def evaluate(epoch,class_name,data_type,device,
         f"Epoch [{epoch + 1}/{EPOCH_NUMS}] |{class_name} {data_type} |running time:{int(current_time - start_time)}s | "
         f"Val Loss: {val_loss:.4f} | Avg PSNR: {avg_psnr:.2f}", end=""
     )
-    loss_str = "".join([loss_label[index] + ':' + str(metric[index] / len(train_loader)) + "," for index in
+    loss_str = "".join([loss_label[index] + ':' + str(metric[index] / train_loader_lens) + "," for index in
                         range(len(loss_label))])
     print(loss_str)
 
@@ -2216,7 +2218,7 @@ if __name__ =="__main__":
                                 metric=metric, data_type=data_type, device=device, class_name=class_name, SCALE=SCALE
                             )
                     #每轮结束后评价一次 验证集只取一轮batch
-                    evaluate(epoch, class_name, data_type, device, generator, discriminator, animator, validate_loader, loss_label, validate_label, SCALE=SCALE,csvOperator=csvOperator)
+                    evaluate(epoch, class_name, data_type, device, generator, discriminator, animator, validate_loader, loss_label, validate_label, SCALE=SCALE,csvOperator=csvOperator,metric=metric,train_loader_lens=len(train_loader))
 
                 wandb.finish()
                 """

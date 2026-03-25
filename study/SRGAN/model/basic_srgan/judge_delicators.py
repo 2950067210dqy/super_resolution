@@ -1,6 +1,12 @@
 """
 评价指标 start
 """
+import math
+
+import numpy as np
+import torch
+
+
 def _to_np_chw(x: torch.Tensor) -> np.ndarray:
     """将单张张量从 torch 转为 numpy，形状保持为 [C,H,W]。"""
     return x.detach().float().cpu().numpy()
