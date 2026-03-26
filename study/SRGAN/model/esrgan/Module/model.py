@@ -1,10 +1,10 @@
-
-from loguru import logger
-import torch
-from torch import nn
 """
 模型 start
 """
+from loguru import logger
+import torch
+from torch import nn
+
 
 def icnr_(tensor: torch.Tensor, scale: int = 2, initializer=nn.init.kaiming_normal_) -> torch.Tensor:
     """
@@ -28,44 +28,40 @@ def icnr_(tensor: torch.Tensor, scale: int = 2, initializer=nn.init.kaiming_norm
     with torch.no_grad():
         tensor.copy_(subkernel)
     return tensor
-class ResidualBlock(nn.Module):
-    """
-    残差块
+class DenseResidualBlock(nn.Module):
+    def __init__(self, channels=64, growth_channels=32, res_scale=0.2):
+        super().__init__()
+        self.res_scale = res_scale
 
-    设计原则：
-    1. 残差连接要求输入和输出形状完全一致，才能做 x + F(x)
-    2. 所以这里通道数保持不变：64 -> 64
-    3. 卷积使用 kernel_size=3, stride=1, padding=1，这样高宽不变
+        self.conv1 = nn.Conv2d(channels, growth_channels, 3, 1, 1)
+        self.conv2 = nn.Conv2d(channels + growth_channels, growth_channels, 3, 1, 1)
+        self.conv3 = nn.Conv2d(channels + growth_channels * 2, growth_channels, 3, 1, 1)
+        self.conv4 = nn.Conv2d(channels + growth_channels * 3, growth_channels, 3, 1, 1)
+        self.conv5 = nn.Conv2d(channels + growth_channels * 4, channels, 3, 1, 1)
 
-    输入:
-        x: [B, 64, H, W]
-
-    输出:
-        out: [B, 64, H, W]
-    """
-    def __init__(self, channels=64):
-        super(ResidualBlock, self).__init__()
-        self.block = nn.Sequential(
-            # 第1个卷积:
-            # in_channel = 64
-            # out_channel = 64
-            # kernel_size = 3
-            # stride = 1
-            # padding = 1
-            # 输出尺寸不变: H x W -> H x W
-            nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(channels),
-            nn.PReLU(),
-
-            # 第2个卷积:
-            # 仍然保持 64 -> 64，方便和输入直接相加
-            nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(channels),
-        )
+        self.lrelu = nn.LeakyReLU(0.2, inplace=True)
 
     def forward(self, x):
-        # 残差连接
-        return x + self.block(x)
+        x1 = self.lrelu(self.conv1(x))
+        x2 = self.lrelu(self.conv2(torch.cat([x, x1], dim=1)))
+        x3 = self.lrelu(self.conv3(torch.cat([x, x1, x2], dim=1)))
+        x4 = self.lrelu(self.conv4(torch.cat([x, x1, x2, x3], dim=1)))
+        x5 = self.conv5(torch.cat([x, x1, x2, x3, x4], dim=1))
+        return x + x5 * self.res_scale
+
+class RRDB(nn.Module):
+    def __init__(self, channels, growth_channels=32, res_scale=0.2):
+        super().__init__()
+        self.rdb1 = DenseResidualBlock(channels, growth_channels, res_scale)
+        self.rdb2 = DenseResidualBlock(channels, growth_channels, res_scale)
+        self.rdb3 = DenseResidualBlock(channels, growth_channels, res_scale)
+        self.res_scale = res_scale
+
+    def forward(self, x):
+        out = self.rdb1(x)
+        out = self.rdb2(out)
+        out = self.rdb3(out)
+        return x + out * self.res_scale
 
 
 class Generator(nn.Module):
@@ -81,12 +77,12 @@ class Generator(nn.Module):
 
     整体结构:
     1. 浅层特征提取
-    2. 16个残差块
+    2. 23个RRDB
     3. 全局残差连接
     4. 两次 2x 上采样，总共 4x
     5. 输出 RGB 图像
     """
-    def __init__(self,inner_chanel=3, num_residual_blocks=16, scale=2):
+    def __init__(self,inner_chanel=3, num_residual_blocks=23, scale=2):
         super(Generator, self).__init__()
 
 
@@ -108,13 +104,13 @@ class Generator(nn.Module):
         # [B, 3, 64, 64] -> [B, 64, 64, 64]
         self.conv1 = nn.Sequential(
             nn.Conv2d(inner_chanel, 64, kernel_size=9, stride=1, padding=4),
-            nn.PReLU()
+            nn.LeakyReLU(0.2, inplace=True)
         )
 
         # 残差块堆叠
         # 每个残差块都保持 [B, 64, H, W] 不变
         self.residual_blocks = nn.Sequential(
-            *[ResidualBlock(64) for _ in range(num_residual_blocks)]
+            *[RRDB(64,growth_channels=32) for _ in range(num_residual_blocks)]
         )
 
         # 残差块之后的融合卷积
@@ -124,7 +120,6 @@ class Generator(nn.Module):
         # [B, 64, 64, 64] -> [B, 64, 64, 64]
         self.conv2 = nn.Sequential(
             nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(64)
         )
 
         # 上采样模块
@@ -146,13 +141,13 @@ class Generator(nn.Module):
             # [B, 256, H, W] -> [B, 64, 2H, 2W]
             nn.PixelShuffle(self.scale),
             nn.Conv2d(64, 64, 3, 1, 1),
-            nn.PReLU(),
+            nn.LeakyReLU(0.2, inplace=True),
 
             nn.Conv2d(64, 64 * self.scale * self.scale, kernel_size=3, stride=1, padding=1),
             # [B, 256, H, W] -> [B, 64, 2H, 2W]
             nn.PixelShuffle(self.scale),
             nn.Conv2d(64, 64, 3, 1, 1),
-            nn.PReLU(),
+            nn.LeakyReLU(0.2, inplace=True)
         )
 
         # 最后一层输出 RGB 图像
@@ -162,11 +157,13 @@ class Generator(nn.Module):
         # 若 scale=4:
         # [B, 64, 256, 256] -> [B, 3, 256, 256]
         self.conv_out = nn.Sequential(
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
             nn.Conv2d(64, inner_chanel, kernel_size=3, stride=1, padding=1),
 
         )
 
-        #ICNR 初始化 srgan不应该有这个
+        #ICNR 初始化 esrgan不应该有这个
         # self._init_subpixel_weights()
 
     def _init_subpixel_weights(self):

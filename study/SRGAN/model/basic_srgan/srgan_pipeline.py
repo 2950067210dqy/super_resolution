@@ -17,7 +17,7 @@ from study.SRGAN.data_load import get_class_names, load_data, save_loaders_paths
 from study.SRGAN.model.basic_srgan.Module.loss import CombinedPixelLoss, PerceptualLoss, RegularizationLoss
 from study.SRGAN.model.basic_srgan.Module.model import Generator, Discriminator
 from study.SRGAN.model.basic_srgan.evaluate import evaluate, evaluate_all
-from study.SRGAN.model.basic_srgan.global_class_srgan import global_data
+from study.SRGAN.model.basic_srgan.global_class import global_data
 from study.SRGAN.model.basic_srgan.train import image_pair_train, flow_train
 from study.SRGAN.util.CSV_operator import CsvTable
 from study.SRGAN.util.accumulator import Accumulator
@@ -107,10 +107,11 @@ def main():
                 # Start a new wandb run to track this script.
                 wandb.init(
                     entity="2950067210-usst",
-                    project="srgnn",
+                    project="srgan",
                     name=f"{global_data.srgan.name}_{global_data.srgan.DESCRIPTION}_{class_name}_{data_type}",
                     config={
                         "createTime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "IS_AUTO_DL":global_data.srgan.IS_AUTO_DL,
                         "epochs": global_data.srgan.EPOCH_NUMS,
                         "batch_size": global_data.srgan.BATCH_SIZE,
                         "lr_G":global_data.srgan. G_LR,

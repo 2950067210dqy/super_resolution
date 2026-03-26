@@ -1,9 +1,9 @@
 from loguru import logger
-
+from study.SRGAN.model.basic_srgan.global_class import global_data
 from model.basic_srgan import srgan_pipeline
-from study.SRGAN.model.basic_srgan.global_class_srgan import global_data
+from study.SRGAN.model.esrgan import esrgan_pipeline
 
-models = {"srgan":srgan_pipeline.main,}
+models = {"srgan":srgan_pipeline.main,"esrgan":esrgan_pipeline.main}
 def main():
     logger.add(
         f"{global_data.srgan.OUT_PUT_DIR}/running_log/running.log",

@@ -35,10 +35,14 @@ except Exception as exc:  # pragma: no cover
 # =========================
 # 配置（请在这里改）
 # =========================
-
+# 运行环境是否是autoDL
+IS_AUTO_DL = True
 INPUT_DIRS = [
-    r"D:\BaiduSyncdisk\AYanJiuSheng\data\sr_dataset\class_1",
-    r"D:\BaiduSyncdisk\AYanJiuSheng\data\sr_dataset\class_2",
+    rf"D:\BaiduSyncdisk\AYanJiuSheng\data\sr_dataset\class_1",
+    rf"D:\BaiduSyncdisk\AYanJiuSheng\data\sr_dataset\class_2",
+] if not IS_AUTO_DL else [
+    rf"/root/autodl-tmp/study_datas/sr_dataset/class_1",
+    rf"/root/autodl-tmp/study_datas/sr_dataset/class_2",
 ]
 
 #下采样倍数

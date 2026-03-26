@@ -13,13 +13,13 @@ from torchvision.utils import save_image
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
-from study.SRGAN.model.basic_srgan.global_class import global_data
-from study.SRGAN.model.basic_srgan.judge_delicators import _to_np_chw, _mse, _psnr_from_mse, _energy_spectrum_mse, \
+from study.SRGAN.model.esrgan.global_class import global_data
+from study.SRGAN.model.esrgan.judge_delicators import _to_np_chw, _mse, _psnr_from_mse, _energy_spectrum_mse, \
     _r2_score, _ssim_score, _tke_reconstruction_accuracy, _nrmse, _energy_spectrum_curves
 
-from study.SRGAN.model.basic_srgan.Module.loss import  pixel_loss
-from study.SRGAN.model.basic_srgan.visual_plot_init import build_flo_uvw_compare_panel
-from study.SRGAN.model.basic_srgan.visual_plot_save import save_vorticity_quiver_compare, _save_triplet, \
+from study.SRGAN.model.esrgan.Module.loss import  pixel_loss
+from study.SRGAN.model.esrgan.visual_plot_init import build_flo_uvw_compare_panel
+from study.SRGAN.model.esrgan.visual_plot_save import save_vorticity_quiver_compare, _save_triplet, \
     _save_energy_spectrum_plot
 from study.SRGAN.util.image_util import flow_to_color_tensor, build_triplet_row, add_vertical_separator, \
     add_horizontal_separator
@@ -53,7 +53,7 @@ def validate_and_save(result_dir, generator, val_dataloader, device, epoch, data
     """
 
     if SAVE_AS_GRAY is None:
-        SAVE_AS_GRAY = global_data.srgan.SAVE_AS_GRAY
+        SAVE_AS_GRAY = global_data.esrgan.SAVE_AS_GRAY
 
     generator.eval()
     os.makedirs(result_dir, exist_ok=True)
@@ -263,7 +263,7 @@ def validate_image_pair(generator, dataloader, device):
     num_images = 0
     with torch.no_grad():
         for batch in dataloader:
-            for image_pair_type in global_data.srgan.IMAGE_PAIR_TYPES:
+            for image_pair_type in global_data.esrgan.IMAGE_PAIR_TYPES:
                 # 低分辨率图像
                 lr_images = batch["image_pair"][image_pair_type]['lr_data'].to(device)
                 # 真实图像
@@ -272,13 +272,13 @@ def validate_image_pair(generator, dataloader, device):
                 lr_images, hr_images = lr_images.to(device), hr_images.to(device)
                 fake_images = generator(lr_images)
 
-                pixel_total, _, _ = pixel_loss(fake_images, hr_images, global_data.srgan.SAVE_AS_GRAY)
+                pixel_total, _, _ = pixel_loss(fake_images, hr_images, global_data.esrgan.SAVE_AS_GRAY)
                 val_loss += pixel_total.item()
                 fake_images_for_metric = _select_metric_or_save_channels(
-                    fake_images, "image_pair", global_data.srgan.SAVE_AS_GRAY
+                    fake_images, "image_pair", global_data.esrgan.SAVE_AS_GRAY
                 )
                 hr_images_for_metric = _select_metric_or_save_channels(
-                    hr_images, "image_pair", global_data.srgan.SAVE_AS_GRAY
+                    hr_images, "image_pair", global_data.esrgan.SAVE_AS_GRAY
                 )
                 for fake_image, hr_image in zip(fake_images_for_metric, hr_images_for_metric):
                     total_psnr += calculate_psnr(fake_image, hr_image)
@@ -332,7 +332,7 @@ def evaluate(epoch,class_name,data_type,device,
     })
     current_time = time.time()
     logger.info(
-        f"Epoch [{epoch + 1}/{global_data.srgan.EPOCH_NUMS}] |{class_name} {data_type} |running time:{int(current_time - global_data.srgan.START_TIME )}s | "
+        f"Epoch [{epoch + 1}/{global_data.esrgan.EPOCH_NUMS}] |{class_name} {data_type} |running time:{int(current_time - global_data.esrgan.START_TIME )}s | "
         f"Val Loss: {val_loss:.4f} | Avg PSNR: {avg_psnr:.2f}"
     )
     loss_str = "".join([loss_label[index] + ':' + str(metric[index] / train_loader_lens) + "," for index in
@@ -340,11 +340,11 @@ def evaluate(epoch,class_name,data_type,device,
     logger.info(loss_str)
 
     # 每轮训练结束后进行验证，并保存最后一批图像
-    validate_and_save(f"{global_data.srgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.srgan.PREDICT_DIR}", generator,
+    validate_and_save(f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.PREDICT_DIR}", generator,
                       validate_loader, device, epoch, data_type=data_type)
     # 保存模型
-    generator_save_path = f"{global_data.srgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.srgan.MODEL_DIR}/discriminator_{global_data.srgan.name}.pth"
-    discriminator_save_path = f"{global_data.srgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.srgan.MODEL_DIR}/generator_{global_data.srgan.name}.pth"
+    generator_save_path = f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.MODEL_DIR}/discriminator_{global_data.esrgan.name}.pth"
+    discriminator_save_path = f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.MODEL_DIR}/generator_{global_data.esrgan.name}.pth"
     torch.save(discriminator.state_dict(),discriminator_save_path )
     torch.save(generator.state_dict(), generator_save_path)
     logger.info(
@@ -354,9 +354,9 @@ def evaluate(epoch,class_name,data_type,device,
     all_loss_and_val_Datas = [metric[index] / train_loader_lens for index in range(len(loss_label))] + [val_loss, avg_psnr]
     animator.add(epoch + 1,all_loss_and_val_Datas )
     # 保存到csv文件中
-    csvOperator.create(dict(zip(global_data.srgan.CSV_COLUMNS,[epoch + 1]+all_loss_and_val_Datas+[datetime.now().strftime("%Y-%m-%d %H:%M:%S")])))
+    csvOperator.create(dict(zip(global_data.esrgan.CSV_COLUMNS,[epoch + 1]+all_loss_and_val_Datas+[datetime.now().strftime("%Y-%m-%d %H:%M:%S")])))
     animator.save_png(
-        f"{global_data.srgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.srgan.LOSS_DIR}/train_loss_epoch_{epoch + 1}_{global_data.srgan.name}.png",
+        f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.LOSS_DIR}/train_loss_epoch_{epoch + 1}_{global_data.esrgan.name}.png",
         fixed_groups=[
             [loss_label[0], loss_label[8], validate_label[0]],
             [loss_label[1], loss_label[2], loss_label[3]],
@@ -409,7 +409,7 @@ def evaluate_all(
     generator.eval()
 
     if data_type == "image_pair":
-        logger.info(f"[evaluate_all] SAVE_AS_GRAY={global_data.srgan.SAVE_AS_GRAY}")
+        logger.info(f"[evaluate_all] SAVE_AS_GRAY={global_data.esrgan.SAVE_AS_GRAY}")
 
     output_root = Path(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -460,20 +460,20 @@ def evaluate_all(
                         one_dir.mkdir(parents=True, exist_ok=True)
 
                         lr_eval = _select_metric_or_save_channels(
-                            lr1_up, "image_pair", global_data.srgan.SAVE_AS_GRAY
+                            lr1_up, "image_pair", global_data.esrgan.SAVE_AS_GRAY
                         )
                         fk_eval = _select_metric_or_save_channels(
-                            fk1, "image_pair", global_data.srgan.SAVE_AS_GRAY
+                            fk1, "image_pair", global_data.esrgan.SAVE_AS_GRAY
                         )
                         hr_eval = _select_metric_or_save_channels(
-                            hr1, "image_pair", global_data.srgan.SAVE_AS_GRAY
+                            hr1, "image_pair", global_data.esrgan.SAVE_AS_GRAY
                         )
 
                         lr_save = lr_eval.clamp(0, 1)
                         fk_save = fk_eval.clamp(0, 1)
                         hr_save = hr_eval.clamp(0, 1)
 
-                        if data_type == "image_pair" and global_data.srgan.SAVE_AS_GRAY:
+                        if data_type == "image_pair" and global_data.esrgan.SAVE_AS_GRAY:
                             # 强制单通道保存，避免任何上游残留导致彩色输出
                             if lr_save.shape[1] > 1:
                                 lr_save = lr_save[:, 0:1, :, :]

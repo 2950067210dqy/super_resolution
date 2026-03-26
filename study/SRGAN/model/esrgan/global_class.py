@@ -7,11 +7,14 @@ from pathlib import Path
 import inspect
 import torch
 class global_data:
-    class srgan:
+    class esrgan:
+        #运行环境是否是autoDL
+        IS_AUTO_DL = True
+        AUTODL_DATA_PATH = rf"/root/autodl-tmp" if IS_AUTO_DL else r""
         # =========================
         # 训练任务标识
         # =========================
-        name = "srgan"  # 当前实验名（用于输出目录/模型名/wandb run名）
+        name = "esrgan"  # 当前实验名（用于输出目录/模型名/wandb run名）
         DESCRIPTION = "v1"  # 实验补充描述（可写损失配置、数据版本等）
         name +=DESCRIPTION
         # 类别训练模式: "all" | "single" | "mixed"
@@ -76,12 +79,12 @@ class global_data:
         # 数据路径与输出路径
         # =========================
         # 真实数据根路径
-        GR_DATA_ROOT_DIR = rf"/study_datas/sr_dataset/class_1/data"
+        GR_DATA_ROOT_DIR = rf"{AUTODL_DATA_PATH}/study_datas/sr_dataset/class_1/data"
         # 低分辨率数据根地址
-        LR_DATA_ROOT_DIR = rf"/study_datas/sr_dataset/class_1_lr"
+        LR_DATA_ROOT_DIR = rf"{AUTODL_DATA_PATH}/study_datas/sr_dataset/class_1_lr"
 
         # 如果路径不存在则创建路径
-        OUT_PUT_DIR = f"/train_datas/{name}"  # 实验输出总目录
+        OUT_PUT_DIR = f"{AUTODL_DATA_PATH}/train_datas/{name}"  # 实验输出总目录
         TRAINING_DIR = "/training_data"#正在训练输出目录
         LOSS_DIR = "/train_loss"  # 损失曲线目录
         MODEL_DIR = "/train_model"  # 模型权重目录
@@ -223,4 +226,4 @@ class global_data:
         #     Path(file_path).write_text("\n".join(lines), encoding="utf-8")
         #     print(f"hyper_parameter Saved to {file_path}")
 # 模块导入时只执行一次
-global_data.srgan.ensure_wandb_login()
+global_data.esrgan.ensure_wandb_login()

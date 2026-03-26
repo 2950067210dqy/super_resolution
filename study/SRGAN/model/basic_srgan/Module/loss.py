@@ -5,7 +5,7 @@ import torch
 from torch import nn
 from torchvision.models import vgg19
 
-from study.SRGAN.model.basic_srgan.global_class_srgan import global_data
+from study.SRGAN.model.basic_srgan.global_class import global_data
 
 
 # class VGG(nn.Module):

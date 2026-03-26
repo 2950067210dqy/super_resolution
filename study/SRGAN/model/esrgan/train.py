@@ -4,10 +4,11 @@ import os
 import torch
 import torchvision
 
-from study.SRGAN.model.basic_srgan.global_class import global_data
-from study.SRGAN.model.basic_srgan.Module.loss import perceptual_loss, pixel_loss, regularization_loss, loss_d
-from study.SRGAN.model.basic_srgan.visual_plot_init import build_flo_uvw_fake_panel
-from study.SRGAN.model.basic_srgan.visual_plot_save import save_vorticity_quiver_single
+from study.SRGAN.model.esrgan.global_class import global_data
+from study.SRGAN.model.esrgan.Module.loss import perceptual_loss, pixel_loss, regularization_loss, \
+    descriminator_loss
+from study.SRGAN.model.esrgan.visual_plot_init import build_flo_uvw_fake_panel
+from study.SRGAN.model.esrgan.visual_plot_save import save_vorticity_quiver_single
 from study.SRGAN.util.image_util import flow_to_color_tensor
 
 
@@ -33,7 +34,7 @@ def image_pair_train(epoch,batch,i, data_type, device, generator, discriminator,
     :param SCALE:上采样因子 具体放大平方倍
     :return:
     """
-    for image_pair_type in global_data.srgan.IMAGE_PAIR_TYPES:
+    for image_pair_type in global_data.esrgan.IMAGE_PAIR_TYPES:
         # 低分辨率图像
         lr_images = batch[data_type][image_pair_type]['lr_data'].to(device)
         # 真实图像
@@ -112,14 +113,15 @@ def batch_train(epoch,lr_images,gr_images, i, data_type, device, generator, disc
     # 生成器生成图像
     pred_images = generator(lr_images)
     # print(f"pred_images:min,max,mean:{pred_images.min().data,pred_images.max().data,pred_images.mean().data} | lr_images:min,max,mean:{lr_images.min().data,lr_images.max().data,lr_images.mean().data} | gr_images:min,max,mean:{gr_images.min().data,gr_images.max().data,gr_images.mean().data} | ")
-    # 判别器判别图像
-    probability = discriminator(pred_images)
-
+    # 判别器判别生成图像
+    probability_pred_images = discriminator(pred_images)
+    #判别器判别真实图像
+    probability_gr_images = discriminator(gr_images)
     """生成器训练 start"""
     # 感知损失
-    perceptual_loss_value,content_loss,adversarial_loss = perceptual_loss(pred_images, gr_images, probability)
+    perceptual_loss_value,content_loss,adversarial_loss = perceptual_loss(pred_images, gr_images, probability_pred_images,probability_gr_images)
     # 像素损失（灰白数据可开加权，flo 默认不开）
-    gray_triplet = (global_data.srgan.SAVE_AS_GRAY and data_type == "image_pair")  # 仅 image_pair 且设置为灰度复制模式
+    gray_triplet = (global_data.esrgan.SAVE_AS_GRAY and data_type == "image_pair")  # 仅 image_pair 且设置为灰度复制模式
     g_loss_pixel, g_loss_l1, g_loss_mse = pixel_loss(pred_images, gr_images, gray_triplet=gray_triplet)
     # 正则损失
     """
@@ -130,8 +132,9 @@ def batch_train(epoch,lr_images,gr_images, i, data_type, device, generator, disc
     regularization_loss_value = regularization_loss(pred_images)
     # 生成器总损失
     # g_loss = perceptual_loss_value + LAMBDA_regularization_loss *regularization_loss_value +LAMBDA_loss_pixel*g_loss_pixel  # 这里的percuptual_loss包含了vgg_loss和对抗损失
-    g_loss = perceptual_loss_value #最原始的srgan
-    # g_loss = perceptual_loss_value+LAMBDA_loss_pixel*g_loss_pixel
+    # g_loss = perceptual_loss_value #最原始的esrgan
+    #没有用混合像素损失 而是直接根据esrgan 用了L1损失
+    g_loss = perceptual_loss_value+global_data.esrgan.LAMBDA_loss_pixel*g_loss_l1
 
     # 优化生成器
     g_optimizer.zero_grad()
@@ -143,9 +146,12 @@ def batch_train(epoch,lr_images,gr_images, i, data_type, device, generator, disc
     # if i % 2 == 0:
     """判别器训练 start"""
     # 判别器判别真实图片之后将概率结果放入损失函数并且优化生成器
-    real_loss = loss_d(discriminator(gr_images), copy.deepcopy(real_labels))
-    fake_loss = loss_d(discriminator(pred_images.detach()), fake_labels)
-    d_loss = (real_loss + fake_loss)
+    """
+    这里的real_loss 代表real data More realistic than fake ？
+        fake_loss 代表fake Less realistic than real data? ？
+        #因为之前已经用了probability_pred_images去更新生成器的梯度了，经过了一次反向传播，所以在用它要detach
+    """
+    d_loss,fake_loss,real_loss =descriminator_loss(probability_pred_images.detach(),probability_gr_images)
     # 优化判别器
     d_optimizer.zero_grad()
     d_loss.backward()
@@ -166,10 +172,10 @@ def batch_train(epoch,lr_images,gr_images, i, data_type, device, generator, disc
     # end if i % 2 == 0:
     if i % 100 == 0:
         image = pred_images.detach()
-        save_dir =f"{global_data.srgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.srgan.TRAINING_DIR}"
+        save_dir =f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.TRAINING_DIR}"
         os.makedirs(save_dir, exist_ok=True)
 
-        save_prefix = f"{save_dir}/image_{len(train_progress_bar) * epoch + i}_{global_data.srgan.name}"
+        save_prefix = f"{save_dir}/image_{len(train_progress_bar) * epoch + i}_{global_data.esrgan.name}"
 
         if image.dim() == 3:
             image = image.unsqueeze(0)  # [C,H,W] -> [1,C,H,W]
@@ -207,7 +213,7 @@ def batch_train(epoch,lr_images,gr_images, i, data_type, device, generator, disc
         elif image.shape[1] == 3:
             # image_pair: 保存前裁剪到 [0,1] 且取第一个通道
             image_to_save = image
-            if global_data.srgan.SAVE_AS_GRAY and data_type != "flo":
+            if global_data.esrgan.SAVE_AS_GRAY and data_type != "flo":
                 image_to_save = image[:, 0:1, :, :]  # [N,1,H,W]
 
             torchvision.utils.save_image(
