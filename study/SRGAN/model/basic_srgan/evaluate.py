@@ -400,6 +400,9 @@ def evaluate_all(
     device = next(generator.parameters()).device
     generator.eval()
 
+    if data_type == "image_pair":
+        print(f"[evaluate_all] SAVE_AS_GRAY={global_data.srgan.SAVE_AS_GRAY}")
+
     output_root = Path(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
 
@@ -461,6 +464,21 @@ def evaluate_all(
                         lr_save = lr_eval.clamp(0, 1)
                         fk_save = fk_eval.clamp(0, 1)
                         hr_save = hr_eval.clamp(0, 1)
+
+                        if data_type == "image_pair" and global_data.srgan.SAVE_AS_GRAY:
+                            # 强制单通道保存，避免任何上游残留导致彩色输出
+                            if lr_save.shape[1] > 1:
+                                lr_save = lr_save[:, 0:1, :, :]
+                            if fk_save.shape[1] > 1:
+                                fk_save = fk_save[:, 0:1, :, :]
+                            if hr_save.shape[1] > 1:
+                                hr_save = hr_save[:, 0:1, :, :]
+
+                            if lr_save.shape[1] != 1 or fk_save.shape[1] != 1 or hr_save.shape[1] != 1:
+                                raise ValueError(
+                                    f"SAVE_AS_GRAY=True expects 1-channel save tensors, got "
+                                    f"lr={lr_save.shape[1]}, fake={fk_save.shape[1]}, hr={hr_save.shape[1]}"
+                                )
 
                         # 1) 自身图
                         save_image(lr_save, str(one_dir / "lr.png"), normalize=False)

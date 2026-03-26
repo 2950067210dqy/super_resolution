@@ -21,7 +21,7 @@ from study.SRGAN.model.basic_srgan.train import image_pair_train, flow_train
 from study.SRGAN.util.CSV_operator import CsvTable
 from study.SRGAN.util.accumulator import Accumulator
 from study.SRGAN.util.animator import Animator
-
+from loguru import logger
 
 def select_single_class(available_class_names, preset_name=None):
     """
@@ -34,6 +34,7 @@ def select_single_class(available_class_names, preset_name=None):
             raise ValueError(
                 f"SINGLE_CLASS_NAME='{preset_name}' 不在可用类别中: {available_class_names}"
             )
+        logger.error( f"SINGLE_CLASS_NAME='{preset_name}' 不在可用类别中: {available_class_names}")
         return preset_name
 
     print("请选择单类别训练目标：")
@@ -137,13 +138,29 @@ def main():
                 # 创建文件夹
                 Path(f"{global_data.srgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.srgan.LOSS_DIR}").mkdir(
                     parents=True, exist_ok=True)
+                Path(f"{global_data.srgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.srgan.TRAINING_DIR}").mkdir(
+                    parents=True, exist_ok=True)
                 Path(f"{global_data.srgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.srgan.MODEL_DIR}").mkdir(
                     parents=True, exist_ok=True)
                 Path(f"{global_data.srgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.srgan.PREDICT_DIR}").mkdir(
                     parents=True, exist_ok=True)
                 Path(f"{global_data.srgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.srgan.PREDICT_ALL_DIR}").mkdir(
                     parents=True, exist_ok=True)
+                Path(f"{global_data.srgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.srgan.LOG_DIR}").mkdir(
+                    parents=True, exist_ok=True)
 
+                #初始化日志
+                logger.add(
+                    f"{global_data.srgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.srgan.LOG_DIR}",
+                    rotation="100 MB",
+                    retention="30 days",
+                    level="DEBUG",
+                    format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {process.name} | {thread.name} | {name}:{module}:{line} | {message}",
+                    enqueue=True,
+                    backtrace=True,
+                    diagnose=True,
+
+                )
                 animator = Animator(xlabel='epoch', xlim=[1, global_data.srgan.EPOCH_NUMS], ylim=[0, 0.5],
                                     legend=global_data.srgan.loss_label + global_data.srgan.validate_label)
 

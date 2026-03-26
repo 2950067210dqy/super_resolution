@@ -166,7 +166,7 @@ def batch_train(epoch,lr_images,gr_images, i, data_type, device, generator, disc
     # end if i % 2 == 0:
     if i % 100 == 0:
         image = pred_images.detach()
-        save_dir = f"{global_data.srgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}"
+        save_dir =f"{global_data.srgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.srgan.TRAINING_DIR}"
         os.makedirs(save_dir, exist_ok=True)
 
         save_prefix = f"{save_dir}/image_{len(train_progress_bar) * epoch + i}_{global_data.srgan.name}"

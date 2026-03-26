@@ -81,11 +81,12 @@ class global_data:
 
         # 如果路径不存在则创建路径
         OUT_PUT_DIR = f"/train_datas/{name}"  # 实验输出总目录
+        TRAINING_DIR = "/training_data"#正在训练输出目录
         LOSS_DIR = "/train_loss"  # 损失曲线目录
         MODEL_DIR = "/train_model"  # 模型权重目录
         PREDICT_DIR = "/predict"  # 预测结果目录
         PREDICT_ALL_DIR = "/predict_all"  # 预测全部结果目录
-
+        LOG_DIR = "/log" #日志目录
         use_gpu = torch.cuda.is_available()
         Path(OUT_PUT_DIR).mkdir(parents=True, exist_ok=True)
 
