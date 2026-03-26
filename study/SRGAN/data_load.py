@@ -3,6 +3,7 @@
 # -*- coding: utf-8 -*-
 
 from __future__ import annotations
+from loguru import logger
 
 import hashlib
 import json
@@ -78,7 +79,7 @@ def progress_iter(iterable, desc: str, total: int | None = None):
     if tqdm is not None:
         return tqdm(iterable, desc=desc, total=total, leave=False)
 
-    print(f"[Progress] {desc}")
+    logger.info(f"[Progress] {desc}")
     return iterable
 
 
@@ -87,7 +88,7 @@ def log_info(message: str, verbose: bool) -> None:
     按需打印日志，避免大数据集下逐文件输出拖慢速度。减少非必要 I/O。
     """
     if verbose:
-        print(message)
+        logger.info(message)
 
 
 def _normalize_image_array(image: np.ndarray, image_path: str) -> np.ndarray:
@@ -100,6 +101,7 @@ def _normalize_image_array(image: np.ndarray, image_path: str) -> np.ndarray:
         image = np.moveaxis(image, 0, -1)
 
     if image.ndim != 3:
+        logger.error(f'Unsupported image shape: {image.shape}, file: {image_path}')
         raise ValueError(f"Unsupported image shape: {image.shape}, file: {image_path}")
 
     if image.shape[-1] == 1:
@@ -122,20 +124,24 @@ def _read_flo_cached(path_str: str) -> np.ndarray:
     path = Path(path_str)
     header = np.fromfile(path, dtype=np.float32, count=1)
     if header.size != 1:
+        logger.error(f'Incomplete .flo file header: {path}')
         raise ValueError(f"Incomplete .flo file header: {path}")
 
     magic = float(header[0])
     if abs(magic - FLO_MAGIC) > 1e-4:
+        logger.error(f'Invalid .flo magic number: {path}')
         raise ValueError(f"Invalid .flo magic number: {path}")
 
     dims = np.fromfile(path, dtype=np.int32, count=2, offset=4)
     if dims.size != 2:
+        logger.error(f'Failed to read width/height from .flo file: {path}')
         raise ValueError(f"Failed to read width/height from .flo file: {path}")
 
     width, height = int(dims[0]), int(dims[1])
     flow_uv = np.fromfile(path, dtype=np.float32, offset=12)
     expected_size = 2 * width * height
     if flow_uv.size != expected_size:
+        logger.error(f'Incomplete .flo data: {path}, expected {expected_size}, got {flow_uv.size}')
         raise ValueError(
             f"Incomplete .flo data: {path}, expected {expected_size}, got {flow_uv.size}"
         )
@@ -263,10 +269,12 @@ def ensure_valid_root_dir(root_dir: str, root_name: str) -> Path:
     校验根目录是否合法，并统一转换成绝对路径。
     """
     if not root_dir:
+        logger.error(f'Please pass {root_name}.')
         raise ValueError(f"Please pass {root_name}.")
 
     root_path = Path(root_dir).expanduser().resolve()
     if not root_path.exists() or not root_path.is_dir():
+        logger.error(f'Invalid {root_name}: {root_path}')
         raise ValueError(f"Invalid {root_name}: {root_path}")
 
     return root_path
@@ -299,6 +307,7 @@ class FloToTensor:
 
     def __call__(self, flow: np.ndarray) -> torch.Tensor:
         if flow.ndim != 3 or flow.shape[-1] != 3:
+            logger.error(f'Unexpected flow shape: {flow.shape}')
             raise ValueError(f"Unexpected flow shape: {flow.shape}")
 
         flow = np.transpose(flow.astype(np.float32, copy=False), (2, 0, 1))
@@ -339,12 +348,12 @@ def discover_class_names(data_root: Path) -> list[str]:
                 data files...
     """
     class_names: list[str] = []
-    print(f"[Scan] Discovering class folders under: {data_root}")
+    logger.info(f"[Scan] Discovering class folders under: {data_root}")
 
     for candidate in progress_iter(sorted(data_root.iterdir()), desc="Discover classes"):
         if candidate.is_dir() and (candidate / candidate.name).is_dir():
             class_names.append(candidate.name)
-            print(f"[Scan] Found class: {candidate.name}")
+            logger.info(f"[Scan] Found class: {candidate.name}")
 
     return class_names
 
@@ -364,6 +373,7 @@ def get_class_names(gr_data_root_dir: str) -> list[str]:
     class_names = discover_class_names(gr_root)
 
     if not class_names:
+        logger.error(f'No class folders found under GR root: {gr_root}')
         raise ValueError(f"No class folders found under GR root: {gr_root}")
 
     return sorted(class_names)
@@ -390,10 +400,12 @@ def normalize_selected_classes(
         normalized = list(selected_classes)
 
     if not normalized:
+        logger.error('selected_classes cannot be empty.')
         raise ValueError("selected_classes cannot be empty.")
 
     invalid_names = [name for name in normalized if name not in available_class_names]
     if invalid_names:
+        logger.error(f'Unknown class names: {invalid_names}. Available classes: {available_class_names}')
         raise ValueError(
             f"Unknown class names: {invalid_names}. Available classes: {available_class_names}"
         )
@@ -455,11 +467,12 @@ def collect_root_class_samples(
     flo_map: dict[str, Path] = {}
 
     if not class_dir.exists() or not class_dir.is_dir():
+        logger.error(f'{domain_name} class directory does not exist: {class_dir}')
         raise ValueError(f"{domain_name} class directory does not exist: {class_dir}")
 
     class_files = sorted(class_dir.iterdir())
-    print(f"[Scan] Reading {domain_name} class '{class_name}' from: {class_dir}")
-    print(f"[Scan] Found {len(class_files)} entries in {domain_name} class '{class_name}'")
+    logger.info(f"[Scan] Reading {domain_name} class '{class_name}' from: {class_dir}")
+    logger.info(f"[Scan] Found {len(class_files)} entries in {domain_name} class '{class_name}'")
 
     for file_path in progress_iter(class_files, desc=f"Scan {domain_name}:{class_name}", total=len(class_files)):
         if not file_path.is_file():
@@ -514,13 +527,13 @@ def collect_root_class_samples(
         )
 
     if incomplete_keys:
-        print(f"[Debug] Incomplete {domain_name} samples in class '{class_name}':")
+        logger.info(f"[Debug] Incomplete {domain_name} samples in class '{class_name}':")
         for sample_key, reason in incomplete_keys[:50]:
-            print(f"  key={sample_key}, reason={reason}")
+            logger.info(f"  key={sample_key}, reason={reason}")
         if len(incomplete_keys) > 50:
-            print(f"[Debug] ... and {len(incomplete_keys) - 50} more incomplete keys")
+            logger.info(f"[Debug] ... and {len(incomplete_keys) - 50} more incomplete keys")
 
-    print(f"[Done] {domain_name} class '{class_name}' collected {len(samples)} complete samples")
+    logger.info(f"[Done] {domain_name} class '{class_name}' collected {len(samples)} complete samples")
     return samples
 
 
@@ -546,15 +559,16 @@ def pair_sr_class_samples(
     lr_only_keys = sorted(set(lr_map.keys()) - set(gr_map.keys()))
 
     if gr_only_keys:
-        print(f"[Warn] GR-only sample keys in class '{class_name}': {gr_only_keys[:20]}")
+        logger.warning(f"[Warn] GR-only sample keys in class '{class_name}': {gr_only_keys[:20]}")
         if len(gr_only_keys) > 20:
-            print(f"[Warn] ... and {len(gr_only_keys) - 20} more")
+            logger.warning(f"[Warn] ... and {len(gr_only_keys) - 20} more")
     if lr_only_keys:
-        print(f"[Warn] LR-only sample keys in class '{class_name}': {lr_only_keys[:20]}")
+        logger.warning(f"[Warn] LR-only sample keys in class '{class_name}': {lr_only_keys[:20]}")
         if len(lr_only_keys) > 20:
-            print(f"[Warn] ... and {len(lr_only_keys) - 20} more")
+            logger.warning(f"[Warn] ... and {len(lr_only_keys) - 20} more")
 
     if not common_keys:
+        logger.error(f"No paired GR/LR samples found for class '{class_name}'")
         raise ValueError(f"No paired GR/LR samples found for class '{class_name}'")
 
     paired_samples: list[dict] = []
@@ -574,7 +588,7 @@ def pair_sr_class_samples(
             }
         )
 
-    print(f"[Done] Class '{class_name}' paired {len(paired_samples)} aligned SR samples")
+    logger.info(f"[Done] Class '{class_name}' paired {len(paired_samples)} aligned SR samples")
     return paired_samples
 
 
@@ -750,6 +764,7 @@ class SRPairedDataset(Dataset):
             image_tensors.append(self.image_transform(image))
 
         if len(image_tensors) != 2:
+            logger.error(f'Expected exactly 2 images, got {len(image_tensors)}')
             raise ValueError(f"Expected exactly 2 images, got {len(image_tensors)}")
 
         return {
@@ -769,12 +784,15 @@ class SRPairedDataset(Dataset):
                     "previous": tensor_or_dict["previous"],
                     "next": tensor_or_dict["next"],
                 }
+            logger.error('Unsupported cached image pair dict format.')
             raise ValueError("Unsupported cached image pair dict format.")
 
         if not isinstance(tensor_or_dict, torch.Tensor):
+            logger.error(f'Unsupported cached image pair type: {type(tensor_or_dict)}')
             raise ValueError(f"Unsupported cached image pair type: {type(tensor_or_dict)}")
 
         if tensor_or_dict.ndim != 3 or tensor_or_dict.shape[0] != 6:
+            logger.error(f'Expected cached 6xHxW tensor, got {tuple(tensor_or_dict.shape)}')
             raise ValueError(f"Expected cached 6xHxW tensor, got {tuple(tensor_or_dict.shape)}")
 
         return {
@@ -818,6 +836,7 @@ class SRPairedDataset(Dataset):
                 },
             }
 
+        logger.error('Unsupported cached image_pair format.')
         raise ValueError("Unsupported cached image_pair format.")
 
     def _clone_image_pair(self, image_pair: dict) -> dict:
@@ -1022,33 +1041,33 @@ def print_batch_debug_info(batch: dict | None, batch_name: str = "batch") -> Non
     打印一个 batch 的完整结构，方便调试。
     打印 batch 结构、形状、路径和 sample_key 对齐信息。
     """
-    print("=" * 80)
-    print(f"[Debug] {batch_name} structure")
+    logger.info("=" * 80)
+    logger.info(f"[Debug] {batch_name} structure")
     if batch is None:
-        print("[Debug] batch is None")
-        print("=" * 80)
+        logger.info("[Debug] batch is None")
+        logger.info("=" * 80)
         return
 
-    print(f"[Debug] top-level keys: {list(batch.keys())}")
+    logger.info(f"[Debug] top-level keys: {list(batch.keys())}")
 
     image_pair = batch.get("image_pair")
     flo = batch.get("flo")
 
     if image_pair is not None:
-        print("[Debug] image_pair sub-batch:")
-        print(f"  previous lr_data shape: {tuple(image_pair['previous']['lr_data'].shape)}")
-        print(f"  previous gr_data shape: {tuple(image_pair['previous']['gr_data'].shape)}")
-        print(f"  next lr_data shape: {tuple(image_pair['next']['lr_data'].shape)}")
-        print(f"  next gr_data shape: {tuple(image_pair['next']['gr_data'].shape)}")
+        logger.info("[Debug] image_pair sub-batch:")
+        logger.info(f"  previous lr_data shape: {tuple(image_pair['previous']['lr_data'].shape)}")
+        logger.info(f"  previous gr_data shape: {tuple(image_pair['previous']['gr_data'].shape)}")
+        logger.info(f"  next lr_data shape: {tuple(image_pair['next']['lr_data'].shape)}")
+        logger.info(f"  next gr_data shape: {tuple(image_pair['next']['gr_data'].shape)}")
     else:
-        print("[Debug] image_pair sub-batch: None")
+        logger.info("[Debug] image_pair sub-batch: None")
 
     if flo is not None:
-        print("[Debug] flo sub-batch:")
-        print(f"  lr_data shape: {tuple(flo['lr_data'].shape)}")
-        print(f"  gr_data shape: {tuple(flo['gr_data'].shape)}")
+        logger.info("[Debug] flo sub-batch:")
+        logger.info(f"  lr_data shape: {tuple(flo['lr_data'].shape)}")
+        logger.info(f"  gr_data shape: {tuple(flo['gr_data'].shape)}")
     else:
-        print("[Debug] flo sub-batch: None")
+        logger.info("[Debug] flo sub-batch: None")
 
     sample_keys = batch.get("sample_key", [])
     class_names = batch.get("class_name", [])
@@ -1057,7 +1076,7 @@ def print_batch_debug_info(batch: dict | None, batch_name: str = "batch") -> Non
     flo_lr_paths = batch.get("flo_lr_paths", [])
     flo_gr_paths = batch.get("flo_gr_paths", [])
 
-    print(f"[Debug] aligned sample count: {len(sample_keys)}")
+    logger.info(f"[Debug] aligned sample count: {len(sample_keys)}")
     for index, sample_key in enumerate(sample_keys):
         class_name = class_names[index] if index < len(class_names) else "UNKNOWN"
         image_pair_lr_path = image_pair_lr_paths[index] if index < len(image_pair_lr_paths) else "N/A"
@@ -1065,13 +1084,13 @@ def print_batch_debug_info(batch: dict | None, batch_name: str = "batch") -> Non
         flo_lr_path = flo_lr_paths[index] if index < len(flo_lr_paths) else "N/A"
         flo_gr_path = flo_gr_paths[index] if index < len(flo_gr_paths) else "N/A"
 
-        print(f"[Debug] sample[{index}] key={sample_key}, class={class_name}")
-        print(f"  image_pair lr_paths: {image_pair_lr_path}")
-        print(f"  image_pair gr_paths: {image_pair_gr_path}")
-        print(f"  flo lr_paths: {flo_lr_path}")
-        print(f"  flo gr_paths: {flo_gr_path}")
+        logger.info(f"[Debug] sample[{index}] key={sample_key}, class={class_name}")
+        logger.info(f"  image_pair lr_paths: {image_pair_lr_path}")
+        logger.info(f"  image_pair gr_paths: {image_pair_gr_path}")
+        logger.info(f"  flo lr_paths: {flo_lr_path}")
+        logger.info(f"  flo gr_paths: {flo_gr_path}")
 
-    print("=" * 80)
+    logger.info("=" * 80)
 
 
 """
@@ -1418,29 +1437,29 @@ def load_data(
 
     is_global_mix_split = selected_classes is None
 
-    print("=" * 80)
-    print("[Start] Begin loading SR dataset")
-    print(f"[Start] GR root: {gr_root}")
-    print(f"[Start] LR root: {lr_root}")
-    print(f"[Start] batch_size={batch_size}, num_workers={num_workers}, shuffle={shuffle}")
-    print(f"[Start] target_size={target_size}, random_seed={random_seed}")
-    print(f"[Start] selected_classes={selected_classes}")
-    print(f"[Start] split_mode={'global_mix' if is_global_mix_split else 'per_class'}")
-    print(f"[Start] verbose={verbose}")
-    print(
+    logger.info("=" * 80)
+    logger.info("[Start] Begin loading SR dataset")
+    logger.info(f"[Start] GR root: {gr_root}")
+    logger.info(f"[Start] LR root: {lr_root}")
+    logger.info(f"[Start] batch_size={batch_size}, num_workers={num_workers}, shuffle={shuffle}")
+    logger.info(f"[Start] target_size={target_size}, random_seed={random_seed}")
+    logger.info(f"[Start] selected_classes={selected_classes}")
+    logger.info(f"[Start] split_mode={'global_mix' if is_global_mix_split else 'per_class'}")
+    logger.info(f"[Start] verbose={verbose}")
+    logger.info(
         f"[Start] use_metadata_cache={use_metadata_cache}, "
         f"cache_file_reads={cache_file_reads}, "
         f"cache_transformed_samples={cache_transformed_samples}, "
         f"use_disk_tensor_cache={use_disk_tensor_cache}"
     )
-    print("=" * 80)
+    logger.info("=" * 80)
 
     available_class_names = get_class_names(gr_data_root_dir)
     class_names = normalize_selected_classes(available_class_names, selected_classes)
 
-    print(f"[Info] Selected {len(class_names)} classes: {class_names}")
+    logger.info(f"[Info] Selected {len(class_names)} classes: {class_names}")
     class_to_idx = {name: idx for idx, name in enumerate(class_names)}
-    print(f"[Info] class_to_idx mapping: {class_to_idx}")
+    logger.info(f"[Info] class_to_idx mapping: {class_to_idx}")
 
     image_transform = transforms.Compose(
         [transforms.ToTensor()] + ([transforms.Resize(target_size)] if target_size else [])
@@ -1449,8 +1468,8 @@ def load_data(
         ([FlowResize(target_size)] if target_size else []) + [FloToTensor()]
     )
 
-    print(f"[Transform] Image transform: {image_transform}")
-    print(f"[Transform] Flow transform: {flow_transform}")
+    logger.info(f"[Transform] Image transform: {image_transform}")
+    logger.info(f"[Transform] Flow transform: {flow_transform}")
 
     cache_dir = Path(__file__).resolve().parent / ".sr_cache"
     cache_path = build_metadata_cache_path(cache_dir, gr_root, lr_root, class_names)
@@ -1464,7 +1483,7 @@ def load_data(
 
     samples: list[dict]
     if use_metadata_cache and cache_path.exists():
-        print(f"[Cache] Loading paired sample metadata from: {cache_path}")
+        logger.info(f"[Cache] Loading paired sample metadata from: {cache_path}")
         samples = load_samples_cache(cache_path)
     else:
         samples = []
@@ -1482,21 +1501,26 @@ def load_data(
 
         if use_metadata_cache:
             dump_samples_cache(cache_path, samples)
-            print(f"[Cache] Saved paired sample metadata to: {cache_path}")
+            logger.info(f"[Cache] Saved paired sample metadata to: {cache_path}")
 
     if not samples:
+        logger.error('No paired GR/LR samples found.')
         raise ValueError("No paired GR/LR samples found.")
 
     if validate_nums_rate is None:
         validate_nums_rate = 1 - train_nums_rate - test_nums_rate
 
     if not 0 < train_nums_rate < 1:
+        logger.error(f'train_nums_rate must be between 0 and 1, got {train_nums_rate}')
         raise ValueError(f"train_nums_rate must be between 0 and 1, got {train_nums_rate}")
     if not 0 <= validate_nums_rate < 1:
+        logger.error(f'validate_nums_rate must be between 0 and 1, got {validate_nums_rate}')
         raise ValueError(f"validate_nums_rate must be between 0 and 1, got {validate_nums_rate}")
     if not 0 <= test_nums_rate < 1:
+        logger.error(f'test_nums_rate must be between 0 and 1, got {test_nums_rate}')
         raise ValueError(f"test_nums_rate must be between 0 and 1, got {test_nums_rate}")
     if abs((train_nums_rate + validate_nums_rate + test_nums_rate) - 1.0) > 1e-8:
+        logger.error(f'train_nums_rate + validate_nums_rate + test_nums_rate must equal 1.0, got {train_nums_rate + validate_nums_rate + test_nums_rate}')
         raise ValueError(
             "train_nums_rate + validate_nums_rate + test_nums_rate must equal 1.0, "
             f"got {train_nums_rate + validate_nums_rate + test_nums_rate}"
@@ -1544,11 +1568,12 @@ def load_data(
     total_samples = len(samples)
 
     if train_size == 0:
+        logger.error('Split produced an empty training set.')
         raise ValueError("Split produced an empty training set.")
     if val_size == 0:
-        print("[Warn] Split produced an empty validation set.")
+        logger.warning("[Warn] Split produced an empty validation set.")
     if test_nums_rate > 0 and test_size == 0:
-        print("[Warn] test_nums_rate > 0 but split produced an empty test set.")
+        logger.warning("[Warn] test_nums_rate > 0 but split produced an empty test set.")
 
     train_dataset = SRPairedDataset(
         samples=train_samples,
@@ -1604,28 +1629,28 @@ def load_data(
         collate_fn=sr_paired_collate_fn,
     ) if test_dataset is not None else None
 
-    print("=" * 80)
-    print(f"[Done] Available classes: {available_class_names}")
-    print(f"[Done] Loaded classes: {class_names}")
-    print(f"[Done] Total paired samples: {total_samples}")
-    print(
+    logger.info("=" * 80)
+    logger.info(f"[Done] Available classes: {available_class_names}")
+    logger.info(f"[Done] Loaded classes: {class_names}")
+    logger.info(f"[Done] Total paired samples: {total_samples}")
+    logger.info(
         f"[Done] Split dataset with train_nums_rate={train_nums_rate}, "
         f"validate_nums_rate={validate_nums_rate}, test_nums_rate={test_nums_rate}"
     )
-    print(f"[Done] Train samples: {train_size}")
-    print(f"[Done] Validate samples: {val_size}")
-    print(f"[Done] Test samples: {test_size}")
+    logger.info(f"[Done] Train samples: {train_size}")
+    logger.info(f"[Done] Validate samples: {val_size}")
+    logger.info(f"[Done] Test samples: {test_size}")
 
     for class_name in class_names:
         class_summary = split_summary.get(class_name, {"total": 0, "train": 0, "val": 0, "test": 0})
-        print(
+        logger.info(
             f"[Done] Class '{class_name}': "
             f"total={class_summary['total']}, "
             f"train={class_summary['train']}, "
             f"val={class_summary['val']}, "
             f"test={class_summary['test']}"
         )
-    print("=" * 80)
+    logger.info("=" * 80)
 
     if return_test_loader:
         return train_dataloader, validate_dataloader, test_dataloader, class_names, samples
@@ -1638,7 +1663,7 @@ def load_data(
 
 if __name__ == "__main__":
     available_class_names = get_class_names(GR_DATA_ROOT_DIR, LR_DATA_ROOT_DIR)
-    print(f"available_class_names: {available_class_names}")
+    logger.info(f"available_class_names: {available_class_names}")
 
     # 示例1：selected_classes=None -> 全类别混合三划分
     train_loader, validate_loader, test_loader, class_names, samples = load_data(
@@ -1662,27 +1687,27 @@ if __name__ == "__main__":
     #     return_test_loader=True,
     # )
 
-    print(f"class_names: {class_names}")
-    print(f"num_samples: {len(samples)}")
+    logger.info(f"class_names: {class_names}")
+    logger.info(f"num_samples: {len(samples)}")
 
     first_train_batch = next(iter(train_loader))
     print_batch_debug_info(first_train_batch, batch_name="train_batch")
-    print(f"train image_pair previous lr_data shape: {first_train_batch['image_pair']['previous']['lr_data'].shape}")
-    print(f"train image_pair previous gr_data shape: {first_train_batch['image_pair']['previous']['gr_data'].shape}")
-    print(f"train image_pair next lr_data shape: {first_train_batch['image_pair']['next']['lr_data'].shape}")
-    print(f"train image_pair next gr_data shape: {first_train_batch['image_pair']['next']['gr_data'].shape}")
-    print(f"train flo lr_data shape: {first_train_batch['flo']['lr_data'].shape}")
-    print(f"train flo gr_data shape: {first_train_batch['flo']['gr_data'].shape}")
+    logger.info(f"train image_pair previous lr_data shape: {first_train_batch['image_pair']['previous']['lr_data'].shape}")
+    logger.info(f"train image_pair previous gr_data shape: {first_train_batch['image_pair']['previous']['gr_data'].shape}")
+    logger.info(f"train image_pair next lr_data shape: {first_train_batch['image_pair']['next']['lr_data'].shape}")
+    logger.info(f"train image_pair next gr_data shape: {first_train_batch['image_pair']['next']['gr_data'].shape}")
+    logger.info(f"train flo lr_data shape: {first_train_batch['flo']['lr_data'].shape}")
+    logger.info(f"train flo gr_data shape: {first_train_batch['flo']['gr_data'].shape}")
 
     if len(validate_loader.dataset) > 0:
         first_validate_batch = next(iter(validate_loader))
         print_batch_debug_info(first_validate_batch, batch_name="validate_batch")
-        print(f"validate image_pair previous lr_data shape: {first_validate_batch['image_pair']['previous']['lr_data'].shape}")
-        print(f"validate image_pair previous gr_data shape: {first_validate_batch['image_pair']['previous']['gr_data'].shape}")
-        print(f"validate image_pair next lr_data shape: {first_validate_batch['image_pair']['next']['lr_data'].shape}")
-        print(f"validate image_pair next gr_data shape: {first_validate_batch['image_pair']['next']['gr_data'].shape}")
-        print(f"validate flo lr_data shape: {first_validate_batch['flo']['lr_data'].shape}")
-        print(f"validate flo gr_data shape: {first_validate_batch['flo']['gr_data'].shape}")
+        logger.info(f"validate image_pair previous lr_data shape: {first_validate_batch['image_pair']['previous']['lr_data'].shape}")
+        logger.info(f"validate image_pair previous gr_data shape: {first_validate_batch['image_pair']['previous']['gr_data'].shape}")
+        logger.info(f"validate image_pair next lr_data shape: {first_validate_batch['image_pair']['next']['lr_data'].shape}")
+        logger.info(f"validate image_pair next gr_data shape: {first_validate_batch['image_pair']['next']['gr_data'].shape}")
+        logger.info(f"validate flo lr_data shape: {first_validate_batch['flo']['lr_data'].shape}")
+        logger.info(f"validate flo gr_data shape: {first_validate_batch['flo']['gr_data'].shape}")
 
     if test_loader is not None and len(test_loader.dataset) > 0:
         first_test_batch = next(iter(test_loader))

@@ -1,3 +1,4 @@
+from loguru import logger
 import os
 import time
 from datetime import datetime
@@ -34,6 +35,7 @@ def _select_metric_or_save_channels(x: torch.Tensor, data_type: str, save_as_gra
     """
     if data_type == "image_pair" and save_as_gray:
         if x.shape[1] < 1:
+            logger.error(f'Expected at least 1 channel for image_pair, got {x.shape[1]}')
             raise ValueError(f"Expected at least 1 channel for image_pair, got {x.shape[1]}")
         return x[:, 0:1, :, :]
     return x
@@ -77,6 +79,7 @@ def validate_and_save(result_dir, generator, val_dataloader, device, epoch, data
                     )
 
                 if lr_images.shape[1] < 2 or fake_images.shape[1] < 2 or hr_images.shape[1] < 2:
+                    logger.error('flo 可视化至少需要前两通道(u,v)')
                     raise ValueError("flo 可视化至少需要前两通道(u,v)")
 
                 # # 仅打印一次数值差异
@@ -136,13 +139,17 @@ def validate_and_save(result_dir, generator, val_dataloader, device, epoch, data
 
                 if SAVE_AS_GRAY:
                     if hr_prev.shape[1] < 1:
+                        logger.error(f'Unsupported previous channel count: {hr_prev.shape[1]}')
                         raise ValueError(f"Unsupported previous channel count: {hr_prev.shape[1]}")
                     if hr_next.shape[1] < 1:
+                        logger.error(f'Unsupported next channel count: {hr_next.shape[1]}')
                         raise ValueError(f"Unsupported next channel count: {hr_next.shape[1]}")
                 else:
                     if hr_prev.shape[1] != 3:
+                        logger.error(f'Unsupported previous channel count: {hr_prev.shape[1]}')
                         raise ValueError(f"Unsupported previous channel count: {hr_prev.shape[1]}")
                     if hr_next.shape[1] != 3:
+                        logger.error(f'Unsupported next channel count: {hr_next.shape[1]}')
                         raise ValueError(f"Unsupported next channel count: {hr_next.shape[1]}")
 
                 sample_rows = []
@@ -175,6 +182,7 @@ def validate_and_save(result_dir, generator, val_dataloader, device, epoch, data
                     sample_rows.append(row)
 
             else:
+                logger.error(f'Unsupported data_type: {data_type}')
                 raise ValueError(f"Unsupported data_type: {data_type}")
 
             batch_combined = sample_rows[0]
@@ -207,7 +215,7 @@ def validate_and_save(result_dir, generator, val_dataloader, device, epoch, data
                     stride=6
                 )
             save_image(batch_combined.clamp(0, 1), save_path, normalize=False)
-            print(f"Saved validation image: {save_path}")
+            logger.info(f"Saved validation image: {save_path}")
             break
 # 计算 PSNR 函数
 def calculate_psnr(fake_image, hr_image):
@@ -323,13 +331,13 @@ def evaluate(epoch,class_name,data_type,device,
         }
     })
     current_time = time.time()
-    print(
+    logger.info(
         f"Epoch [{epoch + 1}/{global_data.srgan.EPOCH_NUMS}] |{class_name} {data_type} |running time:{int(current_time - global_data.srgan.START_TIME )}s | "
-        f"Val Loss: {val_loss:.4f} | Avg PSNR: {avg_psnr:.2f}", end=""
+        f"Val Loss: {val_loss:.4f} | Avg PSNR: {avg_psnr:.2f}"
     )
     loss_str = "".join([loss_label[index] + ':' + str(metric[index] / train_loader_lens) + "," for index in
                         range(len(loss_label))])
-    print(loss_str)
+    logger.info(loss_str)
 
     # 每轮训练结束后进行验证，并保存最后一批图像
     validate_and_save(f"{global_data.srgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.srgan.PREDICT_DIR}", generator,
@@ -339,7 +347,7 @@ def evaluate(epoch,class_name,data_type,device,
     discriminator_save_path = f"{global_data.srgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.srgan.MODEL_DIR}/generator_{global_data.srgan.name}.pth"
     torch.save(discriminator.state_dict(),discriminator_save_path )
     torch.save(generator.state_dict(), generator_save_path)
-    print(
+    logger.info(
         f"{class_name} {data_type} |Models saved: Generator -> {generator_save_path}, Discriminator -> {discriminator_save_path}")
 
     # 保存每一epoch的损失
@@ -401,7 +409,7 @@ def evaluate_all(
     generator.eval()
 
     if data_type == "image_pair":
-        print(f"[evaluate_all] SAVE_AS_GRAY={global_data.srgan.SAVE_AS_GRAY}")
+        logger.info(f"[evaluate_all] SAVE_AS_GRAY={global_data.srgan.SAVE_AS_GRAY}")
 
     output_root = Path(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -447,7 +455,7 @@ def evaluate_all(
                         ("previous", lr_prev_up[i:i+1], fake_prev[i:i+1], hr_prev[i:i+1]),
                         ("next",     lr_next_up[i:i+1], fake_next[i:i+1], hr_next[i:i+1]),
                     ]:
-                        sid = f"batch_{batch_idx}_idx_{i}_{pair_type}"
+                        sid = f"batch_{batch_idx}_idx_{i}_fid_{batch_idx*len(batch)+i}_{pair_type}"
                         one_dir = output_root / sid
                         one_dir.mkdir(parents=True, exist_ok=True)
 
@@ -475,6 +483,7 @@ def evaluate_all(
                                 hr_save = hr_save[:, 0:1, :, :]
 
                             if lr_save.shape[1] != 1 or fk_save.shape[1] != 1 or hr_save.shape[1] != 1:
+                                logger.error(f'SAVE_AS_GRAY=True expects 1-channel save tensors, got lr={lr_save.shape[1]}, fake={fk_save.shape[1]}, hr={hr_save.shape[1]}')
                                 raise ValueError(
                                     f"SAVE_AS_GRAY=True expects 1-channel save tensors, got "
                                     f"lr={lr_save.shape[1]}, fake={fk_save.shape[1]}, hr={hr_save.shape[1]}"
@@ -542,7 +551,7 @@ def evaluate_all(
                 B = lr.shape[0]
 
                 for i in range(B):
-                    sid = f"batch_{batch_idx}_idx_{i}"
+                    sid = f"batch_{batch_idx}_idx_{i}_fid_{batch_idx*len(batch)+i}"
                     one_dir = output_root / sid
                     one_dir.mkdir(parents=True, exist_ok=True)
 
@@ -614,6 +623,7 @@ def evaluate_all(
                         "nrmse": nrmse,
                     })
             else:
+                logger.error(f'Unsupported data_type: {data_type}')
                 raise ValueError(f"Unsupported data_type: {data_type}")
 
     # 计算均值行
@@ -657,8 +667,8 @@ def evaluate_all(
         writer.writeheader()
         writer.writerows(rows)
 
-    print(f"[evaluate_all] metrics csv: {metrics_csv_path}")
-    print(f"[evaluate_all] sample outputs: {output_root}")
+    logger.info(f"[evaluate_all] metrics csv: {metrics_csv_path}")
+    logger.info(f"[evaluate_all] sample outputs: {output_root}")
     return mean_row
 
 

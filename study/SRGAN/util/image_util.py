@@ -1,3 +1,4 @@
+from loguru import logger
 import torch
 from matplotlib import cm
 
@@ -39,6 +40,7 @@ def convert_fake_for_display(fake, fake_mode="rgb"):
         return fake
     if fake_mode == "gray":
         return to_gray_3ch(fake)
+    logger.error(f'Unsupported fake_mode: {fake_mode}')
     raise ValueError(f"Unsupported fake_mode: {fake_mode}")
 def _hsv_to_rgb_torch(h: torch.Tensor, s: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     """将 HSV 张量转换为 RGB 张量。"""
@@ -77,6 +79,7 @@ def flow_to_color_tensor(flow: torch.Tensor, ref_max_rad: float | None = None) -
     返回: rgb [B,3,H,W] in [0,1], max_rad
     """
     if flow.ndim != 4 or flow.shape[1] < 2:
+        logger.error(f'flow shape must be [B,C,H,W] and C>=2, got {tuple(flow.shape)}')
         raise ValueError(f"flow shape must be [B,C,H,W] and C>=2, got {tuple(flow.shape)}")
 
     # 只使用 uv，忽略可能存在的 magnitude 第三通道

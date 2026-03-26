@@ -1,6 +1,7 @@
 """
 CSV 操作 start
 """
+from loguru import logger
 import csv
 from pathlib import Path
 from typing import Any, Callable
@@ -53,6 +54,7 @@ class CsvTable:
         with self.file_path.open("r", newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             if reader.fieldnames != self.columns:
+                logger.error(f'CSV 列不匹配: {reader.fieldnames} != {self.columns}')
                 raise ValueError(f"CSV 列不匹配: {reader.fieldnames} != {self.columns}")
             return list(reader)
 

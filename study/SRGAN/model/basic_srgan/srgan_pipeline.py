@@ -1,3 +1,4 @@
+from loguru import logger
 
 import os
 import time
@@ -21,7 +22,6 @@ from study.SRGAN.model.basic_srgan.train import image_pair_train, flow_train
 from study.SRGAN.util.CSV_operator import CsvTable
 from study.SRGAN.util.accumulator import Accumulator
 from study.SRGAN.util.animator import Animator
-from loguru import logger
 
 def select_single_class(available_class_names, preset_name=None):
     """
@@ -31,15 +31,16 @@ def select_single_class(available_class_names, preset_name=None):
     """
     if preset_name is not None:
         if preset_name not in available_class_names:
+            logger.error(f"SINGLE_CLASS_NAME='{preset_name}' 不在可用类别中: {available_class_names}")
             raise ValueError(
                 f"SINGLE_CLASS_NAME='{preset_name}' 不在可用类别中: {available_class_names}"
             )
         logger.error( f"SINGLE_CLASS_NAME='{preset_name}' 不在可用类别中: {available_class_names}")
         return preset_name
 
-    print("请选择单类别训练目标：")
+    logger.info("请选择单类别训练目标：")
     for idx, cname in enumerate(available_class_names):
-        print(f"  [{idx}] {cname}")
+        logger.info(f"  [{idx}] {cname}")
 
     while True:
         raw = input("输入类别序号: ").strip()
@@ -47,7 +48,7 @@ def select_single_class(available_class_names, preset_name=None):
             i = int(raw)
             if 0 <= i < len(available_class_names):
                 return available_class_names[i]
-        print("输入无效，请重新输入。")
+        logger.warning("输入无效，请重新输入。")
 
 
 
@@ -59,11 +60,12 @@ def main():
     # 获取类别名
     available_class_names = get_class_names(global_data.srgan.GR_DATA_ROOT_DIR)
 
-    print(f"一共{len(available_class_names)}个类别：{available_class_names}")
+    logger.info(f"一共{len(available_class_names)}个类别：{available_class_names}")
 
     # 训练模式: all | single | mixed
     mode = global_data.srgan.TRAIN_CLASS_MODE.lower().strip()
     if mode not in {"all", "single", "mixed"}:
+        logger.error(f'TRAIN_CLASS_MODE 仅支持 all/single/mixed，当前为: {global_data.srgan.TRAIN_CLASS_MODE}')
         raise ValueError(f"TRAIN_CLASS_MODE 仅支持 all/single/mixed，当前为: {global_data.srgan.TRAIN_CLASS_MODE}")
 
     run_jobs = []
@@ -149,9 +151,9 @@ def main():
                 Path(f"{global_data.srgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.srgan.LOG_DIR}").mkdir(
                     parents=True, exist_ok=True)
 
-                #初始化日志
+                #初始化训练日志
                 logger.add(
-                    f"{global_data.srgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.srgan.LOG_DIR}",
+                    f"{global_data.srgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.srgan.LOG_DIR}/training.log",
                     rotation="100 MB",
                     retention="30 days",
                     level="DEBUG",
@@ -177,16 +179,16 @@ def main():
                     generator_save_path = f"{global_data.srgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.srgan.MODEL_DIR}/discriminator_{global_data.srgan.name}.pth"
                     if os.path.exists(generator_save_path):
                         generator.load_state_dict(torch.load(generator_save_path, map_location=global_data.srgan.device))
-                        print(f"Loaded pretrained model generator from {generator_save_path}")
+                        logger.info(f"Loaded pretrained model generator from {generator_save_path}")
                     else:
-                        print("No pretrained model generator found. Starting training from scratch.")
+                        logger.info("No pretrained model generator found. Starting training from scratch.")
 
                     discriminator_save_path = f"{global_data.srgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.srgan.MODEL_DIR}/generator_{global_data.srgan.name}.pth"
                     if os.path.exists(discriminator_save_path):
                         discriminator.load_state_dict(torch.load(discriminator_save_path, map_location=global_data.srgan.device))
-                        print(f"Loaded pretrained model discriminator from {discriminator_save_path}")
+                        logger.info(f"Loaded pretrained model discriminator from {discriminator_save_path}")
                     else:
-                        print("No pretrained model discriminator found. Starting training from scratch.")
+                        logger.info("No pretrained model discriminator found. Starting training from scratch.")
 
                 g_optimizer = torch.optim.Adam(generator.parameters(), lr=global_data.srgan.G_LR, betas=global_data.srgan.g_optimizer_betas,
                                                weight_decay=global_data.srgan.weight_decay)
@@ -258,7 +260,7 @@ def main():
 
 
     global_data.srgan.END_TIME = time.time()
-    print(f"一共运行：{global_data.srgan.END_TIME - global_data.srgan.START_TIME}秒")
+    logger.info(f"一共运行：{global_data.srgan.END_TIME - global_data.srgan.START_TIME}秒")
 
 if __name__ =="__main__":
     main()

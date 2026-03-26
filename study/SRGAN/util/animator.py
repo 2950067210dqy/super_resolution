@@ -1,3 +1,4 @@
+from loguru import logger
 from matplotlib import pyplot as plt
 from matplotlib.animation import FuncAnimation, PillowWriter
 
@@ -307,6 +308,7 @@ class Animator:
     def save(self, gif_path="train.gif", fps=20, exclude_legends=None, split_ratio=8.0, fixed_groups=None):
         """导出训练过程动态 GIF。"""
         if not self.frames:
+            logger.error('没有可保存的帧，请先调用 add().')
             raise ValueError("没有可保存的帧，请先调用 add().")
 
         self._draw_frame(
@@ -343,6 +345,7 @@ class Animator:
     def save_png(self, png_path="train.png", exclude_legends=None, split_ratio=8.0, fixed_groups=None):
         """导出最后一帧静态 PNG。"""
         if not self.frames:
+            logger.error('没有可保存的帧，请先调用 add().')
             raise ValueError("没有可保存的帧，请先调用 add().")
 
         self._draw_frame(

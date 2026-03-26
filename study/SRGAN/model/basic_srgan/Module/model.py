@@ -1,6 +1,7 @@
 """
 模型 start
 """
+from loguru import logger
 import torch
 from torch import nn
 
@@ -13,6 +14,7 @@ def icnr_(tensor: torch.Tensor, scale: int = 2, initializer=nn.init.kaiming_norm
     """
     out_channels, in_channels, kH, kW = tensor.shape
     if out_channels % (scale ** 2) != 0:
+        logger.error(f'out_channels({out_channels}) must be divisible by scale^2({scale ** 2})')
         raise ValueError(f"out_channels({out_channels}) must be divisible by scale^2({scale**2})")
 
     subkernel = torch.zeros(

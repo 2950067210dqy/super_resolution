@@ -1,6 +1,7 @@
 """
 可视化 生成 start
 """
+from loguru import logger
 import numpy as np
 import torch
 
@@ -14,6 +15,7 @@ def build_flo_uvw_fake_panel(fake_bchw, col_sep=8):
     U* | V* | S*
     """
     if fake_bchw.ndim != 4 or fake_bchw.shape[1] < 3:
+        logger.error(f'Need [B,>=3,H,W], got {tuple(fake_bchw.shape)}')
         raise ValueError(f"Need [B,>=3,H,W], got {tuple(fake_bchw.shape)}")
 
     cmin = fake_bchw[:, :3].amin(dim=(0, 2, 3), keepdim=True)
@@ -43,6 +45,7 @@ def build_flo_uvw_compare_panel(lr_bchw, fake_bchw, hr_bchw, sep_width=6, row_se
     """
     for t in (lr_bchw, fake_bchw, hr_bchw):
         if t.shape[1] < 3:
+            logger.error('Need 3 channels (U,V,S).')
             raise ValueError("Need 3 channels (U,V,S).")
 
     # 统一用 HR 做每通道 min-max，保证可比

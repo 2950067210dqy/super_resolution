@@ -1,3 +1,4 @@
+from loguru import logger
 import time
 
 import wandb
@@ -163,7 +164,7 @@ class global_data:
 
             Path(file_path).parent.mkdir(parents=True, exist_ok=True)
             Path(file_path).write_text("\n".join(lines), encoding="utf-8")
-            print(f"hyper_parameter Saved to {file_path}")
+            logger.info(f"hyper_parameter Saved to {file_path}")
         # @classmethod
         # def save_hyper_parameters_txt(cls,file_path="hyper_parameter.txt"):
         #     """将当前实验超参数写入文本文件，便于复现实验。"""

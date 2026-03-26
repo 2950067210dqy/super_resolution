@@ -17,6 +17,7 @@
 """
 
 from __future__ import annotations
+from loguru import logger
 
 import struct
 from pathlib import Path
@@ -27,6 +28,7 @@ import numpy as np
 try:
     from PIL import Image
 except Exception as exc:  # pragma: no cover
+    logger.error('需要 Pillow 才能读写 tif 文件：pip install pillow')
     raise RuntimeError("需要 Pillow 才能读写 tif 文件：pip install pillow") from exc
 
 
@@ -72,6 +74,7 @@ def crop_to_multiple_hw(arr: np.ndarray, factor: int) -> np.ndarray:
     hh = (h // factor) * factor
     ww = (w // factor) * factor
     if hh == 0 or ww == 0:
+        logger.error(f'factor={factor} 对形状 (...,{h},{w}) 太大，裁剪后会变成 0')
         raise ValueError(f"factor={factor} 对形状 (...,{h},{w}) 太大，裁剪后会变成 0")
     return arr[..., :hh, :ww]
 
@@ -80,6 +83,7 @@ def max_pool_last2(arr: np.ndarray, factor: int) -> np.ndarray:
     """对最后两维做factor×factor最大池化下采样。"""
     h, w = arr.shape[-2], arr.shape[-1]
     if h % factor != 0 or w % factor != 0:
+        logger.error(f'形状 (...,{h},{w}) 不能被 factor={factor} 整除')
         raise ValueError(f"形状 (...,{h},{w}) 不能被 factor={factor} 整除")
     reshaped = arr.reshape(arr.shape[:-2] + (h // factor, factor, w // factor, factor))
     return reshaped.max(axis=(-1, -3))
@@ -112,6 +116,7 @@ def _pil_resample(interpolation_mode: str) -> int:
         return Image.Resampling.BILINEAR
     if interpolation_mode == "bicubic":
         return Image.Resampling.BICUBIC
+    logger.error(f'不支持的 INTERPOLATION_MODE={interpolation_mode}，仅支持 bilinear / bicubic')
     raise ValueError(f"不支持的 INTERPOLATION_MODE={interpolation_mode}，仅支持 bilinear / bicubic")
 
 
@@ -119,6 +124,7 @@ def resize_2d_with_pillow(arr2d: np.ndarray, out_hw: tuple[int, int], interpolat
     """使用Pillow对单通道2D数组按指定插值方式缩放到目标尺寸。"""
     out_h, out_w = out_hw
     if out_h <= 0 or out_w <= 0:
+        logger.error(f'非法输出尺寸：{out_hw}')
         raise ValueError(f"非法输出尺寸：{out_hw}")
 
     src_dtype = arr2d.dtype
@@ -142,6 +148,7 @@ def interpolate_last2(arr: np.ndarray, factor: int, interpolation_mode: str) -> 
     out_h = h // factor
     out_w = w // factor
     if out_h == 0 or out_w == 0:
+        logger.error(f'factor={factor} 对形状 (...,{h},{w}) 太大，下采样后会变成 0')
         raise ValueError(f"factor={factor} 对形状 (...,{h},{w}) 太大，下采样后会变成 0")
 
     flat = arr.reshape((-1, h, w))
@@ -160,6 +167,7 @@ def downsample_hw(arr_hw_or_chw: np.ndarray, factor: int, expand_to_original: bo
     elif method == "interpolate":
         lr = interpolate_last2(arr_hw_or_chw, factor, interpolation_mode)
     else:
+        logger.error(f'不支持的 DOWNSAMPLE_METHOD={method}，仅支持 maxpool / interpolate')
         raise ValueError(f"不支持的 DOWNSAMPLE_METHOD={method}，仅支持 maxpool / interpolate")
 
     if not expand_to_original:
@@ -184,12 +192,14 @@ def read_flo(path: Path) -> np.ndarray:
     with path.open("rb") as f:
         magic = struct.unpack("f", f.read(4))[0]
         if abs(magic - FLO_MAGIC) > 1e-4:
+            logger.error(f'{path} 的 .flo magic 不正确：{magic}')
             raise ValueError(f"{path} 的 .flo magic 不正确：{magic}")
         w = struct.unpack("i", f.read(4))[0]
         h = struct.unpack("i", f.read(4))[0]
         data = np.fromfile(f, np.float32, count=2 * w * h)
 
     if data.size != 2 * w * h:
+        logger.error(f'{path} 的 .flo 数据长度异常')
         raise ValueError(f"{path} 的 .flo 数据长度异常")
     return data.reshape(h, w, 2)
 
@@ -197,6 +207,7 @@ def read_flo(path: Path) -> np.ndarray:
 def write_flo(path: Path, flow: np.ndarray) -> None:
     """将HxWx2光流数组按.flo格式写盘。"""
     if flow.ndim != 3 or flow.shape[2] != 2:
+        logger.error('flow 必须是 HxWx2')
         raise ValueError("flow 必须是 HxWx2")
     h, w, _ = flow.shape
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -219,6 +230,7 @@ def downsample_tif(arr: np.ndarray, factor: int, expand_to_original: bool, metho
         lr = np.moveaxis(lr_chw, 0, -1)
         return lr.astype(arr.dtype, copy=False)
 
+    logger.error(f'不支持的 tif shape：{arr.shape}')
     raise ValueError(f"不支持的 tif shape：{arr.shape}")
 
 
@@ -265,6 +277,7 @@ def resize_nearest_image(arr: np.ndarray, out_hw: tuple[int, int]) -> np.ndarray
     if arr.ndim == 3:
         pil = Image.fromarray(arr)
         return np.array(pil.resize((out_w, out_h), resample=Image.Resampling.NEAREST))
+    logger.error(f'不支持 resize 的图像 shape: {arr.shape}')
     raise ValueError(f"不支持 resize 的图像 shape: {arr.shape}")
 
 
@@ -294,6 +307,7 @@ def to_uint8_preview(arr: np.ndarray) -> np.ndarray:
                 x = np.zeros_like(x, dtype=np.float32)
             return (x * 255.0).clip(0, 255).astype(np.uint8)
 
+    logger.error(f'不支持预览转换的图像 shape: {arr.shape}')
     raise ValueError(f"不支持预览转换的图像 shape: {arr.shape}")
 
 
@@ -336,6 +350,7 @@ def flow_to_color(flow: np.ndarray, mag_clip_percentile: float = 99.0) -> np.nda
     将 HxWx2 光流可视化为 RGB(uint8)
     """
     if flow.ndim != 3 or flow.shape[2] != 2:
+        logger.error(f'flow 必须是 HxWx2，实际: {flow.shape}')
         raise ValueError(f"flow 必须是 HxWx2，实际: {flow.shape}")
 
     u = flow[..., 0].astype(np.float32, copy=False)
@@ -449,7 +464,7 @@ def process_one_file(
             out = output_path_for(src, in_root, factor)
             lr = downsample_tif(arr, factor, EXPAND_TO_ORIGINAL, DOWNSAMPLE_METHOD, INTERPOLATION_MODE)
             write_tif(out, lr)
-            print(f"[OK] {src} -> {out} (x{factor}, method={DOWNSAMPLE_METHOD}, {arr.shape} -> {lr.shape})")
+            logger.info(f"[OK] {src} -> {out} (x{factor}, method={DOWNSAMPLE_METHOD}, {arr.shape} -> {lr.shape})")
 
             if SAVE_COMPARE_ARTIFACTS and save_img_compare:
                 save_image_pair_artifacts(src, in_root, factor, arr, lr)
@@ -461,37 +476,43 @@ def process_one_file(
             out = output_path_for(src, in_root, factor)
             lr = downsample_flo(flow, factor, EXPAND_TO_ORIGINAL, DOWNSAMPLE_METHOD, INTERPOLATION_MODE)
             write_flo(out, lr)
-            print(f"[OK] {src} -> {out} (x{factor}, method={DOWNSAMPLE_METHOD}, {flow.shape} -> {lr.shape})")
+            logger.info(f"[OK] {src} -> {out} (x{factor}, method={DOWNSAMPLE_METHOD}, {flow.shape} -> {lr.shape})")
 
             if SAVE_COMPARE_ARTIFACTS and save_flo_compare:
                 save_flo_artifacts(src, in_root, factor, flow, lr)
         return
 
-    print(f"[SKIP] 不支持的文件类型：{src}")
+    logger.warning(f"[SKIP] 不支持的文件类型：{src}")
 
 
 def _validate_config() -> tuple[list[Path], list[int]]:
     """校验配置有效性并返回规范化后的输入目录列表与倍率列表。"""
     if not INPUT_DIRS:
+        logger.error('请在脚本里设置 INPUT_DIRS（至少一个文件夹路径）')
         raise ValueError("请在脚本里设置 INPUT_DIRS（至少一个文件夹路径）")
 
     input_dirs = [Path(p).expanduser().resolve() for p in INPUT_DIRS]
     for d in input_dirs:
         if not d.exists() or not d.is_dir():
+            logger.error(f'输入目录不存在或不是目录：{d}')
             raise ValueError(f"输入目录不存在或不是目录：{d}")
 
     factors = [int(x) for x in FACTORS]
     if not factors or any(x < 1 for x in factors):
+        logger.error(f'FACTORS 配置不合法：{FACTORS}')
         raise ValueError(f"FACTORS 配置不合法：{FACTORS}")
 
     method = DOWNSAMPLE_METHOD.lower()
     if method not in {"maxpool", "interpolate"}:
+        logger.error(f'DOWNSAMPLE_METHOD 配置不合法：{DOWNSAMPLE_METHOD}，仅支持 maxpool / interpolate')
         raise ValueError(f"DOWNSAMPLE_METHOD 配置不合法：{DOWNSAMPLE_METHOD}，仅支持 maxpool / interpolate")
 
     if method == "interpolate" and INTERPOLATION_MODE.lower() not in {"bilinear", "bicubic"}:
+        logger.error('INTERPOLATION_MODE 配置不合法，仅支持 bilinear / bicubic')
         raise ValueError("INTERPOLATION_MODE 配置不合法，仅支持 bilinear / bicubic")
 
     if FLO_COMPARE_SAMPLES < 0 or IMAGE_COMPARE_SAMPLES < 0:
+        logger.error('FLO_COMPARE_SAMPLES / IMAGE_COMPARE_SAMPLES 不能小于 0')
         raise ValueError("FLO_COMPARE_SAMPLES / IMAGE_COMPARE_SAMPLES 不能小于 0")
 
     return input_dirs, factors
@@ -499,6 +520,17 @@ def _validate_config() -> tuple[list[Path], list[int]]:
 
 def main() -> None:
     """主流程：遍历输入目录、处理文件、统计并打印汇总结果。"""
+    logger.add(
+        f"./data_downscal/log/running.log",
+        rotation="100 MB",
+        retention="30 days",
+        level="DEBUG",
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {process.name} | {thread.name} | {name}:{module}:{line} | {message}",
+        enqueue=True,
+        backtrace=True,
+        diagnose=True,
+
+    )
     input_dirs, factors = _validate_config()
 
     total = 0
@@ -529,17 +561,17 @@ def main() -> None:
             )
             total += 1
 
-    print(f"[DONE] 处理完成，源文件数量：{total}")
-    print(f"[DONE] 下采样方式：{DOWNSAMPLE_METHOD}")
+    logger.info(f"[DONE] 处理完成，源文件数量：{total}")
+    logger.info(f"[DONE] 下采样方式：{DOWNSAMPLE_METHOD}")
     if DOWNSAMPLE_METHOD.lower() == "interpolate":
-        print(f"[DONE] 插值模式：{INTERPOLATION_MODE}")
+        logger.info(f"[DONE] 插值模式：{INTERPOLATION_MODE}")
 
-    print(f"[DONE] 保存 flo 对比产物的源文件数：{flo_compare_count} (上限={FLO_COMPARE_SAMPLES})")
-    print(f"[DONE] 保存图像对配对图的源文件数：{img_compare_count} (上限={IMAGE_COMPARE_SAMPLES})")
+    logger.info(f"[DONE] 保存 flo 对比产物的源文件数：{flo_compare_count} (上限={FLO_COMPARE_SAMPLES})")
+    logger.info(f"[DONE] 保存图像对配对图的源文件数：{img_compare_count} (上限={IMAGE_COMPARE_SAMPLES})")
 
     for in_root in input_dirs:
-        print(f"[DONE] 输出根目录：{in_root.parent / (in_root.name + '_lr')}")
-        print(f"[DONE] 对比产物目录：{in_root.parent / (in_root.name + '_lr') / COMPARE_DIR_NAME}")
+        logger.info(f"[DONE] 输出根目录：{in_root.parent / (in_root.name + '_lr')}")
+        logger.info(f"[DONE] 对比产物目录：{in_root.parent / (in_root.name + '_lr') / COMPARE_DIR_NAME}")
 
 
 if __name__ == "__main__":
