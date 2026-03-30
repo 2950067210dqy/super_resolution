@@ -9,16 +9,16 @@ import torch
 class global_data:
     class srgan:
         # 运行环境是否是autoDL
-        IS_AUTO_DL = True
+        IS_AUTO_DL = False
         AUTODL_DATA_PATH = rf"/root/autodl-tmp" if IS_AUTO_DL else r""
         # =========================
         # 训练任务标识
         # =========================
         name = "srgan"  # 当前实验名（用于输出目录/模型名/wandb run名）
-        DESCRIPTION = "v_mixed_all"  # 实验补充描述（可写损失配置、数据版本等）
+        DESCRIPTION = "v_test"  # 实验补充描述（可写损失配置、数据版本等）
         name +=DESCRIPTION
         # 类别训练模式: "all" | "single" | "mixed"
-        TRAIN_CLASS_MODE = "mixed"
+        TRAIN_CLASS_MODE = "all"
         # 当 TRAIN_CLASS_MODE="single" 时可预设；为 None 则运行时让你输入选择
         SINGLE_CLASS_NAME = None
         # mixed 模式下的目录名/日志名

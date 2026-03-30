@@ -65,6 +65,39 @@ FLOW_LR_SUFFIX_PATTERN = re.compile(r"([_-]flow)+([_-]lr)+$")
 FLOW_SUFFIX_PATTERN = re.compile(r"([_-]flow)+$")
 
 
+def resolve_lr_data_root_dir(lr_data_root_dir: str, lr_data_variant: str = "default") -> str:
+    """
+    根据传入参数选择 LR 数据根目录。
+
+    参数:
+        lr_data_root_dir: str
+            当前训练代码传入的 LR 根目录，通常是原始 `_lr` 路径。
+        lr_data_variant: str
+            LR 数据变体标识。
+            - `default` / `original` / `lr`: 使用原始 `_lr` 数据。
+            - `particle` / `lr_particle`: 使用颗粒退化生成的 `_lr_particle` 数据。
+
+    返回:
+        str
+            最终实际要使用的 LR 数据根目录。
+
+    说明:
+        这个函数只负责做路径字符串映射，不检查目录是否存在；
+        目录合法性检查由后续 `ensure_valid_root_dir` 负责。
+    """
+    variant = (lr_data_variant or "default").lower().strip()
+    if variant in {"default", "original", "lr"}:
+        return lr_data_root_dir.replace("_lr_particle", "_lr")
+    if variant in {"particle", "lr_particle"}:
+        if "_lr_particle" in lr_data_root_dir:
+            return lr_data_root_dir
+        if "_lr" in lr_data_root_dir:
+            return lr_data_root_dir.replace("_lr", "_lr_particle", 1)
+        return f"{lr_data_root_dir}_particle"
+    logger.error(f"Unsupported lr_data_variant: {lr_data_variant}")
+    raise ValueError(f"Unsupported lr_data_variant: {lr_data_variant}")
+
+
 # ==============================
 # 通用工具
 # ==============================
@@ -1381,9 +1414,10 @@ loader 序列化存储和读取 end
 def load_data(
     gr_data_root_dir: str,
     lr_data_root_dir: str,
+    lr_data_variant: str = "default",
     selected_classes: str | list[str] | tuple[str, ...] | None = None,
     batch_size: int = 4,
-    num_workers: int = 12,
+    num_workers: int = 24,
     shuffle: bool = True,
     target_size: tuple[int, int] | None = None,
     train_nums_rate: float = 0.8,
@@ -1433,14 +1467,15 @@ def load_data(
         - return_test_loader: 是否在返回值中包含 test_loader
     """
     gr_root = ensure_valid_root_dir(gr_data_root_dir, "gr_data_root_dir")
-    lr_root = ensure_valid_root_dir(lr_data_root_dir, "lr_data_root_dir")
+    resolved_lr_data_root_dir = resolve_lr_data_root_dir(lr_data_root_dir, lr_data_variant)
+    lr_root = ensure_valid_root_dir(resolved_lr_data_root_dir, "lr_data_root_dir")
 
     is_global_mix_split = selected_classes is None
 
     logger.info("=" * 80)
     logger.info("[Start] Begin loading SR dataset")
     logger.info(f"[Start] GR root: {gr_root}")
-    logger.info(f"[Start] LR root: {lr_root}")
+    logger.info(f"[Start] LR root: {lr_root} (variant={lr_data_variant})")
     logger.info(f"[Start] batch_size={batch_size}, num_workers={num_workers}, shuffle={shuffle}")
     logger.info(f"[Start] target_size={target_size}, random_seed={random_seed}")
     logger.info(f"[Start] selected_classes={selected_classes}")

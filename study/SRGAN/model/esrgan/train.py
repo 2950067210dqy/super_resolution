@@ -107,17 +107,20 @@ def batch_train(epoch,lr_images,gr_images, i, data_type, device, generator, disc
     """
     # real_labels_out = torch.ones((len(lr_images), 1, 1, 1)).to(device)
     # real_labels = torch.full_like(real_labels_out, 0.9).to(device)
-    real_labels = torch.ones((len(lr_images), 1, 1, 1)).to(device)
-    fake_labels = torch.zeros((len(lr_images), 1, 1, 1)).to(device)
+
 
     # 生成器生成图像
     pred_images = generator(lr_images)
     # print(f"pred_images:min,max,mean:{pred_images.min().data,pred_images.max().data,pred_images.mean().data} | lr_images:min,max,mean:{lr_images.min().data,lr_images.max().data,lr_images.mean().data} | gr_images:min,max,mean:{gr_images.min().data,gr_images.max().data,gr_images.mean().data} | ")
+    """生成器训练 start"""
+    # G 步只需要通过 D(fake) 把梯度传回生成器，不需要给判别器参数累计梯度。
+    for p in discriminator.parameters():
+        p.requires_grad = False
     # 判别器判别生成图像
     probability_pred_images = discriminator(pred_images)
-    #判别器判别真实图像
-    probability_gr_images = discriminator(gr_images)
-    """生成器训练 start"""
+    # 判别器真实分支只作为相对判别参照，不参与 G 的梯度传播。
+    with torch.no_grad():
+        probability_gr_images = discriminator(gr_images)
     # 感知损失
     perceptual_loss_value,content_loss,adversarial_loss = perceptual_loss(pred_images, gr_images, probability_pred_images,probability_gr_images)
     # 像素损失（灰白数据可开加权，flo 默认不开）
@@ -140,6 +143,10 @@ def batch_train(epoch,lr_images,gr_images, i, data_type, device, generator, disc
     g_optimizer.zero_grad()
     g_loss.backward()
     g_optimizer.step()
+
+    # 恢复 D 参数梯度，为后续判别器更新做准备。
+    for p in discriminator.parameters():
+        p.requires_grad = True
     """生成器训练 end"""
 
     # #因为判别器太强了，让它弱一点，每两次训练一次
@@ -151,7 +158,10 @@ def batch_train(epoch,lr_images,gr_images, i, data_type, device, generator, disc
         fake_loss 代表fake Less realistic than real data? ？
         #因为之前已经用了probability_pred_images去更新生成器的梯度了，经过了一次反向传播，所以在用它要detach
     """
-    d_loss,fake_loss,real_loss =descriminator_loss(probability_pred_images.detach(),probability_gr_images)
+    # D 步需要基于可训练判别器重新前向。
+    probability_pred_images_d = discriminator(pred_images.detach())
+    probability_gr_images_d = discriminator(gr_images)
+    d_loss,fake_loss,real_loss =descriminator_loss(probability_pred_images_d,probability_gr_images_d)
     # 优化判别器
     d_optimizer.zero_grad()
     d_loss.backward()

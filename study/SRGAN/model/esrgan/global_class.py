@@ -9,7 +9,7 @@ import torch
 class global_data:
     class esrgan:
         #运行环境是否是autoDL
-        IS_AUTO_DL = True
+        IS_AUTO_DL = False
         AUTODL_DATA_PATH = rf"/root/autodl-tmp" if IS_AUTO_DL else r""
         # =========================
         # 训练任务标识
@@ -37,7 +37,7 @@ class global_data:
         # 训练主超参数
         # =========================
         EPOCH_NUMS = 20  # 训练轮数
-        BATCH_SIZE = 16  # batch 大小
+        BATCH_SIZE = 8  # batch 大小
         SHUFFLE = True  # 训练集是否打乱
         TARGET_SIZE = None  # 数据加载时是否统一 resize 到该尺寸
         RANDOM_SEED = 42  # 数据划分随机种子
