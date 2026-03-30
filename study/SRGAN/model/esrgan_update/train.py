@@ -4,9 +4,10 @@ import os
 import torch
 import torchvision
 
+
 from study.SRGAN.model.esrgan_update.global_class import global_data
 from study.SRGAN.model.esrgan_update.Module.loss import perceptual_loss, pixel_loss, regularization_loss, \
-    descriminator_loss
+    descriminator_loss,particle_loss
 from study.SRGAN.model.esrgan_update.visual_plot_init import build_flo_uvw_fake_panel
 from study.SRGAN.model.esrgan_update.visual_plot_save import save_vorticity_quiver_single
 from study.SRGAN.util.image_util import flow_to_color_tensor
@@ -112,17 +113,24 @@ def batch_train(epoch,lr_images,gr_images, i, data_type, device, generator, disc
 
     # 生成器生成图像
     pred_images = generator(lr_images)
+    # 冻结判别器参数 避免梯度更新
+    for p in discriminator.parameters():
+        p.requires_grad = False
     # print(f"pred_images:min,max,mean:{pred_images.min().data,pred_images.max().data,pred_images.mean().data} | lr_images:min,max,mean:{lr_images.min().data,lr_images.max().data,lr_images.mean().data} | gr_images:min,max,mean:{gr_images.min().data,gr_images.max().data,gr_images.mean().data} | ")
     # 判别器判别生成图像
     probability_pred_images = discriminator(pred_images)
     #判别器判别真实图像
-    probability_gr_images = discriminator(gr_images)
+    with torch.no_grad():
+        probability_gr_images = discriminator(gr_images)
     """生成器训练 start"""
-    # 感知损失
-    perceptual_loss_value,content_loss,adversarial_loss = perceptual_loss(pred_images, gr_images, probability_pred_images,probability_gr_images)
+    # 感知损失 第无论才开启对抗损失 先与训练生成器
+    if epoch>=global_data.esrgan.PRE_TRIAN_G_EPOCH-1:
+        perceptual_loss_value,content_loss,adversarial_loss = perceptual_loss(pred_images, gr_images, probability_pred_images,probability_gr_images,True)
+    else :
+        perceptual_loss_value,content_loss,adversarial_loss = perceptual_loss(pred_images, gr_images, probability_pred_images,probability_gr_images,False)
     # 像素损失（灰白数据可开加权，flo 默认不开）
     gray_triplet = (global_data.esrgan.SAVE_AS_GRAY and data_type == "image_pair")  # 仅 image_pair 且设置为灰度复制模式
-    g_loss_pixel, g_loss_l1, g_loss_mse = pixel_loss(pred_images, gr_images, gray_triplet=gray_triplet)
+    g_loss_pixel, g_loss_l1, g_loss_mse,g_loss_ssim = pixel_loss(pred_images, gr_images, gray_triplet=gray_triplet)
     # 正则损失
     """
     这是很常见的现象，这个 RegularizationLoss 本质上是在惩罚图像相邻像素差，也就是一种平滑约束。
@@ -134,7 +142,8 @@ def batch_train(epoch,lr_images,gr_images, i, data_type, device, generator, disc
     # g_loss = perceptual_loss_value + LAMBDA_regularization_loss *regularization_loss_value +LAMBDA_loss_pixel*g_loss_pixel  # 这里的percuptual_loss包含了vgg_loss和对抗损失
     # g_loss = perceptual_loss_value #最原始的esrgan
     #没有用混合像素损失 而是直接根据esrgan 用了L1损失
-    g_loss = perceptual_loss_value+global_data.esrgan.LAMBDA_loss_pixel*g_loss_l1
+    p_loss,_ = particle_loss(probability_pred_images, probability_gr_images)
+    g_loss = perceptual_loss_value+p_loss+global_data.esrgan.LAMBDA_PIXEL_L1*g_loss_l1+global_data.esrgan.LAMBDA_SSIM*g_loss_ssim
 
     # 优化生成器
     g_optimizer.zero_grad()
@@ -146,12 +155,18 @@ def batch_train(epoch,lr_images,gr_images, i, data_type, device, generator, disc
     # if i % 2 == 0:
     """判别器训练 start"""
     # 判别器判别真实图片之后将概率结果放入损失函数并且优化生成器
+    #启用判别器梯度
+    for p in discriminator.parameters():
+        p.requires_grad = True
+    # 重新判别
+    pred_fake_d = discriminator(pred_images.detach())
+    pred_real_d = discriminator(gr_images)
     """
     这里的real_loss 代表real data More realistic than fake ？
         fake_loss 代表fake Less realistic than real data? ？
         #因为之前已经用了probability_pred_images去更新生成器的梯度了，经过了一次反向传播，所以在用它要detach
     """
-    d_loss,fake_loss,real_loss =descriminator_loss(probability_pred_images.detach(),probability_gr_images)
+    d_loss,fake_loss,real_loss =descriminator_loss(pred_fake_d,pred_real_d)
     # 优化判别器
     d_optimizer.zero_grad()
     d_loss.backward()
@@ -170,7 +185,7 @@ def batch_train(epoch,lr_images,gr_images, i, data_type, device, generator, disc
                g_loss_l1.item(),g_loss_mse.item(),
                d_loss.item(), real_loss.item(), fake_loss.item())
     # end if i % 2 == 0:
-    if i % 100 == 0:
+    if i % global_data.esrgan.TRAIN_DATA_SAVING_STEP == 0:
         image = pred_images.detach()
         save_dir =f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.TRAINING_DIR}"
         os.makedirs(save_dir, exist_ok=True)

@@ -13,32 +13,22 @@ from torchvision.utils import save_image
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
+from SRGAN.model.esrgan_update.Module.loss import pixel_loss
 from study.SRGAN.model.esrgan_update.global_class import global_data
 from study.SRGAN.model.esrgan_update.judge_delicators import _to_np_chw, _mse, _psnr_from_mse, _energy_spectrum_mse, \
     _r2_score, _ssim_score, _tke_reconstruction_accuracy, _nrmse, _energy_spectrum_curves
 
-from study.SRGAN.model.esrgan_update.Module.loss import  pixel_loss
+
 from study.SRGAN.model.esrgan_update.visual_plot_init import build_flo_uvw_compare_panel
 from study.SRGAN.model.esrgan_update.visual_plot_save import save_vorticity_quiver_compare, _save_triplet, \
     _save_energy_spectrum_plot
 from study.SRGAN.util.image_util import flow_to_color_tensor, build_triplet_row, add_vertical_separator, \
-    add_horizontal_separator
+    add_horizontal_separator, _select_metric_or_save_channels
 
 """
 验证函数 start
 """
-def _select_metric_or_save_channels(x: torch.Tensor, data_type: str, save_as_gray: bool) -> torch.Tensor:
-    """
-    统一通道选择策略：
-    - image_pair 且 SAVE_AS_GRAY=True: 仅使用第一个通道
-    - 其他情况: 保持原通道
-    """
-    if data_type == "image_pair" and save_as_gray:
-        if x.shape[1] < 1:
-            logger.error(f'Expected at least 1 channel for image_pair, got {x.shape[1]}')
-            raise ValueError(f"Expected at least 1 channel for image_pair, got {x.shape[1]}")
-        return x[:, 0:1, :, :]
-    return x
+
 
 def validate_and_save(result_dir, generator, val_dataloader, device, epoch, data_type, SAVE_AS_GRAY=None):
     """
@@ -272,7 +262,7 @@ def validate_image_pair(generator, dataloader, device):
                 lr_images, hr_images = lr_images.to(device), hr_images.to(device)
                 fake_images = generator(lr_images)
 
-                pixel_total, _, _ = pixel_loss(fake_images, hr_images, global_data.esrgan.SAVE_AS_GRAY)
+                pixel_total, _, _,_ = pixel_loss(fake_images, hr_images, global_data.esrgan.SAVE_AS_GRAY)
                 val_loss += pixel_total.item()
                 fake_images_for_metric = _select_metric_or_save_channels(
                     fake_images, "image_pair", global_data.esrgan.SAVE_AS_GRAY
@@ -284,7 +274,7 @@ def validate_image_pair(generator, dataloader, device):
                     total_psnr += calculate_psnr(fake_image, hr_image)
                     num_images += 1
 
-    val_loss /= (len(dataloader)*2)
+    val_loss /= (len(dataloader))
     avg_psnr = total_psnr / num_images
     return val_loss, avg_psnr
 """
@@ -322,18 +312,18 @@ def evaluate(epoch,class_name,data_type,device,
     wandb.log({
         "classname": class_name,
         "data_type": data_type,
-        "Validation Loss": val_loss,
+        "Validation Loss": val_loss if data_type =="flo" else val_loss/2,
         "avg_psnr": avg_psnr,
         "Epoch": epoch,
         **{
-            loss_label[index]: metric[index] / train_loader_lens
+            loss_label[index]: metric[index] / (train_loader_lens) if data_type =="flo" else metric[index] / (train_loader_lens*2)
             for index in range(len(loss_label))
         }
     })
     current_time = time.time()
     logger.info(
         f"Epoch [{epoch + 1}/{global_data.esrgan.EPOCH_NUMS}] |{class_name} {data_type} |running time:{int(current_time - global_data.esrgan.START_TIME )}s | "
-        f"Val Loss: {val_loss:.4f} | Avg PSNR: {avg_psnr:.2f}"
+        f"Val Loss: {val_loss if data_type =='flo' else val_loss/2} | Avg PSNR: {avg_psnr:.2f}"
     )
     loss_str = "".join([loss_label[index] + ':' + str(metric[index] / train_loader_lens) + "," for index in
                         range(len(loss_label))])
@@ -350,8 +340,8 @@ def evaluate(epoch,class_name,data_type,device,
     logger.info(
         f"{class_name} {data_type} |Models saved: Generator -> {generator_save_path}, Discriminator -> {discriminator_save_path}")
 
-    # 保存每一epoch的损失
-    all_loss_and_val_Datas = [metric[index] / train_loader_lens for index in range(len(loss_label))] + [val_loss, avg_psnr]
+    # 保存每一epoch的损失 image_pair 是计算了前图和后图两次 所以要多除2
+    all_loss_and_val_Datas = [metric[index] / (train_loader_lens) if data_type =="flo" else metric[index] / (train_loader_lens*2)  for index in range(len(loss_label))] + [val_loss, avg_psnr]
     animator.add(epoch + 1,all_loss_and_val_Datas )
     # 保存到csv文件中
     csvOperator.create(dict(zip(global_data.esrgan.CSV_COLUMNS,[epoch + 1]+all_loss_and_val_Datas+[datetime.now().strftime("%Y-%m-%d %H:%M:%S")])))
@@ -473,21 +463,21 @@ def evaluate_all(
                         fk_save = fk_eval.clamp(0, 1)
                         hr_save = hr_eval.clamp(0, 1)
 
-                        if data_type == "image_pair" and global_data.esrgan.SAVE_AS_GRAY:
-                            # 强制单通道保存，避免任何上游残留导致彩色输出
-                            if lr_save.shape[1] > 1:
-                                lr_save = lr_save[:, 0:1, :, :]
-                            if fk_save.shape[1] > 1:
-                                fk_save = fk_save[:, 0:1, :, :]
-                            if hr_save.shape[1] > 1:
-                                hr_save = hr_save[:, 0:1, :, :]
-
-                            if lr_save.shape[1] != 1 or fk_save.shape[1] != 1 or hr_save.shape[1] != 1:
-                                logger.error(f'SAVE_AS_GRAY=True expects 1-channel save tensors, got lr={lr_save.shape[1]}, fake={fk_save.shape[1]}, hr={hr_save.shape[1]}')
-                                raise ValueError(
-                                    f"SAVE_AS_GRAY=True expects 1-channel save tensors, got "
-                                    f"lr={lr_save.shape[1]}, fake={fk_save.shape[1]}, hr={hr_save.shape[1]}"
-                                )
+                        # if data_type == "image_pair" and global_data.esrgan.SAVE_AS_GRAY:
+                        #     # 强制单通道保存，避免任何上游残留导致彩色输出
+                        #     if lr_save.shape[1] > 1:
+                        #         lr_save = lr_save[:, 0:1, :, :]
+                        #     if fk_save.shape[1] > 1:
+                        #         fk_save = fk_save[:, 0:1, :, :]
+                        #     if hr_save.shape[1] > 1:
+                        #         hr_save = hr_save[:, 0:1, :, :]
+                        #
+                        #     if lr_save.shape[1] != 1 or fk_save.shape[1] != 1 or hr_save.shape[1] != 1:
+                        #         logger.error(f'SAVE_AS_GRAY=True expects 1-channel save tensors, got lr={lr_save.shape[1]}, fake={fk_save.shape[1]}, hr={hr_save.shape[1]}')
+                        #         raise ValueError(
+                        #             f"SAVE_AS_GRAY=True expects 1-channel save tensors, got "
+                        #             f"lr={lr_save.shape[1]}, fake={fk_save.shape[1]}, hr={hr_save.shape[1]}"
+                        #         )
 
                         # 1) 自身图
                         save_image(lr_save, str(one_dir / "lr.png"), normalize=False)

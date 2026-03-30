@@ -9,17 +9,23 @@ import torch
 class global_data:
     class esrgan:
         #运行环境是否是autoDL
-        IS_AUTO_DL = True
+        IS_AUTO_DL = False
         AUTODL_DATA_PATH = rf"/root/autodl-tmp" if IS_AUTO_DL else r""
         # =========================
         # 训练任务标识
         # =========================
         name = "esrgan_update"  # 当前实验名（用于输出目录/模型名/wandb run名）
-        DESCRIPTION = "v1"  # 实验补充描述（可写损失配置、数据版本等）
+        DESCRIPTION = "v_test"  # 实验补充描述（可写损失配置、数据版本等）
         name +=DESCRIPTION
         README = """
+        v1-v8 是生成器颗粒损失的消融实验。
         将原始的esrgan 根据颗粒图像对进行优化：
-        1） 对生成器进行 #ICNR 初始化 避免棋盘伪影
+        1） 对生成器进行 #ICNR 初始化 避免棋盘伪影。！注释了
+        2） 重新调整判别器的梯度冻结和启用，并且对更新判别器时重新判别一次。 
+            image_pair 的损失因为我生成了两次previous 和 next 所以计算相关损失要多除以2.
+        3） 启用vgg 19 的14
+        4） 结构loss 和 物理loss还需调参
+        5） 上采样pixelshuffle改成upsample
         """#整体项目注释
         # 类别训练模式: "all" | "single" | "mixed"
         TRAIN_CLASS_MODE = "all"
@@ -41,7 +47,9 @@ class global_data:
         # 训练主超参数
         # =========================
         EPOCH_NUMS = 20  # 训练轮数
-        BATCH_SIZE = 16  # batch 大小
+        BATCH_SIZE = 4 # batch 大小
+        PRE_TRIAN_G_EPOCH = 1 #预训练G完成的轮次
+        TRAIN_DATA_SAVING_STEP =50 #每隔多少steps保存一次生成的图片
         SHUFFLE = True  # 训练集是否打乱
         TARGET_SIZE = None  # 数据加载时是否统一 resize 到该尺寸
         RANDOM_SEED = 42  # 数据划分随机种子
@@ -52,14 +60,65 @@ class global_data:
         # 损失项系数
         # =========================
         LAMBDA_PERCEPTION = 5e-4  # 感知损失中对抗项权重
+        LAMBDA_PHYSICAL = 1#感知损失中的内容损失中的物理损失权重 如果需要单独跳里面的参数则设置1
+        LAMBDA_STRUCTURE =1#感知损失中内容损失中的结构损失权重 如果需要单独跳里面的参数则设置1
+
+
         LAMBDA_regularization_loss = 2e-8  # 正则项权重（当前基本未启用）
-        LAMBDA_loss_pixel = 1  # 像素损失总权重
+        LAMBDA_loss_pixel = 1  # 像素损失总权重 （当前基本未启用）
 
-        LAMBDA_PIXEL_L1 = 1e-2  # 像素L1权重
-        LAMBDA_PIXEL_MSE = 1e-3  # 像素MSE权重
-        PIXEL_WHITE_ALPHA = 1.0  # 灰度场白点区域加权系数
-        LAMBDA_GRAY_CONS = 1e-2  # 灰度三通道一致性约束权重
 
+
+
+        LAMBDA_PIXEL_L1 = 0.5  # 像素L1权重
+        LAMBDA_PIXEL_MSE = 1e-3  # 像素MSE权重（当前基本未启用）
+        PIXEL_WHITE_ALPHA = 1.0  # 灰度场白点区域加权系数（当前基本未启用）
+        LAMBDA_GRAY_CONS = 1e-2  # 灰度三通道一致性约束权重（当前基本未启用）
+        # =========================
+        # 结构相似性损失超参数
+        # =========================
+        LAMBDA_SSIM = 0.05  # SSIM结构相似损失权重，约束SR与HR在局部结构上的一致性
+
+        SSIM_WINDOW_SIZE = 11  # SSIM高斯窗口大小，用于计算局部结构统计
+        SSIM_SIGMA = 1.5  # SSIM高斯窗口标准差，控制局部统计平滑程度
+        SSIM_DATA_RANGE = 1.0  # 图像动态范围，若输入已归一化到[0,1]则设为1.0
+        SSIM_K1 = 0.01  # SSIM常数项k1，用于稳定亮度项
+        SSIM_K2 = 0.03  # SSIM常数项k2，用于稳定对比度项
+        # =========================
+        # 颗粒结构保真损失超参数
+        # =========================
+        """
+        LAMBDA_CHARBONNIER,LAMBDA_EDGE,LAMBDA_BRIGHT_MASK太强、LAMBDA_PEAK、LAMBDA_SEPARATION太弱会导致颗粒粘连
+        """
+        LAMBDA_CHARBONNIER =0 # Charbonnier重建损失权重，控制整体像素级重建精度
+        LAMBDA_EDGE =0.003  # 边缘损失权重，控制颗粒边界和轮廓恢复强度
+        LAMBDA_BRIGHT_MASK = 0.008  # 高亮颗粒区域加权损失权重，提升颗粒区域在总损失中的重要性
+        LAMBDA_MASS =0 # 亮度总量守恒损失权重，约束颗粒总体亮度/质量一致性 #！！这个权重会扰乱结果
+        LAMBDA_PEAK = 0.008 # 局部峰值结构损失权重，强化颗粒局部亮峰恢复
+        LAMBDA_SEPARATION =0.003 # 颗粒分离损失权重，抑制颗粒粘连和桥接现象
+
+        CHARBONNIER_EPS = 1e-4  # Charbonnier损失中的平滑项，防止零点附近不可导并提升训练稳定性
+        BRIGHT_THRESHOLD = 0.5  # 高亮颗粒阈值，生成硬mask时用于区分颗粒区域与背景区域
+        USE_SOFT_MASK = True  # 是否使用软mask；True表示直接使用HR亮度作为权重，False表示使用二值mask
+
+        BRIGHT_BASE_WEIGHT = 1.0  # 高亮mask损失中的背景基础权重
+        BRIGHT_PEAK_WEIGHT = 1.0  # 高亮mask损失中的颗粒附加权重，值越大越强调颗粒区域
+
+        PEAK_KERNEL_SIZE = 3  # 局部峰值损失的邻域窗口大小，用于提取颗粒局部峰结构
+        SEPARATION_KERNEL_SIZE = 5  # 颗粒分离损失的邻域窗口大小，用于计算中心-邻域对比度
+        # =========================
+        # 颗粒物理分布损失超参数
+        # =========================
+        LAMBDA_PARTICLE_COUNT = 0  # 颗粒数量损失权重，约束SR与HR中的颗粒总量一致  #！！这个权重会扰乱结果 可能是识别数量有问题
+        LAMBDA_PARTICLE_DENSITY = 0.008  # 颗粒局部密度分布损失权重，约束颗粒空间统计分布一致
+
+        PARTICLE_THRESHOLD = 0.5  # 颗粒阈值，用于从灰度图中提取颗粒占据区域
+        PARTICLE_SHARPNESS = 20.0  # 软阈值Sigmoid斜率，值越大越接近硬阈值
+        PARTICLE_COUNT_EPS = 1e-6  # 颗粒数量损失中的数值稳定项，防止分母为零
+
+        PARTICLE_DENSITY_KERNEL_SIZE = 9  # 局部密度估计窗口大小，决定局部统计范围
+        PARTICLE_DENSITY_SIGMA = 2.0  # 高斯密度核标准差，控制密度平滑程度
+        PARTICLE_DENSITY_USE_GAUSSIAN = True  # 是否使用高斯核构建局部密度图，False时改为均值池化
         # =========================
         # 优化器超参数
         # =========================
@@ -76,8 +135,8 @@ class global_data:
         # =========================
         # 训练数据集和验证集合比例 测试集  比例
         Train_nums_rate = 0.8
-        Test_nums_rate = 0.0
-        Validate_nums_rate = 1 - Train_nums_rate - Test_nums_rate
+        Test_nums_rate = 0.1
+        Validate_nums_rate = round(1 - Train_nums_rate - Test_nums_rate,2)
 
         # =========================
         # 数据路径与输出路径
@@ -99,7 +158,8 @@ class global_data:
         Path(OUT_PUT_DIR).mkdir(parents=True, exist_ok=True)
 
         # 需要训练的数据类型  # 参与训练的数据模态
-        DATA_TYPES = ['image_pair', 'flo']
+        # DATA_TYPES = ['image_pair', 'flo']
+        DATA_TYPES = ['image_pair']
         # DATA_TYPES =['flo']
         IMAGE_PAIR_TYPES = ['previous', 'next']  # 图像对中的两个时刻/帧
         """

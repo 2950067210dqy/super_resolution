@@ -14,11 +14,11 @@ from tqdm import tqdm
 
 import wandb
 from study.SRGAN.data_load import get_class_names, load_data, save_loaders_paths
-from study.SRGAN.model.esrgan.Module.loss import CombinedPixelLoss, PerceptualLoss, RegularizationLoss
-from study.SRGAN.model.esrgan.Module.model import Generator, Discriminator
-from study.SRGAN.model.esrgan.evaluate import evaluate, evaluate_all
-from study.SRGAN.model.esrgan.global_class import global_data
-from study.SRGAN.model.esrgan.train import image_pair_train, flow_train
+from study.SRGAN.model.esrgan_update.Module.loss import CombinedPixelLoss, PerceptualLoss, RegularizationLoss
+from study.SRGAN.model.esrgan_update.Module.model import Generator, Discriminator
+from study.SRGAN.model.esrgan_update.evaluate import evaluate, evaluate_all
+from study.SRGAN.model.esrgan_update.global_class import global_data
+from study.SRGAN.model.esrgan_update.train import image_pair_train, flow_train
 from study.SRGAN.util.CSV_operator import CsvTable
 from study.SRGAN.util.accumulator import Accumulator
 from study.SRGAN.util.animator import Animator

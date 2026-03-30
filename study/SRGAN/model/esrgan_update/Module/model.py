@@ -136,16 +136,18 @@ class Generator(nn.Module):
             # 因为 PixelShuffle(2) 需要输出通道数能被 2^2=4 整除
             # 并且 PixelShuffle 后希望仍然得到 64 通道
             # 所以卷积输出通道 = 64 * 4 = 256
-            nn.Conv2d(64, 64 * self.scale * self.scale, kernel_size=3, stride=1, padding=1),
+            # nn.Conv2d(64, 64 * self.scale * self.scale, kernel_size=3, stride=1, padding=1),
 
             # [B, 256, H, W] -> [B, 64, 2H, 2W]
-            nn.PixelShuffle(self.scale),
+            # nn.PixelShuffle(self.scale),
+            nn.Upsample(scale_factor=self.scale, mode='nearest'),
             nn.Conv2d(64, 64, 3, 1, 1),
             nn.LeakyReLU(0.2, inplace=True),
 
-            nn.Conv2d(64, 64 * self.scale * self.scale, kernel_size=3, stride=1, padding=1),
+            # nn.Conv2d(64, 64 * self.scale * self.scale, kernel_size=3, stride=1, padding=1),
             # [B, 256, H, W] -> [B, 64, 2H, 2W]
-            nn.PixelShuffle(self.scale),
+            # nn.PixelShuffle(self.scale),
+            nn.Upsample(scale_factor=self.scale, mode='nearest'),
             nn.Conv2d(64, 64, 3, 1, 1),
             nn.LeakyReLU(0.2, inplace=True)
         )
@@ -164,7 +166,7 @@ class Generator(nn.Module):
         )
 
         #ICNR 初始化 esrgan不应该有这个
-        self._init_subpixel_weights()
+        # self._init_subpixel_weights()
 
     def _init_subpixel_weights(self):
         #对 PixelShuffle 前的 Conv2d(64, 64*scale*scale, ...) 做了 ICNR，能明显减轻棋盘纹。

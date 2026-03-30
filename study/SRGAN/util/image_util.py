@@ -2,7 +2,28 @@ from loguru import logger
 import torch
 from matplotlib import cm
 
+from SRGAN.model.esrgan_update.global_class import global_data
 
+
+def _to_gray( x: torch.Tensor) -> torch.Tensor:
+    if x.shape[1] == 1:
+        return x
+    if global_data.esrgan.SAVE_AS_GRAY:
+        return _select_metric_or_save_channels(x, data_type="image_pair", save_as_gray=global_data.esrgan.SAVE_AS_GRAY)
+    else:
+        return 0.299 * x[:, 0:1] + 0.587 * x[:, 1:2] + 0.114 * x[:, 2:3]
+def _select_metric_or_save_channels(x: torch.Tensor, data_type: str, save_as_gray: bool) -> torch.Tensor:
+    """
+    统一通道选择策略：
+    - image_pair 且 SAVE_AS_GRAY=True: 仅使用第一个通道
+    - 其他情况: 保持原通道
+    """
+    if data_type == "image_pair" and save_as_gray:
+        if x.shape[1] < 1:
+            logger.error(f'Expected at least 1 channel for image_pair, got {x.shape[1]}')
+            raise ValueError(f"Expected at least 1 channel for image_pair, got {x.shape[1]}")
+        return x[:, 0:1, :, :]
+    return x
 def add_vertical_separator(tensor, sep_width=8, value=1.0):
     """生成竖向白色分隔条，用于拼图。"""
     b, c, h, _ = tensor.shape
