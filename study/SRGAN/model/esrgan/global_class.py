@@ -47,7 +47,7 @@ class global_data:
         # =========================
         # 损失项系数
         # =========================
-        LAMBDA_PERCEPTION = 5e-4  # 感知损失中对抗项权重
+        LAMBDA_ADVERSARIAL = 5e-4  # 感知损失中对抗项权重
         LAMBDA_regularization_loss = 2e-8  # 正则项权重（当前基本未启用）
         LAMBDA_loss_pixel = 1  # 像素损失总权重
 
@@ -192,7 +192,7 @@ class global_data:
         #         f"RANDOM_SEED = {cls.RANDOM_SEED}",
         #         f"SCALE = {cls.SCALES}",
         #         "",
-        #         f"LAMBDA_PERCEPTION = {cls.LAMBDA_PERCEPTION}",
+        #         f"LAMBDA_ADVERSARIAL = {cls.LAMBDA_ADVERSARIAL}",
         #         f"LAMBDA_regularization_loss = {cls.LAMBDA_regularization_loss}",
         #         f"LAMBDA_loss_pixel = {cls.LAMBDA_loss_pixel}",
         #         f"PIXEL_WHITE_ALPHA:{cls.PIXEL_WHITE_ALPHA}",

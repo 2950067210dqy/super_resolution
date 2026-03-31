@@ -15,7 +15,7 @@ class global_data:
         # 训练任务标识
         # =========================
         name = "esrgan_update"  # 当前实验名（用于输出目录/模型名/wandb run名）
-        DESCRIPTION = "v_test"  # 实验补充描述（可写损失配置、数据版本等）
+        DESCRIPTION = "v_test7"  # 实验补充描述（可写损失配置、数据版本等）
         name +=DESCRIPTION
         README = """
         v1-v8 是生成器颗粒损失的消融实验。
@@ -25,7 +25,15 @@ class global_data:
             image_pair 的损失因为我生成了两次previous 和 next 所以计算相关损失要多除以2.
         3） 启用vgg 19 的14
         4） 结构loss 和 物理loss还需调参
-        5） 上采样pixelshuffle改成upsample
+        5） 上采样pixelshuffle改成upsample、
+        6） 修改给p_loss传入的参数 之前是判别器判别之后的概率 应该是生成的图像和真实的图像
+        7) 修改训练过程中 临时的验证的次数为1次batch 并且修改平均信噪比和验证损失的逻辑
+        8) 添加_to_gray时图像归一化 
+        9） 添加内容损失的权重 0.8 与对抗损失0.2
+        10） 减少生成器的RRDB 层 由23层减到11层 可以的 速度提高 轻量化、
+        11）将生成器的第一层的卷积层k9换成三个并行的卷积层k3 k5 k7 并联concat 后 1x1的卷积 -> 64
+        12）将上采样部分改得更细一点  每次上采样后接一个小残差块 Upsample Conv LeakyReLU ResidualBlock ,上采样后的细节修复会更强，尤其对小颗粒边缘恢复更有帮助
+
         """#整体项目注释
         # 类别训练模式: "all" | "single" | "mixed"
         TRAIN_CLASS_MODE = "all"
@@ -46,9 +54,9 @@ class global_data:
         # =========================
         # 训练主超参数
         # =========================
-        EPOCH_NUMS = 20  # 训练轮数
+        EPOCH_NUMS = 50  # 训练轮数
         BATCH_SIZE = 4 # batch 大小
-        PRE_TRIAN_G_EPOCH = 1 #预训练G完成的轮次
+        PRE_TRIAN_G_EPOCH = 1 #预训练G完成的轮次 从1开始
         TRAIN_DATA_SAVING_STEP =50 #每隔多少steps保存一次生成的图片
         SHUFFLE = True  # 训练集是否打乱
         TARGET_SIZE = None  # 数据加载时是否统一 resize 到该尺寸
@@ -59,7 +67,8 @@ class global_data:
         # =========================
         # 损失项系数
         # =========================
-        LAMBDA_PERCEPTION = 5e-4  # 感知损失中对抗项权重
+        LAMBDA_CONTENT = 0.8  #感知损失的内容损失 1
+        LAMBDA_ADVERSARIAL =0.2 # 感知损失中对抗项权重 0.0005
         LAMBDA_PHYSICAL = 1#感知损失中的内容损失中的物理损失权重 如果需要单独跳里面的参数则设置1
         LAMBDA_STRUCTURE =1#感知损失中内容损失中的结构损失权重 如果需要单独跳里面的参数则设置1
 
@@ -128,8 +137,8 @@ class global_data:
         g_optimizer_betas = (0.5, 0.999)
         d_optimizer_betas = (0.5, 0.999)
         # 学习率
-        G_LR = 0.0001
-        D_LR = 0.0001
+        G_LR =0.00008 #0.0001
+        D_LR = 0.0001 # 0.0001
         # =========================
         # 数据集划分比例
         # =========================
@@ -166,10 +175,11 @@ class global_data:
         超参数 end
         """
         loss_label = ['g_loss', 'g_perceptual_loss', "g_content_loss",
-                      "g_adversarial_loss", 'g_regularization_loss', 'g_loss_pixel',
-                      "g_loss_pixel_l1", "g_loss_pixel_mse",
+                      "g_adversarial_loss",  'g_loss_pixel',
+                      'g_particle_loss','g_physic_loss','g_structure_loss',
+                      "g_loss_pixel_l1", "g_loss_pixel_mse",'g_loss_ssim',
                       'd_loss', 'd_real_loss', 'd_fake_loss']
-        validate_label = ['Validation_Loss', 'Avg_PSNR']
+        validate_label = ['VAL_MSE_LOSS','VAL_SSIM_Loss', 'Avg_PSNR']
         # 存储数据至csv的列名
         CSV_COLUMNS = ['EPOCH'] + loss_label + validate_label + ['time']
         # csv操作实例 CsvTable
@@ -256,7 +266,7 @@ class global_data:
         #         f"RANDOM_SEED = {cls.RANDOM_SEED}",
         #         f"SCALE = {cls.SCALES}",
         #         "",
-        #         f"LAMBDA_PERCEPTION = {cls.LAMBDA_PERCEPTION}",
+        #         f"LAMBDA_ADVERSARIAL = {cls.LAMBDA_ADVERSARIAL}",
         #         f"LAMBDA_regularization_loss = {cls.LAMBDA_regularization_loss}",
         #         f"LAMBDA_loss_pixel = {cls.LAMBDA_loss_pixel}",
         #         f"PIXEL_WHITE_ALPHA:{cls.PIXEL_WHITE_ALPHA}",

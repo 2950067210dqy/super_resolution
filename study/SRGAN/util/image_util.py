@@ -5,13 +5,19 @@ from matplotlib import cm
 from SRGAN.model.esrgan_update.global_class import global_data
 
 
-def _to_gray( x: torch.Tensor) -> torch.Tensor:
+def _to_gray( x: torch.Tensor,to_gray_one_channel = True) -> torch.Tensor:
+    # 如果输入不是 [0,1]，而更像 [0,255]，先缩放到 [0,1]
+    # if x.detach().max() > 1.0:
+    #     x = x / 255.0
     if x.shape[1] == 1:
         return x
-    if global_data.esrgan.SAVE_AS_GRAY:
-        return _select_metric_or_save_channels(x, data_type="image_pair", save_as_gray=global_data.esrgan.SAVE_AS_GRAY)
+    if to_gray_one_channel:
+        if global_data.esrgan.SAVE_AS_GRAY:
+            return _select_metric_or_save_channels(x, data_type="image_pair", save_as_gray=global_data.esrgan.SAVE_AS_GRAY)
+        else:
+            return 0.299 * x[:, 0:1] + 0.587 * x[:, 1:2] + 0.114 * x[:, 2:3]
     else:
-        return 0.299 * x[:, 0:1] + 0.587 * x[:, 1:2] + 0.114 * x[:, 2:3]
+        return x
 def _select_metric_or_save_channels(x: torch.Tensor, data_type: str, save_as_gray: bool) -> torch.Tensor:
     """
     统一通道选择策略：

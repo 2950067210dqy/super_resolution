@@ -222,8 +222,10 @@ def validate_flow(generator, dataloader, device):
     """在 flo 验证集上计算平均像素损失与平均 PSNR。 验证所有的验证集"""
     #设置模型为评估模式
     generator.eval()
-    val_loss = 0
-    total_psnr = 0
+    total_val_ssim_loss = 0.0
+    total_val_mse_loss = 0.0
+    total_psnr = 0.0
+    loss_count = 0
     num_images = 0
     with torch.no_grad():
         for batch in dataloader:
@@ -233,50 +235,63 @@ def validate_flow(generator, dataloader, device):
             hr_images = batch["flo"]['gr_data'].to(device)
             lr_images, hr_images = lr_images.to(device), hr_images.to(device)
             fake_images = generator(lr_images)
-            pixel_total, _, _ = pixel_loss(fake_images, hr_images, False)
-            val_loss += pixel_total.item()
+            _, _, mse_total,ssim_total= pixel_loss(fake_images, hr_images, False)
+            total_val_ssim_loss += ssim_total.item()
+            total_val_mse_loss += mse_total.item()
+            loss_count += 1
 
             for fake_image, hr_image in zip(fake_images, hr_images):
                 total_psnr += calculate_psnr(fake_image, hr_image)
                 num_images += 1
-
-    val_loss /= len(dataloader)
-    avg_psnr = total_psnr / num_images
-    return val_loss, avg_psnr
+            # 一个batch 就行了 因为训练中的验证只需要1次batch验证
+            break
+    avg_val_ssim_loss = total_val_ssim_loss / max(loss_count, 1)
+    avg_val_mse_loss = total_val_mse_loss / max(loss_count, 1)
+    avg_psnr = total_psnr / max(num_images, 1)
+    return avg_val_ssim_loss,avg_val_mse_loss, avg_psnr
 # 验证函数 图像对
 def validate_image_pair(generator, dataloader, device):
-    """在 image_pair 验证集上计算平均像素损失与平均 PSNR。 验证所有的验证集"""
-    # 设置模型为评估模式
     generator.eval()
-    val_loss = 0
-    total_psnr = 0
+    total_val_ssim_loss = 0.0
+    total_val_mse_loss = 0.0
+
+    total_psnr = 0.0
+    loss_count = 0
     num_images = 0
+
     with torch.no_grad():
         for batch in dataloader:
             for image_pair_type in global_data.esrgan.IMAGE_PAIR_TYPES:
-                # 低分辨率图像
-                lr_images = batch["image_pair"][image_pair_type]['lr_data'].to(device)
-                # 真实图像
-                hr_images = batch["image_pair"][image_pair_type]['gr_data'].to(device)
+                lr_images = batch["image_pair"][image_pair_type]["lr_data"].to(device)
+                hr_images = batch["image_pair"][image_pair_type]["gr_data"].to(device)
 
-                lr_images, hr_images = lr_images.to(device), hr_images.to(device)
                 fake_images = generator(lr_images)
 
-                pixel_total, _, _,_ = pixel_loss(fake_images, hr_images, global_data.esrgan.SAVE_AS_GRAY)
-                val_loss += pixel_total.item()
+                gray_triplet = (
+                    global_data.esrgan.SAVE_AS_GRAY and image_pair_type == "image_pair"
+                )
+                _, _, mse_total, ssim_total = pixel_loss(fake_images, hr_images, gray_triplet)
+                total_val_ssim_loss += ssim_total.item()
+                total_val_mse_loss += mse_total.item()
+                loss_count += 1
+
                 fake_images_for_metric = _select_metric_or_save_channels(
                     fake_images, "image_pair", global_data.esrgan.SAVE_AS_GRAY
                 )
                 hr_images_for_metric = _select_metric_or_save_channels(
                     hr_images, "image_pair", global_data.esrgan.SAVE_AS_GRAY
                 )
+
                 for fake_image, hr_image in zip(fake_images_for_metric, hr_images_for_metric):
                     total_psnr += calculate_psnr(fake_image, hr_image)
                     num_images += 1
+            #一个batch 就行了 因为训练中的验证只需要1次batch验证
+            break
+    avg_val_ssim_loss = total_val_ssim_loss / max(loss_count, 1)
+    avg_val_mse_loss = total_val_mse_loss / max(loss_count, 1)
+    avg_psnr = total_psnr / max(num_images, 1)
+    return avg_val_ssim_loss, avg_val_mse_loss, avg_psnr
 
-    val_loss /= (len(dataloader))
-    avg_psnr = total_psnr / num_images
-    return val_loss, avg_psnr
 """
 验证函数 end
 """
@@ -303,27 +318,28 @@ def evaluate(epoch,class_name,data_type,device,
     """
     # 每轮训练结束后进行验证
 
-    val_loss,avg_psnr = 0,0
+    avg_val_ssim_loss,avg_val_mse_loss,avg_psnr = 0,0,0
 
     if data_type =="image_pair":
-        val_loss, avg_psnr = validate_image_pair(generator, validate_loader, device)
+        avg_val_ssim_loss, avg_val_mse_loss, avg_psnr = validate_image_pair(generator, validate_loader, device)
     elif data_type =="flo":
-        val_loss, avg_psnr = validate_flow(generator, validate_loader, device)
+        avg_val_ssim_loss, avg_val_mse_loss, avg_psnr = validate_flow(generator, validate_loader, device)
     wandb.log({
         "classname": class_name,
         "data_type": data_type,
-        "Validation Loss": val_loss if data_type =="flo" else val_loss/2,
+        "VAL_AVG_MSE_LOSS": avg_val_mse_loss ,
+        "VAL_AVG_SSIM_LOSS": avg_val_ssim_loss ,
         "avg_psnr": avg_psnr,
         "Epoch": epoch,
         **{
-            loss_label[index]: metric[index] / (train_loader_lens) if data_type =="flo" else metric[index] / (train_loader_lens*2)
+            loss_label[index]: metric[index] / (train_loader_lens)
             for index in range(len(loss_label))
         }
     })
     current_time = time.time()
     logger.info(
         f"Epoch [{epoch + 1}/{global_data.esrgan.EPOCH_NUMS}] |{class_name} {data_type} |running time:{int(current_time - global_data.esrgan.START_TIME )}s | "
-        f"Val Loss: {val_loss if data_type =='flo' else val_loss/2} | Avg PSNR: {avg_psnr:.2f}"
+        f"VAL_AVG_MSE_LOSS: {avg_val_mse_loss} | VAL_AVG_SSIM_LOSS: {avg_val_ssim_loss} | Avg PSNR: {avg_psnr:.2f}"
     )
     loss_str = "".join([loss_label[index] + ':' + str(metric[index] / train_loader_lens) + "," for index in
                         range(len(loss_label))])
@@ -341,19 +357,19 @@ def evaluate(epoch,class_name,data_type,device,
         f"{class_name} {data_type} |Models saved: Generator -> {generator_save_path}, Discriminator -> {discriminator_save_path}")
 
     # 保存每一epoch的损失 image_pair 是计算了前图和后图两次 所以要多除2
-    all_loss_and_val_Datas = [metric[index] / (train_loader_lens) if data_type =="flo" else metric[index] / (train_loader_lens*2)  for index in range(len(loss_label))] + [val_loss, avg_psnr]
+    all_loss_and_val_Datas = [metric[index] / (train_loader_lens)  for index in range(len(loss_label))] + [avg_val_mse_loss,avg_val_ssim_loss, avg_psnr]
     animator.add(epoch + 1,all_loss_and_val_Datas )
     # 保存到csv文件中
     csvOperator.create(dict(zip(global_data.esrgan.CSV_COLUMNS,[epoch + 1]+all_loss_and_val_Datas+[datetime.now().strftime("%Y-%m-%d %H:%M:%S")])))
     animator.save_png(
         f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.LOSS_DIR}/train_loss_epoch_{epoch + 1}_{global_data.esrgan.name}.png",
         fixed_groups=[
-            [loss_label[0], loss_label[8], validate_label[0]],
+            [loss_label[0], loss_label[11], validate_label[0]],
             [loss_label[1], loss_label[2], loss_label[3]],
-            [loss_label[1], loss_label[4], loss_label[5]],
+            [loss_label[4], loss_label[8], loss_label[9], loss_label[10]],
             [loss_label[5], loss_label[6], loss_label[7]],
-            [loss_label[8],loss_label[9], loss_label[10]],
-            [validate_label[1]]
+            [loss_label[11], loss_label[12], loss_label[13]],
+            [validate_label[0], validate_label[1], validate_label[2]]
         ])
     pass
 
@@ -423,7 +439,9 @@ def evaluate_all(
         pbar = tqdm(
             data_loader,
             desc=f"{class_name} {data_type} scale_{int(SCALE * SCALE)} Validating(all)",
-            unit="batch"
+            unit="batch", dynamic_ncols=True,
+            ascii=True,
+            leave=True,
         )
 
         for batch_idx, batch in enumerate(pbar):

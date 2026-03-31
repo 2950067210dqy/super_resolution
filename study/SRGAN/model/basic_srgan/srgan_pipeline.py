@@ -119,7 +119,7 @@ def main():
                         "RANDOM_SEED":global_data.srgan. RANDOM_SEED,
                         "SCALE": SCALE,
                         "SHUFFLE": global_data.srgan.SHUFFLE,
-                        "LAMBDA_PERCEPTION": global_data.srgan.LAMBDA_PERCEPTION,
+                        "LAMBDA_ADVERSARIAL": global_data.srgan.LAMBDA_ADVERSARIAL,
                         "LAMBDA_regularization_loss": global_data.srgan.LAMBDA_regularization_loss,
                         "LAMBDA_loss_pixel": global_data.srgan.LAMBDA_loss_pixel,
                         "LAMBDA_PIXEL_L1": global_data.srgan.LAMBDA_PIXEL_L1,

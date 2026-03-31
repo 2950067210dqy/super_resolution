@@ -49,16 +49,12 @@ class ContentLoss(nn.Module):
         self.criterion = nn.L1Loss()
         self.resize = resize
 
-        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
-        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
-    def normalize(self, x):
-        return (x - self.mean) / self.std
     def forward(self, fake, real):
         """计算 fake 与 real 的 VGG 特征 L1 。"""
-        # 标准化
-        fake = self.normalize(fake)
-        real = self.normalize(real)
+        # 标准化 因为VGG需要【0，1】的图像且需要3通道
+        fake = _to_gray(fake,False)
+        real = _to_gray(real,False)
 
         # 给 G 传梯度：fake 不 detach；real 可以 detach
         fake_features = self.vgg(fake)
@@ -82,7 +78,7 @@ class CharbonnierLoss(nn.Module):
         self.eps = eps
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        diff = pred - target
+        diff = _to_gray(pred) - _to_gray(target)
         return torch.mean(torch.sqrt(diff * diff + self.eps * self.eps))
 
 class SobelEdgeLoss(nn.Module):
@@ -719,28 +715,28 @@ class PerceptualLoss(nn.Module):
 
         #是否启用对抗损失 就是是否预训练生成器
         if is_adversarial:
-            # return vgg_loss +global_data.esrgan.LAMBDA_PERCEPTION*adversarial_loss,vgg_loss,adversarial_loss
-            return content_loss +global_data.esrgan.LAMBDA_PERCEPTION*adversarial_loss,content_loss,adversarial_loss
+            # return vgg_loss +global_data.esrgan.LAMBDA_ADVERSARIAL*adversarial_loss,vgg_loss,adversarial_loss
+            return global_data.esrgan.LAMBDA_CONTENT*content_loss +global_data.esrgan.LAMBDA_ADVERSARIAL*adversarial_loss,content_loss,adversarial_loss
         else:
-            return content_loss,content_loss,adversarial_loss
-class RegularizationLoss(nn.Module):
-    """
-    图像平滑正则：惩罚相邻像素突变，抑制高频噪声。
-    """
-
-    def __init__(self):
-        super(RegularizationLoss,self).__init__()
-
-    def forward(self, x):
-        """计算基于局部梯度的平滑正则损失。"""
-        a = torch.square(
-            x[:, :, :x.shape[2]-1, :x.shape[3]-1] - x[:, :, 1:x.shape[2], :x.shape[3]-1]
-        )
-        b = torch.square(
-            x[:, :, :x.shape[2]-1, :x.shape[3]-1] - x[:, :, :x.shape[2]-1, 1:x.shape[3]]
-        )
-        loss = torch.sum(torch.pow(a+b, 1.25))
-        return loss
+            return global_data.esrgan.LAMBDA_CONTENT*content_loss,content_loss,adversarial_loss
+# class RegularizationLoss(nn.Module):
+#     """
+#     图像平滑正则：惩罚相邻像素突变，抑制高频噪声。
+#     """
+#
+#     def __init__(self):
+#         super(RegularizationLoss,self).__init__()
+#
+#     def forward(self, x):
+#         """计算基于局部梯度的平滑正则损失。"""
+#         a = torch.square(
+#             x[:, :, :x.shape[2]-1, :x.shape[3]-1] - x[:, :, 1:x.shape[2], :x.shape[3]-1]
+#         )
+#         b = torch.square(
+#             x[:, :, :x.shape[2]-1, :x.shape[3]-1] - x[:, :, :x.shape[2]-1, 1:x.shape[3]]
+#         )
+#         loss = torch.sum(torch.pow(a+b, 1.25))
+#         return loss
 
 class SSIMLoss(nn.Module):
     """
@@ -913,7 +909,7 @@ pixel_loss = CombinedPixelLoss(
     lambda_cons=global_data.esrgan.LAMBDA_GRAY_CONS,
 ).to(global_data.esrgan.device)
 # 这里vgg是针对三通道RGB图的
-# vgg = vgg19(pretrained=True).features[:16].eval()  # 提取 VGG 特征 srgan 用的vgg
+# vgg = vgg19(pretrained=True).features[:15].eval()  # 提取 VGG 特征 srgan 用的vgg
 vgg =vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1).features[:15]
 # vgg模型预测模式
 vgg = vgg.to(global_data.esrgan.device).eval()
@@ -921,7 +917,7 @@ vgg = vgg.to(global_data.esrgan.device).eval()
 # 感知损失
 perceptual_loss = PerceptualLoss(vgg=vgg).to(global_data.esrgan.device)
 # 归一化损失 正则化损失
-regularization_loss = RegularizationLoss().to(global_data.esrgan.device)
+# regularization_loss = RegularizationLoss().to(global_data.esrgan.device)
 particle_loss = ParticleTotalLoss(
     lambda_structure=global_data.esrgan.LAMBDA_STRUCTURE,
     lambda_physical=global_data.esrgan.LAMBDA_PHYSICAL

@@ -6,7 +6,7 @@ import torchvision
 
 
 from study.SRGAN.model.esrgan_update.global_class import global_data
-from study.SRGAN.model.esrgan_update.Module.loss import perceptual_loss, pixel_loss, regularization_loss, \
+from study.SRGAN.model.esrgan_update.Module.loss import perceptual_loss, pixel_loss,  \
     descriminator_loss,particle_loss
 from study.SRGAN.model.esrgan_update.visual_plot_init import build_flo_uvw_fake_panel
 from study.SRGAN.model.esrgan_update.visual_plot_save import save_vorticity_quiver_single
@@ -108,8 +108,7 @@ def batch_train(epoch,lr_images,gr_images, i, data_type, device, generator, disc
     """
     # real_labels_out = torch.ones((len(lr_images), 1, 1, 1)).to(device)
     # real_labels = torch.full_like(real_labels_out, 0.9).to(device)
-    real_labels = torch.ones((len(lr_images), 1, 1, 1)).to(device)
-    fake_labels = torch.zeros((len(lr_images), 1, 1, 1)).to(device)
+
 
     # 生成器生成图像
     pred_images = generator(lr_images)
@@ -137,12 +136,12 @@ def batch_train(epoch,lr_images,gr_images, i, data_type, device, generator, disc
     它一开始很大、随后迅速掉到很小，通常不代表代码错了，更多说明生成器输出很快变“更平滑”了。
     也就是说，图像越抖、越噪、局部变化越剧烈，这个值越大；图像越平滑，这个值越小
     """
-    regularization_loss_value = regularization_loss(pred_images)
+
     # 生成器总损失
     # g_loss = perceptual_loss_value + LAMBDA_regularization_loss *regularization_loss_value +LAMBDA_loss_pixel*g_loss_pixel  # 这里的percuptual_loss包含了vgg_loss和对抗损失
     # g_loss = perceptual_loss_value #最原始的esrgan
     #没有用混合像素损失 而是直接根据esrgan 用了L1损失
-    p_loss,_ = particle_loss(probability_pred_images, probability_gr_images)
+    p_loss,p_loss_struct = particle_loss(pred_images, gr_images)
     g_loss = perceptual_loss_value+p_loss+global_data.esrgan.LAMBDA_PIXEL_L1*g_loss_l1+global_data.esrgan.LAMBDA_SSIM*g_loss_ssim
 
     # 优化生成器
@@ -181,8 +180,9 @@ def batch_train(epoch,lr_images,gr_images, i, data_type, device, generator, disc
 
     # 需要和loss_label对应
     metric.add(g_loss.item(), perceptual_loss_value.item(),content_loss.item(),
-               adversarial_loss.item(), regularization_loss_value.item(), g_loss_pixel.item(),
-               g_loss_l1.item(),g_loss_mse.item(),
+               adversarial_loss.item(), g_loss_pixel.item(),
+               p_loss,p_loss_struct['weighted_particle_physical_loss'].item(),p_loss_struct['weighted_particle_structure_loss'].item(),
+               g_loss_l1.item(),g_loss_mse.item(),g_loss_ssim.item(),
                d_loss.item(), real_loss.item(), fake_loss.item())
     # end if i % 2 == 0:
     if i % global_data.esrgan.TRAIN_DATA_SAVING_STEP == 0:

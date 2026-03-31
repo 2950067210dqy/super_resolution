@@ -68,7 +68,7 @@ SCALES = [2] # 生成器上采样倍率（内部两次 PixelShuffle）
 # =========================
 # 损失项系数
 # =========================
-LAMBDA_PERCEPTION = 5e-4          # 感知损失中对抗项权重
+LAMBDA_ADVERSARIAL = 5e-4          # 感知损失中对抗项权重
 LAMBDA_regularization_loss = 2e-8 # 正则项权重（当前基本未启用）
 LAMBDA_loss_pixel = 1             # 像素损失总权重
 
@@ -300,7 +300,7 @@ def save_hyper_parameters_txt(file_path="hyper_parameter.txt"):
         f"RANDOM_SEED = {RANDOM_SEED}",
         f"SCALE = {SCALES}",
         "",
-        f"LAMBDA_PERCEPTION = {LAMBDA_PERCEPTION}",
+        f"LAMBDA_ADVERSARIAL = {LAMBDA_ADVERSARIAL}",
         f"LAMBDA_regularization_loss = {LAMBDA_regularization_loss}",
         f"LAMBDA_loss_pixel = {LAMBDA_loss_pixel}",
         f"PIXEL_WHITE_ALPHA:{PIXEL_WHITE_ALPHA}",
@@ -1406,7 +1406,7 @@ class PerceptualLoss(nn.Module):
         vgg_loss = self.vgg_loss(fake, real)
         adversarial_loss = self.adversarial(x)
 
-        return vgg_loss +LAMBDA_PERCEPTION*adversarial_loss,vgg_loss,adversarial_loss
+        return vgg_loss +LAMBDA_ADVERSARIAL*adversarial_loss,vgg_loss,adversarial_loss
 class RegularizationLoss(nn.Module):
     """
     图像平滑正则：惩罚相邻像素突变，抑制高频噪声。
@@ -2137,7 +2137,7 @@ if __name__ =="__main__":
                         "RANDOM_SEED": RANDOM_SEED,
                         "SCALE": SCALE,
                         "SHUFFLE": SHUFFLE,
-                        "LAMBDA_PERCEPTION": LAMBDA_PERCEPTION,
+                        "LAMBDA_ADVERSARIAL": LAMBDA_ADVERSARIAL,
                         "LAMBDA_regularization_loss": LAMBDA_regularization_loss,
                         "LAMBDA_loss_pixel": LAMBDA_loss_pixel,
                         "LAMBDA_PIXEL_L1": LAMBDA_PIXEL_L1,

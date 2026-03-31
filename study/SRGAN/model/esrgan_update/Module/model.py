@@ -28,6 +28,44 @@ def icnr_(tensor: torch.Tensor, scale: int = 2, initializer=nn.init.kaiming_norm
     with torch.no_grad():
         tensor.copy_(subkernel)
     return tensor
+class ResidualBlock(nn.Module):
+    """
+    残差块
+
+    设计原则：
+    1. 残差连接要求输入和输出形状完全一致，才能做 x + F(x)
+    2. 所以这里通道数保持不变：64 -> 64
+    3. 卷积使用 kernel_size=3, stride=1, padding=1，这样高宽不变
+
+    输入:
+        x: [B, 64, H, W]
+
+    输出:
+        out: [B, 64, H, W]
+    """
+    def __init__(self, channels=64):
+        super(ResidualBlock, self).__init__()
+        self.block = nn.Sequential(
+            # 第1个卷积:
+            # in_channel = 64
+            # out_channel = 64
+            # kernel_size = 3
+            # stride = 1
+            # padding = 1
+            # 输出尺寸不变: H x W -> H x W
+            nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1),
+
+            nn.PReLU(),
+
+            # 第2个卷积:
+            # 仍然保持 64 -> 64，方便和输入直接相加
+            nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1),
+
+        )
+
+    def forward(self, x):
+        # 残差连接
+        return x + self.block(x)
 class DenseResidualBlock(nn.Module):
     def __init__(self, channels=64, growth_channels=32, res_scale=0.2):
         super().__init__()
@@ -77,12 +115,12 @@ class Generator(nn.Module):
 
     整体结构:
     1. 浅层特征提取
-    2. 23个RRDB
+    2. 23个RRDB  11
     3. 全局残差连接
     4. 两次 2x 上采样，总共 4x
     5. 输出 RGB 图像
     """
-    def __init__(self,inner_chanel=3, num_residual_blocks=23, scale=2):
+    def __init__(self,inner_chanel=3, num_residual_blocks=8, scale=2):
         super(Generator, self).__init__()
 
 
@@ -102,8 +140,31 @@ class Generator(nn.Module):
         #
         # 所以:
         # [B, 3, 64, 64] -> [B, 64, 64, 64]
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(inner_chanel, 64, kernel_size=9, stride=1, padding=4),
+        # self.conv1 = nn.Sequential(
+        #     nn.Conv2d(inner_chanel, 64, kernel_size=9, stride=1, padding=4),
+        #     nn.LeakyReLU(0.2, inplace=True)
+        # )
+        """
+        改成并联：
+        3x3 更擅长小颗粒、细边缘、局部纹理
+        5x5 适合中等颗粒和局部结构
+        7x7 或 9x9 更适合大一点的亮斑和上下文
+        """
+        self.stem3 = nn.Sequential(
+            nn.Conv2d(inner_chanel, 32, kernel_size=3, stride=1, padding=1),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+        self.stem5 = nn.Sequential(
+            nn.Conv2d(inner_chanel, 32, kernel_size=5, stride=1, padding=2),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+        self.stem7 = nn.Sequential(
+            nn.Conv2d(inner_chanel, 32, kernel_size=7, stride=1, padding=3),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+
+        self.conv1_fuse = nn.Sequential(
+            nn.Conv2d(32*3, 64, kernel_size=1, stride=1, padding=0),
             nn.LeakyReLU(0.2, inplace=True)
         )
 
@@ -143,13 +204,16 @@ class Generator(nn.Module):
             nn.Upsample(scale_factor=self.scale, mode='nearest'),
             nn.Conv2d(64, 64, 3, 1, 1),
             nn.LeakyReLU(0.2, inplace=True),
-
+            #后面接一个RB让上采样更清晰
+            ResidualBlock(64),
             # nn.Conv2d(64, 64 * self.scale * self.scale, kernel_size=3, stride=1, padding=1),
             # [B, 256, H, W] -> [B, 64, 2H, 2W]
             # nn.PixelShuffle(self.scale),
             nn.Upsample(scale_factor=self.scale, mode='nearest'),
             nn.Conv2d(64, 64, 3, 1, 1),
-            nn.LeakyReLU(0.2, inplace=True)
+            nn.LeakyReLU(0.2, inplace=True),
+            # 后面接一个RB让上采样更清晰
+            ResidualBlock(64),
         )
 
         # 最后一层输出 RGB 图像
@@ -178,9 +242,14 @@ class Generator(nn.Module):
     def forward(self, x):
         # x: [B, 3, 64, 64]
 
-        x1 = self.conv1(x)
+        # x1 = self.conv1(x)
         # x1: [B, 64, 64, 64]
+        #改成并联
+        x1_3 = self.stem3(x)
+        x1_5 = self.stem5(x)
+        x1_7 = self.stem7(x)
 
+        x1 = self.conv1_fuse(torch.cat([x1_3, x1_5, x1_7], dim=1))
         x2 = self.residual_blocks(x1)
         # x2: [B, 64, 64, 64]
 

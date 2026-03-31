@@ -14,7 +14,7 @@ from tqdm import tqdm
 
 import wandb
 from study.SRGAN.data_load import get_class_names, load_data, save_loaders_paths
-from study.SRGAN.model.esrgan_update.Module.loss import CombinedPixelLoss, PerceptualLoss, RegularizationLoss
+
 from study.SRGAN.model.esrgan_update.Module.model import Generator, Discriminator
 from study.SRGAN.model.esrgan_update.evaluate import evaluate, evaluate_all
 from study.SRGAN.model.esrgan_update.global_class import global_data
@@ -119,7 +119,7 @@ def main():
                         "RANDOM_SEED":global_data.esrgan. RANDOM_SEED,
                         "SCALE": SCALE,
                         "SHUFFLE": global_data.esrgan.SHUFFLE,
-                        "LAMBDA_PERCEPTION": global_data.esrgan.LAMBDA_PERCEPTION,
+                        "LAMBDA_ADVERSARIAL": global_data.esrgan.LAMBDA_ADVERSARIAL,
                         "LAMBDA_regularization_loss": global_data.esrgan.LAMBDA_regularization_loss,
                         "LAMBDA_loss_pixel": global_data.esrgan.LAMBDA_loss_pixel,
                         "LAMBDA_PIXEL_L1": global_data.esrgan.LAMBDA_PIXEL_L1,
@@ -208,7 +208,11 @@ def main():
                     metric = Accumulator(len(global_data.esrgan.loss_label))
                     train_progress_bar = tqdm(train_loader,
                                               desc=f"Epoch [{epoch + 1}/{global_data.esrgan.EPOCH_NUMS}] {class_name} {data_type} scale_{int(SCALE * SCALE)} Training",
-                                              unit="batch")
+                                              unit="batch", dynamic_ncols=True,
+                                            ascii=True,
+                                            leave=True,
+
+                                              )
 
                     for i, batch in enumerate(train_progress_bar):
                         """ 图片对训练"""

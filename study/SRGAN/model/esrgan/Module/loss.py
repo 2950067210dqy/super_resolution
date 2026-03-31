@@ -96,7 +96,7 @@ class PerceptualLoss(nn.Module):
 
 
 
-        return vgg_loss +global_data.esrgan.LAMBDA_PERCEPTION*adversarial_loss,vgg_loss,adversarial_loss
+        return vgg_loss +global_data.esrgan.LAMBDA_ADVERSARIAL*adversarial_loss,vgg_loss,adversarial_loss
 class RegularizationLoss(nn.Module):
     """
     图像平滑正则：惩罚相邻像素突变，抑制高频噪声。

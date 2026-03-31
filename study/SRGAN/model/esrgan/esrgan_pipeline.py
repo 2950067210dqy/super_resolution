@@ -119,7 +119,7 @@ def main():
                         "RANDOM_SEED":global_data.esrgan. RANDOM_SEED,
                         "SCALE": SCALE,
                         "SHUFFLE": global_data.esrgan.SHUFFLE,
-                        "LAMBDA_PERCEPTION": global_data.esrgan.LAMBDA_PERCEPTION,
+                        "LAMBDA_ADVERSARIAL": global_data.esrgan.LAMBDA_ADVERSARIAL,
                         "LAMBDA_regularization_loss": global_data.esrgan.LAMBDA_regularization_loss,
                         "LAMBDA_loss_pixel": global_data.esrgan.LAMBDA_loss_pixel,
                         "LAMBDA_PIXEL_L1": global_data.esrgan.LAMBDA_PIXEL_L1,
