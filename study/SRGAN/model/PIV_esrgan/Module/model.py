@@ -53,13 +53,13 @@ class ResidualBlock(nn.Module):
             # stride = 1
             # padding = 1
             # 输出尺寸不变: H x W -> H x W
-            nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1,padding_mode="replicate"),
 
             nn.PReLU(),
 
             # 第2个卷积:
             # 仍然保持 64 -> 64，方便和输入直接相加
-            nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1,padding_mode="replicate"),
 
         )
 
@@ -71,11 +71,11 @@ class DenseResidualBlock(nn.Module):
         super().__init__()
         self.res_scale = res_scale
 
-        self.conv1 = nn.Conv2d(channels, growth_channels, 3, 1, 1)
-        self.conv2 = nn.Conv2d(channels + growth_channels, growth_channels, 3, 1, 1)
-        self.conv3 = nn.Conv2d(channels + growth_channels * 2, growth_channels, 3, 1, 1)
-        self.conv4 = nn.Conv2d(channels + growth_channels * 3, growth_channels, 3, 1, 1)
-        self.conv5 = nn.Conv2d(channels + growth_channels * 4, channels, 3, 1, 1)
+        self.conv1 = nn.Conv2d(channels, growth_channels, 3, 1, 1,padding_mode="replicate")
+        self.conv2 = nn.Conv2d(channels + growth_channels, growth_channels, 3, 1, 1,padding_mode="replicate")
+        self.conv3 = nn.Conv2d(channels + growth_channels * 2, growth_channels, 3, 1, 1,padding_mode="replicate")
+        self.conv4 = nn.Conv2d(channels + growth_channels * 3, growth_channels, 3, 1, 1,padding_mode="replicate")
+        self.conv5 = nn.Conv2d(channels + growth_channels * 4, channels, 3, 1, 1,padding_mode="replicate")
 
         self.lrelu = nn.LeakyReLU(0.2, inplace=True)
 
@@ -118,12 +118,12 @@ class PairAwareFeatureFusion(nn.Module):
     def __init__(self, channels=64):
         super().__init__()
         self.message = nn.Sequential(
-            nn.Conv2d(channels * 2, channels, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(channels * 2, channels, kernel_size=3, stride=1, padding=1,padding_mode="replicate"),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1,padding_mode="replicate"),
         )
         self.gate = nn.Sequential(
-            nn.Conv2d(channels * 3, channels, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(channels * 3, channels, kernel_size=3, stride=1, padding=1,padding_mode="replicate"),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Conv2d(channels, channels, kernel_size=1, stride=1, padding=0),
             nn.Sigmoid(),
@@ -191,15 +191,15 @@ class Generator(nn.Module):
         7x7 或 9x9 更适合大一点的亮斑和上下文
         """
         self.stem3 = nn.Sequential(
-            nn.Conv2d(inner_chanel, 32, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(inner_chanel, 32, kernel_size=3, stride=1, padding=1,padding_mode="replicate"),
             nn.LeakyReLU(0.2, inplace=True)
         )
         self.stem5 = nn.Sequential(
-            nn.Conv2d(inner_chanel, 32, kernel_size=5, stride=1, padding=2),
+            nn.Conv2d(inner_chanel, 32, kernel_size=5, stride=1, padding=2,padding_mode="replicate"),
             nn.LeakyReLU(0.2, inplace=True)
         )
         self.stem7 = nn.Sequential(
-            nn.Conv2d(inner_chanel, 32, kernel_size=7, stride=1, padding=3),
+            nn.Conv2d(inner_chanel, 32, kernel_size=7, stride=1, padding=3,padding_mode="replicate"),
             nn.LeakyReLU(0.2, inplace=True)
         )
 
@@ -220,7 +220,7 @@ class Generator(nn.Module):
         #
         # [B, 64, 64, 64] -> [B, 64, 64, 64]
         self.conv2 = nn.Sequential(
-            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1,padding_mode="replicate"),
         )
         # 只在双帧前向中启用；单帧 forward 不经过这里，保证向后兼容。
         self.pair_fusion = PairAwareFeatureFusion(64)
@@ -244,7 +244,7 @@ class Generator(nn.Module):
             # [B, 256, H, W] -> [B, 64, 2H, 2W]
             # nn.PixelShuffle(self.scale),
             nn.Upsample(scale_factor=self.scale, mode='nearest'),
-            nn.Conv2d(64, 64, 3, 1, 1),
+            nn.Conv2d(64, 64, 3, 1, 1,padding_mode="replicate"),
             nn.LeakyReLU(0.2, inplace=True),
             #后面接一个RB让上采样更清晰
             ResidualBlock(64),
@@ -252,7 +252,7 @@ class Generator(nn.Module):
             # [B, 256, H, W] -> [B, 64, 2H, 2W]
             # nn.PixelShuffle(self.scale),
             nn.Upsample(scale_factor=self.scale, mode='nearest'),
-            nn.Conv2d(64, 64, 3, 1, 1),
+            nn.Conv2d(64, 64, 3, 1, 1,padding_mode="replicate"),
             nn.LeakyReLU(0.2, inplace=True),
             # 后面接一个RB让上采样更清晰
             ResidualBlock(64),
@@ -265,9 +265,9 @@ class Generator(nn.Module):
         # 若 scale=4:
         # [B, 64, 256, 256] -> [B, 3, 256, 256]
         self.conv_out = nn.Sequential(
-            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1,padding_mode="replicate"),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(64, inner_chanel, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(64, inner_chanel, kernel_size=3, stride=1, padding=1,padding_mode="replicate"),
 
         )
 

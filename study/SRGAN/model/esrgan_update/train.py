@@ -129,7 +129,7 @@ def batch_train(epoch,lr_images,gr_images, i, data_type, device, generator, disc
         perceptual_loss_value,content_loss,adversarial_loss = perceptual_loss(pred_images, gr_images, probability_pred_images,probability_gr_images,False)
     # 像素损失（灰白数据可开加权，flo 默认不开）
     gray_triplet = (global_data.esrgan.SAVE_AS_GRAY and data_type == "image_pair")  # 仅 image_pair 且设置为灰度复制模式
-    g_loss_pixel, g_loss_l1, g_loss_mse,g_loss_ssim = pixel_loss(pred_images, gr_images, gray_triplet=gray_triplet)
+    g_loss_pixel, g_loss_l1, g_loss_mse,g_loss_ssim,g_loss_fft = pixel_loss(pred_images, gr_images, gray_triplet=gray_triplet)
     # 正则损失
     """
     这是很常见的现象，这个 RegularizationLoss 本质上是在惩罚图像相邻像素差，也就是一种平滑约束。
@@ -185,6 +185,7 @@ def batch_train(epoch,lr_images,gr_images, i, data_type, device, generator, disc
                g_loss_l1.item(),g_loss_mse.item(),g_loss_ssim.item(),
                p_loss_struct['charbonnier_loss'],p_loss_struct["edge_loss"],p_loss_struct["bright_mask_loss"],p_loss_struct["mass_loss"],p_loss_struct["peak_loss"],p_loss_struct["separation_loss"],
                p_loss_struct["particle_count_loss"],p_loss_struct["particle_density_loss"],
+               g_loss_fft.item(),
                d_loss.item(), real_loss.item(), fake_loss.item())
     # end if i % 2 == 0:
     if i % global_data.esrgan.TRAIN_DATA_SAVING_STEP == 0:

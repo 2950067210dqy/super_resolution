@@ -8,6 +8,28 @@ import inspect
 import torch
 class global_data:
     class esrgan:
+        README = """
+           v1-v8 是生成器颗粒损失的消融实验。
+           将原始的esrgan 根据颗粒图像对进行优化：
+           1） 对生成器进行 #ICNR 初始化 避免棋盘伪影。！注释了
+           2） 重新调整判别器的梯度冻结和启用，并且对更新判别器时重新判别一次。 
+               image_pair 的损失因为我生成了两次previous 和 next 所以计算相关损失要多除以2.
+           3） 启用vgg 19 的14
+           4） 结构loss 和 物理loss还需调参
+           5） 上采样pixelshuffle改成upsample、
+           6） 修改给p_loss传入的参数 之前是判别器判别之后的概率 应该是生成的图像和真实的图像
+           7) 修改训练过程中 临时的验证的次数为1次batch 并且修改平均信噪比和验证损失的逻辑
+           8) 添加_to_gray时图像归一化 
+           9） 添加内容损失的权重 0.8 与对抗损失0.2
+           10） 减少生成器的RRDB 层 由23层减到11层 可以的 速度提高 轻量化、
+           11）将生成器的第一层的卷积层k9换成三个并行的卷积层k3 k5 k7 并联concat 后 1x1的卷积 -> 64
+           12）将上采样部分改得更细一点  每次上采样后接一个小残差块 Upsample Conv LeakyReLU ResidualBlock ,上采样后的细节修复会更强，尤其对小颗粒边缘恢复更有帮助
+           13）改成双帧式针对piv的esrgan
+           14）将卷积的padding 0填充改成反射填充 reflect  replicate 
+               zero padding 像这样： 图像外面全是黑洞卷积一到边缘就看到很多假黑像素
+               reflect padding 像这样：图像边缘像镜子一样往外延伸 卷积在边缘看到的还是类似原图的纹理 解决padding artifact
+           15）
+           """
         #运行环境是否是autoDL
         IS_AUTO_DL = False
         AUTODL_DATA_PATH = rf"/root/autodl-tmp" if IS_AUTO_DL else r""
@@ -15,33 +37,18 @@ class global_data:
         # 训练任务标识
         # =========================
         name = "PIV_esrgan"  # 当前实验名（用于输出目录/模型名/wandb run名）
-        DESCRIPTION = "v_test1"  # 实验补充描述（可写损失配置、数据版本等）
+        DESCRIPTION = "v_test_dyn_advloss"  # 实验补充描述（可写损失配置、数据版本等）
         name +=DESCRIPTION
-        README = """
-        v1-v8 是生成器颗粒损失的消融实验。
-        将原始的esrgan 根据颗粒图像对进行优化：
-        1） 对生成器进行 #ICNR 初始化 避免棋盘伪影。！注释了
-        2） 重新调整判别器的梯度冻结和启用，并且对更新判别器时重新判别一次。 
-            image_pair 的损失因为我生成了两次previous 和 next 所以计算相关损失要多除以2.
-        3） 启用vgg 19 的14
-        4） 结构loss 和 物理loss还需调参
-        5） 上采样pixelshuffle改成upsample、
-        6） 修改给p_loss传入的参数 之前是判别器判别之后的概率 应该是生成的图像和真实的图像
-        7) 修改训练过程中 临时的验证的次数为1次batch 并且修改平均信噪比和验证损失的逻辑
-        8) 添加_to_gray时图像归一化 
-        9） 添加内容损失的权重 0.8 与对抗损失0.2
-        10） 减少生成器的RRDB 层 由23层减到11层 可以的 速度提高 轻量化、
-        11）将生成器的第一层的卷积层k9换成三个并行的卷积层k3 k5 k7 并联concat 后 1x1的卷积 -> 64
-        12）将上采样部分改得更细一点  每次上采样后接一个小残差块 Upsample Conv LeakyReLU ResidualBlock ,上采样后的细节修复会更强，尤其对小颗粒边缘恢复更有帮助
 
-        """#整体项目注释
+        #整体项目注释
         # 类别训练模式: "all" | "single" | "mixed"
         TRAIN_CLASS_MODE = "mixed"
         # 当 TRAIN_CLASS_MODE="single" 时可预设；为 None 则运行时让你输入选择
         SINGLE_CLASS_NAME = None
         # mixed 模式下的目录名/日志名
         MIXED_CLASS_TAG = "mixed_all_classes"
-
+        #每个类别加载多少的数据 50%
+        CLASS_SAMPLE_RATIO =0.4
         # =========================
         # 设备与模型加载
         # =========================
@@ -67,8 +74,20 @@ class global_data:
         # =========================
         # 损失项系数
         # =========================
-        LAMBDA_CONTENT = 0.8  #感知损失的内容损失 1
-        LAMBDA_ADVERSARIAL =0.2 # 感知损失中对抗项权重 0.0005
+        LAMBDA_CONTENT = 1  # 感知损失中的内容项权重
+        # `LAMBDA_ADVERSARIAL` 作为“当前生效值”保留，
+        # 每个 epoch 开始时会由 update_adversarial_weight(...) 动态刷新。
+        LAMBDA_ADVERSARIAL = 0.0005
+        # 动态对抗权重调度：
+        # - 前期让 G 先学稳定重建，避免一上来就被 GAN 拉去造伪纹理
+        # - 中后期再逐步给一点 adversarial，补局部真实感
+        # 注意：这里的 END 不建议再设到 0.2，你已经验证过那会明显放大边界伪影。
+        ADVERSARIAL_WEIGHT_START = 0.0005
+        ADVERSARIAL_WEIGHT_END = 0.05
+        ADVERSARIAL_WARMUP_EPOCHS = EPOCH_NUMS-10
+        ADVERSARIAL_WEIGHT_SCHEDULE = "linear"  # 当前支持: linear | constant
+
+
         LAMBDA_PHYSICAL = 1#感知损失中的内容损失中的物理损失权重 如果需要单独跳里面的参数则设置1
         LAMBDA_STRUCTURE =1#感知损失中内容损失中的结构损失权重 如果需要单独跳里面的参数则设置1
 
@@ -79,18 +98,20 @@ class global_data:
 
 
 
-        LAMBDA_PIXEL_L1 = 0.3  # 像素L1权重 0.5；主重建项，保证整体亮度与局部数值不要漂
-        LAMBDA_PIXEL_FFT = 0.02  # 频域重建约束，稳住颗粒尺度与高频分布；过大容易让结果发硬
-        LAMBDA_PAIR_DELTA = 0.12  # 图像对前后帧差分一致性权重；直接约束 previous/next 的变化量
-        LAMBDA_PAIR_GRADIENT = 0.08  # 图像对差分梯度一致性权重；约束变化边界和位移轮廓
+        LAMBDA_PIXEL_L1 = 0.5 # 像素L1权重 0.5；主重建项，保证整体亮度与局部数值不要漂
+        LAMBDA_PIXEL_FFT = 0.004  # 频域重建约束，稳住颗粒尺度与高频分布；过大容易让结果发硬
         LAMBDA_PIXEL_MSE = 1e-3  # 像素MSE权重（当前基本未启用）
         PIXEL_WHITE_ALPHA = 1.0  # 灰度场白点区域加权系数（当前基本未启用）
         LAMBDA_GRAY_CONS = 1e-2  # 灰度三通道一致性约束权重（当前基本未启用）
-
+        # =========================
+        # 图像对一致性损失超参数
+        # =========================
+        LAMBDA_PAIR_DELTA = 0.012  # 图像对前后帧差分一致性权重；直接约束 previous/next 的变化量
+        LAMBDA_PAIR_GRADIENT = 0.008  # 图像对差分梯度一致性权重；约束变化边界和位移轮廓
         # =========================
         # 结构相似性损失超参数
         # =========================
-        LAMBDA_SSIM = 1    #！important SSIM结构相似损失权重，约束SR与HR在局部结构上的一致性 0.05
+        LAMBDA_SSIM = 0.5    #！important SSIM结构相似损失权重，约束SR与HR在局部结构上的一致性 0.05
 
         SSIM_WINDOW_SIZE = 11  # SSIM高斯窗口大小，用于计算局部结构统计
         SSIM_SIGMA = 1.5  # SSIM高斯窗口标准差，控制局部统计平滑程度
@@ -104,11 +125,11 @@ class global_data:
         LAMBDA_CHARBONNIER,LAMBDA_EDGE,LAMBDA_BRIGHT_MASK太强、LAMBDA_PEAK、LAMBDA_SEPARATION太弱会导致颗粒粘连
         """
         LAMBDA_CHARBONNIER =0 # Charbonnier重建损失权重，控制整体像素级重建精度=0
-        LAMBDA_EDGE =0.003  # 边缘损失权重，控制颗粒边界和轮廓恢复强度0.003
-        LAMBDA_BRIGHT_MASK = 0.008  # 高亮颗粒区域加权损失权重，提升颗粒区域在总损失中的重要性 0.008
-        LAMBDA_MASS =1 # 亮度总量守恒损失权重，约束颗粒总体亮度/质量一致性 #！！这个权重会扰乱结果=0
-        LAMBDA_PEAK = 0.008 # 局部峰值结构损失权重，强化颗粒局部亮峰恢复 0.008
-        LAMBDA_SEPARATION =1 # 颗粒分离损失权重，抑制颗粒粘连和桥接现象0.003
+        LAMBDA_EDGE =0.1  # 边缘损失权重，控制颗粒边界和轮廓恢复强度0.003
+        LAMBDA_BRIGHT_MASK = 0.002  # 高亮颗粒区域加权损失权重，提升颗粒区域在总损失中的重要性 0.008
+        LAMBDA_MASS =0.05 # 亮度总量守恒损失权重，约束颗粒总体亮度/质量一致性 #！！这个权重会扰乱结果=0
+        LAMBDA_PEAK = 0.002 # 局部峰值结构损失权重，强化颗粒局部亮峰恢复 0.008
+        LAMBDA_SEPARATION =0.008 # 颗粒分离损失权重，抑制颗粒粘连和桥接现象0.003
 
         CHARBONNIER_EPS = 1e-4  # Charbonnier损失中的平滑项，防止零点附近不可导并提升训练稳定性
         BRIGHT_THRESHOLD = 0.5  # 高亮颗粒阈值，生成硬mask时用于区分颗粒区域与背景区域
@@ -141,7 +162,7 @@ class global_data:
         g_optimizer_betas = (0.5, 0.999)
         d_optimizer_betas = (0.5, 0.999)
         # 学习率
-        G_LR =0.00008 #0.0001
+        G_LR =0.0001 #0.0001
         D_LR = 0.0001 # 0.0001
         # =========================
         # 数据集划分比例
@@ -204,6 +225,44 @@ class global_data:
         START_TIME = time.time()
         #结束时间
         END_TIME = time.time()
+        @classmethod
+        def get_adversarial_weight(cls, epoch: int) -> float:
+            """
+            根据当前 epoch 返回生效的对抗损失权重。
+
+            设计原则：
+            1. 训练早期优先学习内容重建，避免 GAN 过早主导训练。
+            2. 只做小幅升权，把 adversarial 当作“纹理微调项”，不是主损失。
+            3. 当 warmup 结束后，权重固定在 END，方便实验复现。
+            因为 warmup_epochs = ADVERSARIAL_WARMUP_EPOCHS，所以从 epoch=0 到 epoch=ADVERSARIAL_WARMUP_EPOCHS-1
+            一共 ADVERSARIAL_WARMUP_EPOCHS 个点，线性从 ADVERSARIAL_WEIGHT_START 涨到 ADVERSARIAL_WEIGHT_END
+            """
+            schedule = str(cls.ADVERSARIAL_WEIGHT_SCHEDULE).strip().lower()
+            start = float(cls.ADVERSARIAL_WEIGHT_START)
+            end = float(cls.ADVERSARIAL_WEIGHT_END)
+            warmup_epochs = max(1, int(cls.ADVERSARIAL_WARMUP_EPOCHS))
+
+            if schedule == "constant":
+                return start
+
+            if schedule != "linear":
+                raise ValueError(f"Unsupported ADVERSARIAL_WEIGHT_SCHEDULE: {cls.ADVERSARIAL_WEIGHT_SCHEDULE}")
+
+            if warmup_epochs == 1:
+                return end
+
+            clamped_epoch = min(max(int(epoch), 0), warmup_epochs - 1)
+            progress = clamped_epoch / float(warmup_epochs - 1)
+            return start + (end - start) * progress
+
+        @classmethod
+        def update_adversarial_weight(cls, epoch: int) -> float:
+            """
+            刷新当前 epoch 使用的对抗损失权重，并同步回运行时配置。
+            """
+            cls.LAMBDA_ADVERSARIAL = cls.get_adversarial_weight(epoch)
+            return cls.LAMBDA_ADVERSARIAL
+
         @classmethod
         def ensure_wandb_login(cls):
             if not cls._wandb_logged_in:

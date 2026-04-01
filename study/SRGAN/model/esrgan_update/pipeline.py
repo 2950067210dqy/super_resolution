@@ -100,7 +100,8 @@ def main():
                 test_nums_rate=global_data.esrgan.Test_nums_rate,
                 random_seed=global_data.esrgan.RANDOM_SEED,
                 selected_classes=selected_classes,
-                return_test_loader=True
+                return_test_loader=True,
+                class_sample_ratio=global_data.esrgan.CLASS_SAMPLE_RATIO
             )
             # 每个类别的图像对和flo文件分别训练验证和保存模型
             for data_type in global_data.esrgan.DATA_TYPES:
@@ -202,6 +203,12 @@ def main():
                 训练 start
                 """
                 for epoch in range(global_data.esrgan.EPOCH_NUMS):
+                    # 动态更新对抗损失
+                    current_lambda_adversarial = global_data.esrgan.update_adversarial_weight(epoch)
+                    logger.info(
+                        f"[Train] Epoch {epoch + 1}: current adversarial weight = {current_lambda_adversarial:.6f}"
+                    )
+
                     generator.train()  # 确保生成器在训练模式
                     discriminator.train()  # 确保判别器在训练模式
 

@@ -189,11 +189,14 @@ def build_metadata_cache_path(
     gr_root: Path,
     lr_root: Path,
     class_names: list[str],
+    class_sample_ratio: float = 1.0,
 ) -> Path:
     """
     为当前数据配置生成稳定的元数据缓存文件路径。根据根目录、类别及目录时间戳生成稳定元数据缓存路径。
     """
-    fingerprint_parts = [str(gr_root), str(lr_root)]
+    # 采样比例会直接影响最终收集到的样本集合，
+    # 所以必须把它写进缓存指纹，避免 1.0 和 0.2 误用同一份 metadata cache。
+    fingerprint_parts = [str(gr_root), str(lr_root), f"class_sample_ratio={class_sample_ratio}"]
     for class_name in class_names:
         gr_class_dir = gr_root / class_name / class_name
         lr_class_dir = lr_root / class_name / class_name
@@ -727,6 +730,40 @@ def split_samples_global(
     test_samples = shuffled[n_train + n_val:]
 
     return train_samples, validate_samples, test_samples
+
+
+
+def sample_class_subset(
+    class_samples: list[dict],
+    class_sample_ratio: float,
+    random_seed: int,
+    class_offset: int = 0,
+) -> list[dict]:
+    """
+    按比例从单个类别中稳定抽样。
+
+    - 比例为 1.0 时返回全部样本
+    - 比例在 (0,1) 时按固定随机种子抽样
+    - 当类别非空且比例大于 0 时，至少保留 1 个样本
+    """
+    # ratio=1 代表不裁剪；空类别直接原样返回。
+    if not class_samples or class_sample_ratio >= 1.0:
+        return class_samples
+
+    # 向下取整控制读取比例；只要该类别非空且 ratio>0，就至少保留 1 个样本，
+    # 避免小类别在抽样后被整个删掉。
+    sample_count = max(1, int(len(class_samples) * class_sample_ratio))
+    if sample_count >= len(class_samples):
+        return class_samples
+
+    # 每个类别都用“基础随机种子 + 类别偏移”来抽样：
+    # 1. 同一次配置重复运行时结果稳定；
+    # 2. 不同类别不会因为共用同一个随机序列而拿到相同位置模式。
+    generator = torch.Generator().manual_seed(random_seed + class_offset)
+    sampled_indices = torch.randperm(len(class_samples), generator=generator).tolist()[:sample_count]
+    # 排序后再按原始顺序取回样本，方便日志和后续 cache/debug 更稳定。
+    sampled_indices.sort()
+    return [class_samples[index] for index in sampled_indices]
 
 
 def _bucket_class_name(
@@ -1463,6 +1500,7 @@ def load_data(
     lr_data_root_dir: str,
     lr_data_variant: str = "default",
     selected_classes: str | list[str] | tuple[str, ...] | None = None,
+    class_sample_ratio: float = 1.0,
     batch_size: int = 4,
     num_workers: int = 24,
     shuffle: bool = True,
@@ -1498,6 +1536,8 @@ def load_data(
     参数说明（超参数）:
         - gr_data_root_dir/lr_data_root_dir: GR/LR 数据根目录
         - selected_classes: 只加载指定类别，None 表示全部类别
+        - class_sample_ratio: 每个类别读取比例，1.0 表示全部读取。
+          例如 0.25 表示每个类别只保留约 25% 的配对样本，再参与后续 train/val/test 划分。
         - batch_size: DataLoader 批大小
         - num_workers: DataLoader 并行加载进程数
         - shuffle: 是否打乱训练集
@@ -1526,6 +1566,7 @@ def load_data(
     logger.info(f"[Start] batch_size={batch_size}, num_workers={num_workers}, shuffle={shuffle}")
     logger.info(f"[Start] target_size={target_size}, random_seed={random_seed}")
     logger.info(f"[Start] selected_classes={selected_classes}")
+    logger.info(f"[Start] class_sample_ratio={class_sample_ratio}")
     logger.info(f"[Start] split_mode={'global_mix' if is_global_mix_split else 'per_class'}")
     logger.info(f"[Start] verbose={verbose}")
     logger.info(
@@ -1554,7 +1595,13 @@ def load_data(
     logger.info(f"[Transform] Flow transform: {flow_transform}")
 
     cache_dir = Path(__file__).resolve().parent / ".sr_cache"
-    cache_path = build_metadata_cache_path(cache_dir, gr_root, lr_root, class_names)
+    cache_path = build_metadata_cache_path(
+        cache_dir,
+        gr_root,
+        lr_root,
+        class_names,
+        class_sample_ratio=class_sample_ratio,
+    )
     tensor_cache_root = build_tensor_cache_root(
         cache_dir,
         gr_root,
@@ -1563,23 +1610,46 @@ def load_data(
         target_size,
     ) if use_disk_tensor_cache else None
 
+    # 这里只允许 (0, 1]：
+    # - 1 表示完整读取
+    # - 小于等于 0 没有语义
+    # - 大于 1 会让“比例”这个参数失去直观含义
+    if not 0 < class_sample_ratio <= 1:
+        logger.error(f'class_sample_ratio must be in (0, 1], got {class_sample_ratio}')
+        raise ValueError(f"class_sample_ratio must be in (0, 1], got {class_sample_ratio}")
+
     samples: list[dict]
     if use_metadata_cache and cache_path.exists():
         logger.info(f"[Cache] Loading paired sample metadata from: {cache_path}")
         samples = load_samples_cache(cache_path)
     else:
         samples = []
-        for class_name in progress_iter(class_names, desc="Collect SR samples", total=len(class_names)):
+        for class_offset, class_name in enumerate(progress_iter(class_names, desc="Collect SR samples", total=len(class_names))):
             gr_class_dir = gr_root / class_name / class_name
             lr_class_dir = lr_root / class_name / class_name
+            # 先拿到“该类别下全部已经对齐好的样本”，
+            # 再在类别内部按比例裁剪。这样能保证比例作用在“最终可训练样本”上，
+            # 而不是作用在尚未配对完成的散文件上。
             class_samples = pair_sr_class_samples(
                 class_name,
                 gr_class_dir,
                 lr_class_dir,
                 verbose=verbose,
             )
+            # 记录裁剪前数量，方便日志里同时看到原始规模和实际读取规模。
+            original_class_sample_count = len(class_samples)
+            class_samples = sample_class_subset(
+                class_samples=class_samples,
+                class_sample_ratio=class_sample_ratio,
+                random_seed=random_seed,
+                class_offset=class_offset,
+            )
             samples.extend(class_samples)
-            log_info(f"[Summary] Class '{class_name}' contributes {len(class_samples)} paired samples", verbose)
+            log_info(
+                f"[Summary] Class '{class_name}' contributes {len(class_samples)} paired samples "
+                f"(from {original_class_sample_count}, ratio={class_sample_ratio})",
+                verbose,
+            )
 
         if use_metadata_cache:
             dump_samples_cache(cache_path, samples)

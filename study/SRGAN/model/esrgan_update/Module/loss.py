@@ -824,7 +824,39 @@ class SSIMLoss(nn.Module):
             ssim_value = ssim_map.mean(dim=(1, 2, 3))
 
         return 1.0 - ssim_value
+class FrequencyReconstructionLoss(nn.Module):
+    """
+    频域幅值约束。
 
+    对 PIV 颗粒图像来说，频域分布对应颗粒尺度与空间能量分布，
+    能补足纯像素损失对高频纹理和颗粒间距约束不足的问题。
+    """
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        pred_g = _to_gray(pred)
+        target_g = _to_gray(target)
+
+        # 对灰度图做频域约束即可，因为这里关心的是颗粒尺度/间距对应的能量分布，而不是颜色。
+        pred_fft = torch.fft.fft2(pred_g, norm="ortho")
+        target_fft = torch.fft.fft2(target_g, norm="ortho")
+
+        # 不直接对 complex tensor 用 torch.abs 做反传，
+        # 某些环境/版本下这条复数梯度链会在 backward 里触发
+        # “imag is not implemented for tensors with non-complex dtypes”。
+        # 这里改成显式的实部/虚部幅值计算，保持数学等价但更稳定。
+        pred_fft_ri = torch.view_as_real(pred_fft)
+        target_fft_ri = torch.view_as_real(target_fft)
+
+        pred_amp = torch.log1p(
+            torch.sqrt(pred_fft_ri[..., 0] * pred_fft_ri[..., 0] + pred_fft_ri[..., 1] * pred_fft_ri[..., 1] + 1e-12)
+        )
+        target_amp = torch.log1p(
+            torch.sqrt(
+                target_fft_ri[..., 0] * target_fft_ri[..., 0] +
+                target_fft_ri[..., 1] * target_fft_ri[..., 1] + 1e-12
+            )
+        )
+        return F.l1_loss(pred_amp, target_amp)
 class CombinedPixelLoss(nn.Module):
     """
     组合像素损失：
@@ -837,14 +869,16 @@ class CombinedPixelLoss(nn.Module):
       - 普通 RGB L1 + MSE
     返回: total, l1_term, mse_term
     """
-    def __init__(self, lambda_l1=2e-2, lambda_mse=1e-3, white_alpha=4.0, lambda_cons=1e-2):
+    def __init__(self, lambda_l1=2e-2, lambda_mse=1e-3, white_alpha=4.0, lambda_cons=1e-2, lambda_fft=1e-2):
         super().__init__()
         self.lambda_l1 = lambda_l1
         self.lambda_mse = lambda_mse
         self.white_alpha = white_alpha
         self.lambda_cons = lambda_cons
+        self.lambda_fft = lambda_fft
         self.l1 = nn.SmoothL1Loss()
         self.mse = nn.MSELoss()
+        self.fft = FrequencyReconstructionLoss()
         self.ssim = SSIMLoss(
             window_size=global_data.esrgan.SSIM_WINDOW_SIZE,
             sigma=global_data.esrgan.SSIM_SIGMA,
@@ -856,6 +890,8 @@ class CombinedPixelLoss(nn.Module):
         )
 
     def forward(self, pred, target, gray_triplet=False):
+        # 这里当前统一走“普通多项组合像素损失”。
+        # `gray_triplet` 先保留接口不删，是为了兼容你之前灰度图像对训练时的逻辑接口。
         #优化前
         # if gray_triplet:
         #     pred_gray = pred[:, 0:1]
@@ -879,8 +915,19 @@ class CombinedPixelLoss(nn.Module):
         l1_term = self.l1(pred, target)
         mse_term = self.mse(pred, target)
         SSIM_term = self.ssim(pred, target)
-        total = self.lambda_l1 * l1_term + self.lambda_mse * mse_term+global_data.esrgan.LAMBDA_SSIM*SSIM_term
-        return total, l1_term, mse_term,SSIM_term
+        fft_term = self.fft(pred, target)
+        # total 里四项的角色：
+        # - L1: 主重建项，稳
+        # - MSE: 补充大误差惩罚
+        # - SSIM: 保局部结构
+        # - FFT: 保颗粒尺度与高频能量分布
+        total = (
+            self.lambda_l1 * l1_term +
+            self.lambda_mse * mse_term +
+            global_data.esrgan.LAMBDA_SSIM * SSIM_term +
+            self.lambda_fft * fft_term
+        )
+        return total, l1_term, mse_term, SSIM_term, fft_term
 class Discriminator_loss(nn.Module):
     """
     判别器损失
@@ -907,6 +954,7 @@ pixel_loss = CombinedPixelLoss(
     lambda_mse=global_data.esrgan.LAMBDA_PIXEL_MSE,
     white_alpha=global_data.esrgan.PIXEL_WHITE_ALPHA,
     lambda_cons=global_data.esrgan.LAMBDA_GRAY_CONS,
+    lambda_fft=global_data.esrgan.LAMBDA_PIXEL_FFT,
 ).to(global_data.esrgan.device)
 # 这里vgg是针对三通道RGB图的
 # vgg = vgg19(pretrained=True).features[:15].eval()  # 提取 VGG 特征 srgan 用的vgg
