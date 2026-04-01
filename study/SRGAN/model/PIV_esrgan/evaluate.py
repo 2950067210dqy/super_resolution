@@ -420,6 +420,11 @@ def evaluate_all(
     - CSV: 每样本指标 + 均值行
     - 全局均值能量谱曲线(.npy/.png)
     """
+    # evaluate_all 做的是“全量验证集/测试集统计”，不是训练中的单 batch 快速验证。
+    # 所以这里除了保存每个样本结果，还会：
+    # 1. 按类别写子目录
+    # 2. 按类别写 metrics.csv
+    # 3. 额外汇总 전체 metrics_all.csv
     device = next(generator.parameters()).device
     generator.eval()
 
@@ -440,11 +445,14 @@ def evaluate_all(
         "mse", "psnr", "energy_spectrum_mse", "r2", "ssim", "tke_acc", "nrmse"
     ]
 
+    # 这些属性是在 load_data 里给 validate/test dataset 动态挂上的。
+    # mixed 模式下它们用于把样本重新按真实类别归档。
     dataset = getattr(data_loader, "dataset", None)
     known_class_names = list(getattr(dataset, "known_class_names", []))
     other_name = getattr(dataset, "other_class_name", "other")
 
     def bucket_class_name(sample_class_name: str | None) -> str:
+        # 优先用已知类别；没有命中就归到 other，避免评估阶段因脏类别名直接丢样本。
         if sample_class_name in known_class_names:
             return str(sample_class_name)
         if sample_class_name is None or str(sample_class_name).strip() == "":
@@ -458,6 +466,7 @@ def evaluate_all(
     all_gt_curves = []
 
     def register_curve(bucket_name: str, pred_curve: np.ndarray, gt_curve: np.ndarray) -> None:
+        # 频谱曲线既要进全局统计，也要进分类别统计，所以这里同时登记两份。
         all_pred_curves.append(pred_curve)
         all_gt_curves.append(gt_curve)
         if bucket_name not in curves_by_class:
@@ -466,6 +475,9 @@ def evaluate_all(
         curves_by_class[bucket_name]["gt"].append(gt_curve)
 
     def append_row(row: dict) -> None:
+        # 同一条样本记录：
+        # - rows 用于总表
+        # - rows_by_class 用于类别子表
         rows.append(row)
         bucket = row["class_name"]
         rows_by_class.setdefault(bucket, []).append(row)
@@ -473,6 +485,7 @@ def evaluate_all(
     def save_mean_spectrum(pred_curves: list[np.ndarray], gt_curves: list[np.ndarray], out_dir: Path, title: str) -> None:
         if not pred_curves or not gt_curves:
             return
+        # 不同样本曲线长度可能略有不同，所以先截到共同最短长度再平均。
         min_len = min(min(len(x) for x in pred_curves), min(len(x) for x in gt_curves))
         pred_mean = np.mean(np.stack([x[:min_len] for x in pred_curves], axis=0), axis=0)
         gt_mean = np.mean(np.stack([x[:min_len] for x in gt_curves], axis=0), axis=0)
@@ -511,6 +524,7 @@ def evaluate_all(
 
         for batch_idx, batch in enumerate(pbar):
             batch_class_names = batch.get("class_name", [])
+            # batch['class_name'] 来自 data_load 的 collate_fn，是当前 batch 每个样本的真实类别名列表。
 
             if data_type == "image_pair":
                 lr_prev = batch["image_pair"]["previous"]["lr_data"].to(device)
@@ -530,6 +544,7 @@ def evaluate_all(
                 B = lr_prev.shape[0]
                 for i in range(B):
                     sample_bucket = bucket_class_name(batch_class_names[i] if i < len(batch_class_names) else None)
+                    # 所有属于同一真实类别的样本都写到同一个类别目录下，便于后处理和人工检查。
                     class_root = output_root / sample_bucket
                     class_root.mkdir(parents=True, exist_ok=True)
 
@@ -669,6 +684,7 @@ def evaluate_all(
     mean_row = build_mean_row(rows, class_name)
     all_rows_with_mean = rows + [mean_row]
 
+    # 根目录下的均值频谱图表示“整个 validate/test loader”的总体表现。
     save_mean_spectrum(
         all_pred_curves,
         all_gt_curves,
@@ -685,11 +701,13 @@ def evaluate_all(
         class_root = output_root / bucket_name
         class_root.mkdir(parents=True, exist_ok=True)
         class_mean_row = build_mean_row(class_rows, bucket_name)
+        # 每个类别目录都有自己的 metrics.csv，末尾附一行该类别的均值结果。
         with open(class_root / "metrics.csv", "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=csv_fields)
             writer.writeheader()
             writer.writerows(class_rows + [class_mean_row])
         bucket_curves = curves_by_class.get(bucket_name, {"pred": [], "gt": []})
+        # 每个类别也各自输出一张平均能量谱对比图，方便直接做类间比较。
         save_mean_spectrum(
             bucket_curves["pred"],
             bucket_curves["gt"],

@@ -103,6 +103,18 @@ class RRDB(nn.Module):
 
 
 class PairAwareFeatureFusion(nn.Module):
+    """
+    PIV 图像对特征交互模块。
+
+    设计动机：
+    1. `previous` 和 `next` 两帧不是独立样本，而是同一粒子场在短时间内的两次观测。
+    2. 单帧超分只能学到“像 HR”，但不一定能学到“前后帧位移关系”。
+    3. 这里在编码特征层面引入跨帧消息传递，让网络在恢复当前帧时参考另一帧的颗粒变化。
+
+    结构说明：
+    - `message` 分支负责从 partner 帧和差分特征中提取可迁移信息。
+    - `gate` 分支负责决定这些信息对当前帧到底该注入多少，避免无脑相加带来伪影。
+    """
     def __init__(self, channels=64):
         super().__init__()
         self.message = nn.Sequential(
@@ -118,8 +130,11 @@ class PairAwareFeatureFusion(nn.Module):
         )
 
     def _fuse_one(self, anchor: torch.Tensor, partner: torch.Tensor) -> torch.Tensor:
+        # diff 强调两帧真正发生变化的区域；这些区域往往正是 PIV 位移最敏感的位置。
         diff = torch.abs(anchor - partner)
+        # message 学“另一帧能给当前帧补什么细节”。
         message = self.message(torch.cat([partner, diff], dim=1))
+        # gate 学“该补多少”，让融合是自适应的，而不是固定权重混合。
         gate = self.gate(torch.cat([anchor, partner, diff], dim=1))
         return anchor + gate * message
 
@@ -207,6 +222,7 @@ class Generator(nn.Module):
         self.conv2 = nn.Sequential(
             nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
         )
+        # 只在双帧前向中启用；单帧 forward 不经过这里，保证向后兼容。
         self.pair_fusion = PairAwareFeatureFusion(64)
 
         # 上采样模块
@@ -266,19 +282,28 @@ class Generator(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
     def _encode(self, x: torch.Tensor) -> torch.Tensor:
+        # 三个不同感受野的 stem 分支分别提取：
+        # - 小核：微小颗粒、细边界
+        # - 中核：局部结构
+        # - 大核：较大亮斑和周围上下文
         x1_3 = self.stem3(x)
         x1_5 = self.stem5(x)
         x1_7 = self.stem7(x)
 
         x1 = self.conv1_fuse(torch.cat([x1_3, x1_5, x1_7], dim=1))
+        # 主干仍然是 RRDB 堆叠，负责单帧内部的高频重建。
         x2 = self.residual_blocks(x1)
         x3 = self.conv2(x2)
+        # 返回浅层特征 + 深层残差特征的融合结果，供单帧解码或双帧交互使用。
         return x1 + x3
 
     def _decode(self, features: torch.Tensor) -> torch.Tensor:
+        # 解码阶段保持原来的上采样策略，避免这次改动把双帧交互和解码逻辑耦合得太紧。
         return self.conv_out(self.upsample(features))
 
     def forward_pair(self, prev: torch.Tensor, next_frame: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # 先分别编码，再做跨帧特征融合，最后各自解码。
+        # 这样既保留每一帧自己的外观信息，又显式利用前后帧的运动相关性。
         prev_feat = self._encode(prev)
         next_feat = self._encode(next_frame)
         prev_feat, next_feat = self.pair_fusion(prev_feat, next_feat)
@@ -361,7 +386,6 @@ class Discriminator(nn.Module):
             nn.Conv2d(512, 1024, kernel_size=1, stride=1, padding=0),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Conv2d(1024, 1, kernel_size=1, stride=1, padding=0),
-            nn.Sigmoid()
         )
 
     def forward(self, x):

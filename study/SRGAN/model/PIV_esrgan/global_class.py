@@ -79,10 +79,10 @@ class global_data:
 
 
 
-        LAMBDA_PIXEL_L1 = 0.3  # 像素L1权重 0.5
-        LAMBDA_PIXEL_FFT = 0.02  # 频域重建约束，稳住颗粒尺度与高频分布
-        LAMBDA_PAIR_DELTA = 0.12  # 图像对前后帧差分一致性权重
-        LAMBDA_PAIR_GRADIENT = 0.08  # 图像对差分梯度一致性权重
+        LAMBDA_PIXEL_L1 = 0.3  # 像素L1权重 0.5；主重建项，保证整体亮度与局部数值不要漂
+        LAMBDA_PIXEL_FFT = 0.02  # 频域重建约束，稳住颗粒尺度与高频分布；过大容易让结果发硬
+        LAMBDA_PAIR_DELTA = 0.12  # 图像对前后帧差分一致性权重；直接约束 previous/next 的变化量
+        LAMBDA_PAIR_GRADIENT = 0.08  # 图像对差分梯度一致性权重；约束变化边界和位移轮廓
         LAMBDA_PIXEL_MSE = 1e-3  # 像素MSE权重（当前基本未启用）
         PIXEL_WHITE_ALPHA = 1.0  # 灰度场白点区域加权系数（当前基本未启用）
         LAMBDA_GRAY_CONS = 1e-2  # 灰度三通道一致性约束权重（当前基本未启用）
@@ -178,6 +178,8 @@ class global_data:
         """
         超参数 end
         """
+        # 这里的顺序必须和 train.py 里 metric.add(...) 的顺序一一对应。
+        # 任何一边新增/删除/换位，都要同步改另一边。
         loss_label = ['g_loss', 'g_perceptual_loss', "g_content_loss",
                       "g_adversarial_loss",  'g_loss_pixel',
                       'g_particle_loss','g_physic_loss','g_structure_loss',

@@ -734,6 +734,8 @@ def _bucket_class_name(
     known_class_names: list[str] | tuple[str, ...] | set[str],
     other_name: str = "other",
 ) -> str:
+    # 当 mixed 模式下 validate/test 中出现“未知类别”时，不报错，统一放到 other 桶里。
+    # 这样评估阶段仍然能完整跑完，并且你能在输出目录里看到这些异常样本。
     if sample_class_name in known_class_names:
         return str(sample_class_name)
     return other_name
@@ -744,6 +746,8 @@ def group_samples_by_class(
     known_class_names: list[str],
     other_name: str = "other",
 ) -> dict[str, list[dict]]:
+    # 这里不直接创建多个 DataLoader，而是先做“样本级分桶”。
+    # 原因是训练/验证主流程仍然沿用单个 loader，改动更小、更稳定。
     grouped: dict[str, list[dict]] = defaultdict(list)
     for sample in samples:
         bucket = _bucket_class_name(sample.get("class_name"), known_class_names, other_name=other_name)
@@ -763,6 +767,8 @@ def attach_grouped_class_metadata(
     known_class_names: list[str],
     other_name: str = "other",
 ) -> None:
+    # 动态给 dataset 挂元数据，而不是改 Dataset 构造参数。
+    # 这样能兼容现有 DataLoader / collate_fn / pipeline，不需要级联改很多地方。
     grouped_samples = group_samples_by_class(dataset.samples, known_class_names, other_name=other_name)
     dataset.grouped_samples_by_class = grouped_samples
     dataset.grouped_class_names = list(grouped_samples.keys())
@@ -1615,6 +1621,8 @@ def load_data(
         )
         validate_grouped = group_samples_by_class(validate_samples, available_class_names, other_name="other")
         test_grouped = group_samples_by_class(test_samples, available_class_names, other_name="other")
+        # 这里再展平成 list，不是多此一举：
+        # Dataset 仍然吃扁平样本列表，但顺序已经按类别整理好，同时 metadata 里也保留了真正分组结果。
         validate_samples = [sample for bucket_samples in validate_grouped.values() for sample in bucket_samples]
         test_samples = [sample for bucket_samples in test_grouped.values() for sample in bucket_samples]
         # 用统计方式生成每类汇总，保持打印信息完整

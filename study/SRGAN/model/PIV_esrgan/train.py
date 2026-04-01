@@ -17,6 +17,14 @@ from study.SRGAN.util.image_util import flow_to_color_tensor
 
 
 def _compute_generator_terms(epoch, data_type, discriminator, pred_images, gr_images):
+    """
+    统一计算“单帧生成器侧”的所有损失项。
+
+    这样拆的原因：
+    1. image_pair 的 previous / next 两帧要共享同一套损失定义；
+    2. flo 和 image_pair 的单帧训练也能复用；
+    3. 后续如果继续往里加物理损失，不需要把训练主流程写得越来越乱。
+    """
     probability_pred_images = discriminator(pred_images)
     with torch.no_grad():
         probability_gr_images = discriminator(gr_images)
@@ -26,6 +34,7 @@ def _compute_generator_terms(epoch, data_type, discriminator, pred_images, gr_im
         pred_images, gr_images, probability_pred_images, probability_gr_images, use_adversarial
     )
     gray_triplet = global_data.esrgan.SAVE_AS_GRAY and data_type == "image_pair"
+    # pixel_loss 会返回多个子项，后面日志、csv、可视化会分别记录，便于做消融。
     g_loss_pixel, g_loss_l1, g_loss_mse, g_loss_ssim, g_loss_fft = pixel_loss(
         pred_images, gr_images, gray_triplet=gray_triplet
     )
@@ -46,6 +55,7 @@ def _compute_generator_terms(epoch, data_type, discriminator, pred_images, gr_im
 
 
 def _mean_terms(term_list):
+    # 对 previous / next 两帧的单帧损失做平均，避免图像对训练时某一帧在总损失里权重更大。
     keys = [k for k in term_list[0].keys() if k != "particle_dict"]
     mean_terms = {k: sum(item[k] for item in term_list) / len(term_list) for k in keys}
 
@@ -68,6 +78,7 @@ def _save_training_preview(
     image_pair_type=None,
     SCALE=2,
 ):
+    # 训练中间图只做轻量保存，不参与反向传播；目的是快速观察颗粒是否在朝正确方向恢复。
     if i % global_data.esrgan.TRAIN_DATA_SAVING_STEP != 0:
         return
 
@@ -82,6 +93,7 @@ def _save_training_preview(
         image = image.unsqueeze(0)
 
     if image.shape[1] >= 2 and data_type == "flo":
+        # flo 可视化统一用 GT 的 99 分位速度幅值做颜色参考，减少不同样本之间色标漂移。
         hr_u = gr_images[:, 0]
         hr_v = gr_images[:, 1]
         hr_mag_uv = torch.sqrt(hr_u * hr_u + hr_v * hr_v)
@@ -134,12 +146,22 @@ def image_pair_train(
     class_name,
     SCALE,
 ):
+    """
+    图像对联合训练。
+
+    和旧逻辑的关键区别：
+    - 旧逻辑：previous / next 各当一张单图单独训练
+    - 新逻辑：两帧一起 forward，单帧损失求平均，再叠加 pair temporal loss
+
+    这样模型学到的不只是“每张图清晰”，还会学“前后帧变化要合理”。
+    """
     lr_prev = batch[data_type]["previous"]["lr_data"].to(device)
     hr_prev = batch[data_type]["previous"]["gr_data"].to(device)
     lr_next = batch[data_type]["next"]["lr_data"].to(device)
     hr_next = batch[data_type]["next"]["gr_data"].to(device)
 
     if hasattr(generator, "forward_pair"):
+        # 如果生成器支持双帧联合前向，就优先走这条路径。
         pred_prev, pred_next = generator.forward_pair(lr_prev, lr_next)
     else:
         pred_prev = generator(lr_prev)
@@ -152,6 +174,7 @@ def image_pair_train(
     next_terms = _compute_generator_terms(epoch, data_type, discriminator, pred_next, hr_next)
     mean_terms = _mean_terms([prev_terms, next_terms])
 
+    # temporal loss 显式约束前后帧差分图的一致性，这是 PIV 图像对任务和普通超分最不同的地方。
     pair_temporal_total, pair_temporal_dict = image_pair_temporal_loss(pred_prev, pred_next, hr_prev, hr_next)
     g_loss = mean_terms["perceptual_loss"] + mean_terms["pixel_total"] + mean_terms["particle_total"] + pair_temporal_total
 
@@ -170,6 +193,7 @@ def image_pair_train(
     pred_real_next_d = discriminator(hr_next)
     d_next, fake_next, real_next = descriminator_loss(pred_fake_next_d, pred_real_next_d)
 
+    # 判别器对两帧分别判别，再取平均，保持 previous / next 在对抗学习上的地位一致。
     d_loss = 0.5 * (d_prev + d_next)
     fake_loss = 0.5 * (fake_prev + fake_next)
     real_loss = 0.5 * (real_prev + real_next)
@@ -186,6 +210,7 @@ def image_pair_train(
     })
 
     metric.add(
+        # 注意这里的记录顺序必须和 global_class.loss_label 完全一致，否则 csv/plot 会错位。
         g_loss.item(),
         mean_terms["perceptual_loss"].item(),
         mean_terms["content_loss"].item(),
@@ -233,6 +258,7 @@ def flow_train(
     class_name,
     SCALE,
 ):
+    # flo 保持单帧路径，不引入 pair temporal loss，避免把图像对假设硬套到流场上。
     lr_images = batch[data_type]["lr_data"].to(device)
     gr_images = batch[data_type]["gr_data"].to(device)
     batch_train(
@@ -270,12 +296,20 @@ def batch_train(
     image_pair_type=None,
     SCALE=2,
 ) -> None:
+    """
+    单帧训练路径。
+
+    这个函数主要服务两种情况：
+    1. flo 训练
+    2. 不走 forward_pair 的单图像训练
+    """
     pred_images = generator(lr_images)
 
     for p in discriminator.parameters():
         p.requires_grad = False
 
     terms = _compute_generator_terms(epoch, data_type, discriminator, pred_images, gr_images)
+    # 单帧训练没有 pair temporal loss，对应日志项统一记 0，保证 csv 列结构不变。
     zero_pair = torch.zeros((), device=device)
     g_loss = terms["perceptual_loss"] + terms["pixel_total"] + terms["particle_total"]
 

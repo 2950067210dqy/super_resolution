@@ -29,7 +29,9 @@ class GANLoss(nn.Module):
     """
     def __init__(self):
         super().__init__()
-        self.bce = nn.BCELoss()
+        # RaGAN / ESRGAN 这里应该吃“logits”，不是已经过 sigmoid 的概率。
+        # 用 BCEWithLogitsLoss 后，输入不需要限制在 [0,1]，数值稳定性也更好。
+        self.bce = nn.BCEWithLogitsLoss()
 
     def forward(self, pred, target_is_real):
         target = torch.ones_like(pred) if target_is_real else torch.zeros_like(pred)
@@ -838,11 +840,26 @@ class FrequencyReconstructionLoss(nn.Module):
         pred_g = _to_gray(pred)
         target_g = _to_gray(target)
 
+        # 对灰度图做频域约束即可，因为这里关心的是颗粒尺度/间距对应的能量分布，而不是颜色。
         pred_fft = torch.fft.fft2(pred_g, norm="ortho")
         target_fft = torch.fft.fft2(target_g, norm="ortho")
 
-        pred_amp = torch.log1p(torch.abs(pred_fft))
-        target_amp = torch.log1p(torch.abs(target_fft))
+        # 不直接对 complex tensor 用 torch.abs 做反传，
+        # 某些环境/版本下这条复数梯度链会在 backward 里触发
+        # “imag is not implemented for tensors with non-complex dtypes”。
+        # 这里改成显式的实部/虚部幅值计算，保持数学等价但更稳定。
+        pred_fft_ri = torch.view_as_real(pred_fft)
+        target_fft_ri = torch.view_as_real(target_fft)
+
+        pred_amp = torch.log1p(
+            torch.sqrt(pred_fft_ri[..., 0] * pred_fft_ri[..., 0] + pred_fft_ri[..., 1] * pred_fft_ri[..., 1] + 1e-12)
+        )
+        target_amp = torch.log1p(
+            torch.sqrt(
+                target_fft_ri[..., 0] * target_fft_ri[..., 0] +
+                target_fft_ri[..., 1] * target_fft_ri[..., 1] + 1e-12
+            )
+        )
         return F.l1_loss(pred_amp, target_amp)
 
 class CombinedPixelLoss(nn.Module):
@@ -878,6 +895,8 @@ class CombinedPixelLoss(nn.Module):
         )
 
     def forward(self, pred, target, gray_triplet=False):
+        # 这里当前统一走“普通多项组合像素损失”。
+        # `gray_triplet` 先保留接口不删，是为了兼容你之前灰度图像对训练时的逻辑接口。
         #优化前
         # if gray_triplet:
         #     pred_gray = pred[:, 0:1]
@@ -902,6 +921,11 @@ class CombinedPixelLoss(nn.Module):
         mse_term = self.mse(pred, target)
         SSIM_term = self.ssim(pred, target)
         fft_term = self.fft(pred, target)
+        # total 里四项的角色：
+        # - L1: 主重建项，稳
+        # - MSE: 补充大误差惩罚
+        # - SSIM: 保局部结构
+        # - FFT: 保颗粒尺度与高频能量分布
         total = (
             self.lambda_l1 * l1_term +
             self.lambda_mse * mse_term +
@@ -937,7 +961,10 @@ class ImagePairTemporalConsistencyLoss(nn.Module):
         pred_delta = _to_gray(pred_next) - _to_gray(pred_prev)
         target_delta = _to_gray(target_next) - _to_gray(target_prev)
 
+        # delta_loss 关注“变化量本身是否对”。
         delta_loss = self.charbonnier(pred_delta, target_delta)
+        # gradient_loss 关注“变化发生的位置和边界是否对”。
+        # 两者一起用，能减少前后帧颗粒位移被生成为大面积模糊亮块的问题。
         gradient_loss = self.edge(pred_delta, target_delta)
         total_loss = self.delta_weight * delta_loss + self.gradient_weight * gradient_loss
 
@@ -988,6 +1015,7 @@ particle_loss = ParticleTotalLoss(
     lambda_structure=global_data.esrgan.LAMBDA_STRUCTURE,
     lambda_physical=global_data.esrgan.LAMBDA_PHYSICAL
 ).to(global_data.esrgan.device)
+# 这个 loss 只在 image_pair 联合训练时使用；flo 或单帧路径默认不会走这里。
 image_pair_temporal_loss = ImagePairTemporalConsistencyLoss(
     delta_weight=global_data.esrgan.LAMBDA_PAIR_DELTA,
     gradient_weight=global_data.esrgan.LAMBDA_PAIR_GRADIENT,
