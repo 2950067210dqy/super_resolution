@@ -13,14 +13,14 @@ from torchvision.utils import save_image
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
-from SRGAN.model.esrgan_update.Module.loss import pixel_loss
-from study.SRGAN.model.esrgan_update.global_class import global_data
-from study.SRGAN.model.esrgan_update.judge_delicators import _to_np_chw, _mse, _psnr_from_mse, _energy_spectrum_mse, \
+from SRGAN.model.PIV_esrgan.Module.loss import pixel_loss
+from study.SRGAN.model.PIV_esrgan.global_class import global_data
+from study.SRGAN.model.PIV_esrgan.judge_delicators import _to_np_chw, _mse, _psnr_from_mse, _energy_spectrum_mse, \
     _r2_score, _ssim_score, _tke_reconstruction_accuracy, _nrmse, _energy_spectrum_curves
 
 
-from study.SRGAN.model.esrgan_update.visual_plot_init import build_flo_uvw_compare_panel
-from study.SRGAN.model.esrgan_update.visual_plot_save import save_vorticity_quiver_compare, _save_triplet, \
+from study.SRGAN.model.PIV_esrgan.visual_plot_init import build_flo_uvw_compare_panel
+from study.SRGAN.model.PIV_esrgan.visual_plot_save import save_vorticity_quiver_compare, _save_triplet, \
     _save_energy_spectrum_plot
 from study.SRGAN.util.image_util import flow_to_color_tensor, build_triplet_row, add_vertical_separator, \
     add_horizontal_separator, _select_metric_or_save_channels
@@ -111,8 +111,11 @@ def validate_and_save(result_dir, generator, val_dataloader, device, epoch, data
                 lr_next = batch["image_pair"]["next"]["lr_data"].to(device)
                 hr_next = batch["image_pair"]["next"]["gr_data"].to(device)
 
-                fake_prev = generator(lr_prev)
-                fake_next = generator(lr_next)
+                if hasattr(generator, "forward_pair"):
+                    fake_prev, fake_next = generator.forward_pair(lr_prev, lr_next)
+                else:
+                    fake_prev = generator(lr_prev)
+                    fake_next = generator(lr_next)
 
                 resize_lr_prev = F.interpolate(
                     lr_prev,
@@ -235,7 +238,7 @@ def validate_flow(generator, dataloader, device):
             hr_images = batch["flo"]['gr_data'].to(device)
             lr_images, hr_images = lr_images.to(device), hr_images.to(device)
             fake_images = generator(lr_images)
-            _, _, mse_total,ssim_total= pixel_loss(fake_images, hr_images, False)
+            _, _, mse_total, ssim_total, _ = pixel_loss(fake_images, hr_images, False)
             total_val_ssim_loss += ssim_total.item()
             total_val_mse_loss += mse_total.item()
             loss_count += 1
@@ -261,16 +264,19 @@ def validate_image_pair(generator, dataloader, device):
 
     with torch.no_grad():
         for batch in dataloader:
-            for image_pair_type in global_data.esrgan.IMAGE_PAIR_TYPES:
-                lr_images = batch["image_pair"][image_pair_type]["lr_data"].to(device)
-                hr_images = batch["image_pair"][image_pair_type]["gr_data"].to(device)
+            lr_prev = batch["image_pair"]["previous"]["lr_data"].to(device)
+            hr_prev = batch["image_pair"]["previous"]["gr_data"].to(device)
+            lr_next = batch["image_pair"]["next"]["lr_data"].to(device)
+            hr_next = batch["image_pair"]["next"]["gr_data"].to(device)
 
-                fake_images = generator(lr_images)
+            if hasattr(generator, "forward_pair"):
+                fake_prev, fake_next = generator.forward_pair(lr_prev, lr_next)
+            else:
+                fake_prev = generator(lr_prev)
+                fake_next = generator(lr_next)
 
-                gray_triplet = (
-                    global_data.esrgan.SAVE_AS_GRAY and image_pair_type == "image_pair"
-                )
-                _, _, mse_total, ssim_total = pixel_loss(fake_images, hr_images, gray_triplet)
+            for fake_images, hr_images in ((fake_prev, hr_prev), (fake_next, hr_next)):
+                _, _, mse_total, ssim_total, _ = pixel_loss(fake_images, hr_images, global_data.esrgan.SAVE_AS_GRAY)
                 total_val_ssim_loss += ssim_total.item()
                 total_val_mse_loss += mse_total.item()
                 loss_count += 1
@@ -364,13 +370,14 @@ def evaluate(epoch,class_name,data_type,device,
     animator.save_png(
         f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.LOSS_DIR}/train_loss_epoch_{epoch + 1}_{global_data.esrgan.name}.png",
         fixed_groups=[
-            [loss_label[0], loss_label[11]],
-            [loss_label[1], loss_label[2], loss_label[3]],
-            [loss_label[4], loss_label[8], loss_label[9], loss_label[10]],
-            [loss_label[5], loss_label[6], loss_label[7]],
-            [loss_label[11], loss_label[12], loss_label[13]],
-            [loss_label[14], loss_label[15], loss_label[16], loss_label[17], loss_label[18], loss_label[19]],
-            [loss_label[20], loss_label[21]],
+            ["g_loss", "d_loss"],
+            ["g_perceptual_loss", "g_content_loss", "g_adversarial_loss"],
+            ["g_loss_pixel", "g_loss_pixel_l1", "g_loss_pixel_mse", "g_loss_ssim", "g_loss_fft"],
+            ["g_pair_temporal_loss", "g_pair_delta_loss", "g_pair_gradient_loss"],
+            ["g_particle_loss", "g_physic_loss", "g_structure_loss"],
+            ["d_loss", "d_real_loss", "d_fake_loss"],
+            ["g_CHARBONNIER_loss", "g_edge_loss", "g_BRIGHT_MASK_loss", "g_MASS_loss", "g_peak_loss", "g_SEPARATION_loss"],
+            ["g_PARTICLE_COUNT_loss", "g_PARTICLE_DENSITY_loss"],
             [validate_label[0], validate_label[1], validate_label[2]]
         ])
     pass
@@ -433,9 +440,65 @@ def evaluate_all(
         "mse", "psnr", "energy_spectrum_mse", "r2", "ssim", "tke_acc", "nrmse"
     ]
 
+    dataset = getattr(data_loader, "dataset", None)
+    known_class_names = list(getattr(dataset, "known_class_names", []))
+    other_name = getattr(dataset, "other_class_name", "other")
+
+    def bucket_class_name(sample_class_name: str | None) -> str:
+        if sample_class_name in known_class_names:
+            return str(sample_class_name)
+        if sample_class_name is None or str(sample_class_name).strip() == "":
+            return other_name
+        return str(sample_class_name) if not known_class_names else other_name
+
     rows = []
+    rows_by_class: dict[str, list[dict]] = {}
+    curves_by_class: dict[str, dict[str, list[np.ndarray]]] = {}
     all_pred_curves = []
     all_gt_curves = []
+
+    def register_curve(bucket_name: str, pred_curve: np.ndarray, gt_curve: np.ndarray) -> None:
+        all_pred_curves.append(pred_curve)
+        all_gt_curves.append(gt_curve)
+        if bucket_name not in curves_by_class:
+            curves_by_class[bucket_name] = {"pred": [], "gt": []}
+        curves_by_class[bucket_name]["pred"].append(pred_curve)
+        curves_by_class[bucket_name]["gt"].append(gt_curve)
+
+    def append_row(row: dict) -> None:
+        rows.append(row)
+        bucket = row["class_name"]
+        rows_by_class.setdefault(bucket, []).append(row)
+
+    def save_mean_spectrum(pred_curves: list[np.ndarray], gt_curves: list[np.ndarray], out_dir: Path, title: str) -> None:
+        if not pred_curves or not gt_curves:
+            return
+        min_len = min(min(len(x) for x in pred_curves), min(len(x) for x in gt_curves))
+        pred_mean = np.mean(np.stack([x[:min_len] for x in pred_curves], axis=0), axis=0)
+        gt_mean = np.mean(np.stack([x[:min_len] for x in gt_curves], axis=0), axis=0)
+        np.save(out_dir / "energy_spectrum_pred_mean.npy", pred_mean.astype(np.float32))
+        np.save(out_dir / "energy_spectrum_gt_mean.npy", gt_mean.astype(np.float32))
+        _save_energy_spectrum_plot(pred_mean, gt_mean, out_dir / "energy_spectrum_mean_compare.png", title=title)
+
+    def build_mean_row(target_rows: list[dict], bucket_name: str) -> dict:
+        def _mean_of(key: str) -> float:
+            vals = [float(r[key]) for r in target_rows if np.isfinite(float(r[key]))]
+            return float(np.mean(vals)) if vals else float("nan")
+
+        return {
+            "class_name": bucket_name,
+            "data_type": data_type,
+            "scale": int(SCALE * SCALE),
+            "sample_id": "MEAN",
+            "pair_type": "all",
+            "mse": _mean_of("mse"),
+            "psnr": _mean_of("psnr"),
+            "energy_spectrum_mse": _mean_of("energy_spectrum_mse"),
+            "r2": _mean_of("r2"),
+            "ssim": _mean_of("ssim"),
+            "tke_acc": _mean_of("tke_acc"),
+            "nrmse": _mean_of("nrmse"),
+        }
 
     with torch.no_grad():
         pbar = tqdm(
@@ -447,74 +510,56 @@ def evaluate_all(
         )
 
         for batch_idx, batch in enumerate(pbar):
+            batch_class_names = batch.get("class_name", [])
+
             if data_type == "image_pair":
                 lr_prev = batch["image_pair"]["previous"]["lr_data"].to(device)
                 hr_prev = batch["image_pair"]["previous"]["gr_data"].to(device)
                 lr_next = batch["image_pair"]["next"]["lr_data"].to(device)
                 hr_next = batch["image_pair"]["next"]["gr_data"].to(device)
 
-                fake_prev = generator(lr_prev)
-                fake_next = generator(lr_next)
+                if hasattr(generator, "forward_pair"):
+                    fake_prev, fake_next = generator.forward_pair(lr_prev, lr_next)
+                else:
+                    fake_prev = generator(lr_prev)
+                    fake_next = generator(lr_next)
 
                 lr_prev_up = F.interpolate(lr_prev, size=hr_prev.shape[2:], mode="nearest")
                 lr_next_up = F.interpolate(lr_next, size=hr_next.shape[2:], mode="nearest")
 
                 B = lr_prev.shape[0]
                 for i in range(B):
+                    sample_bucket = bucket_class_name(batch_class_names[i] if i < len(batch_class_names) else None)
+                    class_root = output_root / sample_bucket
+                    class_root.mkdir(parents=True, exist_ok=True)
+
                     for pair_type, lr1_up, fk1, hr1 in [
                         ("previous", lr_prev_up[i:i+1], fake_prev[i:i+1], hr_prev[i:i+1]),
                         ("next",     lr_next_up[i:i+1], fake_next[i:i+1], hr_next[i:i+1]),
                     ]:
-                        sid = f"batch_{batch_idx}_idx_{i}_fid_{batch_idx*len(batch)+i}_{pair_type}"
-                        one_dir = output_root / sid
+                        sid = f"batch_{batch_idx}_idx_{i}_fid_{batch_idx}_{pair_type}"
+                        one_dir = class_root / sid
                         one_dir.mkdir(parents=True, exist_ok=True)
 
-                        lr_eval = _select_metric_or_save_channels(
-                            lr1_up, "image_pair", global_data.esrgan.SAVE_AS_GRAY
-                        )
-                        fk_eval = _select_metric_or_save_channels(
-                            fk1, "image_pair", global_data.esrgan.SAVE_AS_GRAY
-                        )
-                        hr_eval = _select_metric_or_save_channels(
-                            hr1, "image_pair", global_data.esrgan.SAVE_AS_GRAY
-                        )
+                        lr_eval = _select_metric_or_save_channels(lr1_up, "image_pair", global_data.esrgan.SAVE_AS_GRAY)
+                        fk_eval = _select_metric_or_save_channels(fk1, "image_pair", global_data.esrgan.SAVE_AS_GRAY)
+                        hr_eval = _select_metric_or_save_channels(hr1, "image_pair", global_data.esrgan.SAVE_AS_GRAY)
 
                         lr_save = lr_eval.clamp(0, 1)
                         fk_save = fk_eval.clamp(0, 1)
                         hr_save = hr_eval.clamp(0, 1)
 
-                        # if data_type == "image_pair" and global_data.esrgan.SAVE_AS_GRAY:
-                        #     # 强制单通道保存，避免任何上游残留导致彩色输出
-                        #     if lr_save.shape[1] > 1:
-                        #         lr_save = lr_save[:, 0:1, :, :]
-                        #     if fk_save.shape[1] > 1:
-                        #         fk_save = fk_save[:, 0:1, :, :]
-                        #     if hr_save.shape[1] > 1:
-                        #         hr_save = hr_save[:, 0:1, :, :]
-                        #
-                        #     if lr_save.shape[1] != 1 or fk_save.shape[1] != 1 or hr_save.shape[1] != 1:
-                        #         logger.error(f'SAVE_AS_GRAY=True expects 1-channel save tensors, got lr={lr_save.shape[1]}, fake={fk_save.shape[1]}, hr={hr_save.shape[1]}')
-                        #         raise ValueError(
-                        #             f"SAVE_AS_GRAY=True expects 1-channel save tensors, got "
-                        #             f"lr={lr_save.shape[1]}, fake={fk_save.shape[1]}, hr={hr_save.shape[1]}"
-                        #         )
-
-                        # 1) 自身图
                         save_image(lr_save, str(one_dir / "lr.png"), normalize=False)
                         save_image(fk_save, str(one_dir / "fake.png"), normalize=False)
                         save_image(hr_save, str(one_dir / "hr.png"), normalize=False)
 
-                        # 2) 差异图
                         diff = (fk_save - hr_save).abs()
                         diff_gray = diff if diff.shape[1] == 1 else diff.mean(dim=1, keepdim=True)
                         save_image(diff, str(one_dir / "diff_abs.png"), normalize=False)
                         save_image(diff_gray, str(one_dir / "diff_abs_gray.png"), normalize=False)
                         save_image(diff_gray / (diff_gray.max() + 1e-8), str(one_dir / "diff_abs_gray_norm.png"), normalize=False)
-
-                        # 3) 三联图
                         _save_triplet(lr_save, fk_save, hr_save, one_dir / "image_triplet.png")
 
-                        # 4) 指标与能量谱
                         p = _to_np_chw(fk_eval[0])
                         g = _to_np_chw(hr_eval[0])
 
@@ -529,16 +574,11 @@ def evaluate_all(
                         pred_curve, gt_curve = _energy_spectrum_curves(p, g)
                         np.save(one_dir / "energy_spectrum_pred.npy", pred_curve.astype(np.float32))
                         np.save(one_dir / "energy_spectrum_gt.npy", gt_curve.astype(np.float32))
-                        _save_energy_spectrum_plot(
-                            pred_curve, gt_curve,
-                            one_dir / "energy_spectrum_compare.png",
-                            title=f"{sid} Energy Spectrum"
-                        )
-                        all_pred_curves.append(pred_curve)
-                        all_gt_curves.append(gt_curve)
+                        _save_energy_spectrum_plot(pred_curve, gt_curve, one_dir / "energy_spectrum_compare.png", title=f"{sid} Energy Spectrum")
+                        register_curve(sample_bucket, pred_curve, gt_curve)
 
-                        rows.append({
-                            "class_name": class_name,
+                        append_row({
+                            "class_name": sample_bucket,
                             "data_type": data_type,
                             "scale": int(SCALE * SCALE),
                             "sample_id": sid,
@@ -556,13 +596,16 @@ def evaluate_all(
                 lr = batch["flo"]["lr_data"].to(device)
                 hr = batch["flo"]["gr_data"].to(device)
                 fake = generator(lr)
-
                 lr_up = F.interpolate(lr, size=hr.shape[2:], mode="nearest")
                 B = lr.shape[0]
 
                 for i in range(B):
-                    sid = f"batch_{batch_idx}_idx_{i}_fid_{batch_idx*len(batch)+i}"
-                    one_dir = output_root / sid
+                    sample_bucket = bucket_class_name(batch_class_names[i] if i < len(batch_class_names) else None)
+                    class_root = output_root / sample_bucket
+                    class_root.mkdir(parents=True, exist_ok=True)
+
+                    sid = f"batch_{batch_idx}_idx_{i}_fid_{batch_idx}"
+                    one_dir = class_root / sid
                     one_dir.mkdir(parents=True, exist_ok=True)
 
                     lr1 = lr[i:i+1]
@@ -570,12 +613,10 @@ def evaluate_all(
                     fk1 = fake[i:i+1]
                     hr1 = hr[i:i+1]
 
-                    # 1) flo 本身
                     np.save(one_dir / "lr_flo.npy", _to_np_chw(lr1[0]).transpose(1, 2, 0))
                     np.save(one_dir / "fake_flo.npy", _to_np_chw(fk1[0]).transpose(1, 2, 0))
                     np.save(one_dir / "hr_flo.npy", _to_np_chw(hr1[0]).transpose(1, 2, 0))
 
-                    # 2) 颜色流场三联图
                     hr_u = hr1[:, 0]
                     hr_v = hr1[:, 1]
                     hr_mag_uv = torch.sqrt(hr_u * hr_u + hr_v * hr_v)
@@ -586,16 +627,10 @@ def evaluate_all(
                     hr_color, _ = flow_to_color_tensor(hr1[:, :2], ref_max_rad=ref_max_rad)
                     _save_triplet(lr_color, fk_color, hr_color, one_dir / "flow_triplet.png")
 
-                    # 3) U/V/S 图
                     uvs_panel = build_flo_uvw_compare_panel(lr_up1, fk1, hr1)
                     save_image(uvs_panel.clamp(0, 1), str(one_dir / "uvs_compare.png"), normalize=False)
+                    save_vorticity_quiver_compare(lr1, fk1, hr1, str(one_dir / "vorticity_quiver.png"), stride=stride)
 
-                    # 4) 瞬时涡量矢量图
-                    save_vorticity_quiver_compare(
-                        lr1, fk1, hr1, str(one_dir / "vorticity_quiver.png"), stride=stride
-                    )
-
-                    # 5) 指标与能量谱
                     p = _to_np_chw(fk1[0])
                     g = _to_np_chw(hr1[0])
 
@@ -610,16 +645,11 @@ def evaluate_all(
                     pred_curve, gt_curve = _energy_spectrum_curves(p, g)
                     np.save(one_dir / "energy_spectrum_pred.npy", pred_curve.astype(np.float32))
                     np.save(one_dir / "energy_spectrum_gt.npy", gt_curve.astype(np.float32))
-                    _save_energy_spectrum_plot(
-                        pred_curve, gt_curve,
-                        one_dir / "energy_spectrum_compare.png",
-                        title=f"{sid} Energy Spectrum"
-                    )
-                    all_pred_curves.append(pred_curve)
-                    all_gt_curves.append(gt_curve)
+                    _save_energy_spectrum_plot(pred_curve, gt_curve, one_dir / "energy_spectrum_compare.png", title=f"{sid} Energy Spectrum")
+                    register_curve(sample_bucket, pred_curve, gt_curve)
 
-                    rows.append({
-                        "class_name": class_name,
+                    append_row({
+                        "class_name": sample_bucket,
                         "data_type": data_type,
                         "scale": int(SCALE * SCALE),
                         "sample_id": sid,
@@ -636,46 +666,36 @@ def evaluate_all(
                 logger.error(f'Unsupported data_type: {data_type}')
                 raise ValueError(f"Unsupported data_type: {data_type}")
 
-    # 计算均值行
-    def _mean_of(key: str) -> float:
-        vals = [float(r[key]) for r in rows if np.isfinite(float(r[key]))]
-        return float(np.mean(vals)) if vals else float("nan")
+    mean_row = build_mean_row(rows, class_name)
+    all_rows_with_mean = rows + [mean_row]
 
-    mean_row = {
-        "class_name": class_name,
-        "data_type": data_type,
-        "scale": int(SCALE * SCALE),
-        "sample_id": "MEAN",
-        "pair_type": "all",
-        "mse": _mean_of("mse"),
-        "psnr": _mean_of("psnr"),
-        "energy_spectrum_mse": _mean_of("energy_spectrum_mse"),
-        "r2": _mean_of("r2"),
-        "ssim": _mean_of("ssim"),
-        "tke_acc": _mean_of("tke_acc"),
-        "nrmse": _mean_of("nrmse"),
-    }
-    rows.append(mean_row)
+    save_mean_spectrum(
+        all_pred_curves,
+        all_gt_curves,
+        output_root,
+        title=f"{class_name}-{data_type}-x{int(SCALE*SCALE)} Mean Energy Spectrum",
+    )
 
-    # 保存全局均值能量谱曲线
-    if all_pred_curves and all_gt_curves:
-        min_len = min(min(len(x) for x in all_pred_curves), min(len(x) for x in all_gt_curves))
-        pred_mean = np.mean(np.stack([x[:min_len] for x in all_pred_curves], axis=0), axis=0)
-        gt_mean = np.mean(np.stack([x[:min_len] for x in all_gt_curves], axis=0), axis=0)
-
-        np.save(output_root / "energy_spectrum_pred_mean.npy", pred_mean.astype(np.float32))
-        np.save(output_root / "energy_spectrum_gt_mean.npy", gt_mean.astype(np.float32))
-        _save_energy_spectrum_plot(
-            pred_mean, gt_mean,
-            output_root / "energy_spectrum_mean_compare.png",
-            title=f"{class_name}-{data_type}-x{int(SCALE*SCALE)} Mean Energy Spectrum"
-        )
-
-    # CSV 保存
     with open(metrics_csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=csv_fields)
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(all_rows_with_mean)
+
+    for bucket_name, class_rows in rows_by_class.items():
+        class_root = output_root / bucket_name
+        class_root.mkdir(parents=True, exist_ok=True)
+        class_mean_row = build_mean_row(class_rows, bucket_name)
+        with open(class_root / "metrics.csv", "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=csv_fields)
+            writer.writeheader()
+            writer.writerows(class_rows + [class_mean_row])
+        bucket_curves = curves_by_class.get(bucket_name, {"pred": [], "gt": []})
+        save_mean_spectrum(
+            bucket_curves["pred"],
+            bucket_curves["gt"],
+            class_root,
+            title=f"{bucket_name}-{data_type}-x{int(SCALE*SCALE)} Mean Energy Spectrum",
+        )
 
     logger.info(f"[evaluate_all] metrics csv: {metrics_csv_path}")
     logger.info(f"[evaluate_all] sample outputs: {output_root}")

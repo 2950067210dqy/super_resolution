@@ -14,8 +14,8 @@ class global_data:
         # =========================
         # 训练任务标识
         # =========================
-        name = "esrgan_update"  # 当前实验名（用于输出目录/模型名/wandb run名）
-        DESCRIPTION = "v_test10"  # 实验补充描述（可写损失配置、数据版本等）
+        name = "PIV_esrgan"  # 当前实验名（用于输出目录/模型名/wandb run名）
+        DESCRIPTION = "v_test1"  # 实验补充描述（可写损失配置、数据版本等）
         name +=DESCRIPTION
         README = """
         v1-v8 是生成器颗粒损失的消融实验。
@@ -36,7 +36,7 @@ class global_data:
 
         """#整体项目注释
         # 类别训练模式: "all" | "single" | "mixed"
-        TRAIN_CLASS_MODE = "all"
+        TRAIN_CLASS_MODE = "mixed"
         # 当 TRAIN_CLASS_MODE="single" 时可预设；为 None 则运行时让你输入选择
         SINGLE_CLASS_NAME = None
         # mixed 模式下的目录名/日志名
@@ -67,7 +67,7 @@ class global_data:
         # =========================
         # 损失项系数
         # =========================
-        LAMBDA_CONTENT = 0.1  #感知损失的内容损失 1
+        LAMBDA_CONTENT = 0.8  #感知损失的内容损失 1
         LAMBDA_ADVERSARIAL =0.2 # 感知损失中对抗项权重 0.0005
         LAMBDA_PHYSICAL = 1#感知损失中的内容损失中的物理损失权重 如果需要单独跳里面的参数则设置1
         LAMBDA_STRUCTURE =1#感知损失中内容损失中的结构损失权重 如果需要单独跳里面的参数则设置1
@@ -80,9 +80,13 @@ class global_data:
 
 
         LAMBDA_PIXEL_L1 = 0.3  # 像素L1权重 0.5
+        LAMBDA_PIXEL_FFT = 0.02  # 频域重建约束，稳住颗粒尺度与高频分布
+        LAMBDA_PAIR_DELTA = 0.12  # 图像对前后帧差分一致性权重
+        LAMBDA_PAIR_GRADIENT = 0.08  # 图像对差分梯度一致性权重
         LAMBDA_PIXEL_MSE = 1e-3  # 像素MSE权重（当前基本未启用）
         PIXEL_WHITE_ALPHA = 1.0  # 灰度场白点区域加权系数（当前基本未启用）
         LAMBDA_GRAY_CONS = 1e-2  # 灰度三通道一致性约束权重（当前基本未启用）
+
         # =========================
         # 结构相似性损失超参数
         # =========================
@@ -177,7 +181,8 @@ class global_data:
         loss_label = ['g_loss', 'g_perceptual_loss', "g_content_loss",
                       "g_adversarial_loss",  'g_loss_pixel',
                       'g_particle_loss','g_physic_loss','g_structure_loss',
-                      "g_loss_pixel_l1", "g_loss_pixel_mse",'g_loss_ssim',
+                      "g_loss_pixel_l1", "g_loss_pixel_mse",'g_loss_ssim', 'g_loss_fft',
+                      'g_pair_temporal_loss', 'g_pair_delta_loss', 'g_pair_gradient_loss',
                       'd_loss', 'd_real_loss', 'd_fake_loss',
                       'g_CHARBONNIER_loss','g_edge_loss','g_BRIGHT_MASK_loss','g_MASS_loss','g_peak_loss','g_SEPARATION_loss',
                       'g_PARTICLE_COUNT_loss','g_PARTICLE_DENSITY_loss',

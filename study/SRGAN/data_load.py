@@ -729,6 +729,47 @@ def split_samples_global(
     return train_samples, validate_samples, test_samples
 
 
+def _bucket_class_name(
+    sample_class_name: str | None,
+    known_class_names: list[str] | tuple[str, ...] | set[str],
+    other_name: str = "other",
+) -> str:
+    if sample_class_name in known_class_names:
+        return str(sample_class_name)
+    return other_name
+
+
+def group_samples_by_class(
+    samples: list[dict],
+    known_class_names: list[str],
+    other_name: str = "other",
+) -> dict[str, list[dict]]:
+    grouped: dict[str, list[dict]] = defaultdict(list)
+    for sample in samples:
+        bucket = _bucket_class_name(sample.get("class_name"), known_class_names, other_name=other_name)
+        grouped[bucket].append(sample)
+
+    ordered_grouped: dict[str, list[dict]] = {}
+    for class_name in known_class_names:
+        if grouped.get(class_name):
+            ordered_grouped[class_name] = grouped[class_name]
+    if grouped.get(other_name):
+        ordered_grouped[other_name] = grouped[other_name]
+    return ordered_grouped
+
+
+def attach_grouped_class_metadata(
+    dataset: Dataset,
+    known_class_names: list[str],
+    other_name: str = "other",
+) -> None:
+    grouped_samples = group_samples_by_class(dataset.samples, known_class_names, other_name=other_name)
+    dataset.grouped_samples_by_class = grouped_samples
+    dataset.grouped_class_names = list(grouped_samples.keys())
+    dataset.known_class_names = list(known_class_names)
+    dataset.other_class_name = other_name
+
+
 # ==============================
 # Dataset / collate
 # ==============================
@@ -1572,6 +1613,10 @@ def load_data(
             test_nums_rate=test_nums_rate,
             random_seed=random_seed,
         )
+        validate_grouped = group_samples_by_class(validate_samples, available_class_names, other_name="other")
+        test_grouped = group_samples_by_class(test_samples, available_class_names, other_name="other")
+        validate_samples = [sample for bucket_samples in validate_grouped.values() for sample in bucket_samples]
+        test_samples = [sample for bucket_samples in test_grouped.values() for sample in bucket_samples]
         # 用统计方式生成每类汇总，保持打印信息完整
         train_counter = Counter([s["class_name"] for s in train_samples])
         val_counter = Counter([s["class_name"] for s in validate_samples])
@@ -1642,6 +1687,10 @@ def load_data(
         tensor_cache_root=tensor_cache_root,
     ) if test_size > 0 else None
 
+    attach_grouped_class_metadata(validate_dataset, available_class_names, other_name="other")
+    if test_dataset is not None:
+        attach_grouped_class_metadata(test_dataset, available_class_names, other_name="other")
+
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -1675,6 +1724,13 @@ def load_data(
     logger.info(f"[Done] Train samples: {train_size}")
     logger.info(f"[Done] Validate samples: {val_size}")
     logger.info(f"[Done] Test samples: {test_size}")
+
+    if is_global_mix_split:
+        for bucket_name, bucket_samples in validate_dataset.grouped_samples_by_class.items():
+            logger.info(f"[Done] Validate bucket '{bucket_name}': {len(bucket_samples)}")
+        if test_dataset is not None:
+            for bucket_name, bucket_samples in test_dataset.grouped_samples_by_class.items():
+                logger.info(f"[Done] Test bucket '{bucket_name}': {len(bucket_samples)}")
 
     for class_name in class_names:
         class_summary = split_summary.get(class_name, {"total": 0, "train": 0, "val": 0, "test": 0})

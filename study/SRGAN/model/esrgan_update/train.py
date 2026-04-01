@@ -183,6 +183,8 @@ def batch_train(epoch,lr_images,gr_images, i, data_type, device, generator, disc
                adversarial_loss.item(), g_loss_pixel.item(),
                p_loss,p_loss_struct['weighted_particle_physical_loss'].item(),p_loss_struct['weighted_particle_structure_loss'].item(),
                g_loss_l1.item(),g_loss_mse.item(),g_loss_ssim.item(),
+               p_loss_struct['charbonnier_loss'],p_loss_struct["edge_loss"],p_loss_struct["bright_mask_loss"],p_loss_struct["mass_loss"],p_loss_struct["peak_loss"],p_loss_struct["separation_loss"],
+               p_loss_struct["particle_count_loss"],p_loss_struct["particle_density_loss"],
                d_loss.item(), real_loss.item(), fake_loss.item())
     # end if i % 2 == 0:
     if i % global_data.esrgan.TRAIN_DATA_SAVING_STEP == 0:
