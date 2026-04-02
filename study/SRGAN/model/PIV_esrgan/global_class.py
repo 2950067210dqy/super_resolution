@@ -37,7 +37,7 @@ class global_data:
         # 训练任务标识
         # =========================
         name = "PIV_esrgan"  # 当前实验名（用于输出目录/模型名/wandb run名）
-        DESCRIPTION = "v_test_dyn_advloss"  # 实验补充描述（可写损失配置、数据版本等）
+        DESCRIPTION = "v_test_dyn_advloss_r"  # 实验补充描述（可写损失配置、数据版本等）
         name +=DESCRIPTION
 
         #整体项目注释
