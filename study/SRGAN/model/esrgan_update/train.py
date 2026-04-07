@@ -171,12 +171,12 @@ def batch_train(epoch,lr_images,gr_images, i, data_type, device, generator, disc
     d_loss.backward()
     d_optimizer.step()
     """判别器训练 end"""
-    # 在进度条上显示损失
-    train_progress_bar.set_postfix({
-        "class": class_name,
-        "D Loss": d_loss.item(),
-        "G Loss": g_loss.item()
-    })
+    # # 在进度条上显示损失
+    # train_progress_bar.set_postfix({
+    #     "class": class_name,
+    #     "D Loss": d_loss.item(),
+    #     "G Loss": g_loss.item()
+    # })
 
     # 需要和loss_label对应
     metric.add(g_loss.item(), perceptual_loss_value.item(),content_loss.item(),

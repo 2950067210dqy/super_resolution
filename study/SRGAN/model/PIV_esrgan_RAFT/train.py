@@ -3,16 +3,16 @@ import os
 import torch
 import torchvision
 
-from study.SRGAN.model.PIV_esrgan.global_class import global_data
-from study.SRGAN.model.PIV_esrgan.Module.loss import (
+from study.SRGAN.model.PIV_esrgan_RAFT.global_class import global_data
+from study.SRGAN.model.PIV_esrgan_RAFT.Module.loss import (
     descriminator_loss,
     image_pair_temporal_loss,
     particle_loss,
     perceptual_loss,
     pixel_loss,
 )
-from study.SRGAN.model.PIV_esrgan.visual_plot_init import build_flo_uvw_fake_panel
-from study.SRGAN.model.PIV_esrgan.visual_plot_save import save_vorticity_quiver_single
+from study.SRGAN.model.PIV_esrgan_RAFT.visual_plot_init import build_flo_uvw_fake_panel
+from study.SRGAN.model.PIV_esrgan_RAFT.visual_plot_save import save_vorticity_quiver_single
 from study.SRGAN.util.image_util import flow_to_color_tensor
 
 
