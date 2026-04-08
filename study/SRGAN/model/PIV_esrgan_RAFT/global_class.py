@@ -60,6 +60,7 @@ class global_data:
         # =========================
         device = torch.device("cuda")  # 训练设备
         IS_LOAD_EXISTS_MODEL = False  # 是否从已保存模型断点继续训练
+        AMP =True #是否开启混合精度训练
         # =========================
         # 可视化与保存相关
         # =========================
@@ -76,6 +77,10 @@ class global_data:
         RANDOM_SEED = 42  # 数据划分随机种子
         # SCALES = [2,math.sqrt(8),4] # 生成器上采样倍率（内部两次 PixelShuffle）
         SCALES = [2]  # 生成器上采样倍率（内部两次 PixelShuffle）
+        # =========================
+        # RAFT 配置
+        # =========================
+        GRU_ITERS = 12 #RAFT的GRU迭代次数 12
 
         # =========================
         # 损失项系数
@@ -89,7 +94,7 @@ class global_data:
         # - 中后期再逐步给一点 adversarial，补局部真实感
         # 注意：这里的 END 不建议再设到 0.2，你已经验证过那会明显放大边界伪影。
         ADVERSARIAL_WEIGHT_START = 0.0005
-        ADVERSARIAL_WEIGHT_END = 0.05
+        ADVERSARIAL_WEIGHT_END = 0.02
         ADVERSARIAL_WARMUP_EPOCHS = EPOCH_NUMS-10
         ADVERSARIAL_WEIGHT_SCHEDULE = "linear"  # 当前支持: linear | constant
 
@@ -124,41 +129,7 @@ class global_data:
         SSIM_DATA_RANGE = 1.0  # 图像动态范围，若输入已归一化到[0,1]则设为1.0
         SSIM_K1 = 0.01  # SSIM常数项k1，用于稳定亮度项
         SSIM_K2 = 0.03  # SSIM常数项k2，用于稳定对比度项
-        # =========================
-        # 颗粒结构保真损失超参数
-        # =========================
-        """
-        LAMBDA_CHARBONNIER,LAMBDA_EDGE,LAMBDA_BRIGHT_MASK太强、LAMBDA_PEAK、LAMBDA_SEPARATION太弱会导致颗粒粘连
-        """
-        LAMBDA_CHARBONNIER =0 # Charbonnier重建损失权重，控制整体像素级重建精度=0
-        LAMBDA_EDGE =0.1  # 边缘损失权重，控制颗粒边界和轮廓恢复强度0.003
-        LAMBDA_BRIGHT_MASK = 0.002  # 高亮颗粒区域加权损失权重，提升颗粒区域在总损失中的重要性 0.008
-        LAMBDA_MASS =0.05 # 亮度总量守恒损失权重，约束颗粒总体亮度/质量一致性 #！！这个权重会扰乱结果=0
-        LAMBDA_PEAK = 0.002 # 局部峰值结构损失权重，强化颗粒局部亮峰恢复 0.008
-        LAMBDA_SEPARATION =0.008 # 颗粒分离损失权重，抑制颗粒粘连和桥接现象0.003
 
-        CHARBONNIER_EPS = 1e-4  # Charbonnier损失中的平滑项，防止零点附近不可导并提升训练稳定性
-        BRIGHT_THRESHOLD = 0.5  # 高亮颗粒阈值，生成硬mask时用于区分颗粒区域与背景区域
-        USE_SOFT_MASK = True  # 是否使用软mask；True表示直接使用HR亮度作为权重，False表示使用二值mask
-
-        BRIGHT_BASE_WEIGHT = 1.0  # 高亮mask损失中的背景基础权重
-        BRIGHT_PEAK_WEIGHT = 1.0  # 高亮mask损失中的颗粒附加权重，值越大越强调颗粒区域
-
-        PEAK_KERNEL_SIZE = 3  # 局部峰值损失的邻域窗口大小，用于提取颗粒局部峰结构
-        SEPARATION_KERNEL_SIZE = 5  # 颗粒分离损失的邻域窗口大小，用于计算中心-邻域对比度
-        # =========================
-        # 颗粒物理分布损失超参数
-        # =========================
-        LAMBDA_PARTICLE_COUNT = 0.5  # 颗粒数量损失权重，约束SR与HR中的颗粒总量一致 0  #！！这个权重会扰乱结果 可能是识别数量有问题
-        LAMBDA_PARTICLE_DENSITY = 0.5  # 颗粒局部密度分布损失权重，约束颗粒空间统计分布一致 0.008
-
-        PARTICLE_THRESHOLD = 0.5  # 颗粒阈值，用于从灰度图中提取颗粒占据区域
-        PARTICLE_SHARPNESS = 20.0  # 软阈值Sigmoid斜率，值越大越接近硬阈值
-        PARTICLE_COUNT_EPS = 1e-6  # 颗粒数量损失中的数值稳定项，防止分母为零
-
-        PARTICLE_DENSITY_KERNEL_SIZE = 9  # 局部密度估计窗口大小，决定局部统计范围
-        PARTICLE_DENSITY_SIGMA = 2.0  # 高斯密度核标准差，控制密度平滑程度
-        PARTICLE_DENSITY_USE_GAUSSIAN = True  # 是否使用高斯核构建局部密度图，False时改为均值池化
         # =========================
         # 优化器超参数
         # =========================
@@ -167,9 +138,11 @@ class global_data:
         # 优化器 betas
         g_optimizer_betas = (0.5, 0.999)
         d_optimizer_betas = (0.5, 0.999)
+        RAFT_optimizer_betas = (0.5, 0.999)
         # 学习率
         G_LR =0.0001 #0.0001
         D_LR = 0.0001 # 0.0001
+        RAFT_LR =0.0001
         # =========================
         # 数据集划分比例
         # =========================
@@ -198,8 +171,9 @@ class global_data:
         Path(OUT_PUT_DIR).mkdir(parents=True, exist_ok=True)
 
         # 需要训练的数据类型  # 参与训练的数据模态
+        DATA_TYPES = ['RAFT']
         # DATA_TYPES = ['image_pair', 'flo']
-        DATA_TYPES = ['image_pair']
+        # DATA_TYPES = ['image_pair']
         # DATA_TYPES =['flo']
         IMAGE_PAIR_TYPES = ['previous', 'next']  # 图像对中的两个时刻/帧
         """
@@ -209,12 +183,10 @@ class global_data:
         # 任何一边新增/删除/换位，都要同步改另一边。
         loss_label = ['g_loss', 'g_perceptual_loss', "g_content_loss",
                       "g_adversarial_loss",  'g_loss_pixel',
-                      'g_particle_loss','g_physic_loss','g_structure_loss',
                       "g_loss_pixel_l1", "g_loss_pixel_mse",'g_loss_ssim', 'g_loss_fft',
                       'g_pair_temporal_loss', 'g_pair_delta_loss', 'g_pair_gradient_loss',
                       'd_loss', 'd_real_loss', 'd_fake_loss',
-                      'g_CHARBONNIER_loss','g_edge_loss','g_BRIGHT_MASK_loss','g_MASS_loss','g_peak_loss','g_SEPARATION_loss',
-                      'g_PARTICLE_COUNT_loss','g_PARTICLE_DENSITY_loss',
+                      'raft_loss', 'raft_epe','raft_1px', 'raft_3px','raft_5px',
                       ]
         validate_label = ['VAL_MSE_LOSS','VAL_SSIM_Loss', 'Avg_PSNR']
         # 存储数据至csv的列名

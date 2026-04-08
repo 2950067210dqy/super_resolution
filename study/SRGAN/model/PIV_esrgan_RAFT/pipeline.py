@@ -15,14 +15,30 @@ from tqdm import tqdm
 import wandb
 from study.SRGAN.data_load import get_class_names, load_data, save_loaders_paths
 
-from study.SRGAN.model.PIV_esrgan_RAFT.Module.model import Generator, Discriminator
+
+
+from study.SRGAN.model.PIV_esrgan_RAFT.Module.PIV_ESRGAN_RAFT_Model import PIV_ESRGAN_RAFT
 from study.SRGAN.model.PIV_esrgan_RAFT.evaluate import evaluate, evaluate_all
 from study.SRGAN.model.PIV_esrgan_RAFT.global_class import global_data
-from study.SRGAN.model.PIV_esrgan_RAFT.train import image_pair_train, flow_train
+from study.SRGAN.model.PIV_esrgan_RAFT.train import image_pair_train, flow_train, esrgan_union_RAFT_train
 from study.SRGAN.util.CSV_operator import CsvTable
 from study.SRGAN.util.accumulator import Accumulator
 from study.SRGAN.util.animator import Animator
-
+try:
+    from torch.cuda.amp import GradScaler
+except:
+    # dummy GradScaler for PyTorch < 1.6
+    class GradScaler:
+        def __init__(self):
+            pass
+        def scale(self, loss):
+            return loss
+        def unscale_(self, optimizer):
+            pass
+        def step(self, optimizer):
+            optimizer.step()
+        def update(self):
+            pass
 def select_single_class(available_class_names, preset_name=None):
     """
     单类别训练时选择类别：
@@ -103,171 +119,164 @@ def main():
                 class_sample_ratio=global_data.esrgan.CLASS_SAMPLE_RATIO,
                 return_test_loader=True
             )
-            # 每个类别的图像对和flo文件分别训练验证和保存模型
-            for data_type in global_data.esrgan.DATA_TYPES:
-                # Start a new wandb run to track this script.
-                wandb.init(
-                    entity="2950067210-usst",
-                    project="esrgan",
-                    name=f"{global_data.esrgan.name}_{global_data.esrgan.DESCRIPTION}_{class_name}_{data_type}",
-                    config={
-                        "createTime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "IS_AUTO_DL": global_data.esrgan.IS_AUTO_DL,
-                        "epochs": global_data.esrgan.EPOCH_NUMS,
-                        "batch_size": global_data.esrgan.BATCH_SIZE,
-                        "lr_G":global_data.esrgan. G_LR,
-                        "lr_D": global_data.esrgan.D_LR,
-                        "RANDOM_SEED":global_data.esrgan. RANDOM_SEED,
-                        "SCALE": SCALE,
-                        "SHUFFLE": global_data.esrgan.SHUFFLE,
-                        "LAMBDA_ADVERSARIAL": global_data.esrgan.LAMBDA_ADVERSARIAL,
-                        "LAMBDA_regularization_loss": global_data.esrgan.LAMBDA_regularization_loss,
-                        "LAMBDA_loss_pixel": global_data.esrgan.LAMBDA_loss_pixel,
-                        "LAMBDA_PIXEL_L1": global_data.esrgan.LAMBDA_PIXEL_L1,
-                        "LAMBDA_PIXEL_MSE": global_data.esrgan.LAMBDA_PIXEL_MSE,
-                        "PIXEL_WHITE_ALPHA": global_data.esrgan.PIXEL_WHITE_ALPHA,
-                        "LAMBDA_GRAY_CONS": global_data.esrgan.LAMBDA_GRAY_CONS,
-                        "SAVE_AS_GRAY": global_data.esrgan.SAVE_AS_GRAY,
-                        "weight_decay": global_data.esrgan.weight_decay,
-                        "g_optimizer_betas": global_data.esrgan.g_optimizer_betas,
-                        "d_optimizer_betas": global_data.esrgan.d_optimizer_betas,
-                        "Train_nums_rate": global_data.esrgan.Train_nums_rate,
-                        "Validate_nums_rate": global_data.esrgan.Validate_nums_rate,
-                        "Test_nums_rate": global_data.esrgan.Test_nums_rate,
-                        "train_mode": mode,
-                        "selected_classes": selected_classes if selected_classes is not None else "ALL_MIXED",
-                    },
-                )
+            # 每个类别的图像对和flo文件分别训练验证和保存模型 ！！！！！已经去除
+            # Start a new wandb run to track this script.
+            wandb.init(
+                entity="2950067210-usst",
+                project="esrgan",
+                name=f"{global_data.esrgan.name}_{global_data.esrgan.DESCRIPTION}_{class_name}_{data_type}",
+                config={
+                    "createTime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "IS_AUTO_DL": global_data.esrgan.IS_AUTO_DL,
+                    "epochs": global_data.esrgan.EPOCH_NUMS,
+                    "batch_size": global_data.esrgan.BATCH_SIZE,
+                    "lr_G":global_data.esrgan. G_LR,
+                    "lr_D": global_data.esrgan.D_LR,
+                    "RANDOM_SEED":global_data.esrgan. RANDOM_SEED,
+                    "SCALE": SCALE,
+                    "SHUFFLE": global_data.esrgan.SHUFFLE,
+                    "LAMBDA_ADVERSARIAL": global_data.esrgan.LAMBDA_ADVERSARIAL,
+                    "LAMBDA_regularization_loss": global_data.esrgan.LAMBDA_regularization_loss,
+                    "LAMBDA_loss_pixel": global_data.esrgan.LAMBDA_loss_pixel,
+                    "LAMBDA_PIXEL_L1": global_data.esrgan.LAMBDA_PIXEL_L1,
+                    "LAMBDA_PIXEL_MSE": global_data.esrgan.LAMBDA_PIXEL_MSE,
+                    "PIXEL_WHITE_ALPHA": global_data.esrgan.PIXEL_WHITE_ALPHA,
+                    "LAMBDA_GRAY_CONS": global_data.esrgan.LAMBDA_GRAY_CONS,
+                    "SAVE_AS_GRAY": global_data.esrgan.SAVE_AS_GRAY,
+                    "weight_decay": global_data.esrgan.weight_decay,
+                    "g_optimizer_betas": global_data.esrgan.g_optimizer_betas,
+                    "d_optimizer_betas": global_data.esrgan.d_optimizer_betas,
+                    "Train_nums_rate": global_data.esrgan.Train_nums_rate,
+                    "Validate_nums_rate": global_data.esrgan.Validate_nums_rate,
+                    "Test_nums_rate": global_data.esrgan.Test_nums_rate,
+                    "train_mode": mode,
+                    "selected_classes": selected_classes if selected_classes is not None else "ALL_MIXED",
+                },
+            )
+            data_type="RAFT"
+            # 创建文件夹
+            Path(f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.LOSS_DIR}").mkdir(
+                parents=True, exist_ok=True)
+            Path(f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.TRAINING_DIR}").mkdir(
+                parents=True, exist_ok=True)
+            Path(f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.MODEL_DIR}").mkdir(
+                parents=True, exist_ok=True)
+            Path(f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.PREDICT_DIR}").mkdir(
+                parents=True, exist_ok=True)
+            Path(f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.PREDICT_ALL_DIR}").mkdir(
+                parents=True, exist_ok=True)
+            Path(f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.LOG_DIR}").mkdir(
+                parents=True, exist_ok=True)
 
-                # 创建文件夹
-                Path(f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.LOSS_DIR}").mkdir(
-                    parents=True, exist_ok=True)
-                Path(f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.TRAINING_DIR}").mkdir(
-                    parents=True, exist_ok=True)
-                Path(f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.MODEL_DIR}").mkdir(
-                    parents=True, exist_ok=True)
-                Path(f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.PREDICT_DIR}").mkdir(
-                    parents=True, exist_ok=True)
-                Path(f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.PREDICT_ALL_DIR}").mkdir(
-                    parents=True, exist_ok=True)
-                Path(f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.LOG_DIR}").mkdir(
-                    parents=True, exist_ok=True)
+            #初始化训练日志
+            logger.add(
+                f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.LOG_DIR}/training.log",
+                rotation="100 MB",
+                retention="30 days",
+                level="DEBUG",
+                format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {process.name} | {thread.name} | {name}:{module}:{line} | {message}",
+                enqueue=True,
+                backtrace=True,
+                diagnose=True,
 
-                #初始化训练日志
-                logger.add(
-                    f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.LOG_DIR}/training.log",
-                    rotation="100 MB",
-                    retention="30 days",
-                    level="DEBUG",
-                    format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {process.name} | {thread.name} | {name}:{module}:{line} | {message}",
-                    enqueue=True,
-                    backtrace=True,
-                    diagnose=True,
+            )
+            animator = Animator(xlabel='epoch', xlim=[1, global_data.esrgan.EPOCH_NUMS], ylim=[0, 0.5],
+                                legend=global_data.esrgan.loss_label + global_data.esrgan.validate_label)
 
-                )
-                animator = Animator(xlabel='epoch', xlim=[1, global_data.esrgan.EPOCH_NUMS], ylim=[0, 0.5],
-                                    legend=global_data.esrgan.loss_label + global_data.esrgan.validate_label)
-
-                generator = Generator(inner_chanel=3).to(global_data.esrgan.device)
-                discriminator = Discriminator(inner_chanel=3).to(global_data.esrgan.device)
-                if global_data.esrgan.csvOperator is None:
-                    global_data.esrgan.csvOperator = CsvTable(
-                        file_path=f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.LOSS_DIR}/loss_{class_name} _{data_type}_scale_{int(SCALE * SCALE)}.csv",
-                        columns=global_data.esrgan.CSV_COLUMNS)
+            PIV_ESRGAN_RAFT_model = PIV_ESRGAN_RAFT(inner_chanel=3).to(global_data.esrgan.device)
+            if global_data.esrgan.csvOperator is None:
+                global_data.esrgan.csvOperator = CsvTable(
+                    file_path=f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.LOSS_DIR}/loss_{class_name} _{data_type}_scale_{int(SCALE * SCALE)}.csv",
+                    columns=global_data.esrgan.CSV_COLUMNS)
+            else:
+                global_data.esrgan.csvOperator.switch_file(
+                    file_path=f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.LOSS_DIR}/loss_{class_name} _{data_type}_scale_{int(SCALE * SCALE)}.csv")
+            if global_data.esrgan.IS_LOAD_EXISTS_MODEL:
+                PIV_ESRGAN_RAFT_model_save_path = f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.MODEL_DIR}/PIV_ESRGAN_RAFT_model_{global_data.esrgan.name}.pth"
+                if os.path.exists(PIV_ESRGAN_RAFT_model_save_path):
+                    PIV_ESRGAN_RAFT_model.load_state_dict(torch.load(PIV_ESRGAN_RAFT_model_save_path, map_location=global_data.esrgan.device))
+                    logger.info(f"Loaded pretrained model PIV_ESRGAN_RAFT_model from {PIV_ESRGAN_RAFT_model_save_path}")
                 else:
-                    global_data.esrgan.csvOperator.switch_file(
-                        file_path=f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.LOSS_DIR}/loss_{class_name} _{data_type}_scale_{int(SCALE * SCALE)}.csv")
-                if global_data.esrgan.IS_LOAD_EXISTS_MODEL:
-                    generator_save_path = f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.MODEL_DIR}/discriminator_{global_data.esrgan.name}.pth"
-                    if os.path.exists(generator_save_path):
-                        generator.load_state_dict(torch.load(generator_save_path, map_location=global_data.esrgan.device))
-                        logger.info(f"Loaded pretrained model generator from {generator_save_path}")
-                    else:
-                        logger.info("No pretrained model generator found. Starting training from scratch.")
+                    logger.info("No pretrained model PIV_ESRGAN_RAFT_model found. Starting training from scratch.")
 
-                    discriminator_save_path = f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.MODEL_DIR}/generator_{global_data.esrgan.name}.pth"
-                    if os.path.exists(discriminator_save_path):
-                        discriminator.load_state_dict(torch.load(discriminator_save_path, map_location=global_data.esrgan.device))
-                        logger.info(f"Loaded pretrained model discriminator from {discriminator_save_path}")
-                    else:
-                        logger.info("No pretrained model discriminator found. Starting training from scratch.")
 
-                g_optimizer = torch.optim.Adam(generator.parameters(), lr=global_data.esrgan.G_LR, betas=global_data.esrgan.g_optimizer_betas,
-                                               weight_decay=global_data.esrgan.weight_decay)
-                d_optimizer = torch.optim.Adam(discriminator.parameters(), lr=global_data.esrgan.D_LR, betas=global_data.esrgan.d_optimizer_betas,
-                                               weight_decay=global_data.esrgan.weight_decay)
 
-                global_data.esrgan.START_TIME = time.time()
-                # 轮数
-                """
-                训练 start
-                """
-                for epoch in range(global_data.esrgan.EPOCH_NUMS):
-                    #动态更新对抗损失
-                    current_lambda_adversarial = global_data.esrgan.update_adversarial_weight(epoch)
-                    logger.info(
-                        f"[Train] Epoch {epoch + 1}: current adversarial weight = {current_lambda_adversarial:.6f}"
-                    )
-                    generator.train()  # 确保生成器在训练模式
-                    discriminator.train()  # 确保判别器在训练模式
+            PIV_ESRGAN_RAFT_model_g_optimizer = torch.optim.Adam(PIV_ESRGAN_RAFT_model.piv_esrgan_generator.parameters(), lr=global_data.esrgan.G_LR, betas=global_data.esrgan.g_optimizer_betas,
+                                           weight_decay=global_data.esrgan.weight_decay)
+            PIV_ESRGAN_RAFT_model_d_optimizer = torch.optim.Adam(PIV_ESRGAN_RAFT_model.piv_esrgan_discriminator.parameters(), lr=global_data.esrgan.D_LR, betas=global_data.esrgan.d_optimizer_betas,
+                                           weight_decay=global_data.esrgan.weight_decay)
 
-                    metric = Accumulator(len(global_data.esrgan.loss_label))
-                    train_progress_bar = tqdm(train_loader,
-                                              desc=f"Epoch [{epoch + 1}/{global_data.esrgan.EPOCH_NUMS}] {class_name} {data_type} scale_{int(SCALE * SCALE)} Training",
-                                              unit="batch", dynamic_ncols=True,
-                                            ascii=True,
-                                            leave=True,
+            PIV_ESRGAN_RAFT_model_RAFT_optimizeroptimizer = torch.optim.AdamW(PIV_ESRGAN_RAFT_model.piv_RAFT.parameters(), lr=global_data.esrgan.RAFT_LR, betas=global_data.esrgan.RAFT_optimizer_betas,)
+            PIV_ESRGAN_RAFT_model_scaler = GradScaler()
 
-                                              )
 
-                    for i, batch in enumerate(train_progress_bar):
-                        """ 图片对训练"""
-                        if data_type == "image_pair":
-                            image_pair_train(
-                                epoch=epoch,batch=batch, i=i, g_optimizer=g_optimizer,
-                                d_optimizer=d_optimizer, generator=generator,
-                                discriminator=discriminator, train_progress_bar=train_progress_bar,
-                                metric=metric, data_type=data_type, device=global_data.esrgan.device, class_name=class_name, SCALE=SCALE
-                            )
-                        elif data_type == "flo":
-                            """flo文件训练"""
-                            flow_train(
-                                epoch=epoch,batch=batch, i=i, g_optimizer=g_optimizer,
-                                d_optimizer=d_optimizer, generator=generator,
-                                discriminator=discriminator, train_progress_bar=train_progress_bar,
-                                metric=metric, data_type=data_type, device=global_data.esrgan.device, class_name=class_name, SCALE=SCALE
-                            )
-                    # 每轮结束后评价一次 验证集只取一轮batch
-                    evaluate(epoch=epoch, class_name=class_name, data_type=data_type, device=global_data.esrgan.device,
-                             generator=generator, discriminator=discriminator, animator=animator, validate_loader=validate_loader,
-                             loss_label=global_data.esrgan.loss_label,validate_label=global_data.esrgan. validate_label, SCALE=SCALE,
-                             csvOperator=global_data.esrgan.csvOperator,metric=metric,train_loader_lens=len(train_loader))
-
-                wandb.finish()
-                """
-                训练 end
-                """
-
-                """
-                验证集全部验证一遍 start
-                """
-                evaluate_all(
-                    generator=generator,
-                    data_loader=validate_loader,
-                    class_name=class_name,
-                    data_type=data_type,
-                    SCALE=SCALE,
-                    output_root=f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.PREDICT_ALL_DIR}",
-                    metrics_csv_path=f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.PREDICT_ALL_DIR}/metrics_all.csv",
-                    stride=6,
+            global_data.esrgan.START_TIME = time.time()
+            # 轮数
+            """
+            训练 start
+            """
+            for epoch in range(global_data.esrgan.EPOCH_NUMS):
+                #动态更新对抗损失
+                current_lambda_adversarial = global_data.esrgan.update_adversarial_weight(epoch)
+                logger.info(
+                    f"[Train] Epoch {epoch + 1}: current adversarial weight = {current_lambda_adversarial:.6f}"
                 )
-                """
-                验证集全部验证一遍 end
-                """
-                """
-                保存 训练集 验证集 测试集的引用地址json合集 方便查看用了哪些数据 而且也可以重新load 
-                """
-                save_loaders_paths(f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/datas_splits.json", train_loader=train_loader,validate_loader=validate_loader, test_loader=test_loader)
+                PIV_ESRGAN_RAFT_model.train()  # 确保在训练模式
+                metric = Accumulator(len(global_data.esrgan.loss_label))
+                train_progress_bar = tqdm(train_loader,
+                                          desc=f"Epoch [{epoch + 1}/{global_data.esrgan.EPOCH_NUMS}] {class_name} {data_type} scale_{int(SCALE * SCALE)} Training",
+                                          unit="batch", dynamic_ncols=True,
+                                        ascii=True,
+                                        leave=True,
+
+                                          )
+
+                for i, batch in enumerate(train_progress_bar):
+                    """RAFT 联合训练"""
+                    esrgan_union_RAFT_train(
+                        epoch=epoch,
+                        batch=batch, i=i,
+                        g_optimizer=PIV_ESRGAN_RAFT_model_g_optimizer,
+                        d_optimizer=PIV_ESRGAN_RAFT_model_d_optimizer,
+                        RAFT_optimizer = PIV_ESRGAN_RAFT_model_RAFT_optimizeroptimizer,
+                        scaler = PIV_ESRGAN_RAFT_model_scaler,
+
+                        model = PIV_ESRGAN_RAFT_model,
+                        train_progress_bar=train_progress_bar,
+                        metric=metric, data_type=data_type, device=global_data.esrgan.device, class_name=class_name,
+                        SCALE=SCALE
+                    )
+                # 每轮结束后评价一次 验证集只取一轮batch
+                evaluate(epoch=epoch, class_name=class_name, data_type=data_type, device=global_data.esrgan.device,
+                         model = PIV_ESRGAN_RAFT_model, animator=animator, validate_loader=validate_loader,
+                         loss_label=global_data.esrgan.loss_label,validate_label=global_data.esrgan. validate_label, SCALE=SCALE,
+                         csvOperator=global_data.esrgan.csvOperator,metric=metric,train_loader_lens=len(train_loader))
+
+            wandb.finish()
+            """
+            训练 end
+            """
+
+            """
+            验证集全部验证一遍 start
+            """
+            evaluate_all(
+                model = PIV_ESRGAN_RAFT_model,
+                data_loader=validate_loader,
+                class_name=class_name,
+                data_type=data_type,
+                SCALE=SCALE,
+                output_root=f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.PREDICT_ALL_DIR}",
+                metrics_csv_path=f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.PREDICT_ALL_DIR}/metrics_all.csv",
+                stride=6,
+            )
+            """
+            验证集全部验证一遍 end
+            """
+            """
+            保存 训练集 验证集 测试集的引用地址json合集 方便查看用了哪些数据 而且也可以重新load 
+            """
+            save_loaders_paths(f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/datas_splits.json", train_loader=train_loader,validate_loader=validate_loader, test_loader=test_loader)
 
 
     global_data.esrgan.END_TIME = time.time()

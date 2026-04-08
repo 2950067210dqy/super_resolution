@@ -10,6 +10,7 @@ from study.SRGAN.model.PIV_esrgan_RAFT_RAFT.Module.subModule.submodules_RAFT_ext
 # import torch.nn.functional as F
 import torch.functional as F
 
+from study.SRGAN.model.PIV_esrgan_RAFT.global_class import global_data
 
 try:
     # 自动混合精度上下文管理器
@@ -338,7 +339,7 @@ class RAFT(nn.Module):
 
         return coords0, coords1
 
-    def forward(self, input, flowl0, args, flow_init=None, upsample=True):
+    def forward(self, input, flowl0, flow_init=None, upsample=True):
         """
         前向传播。
 
@@ -346,9 +347,7 @@ class RAFT(nn.Module):
             input:     输入图像对，形状大概率为 [B, 2, H, W]
                        其中第 0 通道是第一帧，第 1 通道是第二帧
             flowl0:    光流真值 [B, 2, H, W]
-            args:      配置参数，需要至少包含:
-                       - args.amp: 是否使用自动混合精度
-                       - args.iters: 迭代次数
+        =
             flow_init: 可选的初始 flow
             upsample:  是否上采样（当前代码中未实际使用）
 
@@ -362,14 +361,14 @@ class RAFT(nn.Module):
         img2 = torch.unsqueeze(input[:, 1, :, :], dim=1)
 
         # 提取两帧图像特征，用于构建相关性体
-        with autocast(enabled=args.amp):
+        with autocast(enabled=global_data.esrgan.AMP):
             fmap1, fmap2 = self.fnet([img1, img2])
 
         # 构建相关性金字塔
         corr_fn = CorrBlock(fmap1, fmap2, radius=self.corr_radius, num_levels=self.corr_levels)
 
         # 对第一帧提取上下文特征
-        with autocast(enabled=args.amp):
+        with autocast(enabled=global_data.esrgan.AMP):
             cnet = self.cnet(img1)
 
             # 将上下文特征拆分成两部分：
@@ -389,7 +388,7 @@ class RAFT(nn.Module):
         flow_predictions = []
 
         # 迭代更新 flow
-        for itr in range(args.iters):
+        for itr in range(global_data.esrgan.GRU_ITERS):
             # 阻断 coords1 的梯度传播，避免跨迭代的反向传播图过大
             coords1 = coords1.detach()
 
@@ -407,7 +406,7 @@ class RAFT(nn.Module):
             # net: 更新后的隐藏状态
             # up_mask: 上采样掩码（这里虽然输出了，但后续没用）
             # delta_flow: 当前轮预测的光流增量
-            with autocast(enabled=args.amp):
+            with autocast(enabled=global_data.esrgan.AMP):
                 net, up_mask, delta_flow = self.update_block(net, inp, corr, flow)
 
             # 坐标递推更新

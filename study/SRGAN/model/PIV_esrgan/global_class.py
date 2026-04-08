@@ -35,15 +35,23 @@ class global_data:
            将结构loss 和 物理loss设置为0
             LAMBDA_PHYSICAL = 0
             LAMBDA_STRUCTURE =0
+            
+            v_test_dyn_advloss_r_update_param_v2:
+            ADVERSARIAL_WEIGHT_END =0.018269    原来是0.05
+            
+            v_test_dyn_advloss_r_update_param_v3:
+            ADVERSARIAL_WEIGHT_END =0.02    原来是0.018269 
            """
+
+
         #运行环境是否是autoDL
-        IS_AUTO_DL = False
+        IS_AUTO_DL = True
         AUTODL_DATA_PATH = rf"/root/autodl-tmp" if IS_AUTO_DL else r""
         # =========================
         # 训练任务标识
         # =========================
         name = "PIV_esrgan"  # 当前实验名（用于输出目录/模型名/wandb run名）
-        DESCRIPTION = "v_test_dyn_advloss_r_update_param_v1"  # 实验补充描述（可写损失配置、数据版本等）
+        DESCRIPTION = "v_test_dyn_advloss_r_update_param_v3"  # 实验补充描述（可写损失配置、数据版本等）
         name +=DESCRIPTION
 
         #整体项目注释
@@ -89,7 +97,7 @@ class global_data:
         # - 中后期再逐步给一点 adversarial，补局部真实感
         # 注意：这里的 END 不建议再设到 0.2，你已经验证过那会明显放大边界伪影。
         ADVERSARIAL_WEIGHT_START = 0.0005
-        ADVERSARIAL_WEIGHT_END = 0.05  # 0.018269
+        ADVERSARIAL_WEIGHT_END =0.02  # 0.018269
         ADVERSARIAL_WARMUP_EPOCHS = EPOCH_NUMS-10
         ADVERSARIAL_WEIGHT_SCHEDULE = "linear"  # 当前支持: linear | constant
 
