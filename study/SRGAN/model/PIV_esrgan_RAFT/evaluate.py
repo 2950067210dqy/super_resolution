@@ -110,39 +110,36 @@ def validate_and_save(result_dir, model, val_dataloader, device, epoch, data_typ
                 logger.error('RAFT 联合可视化至少需要前两通道(u,v)')
                 raise ValueError("RAFT 联合可视化至少需要前两通道(u,v)")
 
-            # 统一颜色尺度：用 HR 的 uv 计算 ref_max_rad
-            hr_u = hr_images[:, 0]
-            hr_v = hr_images[:, 1]
-            hr_mag_uv = torch.sqrt(hr_u * hr_u + hr_v * hr_v)
-            ref_max_rad = max(torch.quantile(hr_mag_uv.flatten(), 0.99).item(), 1e-6)
+            # 统一颜色尺度：用 HR 的 uv 计算 ref_max_rad。
+            ref_max_rad = _compute_flow_ref_max_rad(hr_images)
 
             # RAFT 分支统一用 uv 转彩色可视化（不直接 save 原3通道）。
             # 这里不再使用 flo 的 LR 图像，只保留 Pred/HR 两列。
-            fake_color, _ = flow_to_color_tensor(fake_images[:, :2], ref_max_rad=ref_max_rad)
-            hr_color, _ = flow_to_color_tensor(hr_images[:, :2], ref_max_rad=ref_max_rad)
+            fake_color = _flow_to_color_preview(fake_images[:, :2], ref_max_rad=ref_max_rad)
+            hr_color = _flow_to_color_preview(hr_images[:, :2], ref_max_rad=ref_max_rad)
 
             sample_rows = []
             for i in range(lr_prev.size(0)):
                 # 上半部分：previous / next 的超分三联图。
-                single_lr_prev = _select_metric_or_save_channels(
-                    resize_lr_prev[i].unsqueeze(0), "image_pair", SAVE_AS_GRAY
-                ).clamp(0, 1)
-                single_fake_prev = _select_metric_or_save_channels(
-                    fake_prev[i].unsqueeze(0), "image_pair", SAVE_AS_GRAY
-                ).clamp(0, 1)
-                single_hr_prev = _select_metric_or_save_channels(
-                    hr_prev[i].unsqueeze(0), "image_pair", SAVE_AS_GRAY
-                ).clamp(0, 1)
+                single_lr_prev = _prepare_image_pair_tensor_for_save(
+                    resize_lr_prev[i:i + 1], SAVE_AS_GRAY
+                )
+                single_fake_prev = _prepare_image_pair_tensor_for_save(
+                    fake_prev[i:i + 1], SAVE_AS_GRAY
+                )
+                single_hr_prev = _prepare_image_pair_tensor_for_save(
+                    hr_prev[i:i + 1], SAVE_AS_GRAY
+                )
 
-                single_lr_next = _select_metric_or_save_channels(
-                    resize_lr_next[i].unsqueeze(0), "image_pair", SAVE_AS_GRAY
-                ).clamp(0, 1)
-                single_fake_next = _select_metric_or_save_channels(
-                    fake_next[i].unsqueeze(0), "image_pair", SAVE_AS_GRAY
-                ).clamp(0, 1)
-                single_hr_next = _select_metric_or_save_channels(
-                    hr_next[i].unsqueeze(0), "image_pair", SAVE_AS_GRAY
-                ).clamp(0, 1)
+                single_lr_next = _prepare_image_pair_tensor_for_save(
+                    resize_lr_next[i:i + 1], SAVE_AS_GRAY
+                )
+                single_fake_next = _prepare_image_pair_tensor_for_save(
+                    fake_next[i:i + 1], SAVE_AS_GRAY
+                )
+                single_hr_next = _prepare_image_pair_tensor_for_save(
+                    hr_next[i:i + 1], SAVE_AS_GRAY
+                )
 
                 left_group = build_triplet_row(single_lr_prev, single_fake_prev, single_hr_prev, sep_width=6)
                 right_group = build_triplet_row(single_lr_next, single_fake_next, single_hr_next, sep_width=6)
@@ -159,8 +156,8 @@ def validate_and_save(result_dir, model, val_dataloader, device, epoch, data_typ
 
                 # 下半部分：流场双联图 Pred/HR，不再包含 flo 的 LR 图像。
                 flow_row = build_pair_row(
-                    fake_color[i].unsqueeze(0),
-                    hr_color[i].unsqueeze(0),
+                    fake_color[i:i + 1],
+                    hr_color[i:i + 1],
                     sep_width=6,
                 )
                 flow_w = fake_color.shape[3]
@@ -310,6 +307,41 @@ def _compute_aee_from_chw(pred_chw: np.ndarray, gt_chw: np.ndarray) -> float:
     return float(np.mean(epe))
 
 
+def _prepare_image_pair_tensor_for_save(
+    tensor_bchw: torch.Tensor,
+    save_as_gray: bool,
+) -> torch.Tensor:
+    """
+    统一 image_pair 分支的保存前处理：
+    1. 先按 SAVE_AS_GRAY 选择可视化通道；
+    2. 再统一裁剪到 [0, 1]。
+    """
+    return _select_metric_or_save_channels(
+        tensor_bchw, "image_pair", save_as_gray
+    ).clamp(0, 1)
+
+
+def _compute_flow_ref_max_rad(flow_gt_bchw: torch.Tensor) -> float:
+    """
+    用 GT 的 uv 通道统一计算彩色光流图的参考半径，
+    避免不同位置各自计算导致同批样本颜色尺度不一致。
+    """
+    if flow_gt_bchw.dim() != 4 or flow_gt_bchw.shape[1] < 2:
+        raise ValueError(f"Expected GT flow with shape [B, >=2, H, W], got {tuple(flow_gt_bchw.shape)}")
+    gt_u = flow_gt_bchw[:, 0]
+    gt_v = flow_gt_bchw[:, 1]
+    gt_mag_uv = torch.sqrt(gt_u * gt_u + gt_v * gt_v)
+    return max(torch.quantile(gt_mag_uv.flatten(), 0.99).item(), 1e-6)
+
+
+def _flow_to_color_preview(flow_uv_bchw: torch.Tensor, ref_max_rad: float) -> torch.Tensor:
+    """
+    统一预测/真值光流彩图的生成方式，避免不同位置混用不同的 clamp/维度写法。
+    """
+    color, _ = flow_to_color_tensor(flow_uv_bchw[:, :2], ref_max_rad=ref_max_rad)
+    return color.clamp(0, 1)
+
+
 def _tensor_to_rgb_pil(tensor: torch.Tensor) -> Image.Image:
     """
     将 [1,C,H,W] 或 [C,H,W] 的张量转成 PIL RGB 图像，便于在顶部写标题。
@@ -398,29 +430,123 @@ def _save_heatmap(arr_2d: np.ndarray, out_png: Path, title: str, cmap: str = "vi
     plt.close()
 
 
-def _save_flow_error_visuals(pred_bchw: torch.Tensor, gt_bchw: torch.Tensor, out_dir: Path) -> tuple[np.ndarray, np.ndarray]:
+def _compute_flow_error_maps(pred_bchw: torch.Tensor, gt_bchw: torch.Tensor) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    保存预测光流彩色图、AEE 误差图、涡度误差图。
+    统一计算水平位移误差、垂直位移误差和端点误差图。
+    """
+    pred_np = _to_np_chw(pred_bchw[0])
+    gt_np = _to_np_chw(gt_bchw[0])
+    delta_u = pred_np[0] - gt_np[0]
+    delta_v = pred_np[1] - gt_np[1]
+    epe = np.sqrt(delta_u * delta_u + delta_v * delta_v)
+    return delta_u, delta_v, epe
+
+
+def _save_signed_error_map(
+    arr_2d: np.ndarray,
+    out_png: Path,
+    title_text: str,
+    colorbar_label: str,
+    vmin: float = -0.5,
+    vmax: float = 0.5,
+    cmap: str = "bwr",
+    stat_text: str | None = None,
+) -> None:
+    """
+    保存带固定对称色标的误差图。
+    这里固定到 [-0.5, 0.5]，并采用蓝-白-红渐变，以对齐参考图风格。
+    """
+    fig, ax = plt.subplots(1, 1, figsize=(4.8, 3.9), dpi=160)
+    im = ax.imshow(arr_2d, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    if stat_text:
+        ax.text(
+            0.02, 0.98, stat_text,
+            transform=ax.transAxes,
+            ha="left", va="top",
+            fontsize=18, color="black",
+        )
+    else:
+        ax.set_title(title_text)
+    cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cb.set_label(colorbar_label, rotation=270, labelpad=18)
+    cb.set_ticks(np.linspace(vmin, vmax, 5))
+    fig.tight_layout()
+    fig.savefig(out_png, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _save_error_histogram(
+    values_1d: np.ndarray,
+    out_png: Path,
+    title_text: str,
+    xlabel: str,
+    bins: int = 121,
+    color: str = "#F4A142",
+) -> None:
+    """
+    保存单组误差直方图，风格对齐参考图的中心对称分布展示。
+    """
+    values = values_1d.reshape(-1).astype(np.float32)
+    max_abs = float(np.quantile(np.abs(values), 0.995))
+    max_abs = max(max_abs, 0.05)
+    fig, ax = plt.subplots(1, 1, figsize=(4.8, 3.9), dpi=160)
+    ax.hist(values, bins=bins, range=(-max_abs, max_abs), color=color, alpha=0.65, edgecolor="none")
+    ax.set_xlim(-max_abs, max_abs)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Count")
+    ax.set_title(title_text)
+    fig.tight_layout()
+    fig.savefig(out_png, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _save_flow_error_visuals(pred_bchw: torch.Tensor, gt_bchw: torch.Tensor, out_dir: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    保存预测光流彩色图、AEE 误差图、Δu/Δv 误差分布图、涡度误差图。
 
     返回：
         delta_u_2d: 水平位移误差图
+        delta_v_2d: 垂直位移误差图
         epe_2d:     端点误差图
     """
     pred_np = _to_np_chw(pred_bchw[0])
     gt_np = _to_np_chw(gt_bchw[0])
 
-    du = pred_np[0] - gt_np[0]
-    dv = pred_np[1] - gt_np[1]
-    epe = np.sqrt(du * du + dv * dv)
+    du, dv, epe = _compute_flow_error_maps(pred_bchw, gt_bchw)
+    aee = float(np.mean(epe))
 
-    pred_color, _ = flow_to_color_tensor(pred_bchw[:, :2], ref_max_rad=None)
-    gt_color, _ = flow_to_color_tensor(gt_bchw[:, :2], ref_max_rad=None)
+    ref_max_rad = _compute_flow_ref_max_rad(gt_bchw)
+    pred_color = _flow_to_color_preview(pred_bchw[:, :2], ref_max_rad=ref_max_rad)
+    gt_color = _flow_to_color_preview(gt_bchw[:, :2], ref_max_rad=ref_max_rad)
     # 统一命名为 pred_flow / gt_flow，避免和别处的 pred_flow.png 重名但语义重复。
-    save_image(pred_color.clamp(0, 1), str(out_dir / "pred_flow.png"), normalize=False)
-    save_image(gt_color.clamp(0, 1), str(out_dir / "gt_flow.png"), normalize=False)
+    save_image(pred_color, str(out_dir / "pred_flow.png"), normalize=False)
+    save_image(gt_color, str(out_dir / "gt_flow.png"), normalize=False)
 
-    _save_heatmap(du, out_dir / "delta_u_error.png", title="Delta u Error", cmap="RdBu_r", symmetric=True)
-    _save_heatmap(epe, out_dir / "aee_error.png", title="AEE / EPE Error", cmap="magma", symmetric=False)
+    # AEE 仍按标准 EPE 公式计算：sqrt((u_pred-u_gt)^2 + (v_pred-v_gt)^2)，
+    # 这里只把绘图色标固定到 [-0.5, 0.5]，以对齐参考图的视觉风格。
+    _save_signed_error_map(
+        epe,
+        out_dir / "aee_error.png",
+        title_text="AEE Error",
+        colorbar_label="Abs.error [px]",
+        stat_text=rf"$AEE={aee:.4f}$",
+    )
+    _save_error_histogram(
+        du,
+        out_dir / "delta_u_error.png",
+        title_text=r"$\Delta u$ Error Distribution",
+        xlabel=r"$\Delta u$ displacement [px]",
+        color="#F4A142",
+    )
+    _save_error_histogram(
+        dv,
+        out_dir / "delta_v_error.png",
+        title_text=r"$\Delta v$ Error Distribution",
+        xlabel=r"$\Delta v$ displacement [px]",
+        color="#4C9F70",
+    )
 
     pred_omega = _omega_star_from_uv(pred_np[0], pred_np[1])
     gt_omega = _omega_star_from_uv(gt_np[0], gt_np[1])
@@ -431,7 +557,7 @@ def _save_flow_error_visuals(pred_bchw: torch.Tensor, gt_bchw: torch.Tensor, out
     np.save(out_dir / "vorticity_error.npy", vorticity_error.astype(np.float32))
     _save_heatmap(vorticity_error, out_dir / "vorticity_error.png", title="Vorticity Error", cmap="RdBu_r", symmetric=True)
 
-    return du.astype(np.float32), epe.astype(np.float32)
+    return du.astype(np.float32), dv.astype(np.float32), epe.astype(np.float32)
 
 
 def _histogram_matrix(values: np.ndarray, bins: np.ndarray) -> np.ndarray:
@@ -452,6 +578,16 @@ def _delta_u_histogram_matrix(delta_u_2d: np.ndarray, bins: int = 201) -> np.nda
     max_abs = float(np.max(np.abs(delta_u_2d))) + 1e-12
     edges = np.linspace(-max_abs, max_abs, bins + 1, dtype=np.float32)
     return _histogram_matrix(delta_u_2d, edges)
+
+
+def _delta_v_histogram_matrix(delta_v_2d: np.ndarray, bins: int = 201) -> np.ndarray:
+    """
+    统计 Δv 的像素计数分布。
+    分布区间同样以 0 为中心，便于和 Δu 采用一致的误差分析口径。
+    """
+    max_abs = float(np.max(np.abs(delta_v_2d))) + 1e-12
+    edges = np.linspace(-max_abs, max_abs, bins + 1, dtype=np.float32)
+    return _histogram_matrix(delta_v_2d, edges)
 
 
 def _epe_histogram_matrix(epe_2d: np.ndarray, bins: int = 201) -> np.ndarray:
@@ -738,6 +874,7 @@ def evaluate_all(
     rows_by_class: dict[str, list[dict]] = {}
     curves_by_class: dict[str, dict[str, list[np.ndarray]]] = {}
     delta_u_hist_by_class: dict[str, list[np.ndarray]] = {}
+    delta_v_hist_by_class: dict[str, list[np.ndarray]] = {}
     epe_hist_by_class: dict[str, list[np.ndarray]] = {}
     all_pred_curves = []
     all_gt_curves = []
@@ -759,6 +896,7 @@ def evaluate_all(
         bucket = row["class_name"]
         rows_by_class.setdefault(bucket, []).append(row)
         delta_u_hist_by_class.setdefault(bucket, [])
+        delta_v_hist_by_class.setdefault(bucket, [])
         epe_hist_by_class.setdefault(bucket, [])
 
     def save_mean_spectrum(pred_curves: list[np.ndarray], gt_curves: list[np.ndarray], out_dir: Path, title: str) -> None:
@@ -855,13 +993,14 @@ def evaluate_all(
                     pair_dir = one_dir / pair_type
                     pair_dir.mkdir(parents=True, exist_ok=True)
 
-                    lr_eval = _select_metric_or_save_channels(lr1_up, "image_pair", global_data.esrgan.SAVE_AS_GRAY)
-                    fk_eval = _select_metric_or_save_channels(fk1, "image_pair", global_data.esrgan.SAVE_AS_GRAY)
-                    hr_eval = _select_metric_or_save_channels(hr1, "image_pair", global_data.esrgan.SAVE_AS_GRAY)
+                    lr_save = _prepare_image_pair_tensor_for_save(lr1_up, global_data.esrgan.SAVE_AS_GRAY)
+                    fk_save = _prepare_image_pair_tensor_for_save(fk1, global_data.esrgan.SAVE_AS_GRAY)
+                    hr_save = _prepare_image_pair_tensor_for_save(hr1, global_data.esrgan.SAVE_AS_GRAY)
 
-                    lr_save = lr_eval.clamp(0, 1)
-                    fk_save = fk_eval.clamp(0, 1)
-                    hr_save = hr_eval.clamp(0, 1)
+                    # 频谱等数值指标继续复用统一通道选择后的结果，避免保存和计算口径不一致。
+                    lr_eval = lr_save
+                    fk_eval = fk_save
+                    hr_eval = hr_save
 
                     save_image(lr_save, str(pair_dir / "lr.png"), normalize=False)
                     save_image(fk_save, str(pair_dir / "fake.png"), normalize=False)
@@ -893,14 +1032,11 @@ def evaluate_all(
                 np.save(one_dir / "fake_flo.npy", _to_np_chw(fk1_uvw[0]).transpose(1, 2, 0))
                 np.save(one_dir / "hr_flo.npy", _to_np_chw(hr1[0]).transpose(1, 2, 0))
 
-                hr_u = hr1[:, 0]
-                hr_v = hr1[:, 1]
-                hr_mag_uv = torch.sqrt(hr_u * hr_u + hr_v * hr_v)
-                ref_max_rad = max(torch.quantile(hr_mag_uv.flatten(), 0.99).item(), 1e-6)
+                ref_max_rad = _compute_flow_ref_max_rad(hr1)
 
                 # lr_color, _ = flow_to_color_tensor(lr_up1[:, :2], ref_max_rad=ref_max_rad)
-                fk_color, _ = flow_to_color_tensor(fk1[:, :2], ref_max_rad=ref_max_rad)
-                hr_color, _ = flow_to_color_tensor(hr1[:, :2], ref_max_rad=ref_max_rad)
+                fk_color = _flow_to_color_preview(fk1[:, :2], ref_max_rad=ref_max_rad)
+                hr_color = _flow_to_color_preview(hr1[:, :2], ref_max_rad=ref_max_rad)
                 # 流场样本级拼图不再包含 flo 的 LR 图像，只保留 Pred/HR 两列。
                 _save_pair(fk_color, hr_color, one_dir / "flow_triplet.png")
                 # 单独的预测流场彩图已经在 _save_flow_error_visuals 中按统一命名保存为 pred_flow.png，
@@ -912,21 +1048,25 @@ def evaluate_all(
                 # 涡度图内部实际只依赖前两个通道 uv，这里传三通道预测和真值保持接口一致。
                 save_vorticity_quiver_compare(fk1_uvw, hr1, str(one_dir / "vorticity_quiver.png"), stride=stride)
                 # 额外保存 AEE 误差图、涡度误差图，并返回像素级误差用于统计分布。
-                delta_u_map, epe_map = _save_flow_error_visuals(fk1, hr1, one_dir)
+                delta_u_map, delta_v_map, epe_map = _save_flow_error_visuals(fk1, hr1, one_dir)
 
-                # 逐样本保存 Δu 分布和 EPE 分布。
-                # Δu 直方图以 0 为中心，便于直观看出误差是否集中在零附近。
+                # 逐样本保存 Δu / Δv / EPE 分布。
+                # Δu、Δv 直方图都以 0 为中心，便于横向比较水平/垂直位移误差。
                 sample_delta_u_hist = _delta_u_histogram_matrix(delta_u_map)
+                sample_delta_v_hist = _delta_v_histogram_matrix(delta_v_map)
                 sample_epe_hist = _epe_histogram_matrix(epe_map)
                 np.save(one_dir / "delta_u_hist.npy", sample_delta_u_hist)
+                np.save(one_dir / "delta_v_hist.npy", sample_delta_v_hist)
                 np.save(one_dir / "epe_hist.npy", sample_epe_hist)
 
                 # 同时把每个 sample 的误差统计登记到所属类别，便于类别级汇总。
                 # 这里要先确保类别桶已经创建，再去 append；
                 # 否则像 DNS_turbulence 这类首次出现的类别会在 append 时直接 KeyError。
                 delta_u_hist_by_class.setdefault(sample_bucket, [])
+                delta_v_hist_by_class.setdefault(sample_bucket, [])
                 epe_hist_by_class.setdefault(sample_bucket, [])
                 delta_u_hist_by_class[sample_bucket].append(delta_u_map.reshape(-1))
+                delta_v_hist_by_class[sample_bucket].append(delta_v_map.reshape(-1))
                 epe_hist_by_class[sample_bucket].append(epe_map.reshape(-1))
 
                 # 数值指标对比统一使用三通道 [u, v, magnitude]。
@@ -977,9 +1117,12 @@ def evaluate_all(
 
     # 根目录额外保存整套验证集的 Δu / EPE 统计结果，便于做全局误差分布分析。
     all_delta_u_values = [v for values in delta_u_hist_by_class.values() for v in values]
+    all_delta_v_values = [v for values in delta_v_hist_by_class.values() for v in values]
     all_epe_values = [v for values in epe_hist_by_class.values() for v in values]
     if all_delta_u_values:
         np.save(output_root / "delta_u_hist_all.npy", _delta_u_histogram_matrix(np.concatenate(all_delta_u_values, axis=0)))
+    if all_delta_v_values:
+        np.save(output_root / "delta_v_hist_all.npy", _delta_v_histogram_matrix(np.concatenate(all_delta_v_values, axis=0)))
     if all_epe_values:
         np.save(output_root / "epe_hist_all.npy", _epe_histogram_matrix(np.concatenate(all_epe_values, axis=0)))
 
@@ -1010,6 +1153,9 @@ def evaluate_all(
         if delta_u_hist_by_class.get(bucket_name):
             class_delta_u_values = np.concatenate(delta_u_hist_by_class[bucket_name], axis=0)
             np.save(class_root / "delta_u_hist_all.npy", _delta_u_histogram_matrix(class_delta_u_values))
+        if delta_v_hist_by_class.get(bucket_name):
+            class_delta_v_values = np.concatenate(delta_v_hist_by_class[bucket_name], axis=0)
+            np.save(class_root / "delta_v_hist_all.npy", _delta_v_histogram_matrix(class_delta_v_values))
         if epe_hist_by_class.get(bucket_name):
             class_epe_values = np.concatenate(epe_hist_by_class[bucket_name], axis=0)
             np.save(class_root / "epe_hist_all.npy", _epe_histogram_matrix(class_epe_values))

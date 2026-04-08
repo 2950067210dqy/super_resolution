@@ -166,7 +166,14 @@ def save_vorticity_quiver_compare(
         t = F.interpolate(t, size=(out_h, out_w), mode="nearest")
         return t[0, 0].numpy()
 
-    fig, axes = plt.subplots(B, 2, figsize=(7.8, 3.2 * B), dpi=160, squeeze=False)
+    # 额外给每一行预留一个独立的 colorbar 轴，确保色条始终贴在整张图最右侧。
+    fig, axes = plt.subplots(
+        B, 3,
+        figsize=(8.3, 3.2 * B),
+        dpi=160,
+        squeeze=False,
+        gridspec_kw={"width_ratios": [1.0, 1.0, 0.055]},
+    )
 
     for i in range(B):
         triplet = [pred_bchw[i:i + 1], hr_bchw[i:i + 1]]
@@ -231,10 +238,15 @@ def save_vorticity_quiver_compare(
             ax.set_xticks([])
             ax.set_yticks([])
 
-        # 当前已经改成两列 Pred / HR，因此色条挂到这一整行的两个子图上。
-        plt.colorbar(im, ax=axes[i, :].tolist(), fraction=0.046, pad=0.02)
+        # colorbar 专用轴不参与图像绘制，只保留右侧色标。
+        axes[i, 2].set_frame_on(True)
 
-    plt.tight_layout()
+        # 当前已经改成两列 Pred / HR，因此把色条固定画到这一行最右边的专用轴上。
+        cax = axes[i, 2]
+        fig.colorbar(im, cax=cax)
+        cax.yaxis.set_ticks_position("right")
+
+    fig.tight_layout()
     plt.savefig(save_path, bbox_inches="tight")
     plt.close(fig)
 #瞬时涡流速度场 end

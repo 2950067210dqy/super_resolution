@@ -28,13 +28,10 @@ class global_data:
            14）将卷积的padding 0填充改成反射填充 reflect  replicate 
                zero padding 像这样： 图像外面全是黑洞卷积一到边缘就看到很多假黑像素
                reflect padding 像这样：图像边缘像镜子一样往外延伸 卷积在边缘看到的还是类似原图的纹理 解决padding artifact
-           15）
+           15）与RAFT联合
            ......
            
-           v_test_dyn_advloss_r_update_param_v1:
-           将结构loss 和 物理loss设置为0
-            LAMBDA_PHYSICAL = 0
-            LAMBDA_STRUCTURE =0
+   
            """
         #运行环境是否是autoDL
         IS_AUTO_DL = True
@@ -54,7 +51,7 @@ class global_data:
         # mixed 模式下的目录名/日志名
         MIXED_CLASS_TAG = "mixed_all_classes"
         #每个类别加载多少的数据 50%
-        CLASS_SAMPLE_RATIO =0.01
+        CLASS_SAMPLE_RATIO =0.5
         # =========================
         # 设备与模型加载
         # =========================
@@ -68,7 +65,7 @@ class global_data:
         # =========================
         # 训练主超参数
         # =========================
-        EPOCH_NUMS = 1 # 训练轮数 50
+        EPOCH_NUMS = 50 # 训练轮数 50
         BATCH_SIZE = 2 # batch 大小
         PRE_TRIAN_G_EPOCH = 1 #预训练G完成的轮次 从1开始
         TRAIN_DATA_SAVING_STEP =50 #每隔多少steps保存一次生成的图片
