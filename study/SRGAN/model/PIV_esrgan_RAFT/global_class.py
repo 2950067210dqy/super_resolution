@@ -68,7 +68,7 @@ class global_data:
         EPOCH_NUMS = 50 # 训练轮数 50
         BATCH_SIZE = 2 # batch 大小
         PRE_TRIAN_G_EPOCH = 1 #预训练G完成的轮次 从1开始
-        TRAIN_DATA_SAVING_STEP =50 #每隔多少steps保存一次生成的图片
+        TRAIN_DATA_SAVING_STEP =250 #每隔多少steps保存一次生成的图片 50
         SHUFFLE = True  # 训练集是否打乱
         TARGET_SIZE = None  # 数据加载时是否统一 resize 到该尺寸
         RANDOM_SEED = 42  # 数据划分随机种子
