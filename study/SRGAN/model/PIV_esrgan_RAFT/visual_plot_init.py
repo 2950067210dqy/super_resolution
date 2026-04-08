@@ -5,7 +5,7 @@ from loguru import logger
 import numpy as np
 import torch
 
-from study.SRGAN.util.image_util import scalar_to_jet, build_triplet_row, add_horizontal_separator
+from study.SRGAN.util.image_util import scalar_to_jet, build_triplet_row, build_pair_row, add_horizontal_separator
 
 
 def build_flo_uvw_fake_panel(fake_bchw, col_sep=8):
@@ -68,6 +68,53 @@ def build_flo_uvw_compare_panel(lr_bchw, fake_bchw, hr_bchw, sep_width=6, row_se
             # fk_ch = fk_n[i:i+1, ch:ch+1].repeat(1, 3, 1, 1)
             # hr_ch = hr_n[i:i+1, ch:ch+1].repeat(1, 3, 1, 1)
             ch_rows.append(build_triplet_row(lr_ch, fk_ch, hr_ch, sep_width=sep_width))
+
+        one = ch_rows[0]
+        for r in ch_rows[1:]:
+            h_sep = add_horizontal_separator(
+                width=one.shape[3], channels=one.shape[1], sep_height=row_sep,
+                value=1.0, device=one.device, dtype=one.dtype
+            )
+            one = torch.cat([one, h_sep, r], dim=2)
+        sample_rows.append(one)
+
+    out = sample_rows[0]
+    for r in sample_rows[1:]:
+        h_sep = add_horizontal_separator(
+            width=out.shape[3], channels=out.shape[1], sep_height=sample_sep,
+            value=1.0, device=out.device, dtype=out.dtype
+        )
+        out = torch.cat([out, h_sep, r], dim=2)
+    return out.clamp(0, 1)
+
+
+def build_flo_uvw_pred_gt_panel(pred_bchw, hr_bchw, sep_width=6, row_sep=8, sample_sep=10):
+    """
+    对 Pred/HR 的 U/V/S 三通道做对比拼图。
+    每个样本两列：
+    U*: Pred|HR
+    V*: Pred|HR
+    S*: Pred|HR
+    """
+    for t in (pred_bchw, hr_bchw):
+        if t.shape[1] < 3:
+            logger.error('Need 3 channels (U,V,S).')
+            raise ValueError("Need 3 channels (U,V,S).")
+
+    cmin = hr_bchw[:, :3].amin(dim=(0, 2, 3), keepdim=True)
+    cmax = hr_bchw[:, :3].amax(dim=(0, 2, 3), keepdim=True)
+    den = (cmax - cmin).clamp_min(1e-8)
+
+    pred_n = (pred_bchw[:, :3] - cmin) / den
+    hr_n = (hr_bchw[:, :3] - cmin) / den
+
+    sample_rows = []
+    for i in range(pred_n.size(0)):
+        ch_rows = []
+        for ch in range(3):
+            pred_ch = scalar_to_jet(pred_n[i:i+1, ch:ch+1])
+            hr_ch = scalar_to_jet(hr_n[i:i+1, ch:ch+1])
+            ch_rows.append(build_pair_row(pred_ch, hr_ch, sep_width=sep_width))
 
         one = ch_rows[0]
         for r in ch_rows[1:]:

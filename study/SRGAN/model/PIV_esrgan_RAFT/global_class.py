@@ -37,13 +37,13 @@ class global_data:
             LAMBDA_STRUCTURE =0
            """
         #运行环境是否是autoDL
-        IS_AUTO_DL = False
+        IS_AUTO_DL = True
         AUTODL_DATA_PATH = rf"/root/autodl-tmp" if IS_AUTO_DL else r""
         # =========================
         # 训练任务标识
         # =========================
         name = "PIV_esrgan_RAFT"  # 当前实验名（用于输出目录/模型名/wandb run名）
-        DESCRIPTION = "v_test_dyn_advloss_r_update_param_v1"  # 实验补充描述（可写损失配置、数据版本等）
+        DESCRIPTION = "v1"  # 实验补充描述（可写损失配置、数据版本等）
         name +=DESCRIPTION
 
         #整体项目注释
@@ -54,7 +54,7 @@ class global_data:
         # mixed 模式下的目录名/日志名
         MIXED_CLASS_TAG = "mixed_all_classes"
         #每个类别加载多少的数据 50%
-        CLASS_SAMPLE_RATIO =0.4
+        CLASS_SAMPLE_RATIO =0.01
         # =========================
         # 设备与模型加载
         # =========================
@@ -68,8 +68,8 @@ class global_data:
         # =========================
         # 训练主超参数
         # =========================
-        EPOCH_NUMS = 50  # 训练轮数
-        BATCH_SIZE = 4 # batch 大小
+        EPOCH_NUMS = 1 # 训练轮数 50
+        BATCH_SIZE = 2 # batch 大小
         PRE_TRIAN_G_EPOCH = 1 #预训练G完成的轮次 从1开始
         TRAIN_DATA_SAVING_STEP =50 #每隔多少steps保存一次生成的图片
         SHUFFLE = True  # 训练集是否打乱
@@ -81,6 +81,12 @@ class global_data:
         # RAFT 配置
         # =========================
         GRU_ITERS = 12 #RAFT的GRU迭代次数 12
+        """
+        RAFT的上采样方法
+             bicubic 上采样2倍 bicubic8 上采样8倍  #nn.Upsample(scale_factor=2, mode='bicubic')
+             lanczos4 ->2*        lanczos4_8 ->2*->4*->8*    用的LanczosUpsampling模块
+        """
+        RAFT_UPSAMPLE = 'lanczos4_8'
 
         # =========================
         # 损失项系数
@@ -188,7 +194,10 @@ class global_data:
                       'd_loss', 'd_real_loss', 'd_fake_loss',
                       'raft_loss', 'raft_epe','raft_1px', 'raft_3px','raft_5px',
                       ]
-        validate_label = ['VAL_MSE_LOSS','VAL_SSIM_Loss', 'Avg_PSNR']
+        validate_label = ['VAL_MSE_LOSS','VAL_SSIM_Loss', 'Avg_PSNR',"VAL_energy_spectrum_mse",
+                          "VAL_AEE"]
+
+
         # 存储数据至csv的列名
         CSV_COLUMNS = ['EPOCH'] + loss_label + validate_label + ['time']
         # csv操作实例 CsvTable

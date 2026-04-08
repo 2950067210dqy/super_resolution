@@ -47,6 +47,12 @@ def build_triplet_row(lr, fake, hr, sep_width=6):
     return torch.cat([lr, sep, fake, sep, hr], dim=3)
 
 
+def build_pair_row(left, right, sep_width=6):
+    """拼接一行对比图：Left | Right。"""
+    sep = add_vertical_separator(left, sep_width=sep_width, value=1.0)
+    return torch.cat([left, sep, right], dim=3)
+
+
 def to_gray_3ch(x):
     """
     把 3 通道图压成灰度后再复制为 3 通道，便于统一可视化接口。
@@ -101,9 +107,18 @@ def _hsv_to_rgb_torch(h: torch.Tensor, s: torch.Tensor, v: torch.Tensor) -> torc
 
 def flow_to_color_tensor(flow: torch.Tensor, ref_max_rad: float | None = None) -> tuple[torch.Tensor, float]:
     """
-    将光流 uv 通道映射为色轮可视化 RGB 图。
+    将光流 uv 通道映射为与 flo U/V/S 面板一致风格的伪彩 RGB 图。
     flow: [B,C,H,W], C>=2（可为2或3，若3则第3通道会被忽略）
     返回: rgb [B,3,H,W] in [0,1], max_rad
+
+    说明：
+        这里不再使用传统光流色轮 HSV 编码，
+        而是改为和 fake_uvw_panel 一致的 jet 伪彩风格。
+        具体做法是：
+        1. 先由 uv 计算 magnitude
+        2. 再将 magnitude 归一化到 [0,1]
+        3. 最后用 jet colormap 映射到 RGB
+        4. 最终返回标准可视化常用范围 [0,1]
     """
     if flow.ndim != 4 or flow.shape[1] < 2:
         logger.error(f'flow shape must be [B,C,H,W] and C>=2, got {tuple(flow.shape)}')
@@ -114,10 +129,6 @@ def flow_to_color_tensor(flow: torch.Tensor, ref_max_rad: float | None = None) -
     v = flow[:, 1]
 
     mag = torch.sqrt(u * u + v * v)
-    ang = torch.atan2(v, u)  # [-pi, pi]
-
-    h = (ang + torch.pi) / (2.0 * torch.pi)
-    s = torch.ones_like(h)
 
     if ref_max_rad is None:
         max_rad = torch.quantile(mag.flatten(), 0.99).item()
@@ -125,8 +136,9 @@ def flow_to_color_tensor(flow: torch.Tensor, ref_max_rad: float | None = None) -
         max_rad = float(ref_max_rad)
     max_rad = max(max_rad, 1e-6)
 
-    val = torch.clamp(mag / max_rad, 0.0, 1.0)
-    rgb = _hsv_to_rgb_torch(h, s, val)
+    # 用 magnitude 做归一化，并复用 fake_uvw_panel 同风格的 jet 伪彩映射。
+    val = torch.clamp(mag / max_rad, 0.0, 1.0).unsqueeze(1)  # [B,1,H,W] in [0,1]
+    rgb = scalar_to_jet(val)  # [B,3,H,W] in [0,1]
     return rgb, max_rad
 def scalar_to_jet(x01: torch.Tensor) -> torch.Tensor:
     """

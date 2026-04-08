@@ -7,10 +7,59 @@ import numpy as np
 import torch
 from matplotlib import pyplot as plt
 from torchvision.utils import save_image
+from PIL import Image, ImageDraw, ImageFont
 
 from study.SRGAN.model.PIV_esrgan_RAFT.visual_plot_init import _omega_star_from_uv
-from study.SRGAN.util.image_util import build_triplet_row
+from study.SRGAN.util.image_util import build_triplet_row, build_pair_row
 from study.SRGAN.util.tensor_util import _to_np_2d
+
+
+def _tensor_to_rgb_pil(tensor: torch.Tensor) -> Image.Image:
+    """将 [1,C,H,W] 或 [C,H,W] 张量转成 RGB PIL 图像。"""
+    if tensor.dim() == 4:
+        tensor = tensor[0]
+    tensor = tensor.detach().cpu().clamp(0, 1)
+    if tensor.shape[0] == 1:
+        arr = (tensor[0].numpy() * 255.0).astype(np.uint8)
+        return Image.fromarray(arr, mode="L").convert("RGB")
+    arr = (tensor.permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+    return Image.fromarray(arr, mode="RGB")
+
+
+def _pil_rgb_to_tensor01(image: Image.Image, device, dtype) -> torch.Tensor:
+    """将 RGB PIL 图像转回 [1,3,H,W] 的 [0,1] 张量。"""
+    arr = np.asarray(image).astype(np.float32) / 255.0
+    return torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(device=device, dtype=dtype)
+
+
+def _add_headers_to_panel(
+    panel: torch.Tensor,
+    headers: list[str],
+    column_widths: list[int],
+    separator_widths: list[int],
+    header_height: int = 22,
+) -> torch.Tensor:
+    """在拼图顶部加列标题。"""
+    base = _tensor_to_rgb_pil(panel)
+    canvas = Image.new("RGB", (base.width, base.height + header_height), color=(255, 255, 255))
+    canvas.paste(base, (0, header_height))
+
+    draw = ImageDraw.Draw(canvas)
+    font = ImageFont.load_default()
+
+    x = 0
+    for idx, (title, width) in enumerate(zip(headers, column_widths)):
+        bbox = draw.textbbox((0, 0), title, font=font)
+        text_w = bbox[2] - bbox[0]
+        text_h = bbox[3] - bbox[1]
+        tx = int(x + max((width - text_w) * 0.5, 0))
+        ty = int(max((header_height - text_h) * 0.5, 0))
+        draw.text((tx, ty), title, fill=(0, 0, 0), font=font)
+        x += width
+        if idx < len(separator_widths):
+            x += separator_widths[idx]
+
+    return _pil_rgb_to_tensor01(canvas, panel.device, panel.dtype)
 
 
 def _save_energy_spectrum_plot(pred_curve: np.ndarray, gt_curve: np.ndarray, out_png: Path, title: str) -> None:
@@ -32,7 +81,27 @@ def _save_energy_spectrum_plot(pred_curve: np.ndarray, gt_curve: np.ndarray, out
 def _save_triplet(lr_1chw: torch.Tensor, fake_1chw: torch.Tensor, hr_1chw: torch.Tensor, out_png: Path) -> None:
     """保存三联图 LR|Fake|HR。"""
     trip = build_triplet_row(lr_1chw, fake_1chw, hr_1chw, sep_width=6)
+    col_w = int(lr_1chw.shape[-1])
+    trip = _add_headers_to_panel(
+        trip,
+        headers=["LR", "Fake", "HR"],
+        column_widths=[col_w, col_w, col_w],
+        separator_widths=[6, 6],
+    )
     save_image(trip.clamp(0, 1), str(out_png), normalize=False)
+
+
+def _save_pair(left_1chw: torch.Tensor, right_1chw: torch.Tensor, out_png: Path) -> None:
+    """保存双联图 Left|Right。"""
+    pair = build_pair_row(left_1chw, right_1chw, sep_width=6)
+    col_w = int(left_1chw.shape[-1])
+    pair = _add_headers_to_panel(
+        pair,
+        headers=["Pred", "HR"],
+        column_widths=[col_w, col_w],
+        separator_widths=[6],
+    )
+    save_image(pair.clamp(0, 1), str(out_png), normalize=False)
 
 
 
@@ -76,21 +145,20 @@ def save_vorticity_quiver_single(fake_bchw: torch.Tensor, save_path: str, stride
     plt.close(fig)
 
 def save_vorticity_quiver_compare(
-    lr_bchw: torch.Tensor,
-    fake_bchw: torch.Tensor,
+    pred_bchw: torch.Tensor,
     hr_bchw: torch.Tensor,
     save_path: str,
     stride: int = 8
 ):
     """
-    保存 batch 级对比图：每行一个样本，三列 LR/Fake/HR 的涡量+矢量。
+    保存 batch 级对比图：每行一个样本，两列 Pred/HR 的涡量+矢量。
     把一个 batch 画成一张图：
-    每个样本一行，三列 LR（原始 未扩充大小） | Fake | HR
+    每个样本一行，两列 Pred | HR
     输入: [B,3,H,W]
-    自动处理三者分辨率不一致
+    自动处理两者分辨率不一致
     """
-    B = min(lr_bchw.shape[0], fake_bchw.shape[0], hr_bchw.shape[0])
-    titles = ["LR", "Fake", "HR"]
+    B = min(pred_bchw.shape[0], hr_bchw.shape[0])
+    titles = ["Pred", "HR"]
 
     def _resize_np_nearest(arr, out_h, out_w):
         # arr: [h,w]
@@ -98,10 +166,10 @@ def save_vorticity_quiver_compare(
         t = F.interpolate(t, size=(out_h, out_w), mode="nearest")
         return t[0, 0].numpy()
 
-    fig, axes = plt.subplots(B, 3, figsize=(11.0, 3.2 * B), dpi=160, squeeze=False)
+    fig, axes = plt.subplots(B, 2, figsize=(7.8, 3.2 * B), dpi=160, squeeze=False)
 
     for i in range(B):
-        triplet = [lr_bchw[i:i + 1], fake_bchw[i:i + 1], hr_bchw[i:i + 1]]
+        triplet = [pred_bchw[i:i + 1], hr_bchw[i:i + 1]]
 
         # 当前样本三图目标画布尺寸：取最大
         hs = [int(t.shape[-2]) for t in triplet]
@@ -163,7 +231,8 @@ def save_vorticity_quiver_compare(
             ax.set_xticks([])
             ax.set_yticks([])
 
-        plt.colorbar(im, ax=axes[i, 2], fraction=0.046, pad=0.02)
+        # 当前已经改成两列 Pred / HR，因此色条挂到这一整行的两个子图上。
+        plt.colorbar(im, ax=axes[i, :].tolist(), fraction=0.046, pad=0.02)
 
     plt.tight_layout()
     plt.savefig(save_path, bbox_inches="tight")

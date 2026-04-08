@@ -7,7 +7,7 @@ from torchvision import models
 from torchvision.models import vgg19
 import torch.nn.functional as F
 
-from SRGAN.util.image_util import _select_metric_or_save_channels, _to_gray
+from study.SRGAN.util.image_util import _select_metric_or_save_channels, _to_gray
 from study.SRGAN.model.PIV_esrgan_RAFT.global_class import global_data
 
 
@@ -23,6 +23,74 @@ from study.SRGAN.model.PIV_esrgan_RAFT.global_class import global_data
 #     def forward(self, x):
 #         out = self.vgg(x)
 #         return out
+class CharbonnierLoss(nn.Module):
+    """
+    Charbonnier 重建损失
+
+    功能：
+    1. 作为基础像素重建项，保证 SR 与 HR 在整体灰度分布上保持一致。
+    2. 相比 MSE 对异常亮点更鲁棒，相比普通 L1 在零点附近更平滑。
+    3. 适合微米颗粒图像中稀疏高亮颗粒的稳定恢复。
+
+    数学形式：
+        L_char = mean( sqrt((pred - target)^2 + eps^2) )
+    """
+
+    def __init__(self, eps: float = 1e-3):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        diff = _to_gray(pred) - _to_gray(target)
+        return torch.mean(torch.sqrt(diff * diff + self.eps * self.eps))
+class SobelEdgeLoss(nn.Module):
+    """
+    Sobel 边缘损失
+
+    功能：
+    1. 约束预测图像与真值图像在边缘梯度上的一致性。
+    2. 强化颗粒边界与轮廓恢复。
+    3. 减少颗粒边缘被平滑掉的问题。
+
+    实现方式：
+    1. 先将输入转为灰度图。
+    2. 使用 Sobel 卷积核计算水平梯度与垂直梯度。
+    3. 计算梯度幅值图。
+    4. 对预测图和真值图的梯度幅值图做 L1 约束。
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        sobel_x = torch.tensor(
+            [[1, 0, -1],
+             [2, 0, -2],
+             [1, 0, -1]],
+            dtype=torch.float32
+        ).view(1, 1, 3, 3)
+
+        sobel_y = torch.tensor(
+            [[1, 2, 1],
+             [0, 0, 0],
+             [-1, -2, -1]],
+            dtype=torch.float32
+        ).view(1, 1, 3, 3)
+
+        self.register_buffer("sobel_x", sobel_x)
+        self.register_buffer("sobel_y", sobel_y)
+
+
+
+    def _grad_mag(self, x: torch.Tensor) -> torch.Tensor:
+        x = _to_gray(x)
+        gx = F.conv2d(x, self.sobel_x, padding=1)
+        gy = F.conv2d(x, self.sobel_y, padding=1)
+        return torch.sqrt(gx * gx + gy * gy + 1e-6)
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        pred_edge = self._grad_mag(pred)
+        target_edge = self._grad_mag(target)
+        return F.l1_loss(pred_edge, target_edge)
 class GANLoss(nn.Module):
     """
     根据esrgan 的公式 生成器的对抗损失和判别器的损失都要用到这个计算
@@ -397,10 +465,7 @@ vgg = vgg.to(global_data.esrgan.device).eval()
 perceptual_loss = PerceptualLoss(vgg=vgg).to(global_data.esrgan.device)
 # 归一化损失 正则化损失
 # regularization_loss = RegularizationLoss().to(global_data.esrgan.device)
-particle_loss = ParticleTotalLoss(
-    lambda_structure=global_data.esrgan.LAMBDA_STRUCTURE,
-    lambda_physical=global_data.esrgan.LAMBDA_PHYSICAL
-).to(global_data.esrgan.device)
+
 # 这个 loss 只在 image_pair 联合训练时使用；flo 或单帧路径默认不会走这里。
 image_pair_temporal_loss = ImagePairTemporalConsistencyLoss(
     delta_weight=global_data.esrgan.LAMBDA_PAIR_DELTA,

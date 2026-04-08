@@ -2,15 +2,17 @@ import torch  # 导入 PyTorch 主库
 from torch import nn  # 导入神经网络模块基类和常用层接口
 import torch.nn.functional as F  # 导入函数式接口，便于直接调用 loss / 激活等函数
 
-from study.SRGAN.model.PIV_esrgan_RAFT.Module.RAFT_Model import RAFT  # 导入 RAFT 光流估计主网络
+from study.SRGAN.model.PIV_esrgan_RAFT.Module.RAFT_Model import RAFT, RAFT256  # 导入 RAFT 光流估计主网络
 from study.SRGAN.model.PIV_esrgan_RAFT.Module.loss import (
     descriminator_loss,  # 判别器损失，负责训练 D 区分真/假图像
     image_pair_temporal_loss,  # 图像对时间一致性损失，约束前后帧变化关系
     perceptual_loss,  # 感知损失，内部可选带对抗项
-    particle_loss,  # 粒子结构/物理分布损失
+
     pixel_loss,  # 像素域复合损失，包含 L1/MSE/SSIM/FFT 等项
 )
 from study.SRGAN.model.PIV_esrgan_RAFT.Module.piv_esrgan_model import Generator, Discriminator  # 导入 ESRGAN 生成器和判别器
+from study.SRGAN.model.PIV_esrgan_RAFT.global_class import global_data
+
 try:
     # 自动混合精度上下文管理器
     # 使用后可以在前向推理中自动选择 float16 / float32，
@@ -38,12 +40,12 @@ class PIV_ESRGAN_RAFT(nn.Module):
     2.然后用基本的RAFT进行piv估计
     """
 
-    def __init__(self,inner_chanel):
+    def __init__(self,inner_chanel,batch_size):
         super(PIV_ESRGAN_RAFT, self).__init__()  # 调用父类初始化
 
         self.piv_esrgan_generator = Generator(inner_chanel=inner_chanel)  # 初始化超分生成器，输入 LR 图像对，输出 SR 图像对
         self.piv_esrgan_discriminator = Discriminator(inner_chanel=inner_chanel)  # 初始化判别器，用于区分 SR 图像和真实 HR 图像
-        self.piv_RAFT = RAFT()  # 初始化 RAFT，用于根据两帧 SR 图像预测 PIV/光流场
+        self.piv_RAFT = RAFT256(upsample=global_data.esrgan.RAFT_UPSAMPLE,batch_size=batch_size)  # 初始化 RAFT，用于根据两帧 SR 图像预测 PIV/光流场
 
     @staticmethod
     def _set_requires_grad(module: nn.Module, requires_grad: bool) -> None:
@@ -76,6 +78,21 @@ class PIV_ESRGAN_RAFT(nn.Module):
         # 当前 RAFT 分支按单通道实现；若生成器输出是 3 通道，
         # 这里先在通道维求均值压成单通道，保证接口兼容。
         return image.mean(dim=1, keepdim=True)  # 否则在通道维求均值，将多通道图压成单通道图
+
+    def _to_raft_flow_gt(self, flow: torch.Tensor) -> torch.Tensor:
+        """
+        将数据集中的流场真值转换成 RAFT 监督所需的 2 通道 uv 形式。
+
+        说明：
+            数据集里的 flo 常常是三通道 [u, v, magnitude]，
+            但 RAFT 的监督和 EPE 计算只使用前两个通道 [u, v]。
+        """
+        if flow.dim() != 4:  # 检查输入是否是标准 4 维流场张量
+            raise ValueError(f"Expected flow to be 4D [B, C, H, W], got shape={tuple(flow.shape)}")
+        if flow.size(1) < 2:  # 至少要有 u、v 两个通道
+            raise ValueError(f"Expected flow to have at least 2 channels, got shape={tuple(flow.shape)}")
+        # 这里显式只保留前两个通道 u / v，避免把 magnitude 一起传给 RAFT loss。
+        return flow[:, :2, :, :]
 
     def _compute_generator_frame_terms(self, pred: torch.Tensor, target: torch.Tensor, is_adversarial: bool) -> dict:
         """
@@ -149,6 +166,89 @@ class PIV_ESRGAN_RAFT(nn.Module):
 
         return d_loss, fake_loss, real_loss  # 返回判别器总损失以及两个监控项
 
+    def _compute_sr_branch(self, input_lr_prev, input_lr_next, input_gr_prev, input_gr_next, is_adversarial: bool):
+        """
+        单独计算 ESRGAN 生成器分支。
+
+        说明：
+            这个分支只负责：
+            1. 生成前后两帧超分结果
+            2. 计算 Generator 相关的 sr_loss
+
+            这样 train_step 里就可以真正做到：
+            - Generator 只用 sr_loss 更新
+            - RAFT 不共享 total_loss
+        """
+        if hasattr(self.piv_esrgan_generator, "forward_pair"):  # 如果生成器支持双帧联合前向
+            pred_prev, pred_next = self.piv_esrgan_generator.forward_pair(input_lr_prev, input_lr_next)  # 同时生成前后两帧
+        else:
+            pred_prev = self.piv_esrgan_generator(input_lr_prev)  # 退化为单帧前向
+            pred_next = self.piv_esrgan_generator(input_lr_next)  # 退化为单帧前向
+
+        prev_terms = self._compute_generator_frame_terms(pred_prev, input_gr_prev, is_adversarial=is_adversarial)  # previous 帧生成器损失
+        next_terms = self._compute_generator_frame_terms(pred_next, input_gr_next, is_adversarial=is_adversarial)  # next 帧生成器损失
+
+        perceptual_total = self._mean_loss_term(prev_terms, next_terms, "perceptual_loss")  # 平均后的感知损失
+        content_loss = self._mean_loss_term(prev_terms, next_terms, "content_loss")  # 平均后的内容损失
+        adversarial_loss = self._mean_loss_term(prev_terms, next_terms, "adversarial_loss")  # 平均后的生成器对抗损失
+        pixel_total = self._mean_loss_term(prev_terms, next_terms, "pixel_total")  # 平均后的像素总损失
+        pixel_l1 = self._mean_loss_term(prev_terms, next_terms, "pixel_l1")  # 平均后的 L1 损失
+        pixel_mse = self._mean_loss_term(prev_terms, next_terms, "pixel_mse")  # 平均后的 MSE 损失
+        pixel_ssim = self._mean_loss_term(prev_terms, next_terms, "pixel_ssim")  # 平均后的 SSIM 损失
+        pixel_fft = self._mean_loss_term(prev_terms, next_terms, "pixel_fft")  # 平均后的频域损失
+
+        pair_temporal_total, pair_temporal_dict = image_pair_temporal_loss(
+            pred_prev,  # SR previous 帧
+            pred_next,  # SR next 帧
+            input_gr_prev,  # HR previous 真值
+            input_gr_next,  # HR next 真值
+        )
+
+        sr_loss = perceptual_total + pixel_total + pair_temporal_total  # ESRGAN 分支总损失
+
+        return pred_prev, pred_next, {
+            "sr_loss": sr_loss,  # ESRGAN 侧总损失
+            "perceptual_loss": perceptual_total,  # 感知损失
+            "content_loss": content_loss,  # 内容损失
+            "adversarial_loss": adversarial_loss,  # 对抗损失
+            "pixel_total": pixel_total,  # 像素总损失
+            "pixel_l1": pixel_l1,  # L1 子项
+            "pixel_mse": pixel_mse,  # MSE 子项
+            "pixel_ssim": pixel_ssim,  # SSIM 子项
+            "pixel_fft": pixel_fft,  # FFT 子项
+            "pair_temporal_loss": pair_temporal_total,  # 时间一致性总损失
+            "pair_delta_loss": pair_temporal_dict["pair_delta_loss"],  # 时间一致性中的差分项
+            "pair_gradient_loss": pair_temporal_dict["pair_gradient_loss"],  # 时间一致性中的梯度项
+        }
+
+    def _compute_raft_branch(self, pred_prev: torch.Tensor, pred_next: torch.Tensor, flowl0, flow_init=None):
+        """
+        单独计算 RAFT 分支。
+
+        说明：
+            这个分支只负责：
+            1. 将超分结果转换为 RAFT 输入
+            2. 计算 RAFT 的流场预测与 raft_loss
+        """
+        raft_prev = self._to_raft_frame(pred_prev)  # 将前一帧 SR 图转成 RAFT 单通道输入
+        raft_next = self._to_raft_frame(pred_next)  # 将后一帧 SR 图转成 RAFT 单通道输入
+        raft_input = torch.cat([raft_prev, raft_next], dim=1)  # 拼成 [B, 2, H, W]
+        raft_flow_gt = self._to_raft_flow_gt(flowl0)  # 只保留 uv 两个通道作为监督
+
+        flow_predictions, (raft_loss, raft_metrics) = self.piv_RAFT(
+            raft_input,  # RAFT 输入图像对
+            raft_flow_gt,  # RAFT 光流真值
+            flow_init=flow_init,  # 可选初始光流
+        )
+
+        return flow_predictions, {
+            "raft_input_prev": raft_prev,  # 送入 RAFT 前的前一帧单通道图
+            "raft_input_next": raft_next,  # 送入 RAFT 前的后一帧单通道图
+            "flow_predictions": flow_predictions,  # RAFT 每次迭代得到的流场预测序列
+            "raft_loss": raft_loss,  # RAFT 流场序列损失
+            "raft_metrics": raft_metrics,  # RAFT 评估指标
+        }
+
     def forward(
         self,
         input_lr_prev,
@@ -157,7 +257,7 @@ class PIV_ESRGAN_RAFT(nn.Module):
         input_gr_next,
         flowl0,
         flow_init=None,
-        upsample=True,
+        upsample=global_data.esrgan.RAFT_UPSAMPLE,
         is_adversarial: bool = False,
     ):
         """
@@ -169,7 +269,7 @@ class PIV_ESRGAN_RAFT(nn.Module):
             flowl0:    光流真值 [B, 2, H, W]
 
             flow_init: 可选的初始 flow
-            upsample:  是否上采样（当前代码中未实际使用）
+            upsample:  上采样模式
             is_adversarial: 是否在生成器损失中启用对抗项
 
         返回:
@@ -213,17 +313,27 @@ class PIV_ESRGAN_RAFT(nn.Module):
         # 其中第 0 通道是前一帧，第 1 通道是后一帧。
         raft_input = torch.cat([raft_prev, raft_next], dim=1)  # 将两帧单通道图沿通道维拼接成 [B,2,H,W]
 
+        # RAFT 的监督只使用 uv 两个通道；如果数据集中还带 magnitude，这里要显式裁掉。
+        raft_flow_gt = self._to_raft_flow_gt(flowl0)
+
         # 5. 调用 RAFT 估计流场，并计算 RAFT 的序列损失。
         flow_predictions, (raft_loss, raft_metrics) = self.piv_RAFT(
             raft_input,  # RAFT 输入图像对
-            flowl0,  # 光流真值
+            raft_flow_gt,  # RAFT 光流真值，只保留 uv 两个通道
 
             flow_init=flow_init,  # 可选初始光流
-            upsample=upsample,  # 可选上采样开关
+
         )
 
-        # 6. 组合总损失。 不使用这个损失
-        # total_loss = sr_loss + raft_loss  # 将 SR 分支和 RAFT 分支的损失合并成总损失，用于更新 G + RAFT
+        # 6. 组合总损失。
+        # 这里的 total_loss 同时包含：
+        # 1. ESRGAN 自身的超分损失
+        # 2. RAFT 的流场监督损失
+        # 这样在一次 backward 中：
+        # - Generator 可以拿到超分损失梯度
+        # - RAFT 可以拿到流场损失梯度
+        # - 如果流场损失对 Generator 的输出有约束，也能继续把梯度传回 Generator
+        total_loss = sr_loss + raft_loss  # 用于联合更新 Generator + RAFT，但两个模块仍然各自使用独立 optimizer
 
         # 7. 计算判别器损失。
         discriminator_loss, d_fake_loss, d_real_loss = self._compute_discriminator_loss(
@@ -257,7 +367,7 @@ class PIV_ESRGAN_RAFT(nn.Module):
             "discriminator_loss": discriminator_loss,  # 判别器总损失
             "d_fake_loss": d_fake_loss,  # 判别器对 fake 的损失
             "d_real_loss": d_real_loss,  # 判别器对 real 的损失
-            # "total_loss": total_loss,  # 用于更新 Generator + RAFT 的总损失
+            "total_loss": total_loss,  # 用于联合更新 Generator + RAFT 的总损失
         }
 
 
@@ -274,7 +384,7 @@ class PIV_ESRGAN_RAFT(nn.Module):
         d_optimizer,
         scaler=None,
         flow_init=None,
-        upsample=True,
+        upsample=global_data.esrgan.RAFT_UPSAMPLE,
         is_adversarial: bool = False,
     ) -> dict:
         """
@@ -296,85 +406,117 @@ class PIV_ESRGAN_RAFT(nn.Module):
             d_optimizer: Discriminator 的优化器
             scaler: 可选 AMP GradScaler
             flow_init: 可选 RAFT 初始流
-            upsample: 是否上采样
+            upsample: 上采样模式
             is_adversarial: 是否在生成器损失中启用对抗项
 
         返回:
             包含本次训练主要标量的字典
         """
-        pred_prev,pred_next,flow_predictions,outputs = self.forward(
+        # 第一阶段：只更新 Generator，严格只使用 sr_loss。
+        self._set_requires_grad(self.piv_esrgan_generator, True)  # 开启 Generator 梯度
+        self._set_requires_grad(self.piv_RAFT, False)  # 冻结 RAFT，保证这一阶段不更新流场网络
+        self._set_requires_grad(self.piv_esrgan_discriminator, False)  # 冻结判别器，避免生成器阶段误更新 D
+        generator_optimizer.zero_grad(set_to_none=True)  # 清空 Generator 梯度
+
+        pred_prev_g, pred_next_g, sr_outputs = self._compute_sr_branch(
             input_lr_prev=input_lr_prev,  # 前一帧 LR 输入
             input_lr_next=input_lr_next,  # 后一帧 LR 输入
             input_gr_prev=input_gr_prev,  # 前一帧 HR 真值
             input_gr_next=input_gr_next,  # 后一帧 HR 真值
-            flowl0=flowl0,  # 光流真值
-
-            flow_init=flow_init,  # 可选 RAFT 初始流
-            upsample=upsample,  # 是否上采样
             is_adversarial=is_adversarial,  # 是否在 G 侧启用对抗项
         )
 
-        # 先更新 Generator
-        self._set_requires_grad(self.piv_esrgan_discriminator, False)  # 冻结判别器，避免第一阶段更新误伤 D
-        generator_optimizer.zero_grad(set_to_none=True)  # 清空 Generator 梯度
-
-
-        if scaler is not None:  # AMP 模式下更新 G
-            scaler.scale(outputs["sr_loss"]).backward()  # 对总损失做缩放后反向传播
-            scaler.step(generator_optimizer)  # 更新 Generator 参数
-            scaler.step(raft_optimizer)  # 更新 RAFT 参数
+        if scaler is not None:  # AMP 模式下更新 Generator
+            scaler.scale(sr_outputs["sr_loss"]).backward()  # Generator 只对 sr_loss 反向传播
+            scaler.step(generator_optimizer)  # 只更新 Generator 参数
         else:
-            outputs["sr_loss"].backward()  # 常规反向传播
-            generator_optimizer.step()  # 更新 Generator 参数
-            raft_optimizer.step()  # 更新 RAFT 参数
+            sr_outputs["sr_loss"].backward()  # 常规模式下 Generator 只回传 sr_loss
+            generator_optimizer.step()  # 只更新 Generator 参数
 
-
-        # 继续更新RAFT
+        # 第二阶段：只更新 RAFT，严格只使用 raft_loss。
+        # 这里把 Generator 冻结，再重新前向一次拿到当前 Generator 参数下的 SR 图，
+        # 但不让 raft_loss 反向传播回 Generator。
+        self._set_requires_grad(self.piv_esrgan_generator, False)  # 冻结 Generator，保证 RAFT 阶段不更新 G
+        self._set_requires_grad(self.piv_RAFT, True)  # 开启 RAFT 梯度
+        self._set_requires_grad(self.piv_esrgan_discriminator, False)  # 判别器保持冻结
         raft_optimizer.zero_grad(set_to_none=True)  # 清空 RAFT 梯度
-        if scaler is not None:  # AMP 模式下更新  RAFT
-            scaler.scale(outputs["raft_loss"]).backward()  # 对总损失做缩放后反向传播
-            scaler.step(raft_optimizer)  # 更新 RAFT 参数
+
+        if hasattr(self.piv_esrgan_generator, "forward_pair"):  # 用当前 Generator 参数重新生成一份 SR 图给 RAFT 使用
+            pred_prev_r, pred_next_r = self.piv_esrgan_generator.forward_pair(input_lr_prev, input_lr_next)
         else:
-            outputs["raft_loss"].backward()  # 常规反向传播
-            raft_optimizer.step()  # 更新 RAFT 参数
+            pred_prev_r = self.piv_esrgan_generator(input_lr_prev)
+            pred_next_r = self.piv_esrgan_generator(input_lr_next)
 
+        flow_predictions, raft_outputs = self._compute_raft_branch(
+            pred_prev=pred_prev_r,  # 当前 Generator 输出的前一帧 SR 图
+            pred_next=pred_next_r,  # 当前 Generator 输出的后一帧 SR 图
+            flowl0=flowl0,  # 光流真值
+            flow_init=flow_init,  # 可选 RAFT 初始流
+        )
+        # 训练阶段对外只返回最后一轮流场预测张量，
+        # 避免上层训练代码继续把“整段预测列表”当成单个图像张量使用。
+        final_flow_prediction = flow_predictions[-1]
 
-
-
-        # 再更新 Discriminator
-        self._set_requires_grad(self.piv_esrgan_discriminator, True)  # 打开判别器梯度，准备第二阶段训练 D
-        d_optimizer.zero_grad(set_to_none=True)  # 清空 D 梯度
-
-        if scaler is not None:  # AMP 模式下更新 D
-            scaler.scale(outputs["discriminator_loss"]).backward()  # 反向传播 D 损失
-            scaler.step(d_optimizer)  # 更新 D 参数
-            scaler.update()  # 一次 train_step 结束后更新 scaler
+        if scaler is not None:  # AMP 模式下更新 RAFT
+            scaler.scale(raft_outputs["raft_loss"]).backward()  # RAFT 只对 raft_loss 反向传播
+            scaler.step(raft_optimizer)  # 只更新 RAFT 参数
         else:
-            outputs["discriminator_loss"].backward()  # 常规反向传播 D 损失
-            d_optimizer.step()  # 更新 D 参数
+            raft_outputs["raft_loss"].backward()  # 常规模式下 RAFT 只回传 raft_loss
+            raft_optimizer.step()  # 只更新 RAFT 参数
 
-        return pred_prev,pred_next,flow_predictions,{  # 返回适合直接写日志或进度条的标量字典
-            # "total_loss": float(outputs["total_loss"].detach().item()),  # 总损失
-            "sr_loss": float(outputs["sr_loss"].detach().item()),  # ESRGAN 侧总损失
-            "perceptual_loss": float(outputs["perceptual_loss"].detach().item()),  # 感知损失
-            "content_loss": float(outputs["content_loss"].detach().item()),  # 内容损失
-            "adversarial_loss": float(outputs["adversarial_loss"].detach().item()),  # 生成器对抗损失
-            "pixel_total": float(outputs["pixel_total"].detach().item()),  # 像素总损失
-            "pixel_l1": float(outputs["pixel_l1"].detach().item()),  # L1 子项
-            "pixel_mse": float(outputs["pixel_mse"].detach().item()),  # MSE 子项
-            "pixel_ssim": float(outputs["pixel_ssim"].detach().item()),  # SSIM 子项
-            "pixel_fft": float(outputs["pixel_fft"].detach().item()),  # FFT 子项
+        # 第三阶段：只更新 Discriminator，严格只使用 discriminator_loss。
+        # 这里同样重新生成一份 SR 图，但判别器损失内部会对 fake 图做 detach，
+        # 因此不会把梯度传回 Generator。
+        self._set_requires_grad(self.piv_esrgan_generator, False)  # 继续冻结 Generator
+        self._set_requires_grad(self.piv_RAFT, False)  # 冻结 RAFT
+        self._set_requires_grad(self.piv_esrgan_discriminator, True)  # 只开启判别器梯度
+        d_optimizer.zero_grad(set_to_none=True)  # 清空判别器梯度
 
-            "pair_temporal_loss": float(outputs["pair_temporal_loss"].detach().item()),  # 时间一致性总损失
-            "pair_delta_loss": float(outputs["pair_delta_loss"].detach().item()),  # 时间一致性中的差分项
-            "pair_gradient_loss": float(outputs["pair_gradient_loss"].detach().item()),  # 时间一致性中的梯度项
-            "raft_loss": float(outputs["raft_loss"].detach().item()),  # RAFT 损失
-            "discriminator_loss": float(outputs["discriminator_loss"].detach().item()),  # 判别器总损失
-            "d_real_loss": float(outputs["d_real_loss"].detach().item()),  # 判别器真样本损失
-            "d_fake_loss": float(outputs["d_fake_loss"].detach().item()),  # 判别器假样本损失
-            "raft_epe": float(outputs["raft_metrics"]["epe"]),  # RAFT 平均 EPE
-            "raft_1px": float(outputs["raft_metrics"]["1px"]),  # EPE < 1 像素的比例
-            "raft_3px": float(outputs["raft_metrics"]["3px"]),  # EPE < 3 像素的比例
-            "raft_5px": float(outputs["raft_metrics"]["5px"]),  # EPE < 5 像素的比例
+        if hasattr(self.piv_esrgan_generator, "forward_pair"):
+            pred_prev_d, pred_next_d = self.piv_esrgan_generator.forward_pair(input_lr_prev, input_lr_next)
+        else:
+            pred_prev_d = self.piv_esrgan_generator(input_lr_prev)
+            pred_next_d = self.piv_esrgan_generator(input_lr_next)
+
+        discriminator_loss, d_fake_loss, d_real_loss = self._compute_discriminator_loss(
+            pred_prev_d,  # previous 生成图
+            pred_next_d,  # next 生成图
+            input_gr_prev,  # previous 真值图
+            input_gr_next,  # next 真值图
+        )
+
+        if scaler is not None:  # AMP 模式下更新判别器
+            scaler.scale(discriminator_loss).backward()  # 判别器只对自身损失反向传播
+            scaler.step(d_optimizer)  # 只更新判别器参数
+            scaler.update()  # 所有 optimizer 都 step 完之后，再统一 update scaler
+        else:
+            discriminator_loss.backward()  # 常规模式下反向传播判别器损失
+            d_optimizer.step()  # 更新判别器参数
+
+        # 恢复三个子模块的梯度开关，避免影响外部后续逻辑。
+        self._set_requires_grad(self.piv_esrgan_generator, True)
+        self._set_requires_grad(self.piv_RAFT, True)
+        self._set_requires_grad(self.piv_esrgan_discriminator, True)
+
+        return pred_prev_r,pred_next_r,final_flow_prediction,{  # 返回分离损失训练下的日志字典
+            "sr_loss": float(sr_outputs["sr_loss"].detach().item()),  # ESRGAN 侧总损失
+            "perceptual_loss": float(sr_outputs["perceptual_loss"].detach().item()),  # 感知损失
+            "content_loss": float(sr_outputs["content_loss"].detach().item()),  # 内容损失
+            "adversarial_loss": float(sr_outputs["adversarial_loss"].detach().item()),  # 生成器对抗损失
+            "pixel_total": float(sr_outputs["pixel_total"].detach().item()),  # 像素总损失
+            "pixel_l1": float(sr_outputs["pixel_l1"].detach().item()),  # L1 子项
+            "pixel_mse": float(sr_outputs["pixel_mse"].detach().item()),  # MSE 子项
+            "pixel_ssim": float(sr_outputs["pixel_ssim"].detach().item()),  # SSIM 子项
+            "pixel_fft": float(sr_outputs["pixel_fft"].detach().item()),  # FFT 子项
+            "pair_temporal_loss": float(sr_outputs["pair_temporal_loss"].detach().item()),  # 时间一致性总损失
+            "pair_delta_loss": float(sr_outputs["pair_delta_loss"].detach().item()),  # 时间一致性中的差分项
+            "pair_gradient_loss": float(sr_outputs["pair_gradient_loss"].detach().item()),  # 时间一致性中的梯度项
+            "raft_loss": float(raft_outputs["raft_loss"].detach().item()),  # RAFT 损失
+            "discriminator_loss": float(discriminator_loss.detach().item()),  # 判别器总损失
+            "d_real_loss": float(d_real_loss.detach().item()),  # 判别器真样本损失
+            "d_fake_loss": float(d_fake_loss.detach().item()),  # 判别器假样本损失
+            "raft_epe": float(raft_outputs["raft_metrics"]["epe"]),  # RAFT 平均 EPE
+            "raft_1px": float(raft_outputs["raft_metrics"]["1px"]),  # EPE < 1 像素的比例
+            "raft_3px": float(raft_outputs["raft_metrics"]["3px"]),  # EPE < 3 像素的比例
+            "raft_5px": float(raft_outputs["raft_metrics"]["5px"]),  # EPE < 5 像素的比例
         }
-

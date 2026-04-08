@@ -20,7 +20,7 @@ from study.SRGAN.data_load import get_class_names, load_data, save_loaders_paths
 from study.SRGAN.model.PIV_esrgan_RAFT.Module.PIV_ESRGAN_RAFT_Model import PIV_ESRGAN_RAFT
 from study.SRGAN.model.PIV_esrgan_RAFT.evaluate import evaluate, evaluate_all
 from study.SRGAN.model.PIV_esrgan_RAFT.global_class import global_data
-from study.SRGAN.model.PIV_esrgan_RAFT.train import image_pair_train, flow_train, esrgan_union_RAFT_train
+from study.SRGAN.model.PIV_esrgan_RAFT.train import esrgan_union_RAFT_train
 from study.SRGAN.util.CSV_operator import CsvTable
 from study.SRGAN.util.accumulator import Accumulator
 from study.SRGAN.util.animator import Animator
@@ -120,6 +120,7 @@ def main():
                 return_test_loader=True
             )
             # 每个类别的图像对和flo文件分别训练验证和保存模型 ！！！！！已经去除
+            data_type = "RAFT"
             # Start a new wandb run to track this script.
             wandb.init(
                 entity="2950067210-usst",
@@ -153,7 +154,7 @@ def main():
                     "selected_classes": selected_classes if selected_classes is not None else "ALL_MIXED",
                 },
             )
-            data_type="RAFT"
+
             # 创建文件夹
             Path(f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.LOSS_DIR}").mkdir(
                 parents=True, exist_ok=True)
@@ -183,7 +184,7 @@ def main():
             animator = Animator(xlabel='epoch', xlim=[1, global_data.esrgan.EPOCH_NUMS], ylim=[0, 0.5],
                                 legend=global_data.esrgan.loss_label + global_data.esrgan.validate_label)
 
-            PIV_ESRGAN_RAFT_model = PIV_ESRGAN_RAFT(inner_chanel=3).to(global_data.esrgan.device)
+            PIV_ESRGAN_RAFT_model = PIV_ESRGAN_RAFT(inner_chanel=3,batch_size=global_data.esrgan.BATCH_SIZE).to(global_data.esrgan.device)
             if global_data.esrgan.csvOperator is None:
                 global_data.esrgan.csvOperator = CsvTable(
                     file_path=f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.LOSS_DIR}/loss_{class_name} _{data_type}_scale_{int(SCALE * SCALE)}.csv",
@@ -245,6 +246,7 @@ def main():
                         train_progress_bar=train_progress_bar,
                         metric=metric, data_type=data_type, device=global_data.esrgan.device, class_name=class_name,
                         SCALE=SCALE
+
                     )
                 # 每轮结束后评价一次 验证集只取一轮batch
                 evaluate(epoch=epoch, class_name=class_name, data_type=data_type, device=global_data.esrgan.device,

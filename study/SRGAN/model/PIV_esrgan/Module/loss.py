@@ -7,7 +7,7 @@ from torchvision import models
 from torchvision.models import vgg19
 import torch.nn.functional as F
 
-from SRGAN.util.image_util import _select_metric_or_save_channels, _to_gray
+from study.SRGAN.util.image_util import _select_metric_or_save_channels, _to_gray
 from study.SRGAN.model.PIV_esrgan.global_class import global_data
 
 
