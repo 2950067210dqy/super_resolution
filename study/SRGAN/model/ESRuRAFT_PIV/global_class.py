@@ -29,17 +29,18 @@ class global_data:
                zero padding 像这样： 图像外面全是黑洞卷积一到边缘就看到很多假黑像素
                reflect padding 像这样：图像边缘像镜子一样往外延伸 卷积在边缘看到的还是类似原图的纹理 解决padding artifact
            15）与RAFT联合
+           16）将RAFT的epe损失补偿到生成器的g_loss中
            ......
            
    
            """
         #运行环境是否是autoDL
-        IS_AUTO_DL = True
+        IS_AUTO_DL = False
         AUTODL_DATA_PATH = rf"/root/autodl-tmp" if IS_AUTO_DL else r""
         # =========================
         # 训练任务标识
         # =========================
-        name = "PIV_esrgan_RAFT"  # 当前实验名（用于输出目录/模型名/wandb run名）
+        name = "ESRuRAFT_PIV"  # 当前实验名（用于输出目录/模型名/wandb run名）
         DESCRIPTION = "v1"  # 实验补充描述（可写损失配置、数据版本等）
         name +=DESCRIPTION
 
@@ -89,7 +90,8 @@ class global_data:
         # =========================
         # 损失项系数
         # =========================
-        LAMBDA_CONTENT = 1  # 感知损失中的内容项权重
+        LAMBDA_CONTENT = 1  # 感知损失中的内容项权重 vgg
+        RAFT_EPE_WEIGHT = 0.1  # 生成器侧附加的 RAFT EPE 反作用权重，用来让更小的 EPE 反向约束 SR 结果
         # `LAMBDA_ADVERSARIAL` 作为“当前生效值”保留，
         # 每个 epoch 开始时会由 update_adversarial_weight(...) 动态刷新。
         LAMBDA_ADVERSARIAL = 0.0005
@@ -123,6 +125,7 @@ class global_data:
         # =========================
         LAMBDA_PAIR_DELTA = 0.012  # 图像对前后帧差分一致性权重；直接约束 previous/next 的变化量
         LAMBDA_PAIR_GRADIENT = 0.008  # 图像对差分梯度一致性权重；约束变化边界和位移轮廓
+
         # =========================
         # 结构相似性损失超参数
         # =========================
