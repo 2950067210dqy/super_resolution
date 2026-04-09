@@ -5,6 +5,7 @@ from study.SRGAN.model.esrgan import esrgan_pipeline as esrgan_pipeline
 from study.SRGAN.model.esrgan_update import pipeline as esrgan_update_pipeline
 from study.SRGAN.model.PIV_esrgan import pipeline as PIV_esrgan_pipeline
 from study.SRGAN.model.PIV_esrgan_RAFT import pipeline as PIV_esrgan_RAFT_pipeline
+from study.SRGAN.model.ESRuRAFT_PIV import pipeline as ESRuRAFT_PIV_pipeline
 
 
 models = {
@@ -13,6 +14,7 @@ models = {
         "esrgan_update":esrgan_update_pipeline.main,
         "piv_esrgan":PIV_esrgan_pipeline.main,
         "piv_esrgan_RAFT":PIV_esrgan_RAFT_pipeline.main,
+        "ESRuRAFT_PIV":ESRuRAFT_PIV_pipeline.main,
           }
 def main():
     logger.add(

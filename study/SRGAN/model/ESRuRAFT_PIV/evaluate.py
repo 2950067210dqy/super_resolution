@@ -687,7 +687,9 @@ def validate_raft(model, dataloader, device):
     avg_val_mse_loss = total_val_mse_loss / max(loss_count, 1)
     avg_psnr = total_psnr / max(num_images, 1)
     avg_energy_spectrum_mse = total_energy_spectrum_mse / max(num_images, 1)
-    avg_aee = total_aee / max(loss_count, 1)
+    # outputs["raft_metrics"]["epe"] 本身已经是当前验证 batch 的平均 EPE/AEE，
+    # 这里不能再按 image_pair 分支累计出来的 loss_count 再除一次，否则会把 AEE 额外缩小。
+    avg_aee = total_aee
     return avg_val_ssim_loss, avg_val_mse_loss, avg_psnr, avg_energy_spectrum_mse, avg_aee
 
 """
