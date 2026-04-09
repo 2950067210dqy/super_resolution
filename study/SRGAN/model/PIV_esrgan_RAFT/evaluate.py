@@ -1097,22 +1097,32 @@ def evaluate_all(
 
     rows = []
     rows_by_class: dict[str, list[dict]] = {}
-    curves_by_class: dict[str, dict[str, list[np.ndarray]]] = {}
+    image_pair_curves_by_class: dict[str, dict[str, list[np.ndarray]]] = {}
+    flow_curves_by_class: dict[str, dict[str, list[np.ndarray]]] = {}
     delta_u_hist_by_class: dict[str, list[np.ndarray]] = {}
     delta_v_hist_by_class: dict[str, list[np.ndarray]] = {}
     delta_w_hist_by_class: dict[str, list[np.ndarray]] = {}
     epe_hist_by_class: dict[str, list[np.ndarray]] = {}
-    all_pred_curves = []
-    all_gt_curves = []
+    all_image_pair_pred_curves = []
+    all_image_pair_gt_curves = []
+    all_flow_pred_curves = []
+    all_flow_gt_curves = []
 
-    def register_curve(bucket_name: str, pred_curve: np.ndarray, gt_curve: np.ndarray) -> None:
-        # 频谱曲线既要进全局统计，也要进分类别统计，所以这里同时登记两份。
-        all_pred_curves.append(pred_curve)
-        all_gt_curves.append(gt_curve)
-        if bucket_name not in curves_by_class:
-            curves_by_class[bucket_name] = {"pred": [], "gt": []}
-        curves_by_class[bucket_name]["pred"].append(pred_curve)
-        curves_by_class[bucket_name]["gt"].append(gt_curve)
+    def register_curve(bucket_name: str, pred_curve: np.ndarray, gt_curve: np.ndarray, curve_group: str) -> None:
+        # 频谱曲线按 image_pair / flow 两条链分别登记，
+        # 这样全局和分类别输出时可以同时保留两套均值能量谱图与 .npy。
+        if curve_group == "image_pair":
+            all_image_pair_pred_curves.append(pred_curve)
+            all_image_pair_gt_curves.append(gt_curve)
+            curves_by_group = image_pair_curves_by_class
+        else:
+            all_flow_pred_curves.append(pred_curve)
+            all_flow_gt_curves.append(gt_curve)
+            curves_by_group = flow_curves_by_class
+        if bucket_name not in curves_by_group:
+            curves_by_group[bucket_name] = {"pred": [], "gt": []}
+        curves_by_group[bucket_name]["pred"].append(pred_curve)
+        curves_by_group[bucket_name]["gt"].append(gt_curve)
 
     def append_row(row: dict) -> None:
         # 同一条样本记录：
@@ -1125,16 +1135,32 @@ def evaluate_all(
         delta_v_hist_by_class.setdefault(bucket, [])
         epe_hist_by_class.setdefault(bucket, [])
 
-    def save_mean_spectrum(pred_curves: list[np.ndarray], gt_curves: list[np.ndarray], out_dir: Path, title: str) -> None:
+    def save_mean_spectrum(
+        pred_curves: list[np.ndarray],
+        gt_curves: list[np.ndarray],
+        out_dir: Path,
+        title: str,
+        file_prefix: str,
+        also_save_legacy_names: bool = False,
+    ) -> None:
         if not pred_curves or not gt_curves:
             return
         # 不同样本曲线长度可能略有不同，所以先截到共同最短长度再平均。
         min_len = min(min(len(x) for x in pred_curves), min(len(x) for x in gt_curves))
         pred_mean = np.mean(np.stack([x[:min_len] for x in pred_curves], axis=0), axis=0)
         gt_mean = np.mean(np.stack([x[:min_len] for x in gt_curves], axis=0), axis=0)
-        np.save(out_dir / "energy_spectrum_pred_mean.npy", pred_mean.astype(np.float32))
-        np.save(out_dir / "energy_spectrum_gt_mean.npy", gt_mean.astype(np.float32))
-        _save_energy_spectrum_plot(pred_mean, gt_mean, out_dir / "energy_spectrum_mean_compare.png", title=title)
+        np.save(out_dir / f"{file_prefix}_energy_spectrum_pred_mean.npy", pred_mean.astype(np.float32))
+        np.save(out_dir / f"{file_prefix}_energy_spectrum_gt_mean.npy", gt_mean.astype(np.float32))
+        _save_energy_spectrum_plot(
+            pred_mean,
+            gt_mean,
+            out_dir / f"{file_prefix}_energy_spectrum_mean_compare.png",
+            title=title,
+        )
+        if also_save_legacy_names:
+            np.save(out_dir / "energy_spectrum_pred_mean.npy", pred_mean.astype(np.float32))
+            np.save(out_dir / "energy_spectrum_gt_mean.npy", gt_mean.astype(np.float32))
+            _save_energy_spectrum_plot(pred_mean, gt_mean, out_dir / "energy_spectrum_mean_compare.png", title=title)
 
     def build_mean_row(target_rows: list[dict], bucket_name: str) -> dict:
         def _mean_of(key: str) -> float:
@@ -1258,6 +1284,7 @@ def evaluate_all(
                     np.save(pair_dir / "energy_spectrum_pred.npy", pred_curve.astype(np.float32))
                     np.save(pair_dir / "energy_spectrum_gt.npy", gt_curve.astype(np.float32))
                     _save_energy_spectrum_plot(pred_curve, gt_curve, pair_dir / "energy_spectrum_compare.png", title=f"{sid}-{pair_type} Energy Spectrum")
+                    register_curve(sample_bucket, pred_curve, gt_curve, curve_group="image_pair")
 
                     append_row({
                         "class_name": sample_bucket,
@@ -1381,8 +1408,11 @@ def evaluate_all(
                 pred_curve, gt_curve = _energy_spectrum_curves(p, g)
                 np.save(one_dir / "energy_spectrum_pred.npy", pred_curve.astype(np.float32))
                 np.save(one_dir / "energy_spectrum_gt.npy", gt_curve.astype(np.float32))
+                np.save(one_dir / "flow_energy_spectrum_pred.npy", pred_curve.astype(np.float32))
+                np.save(one_dir / "flow_energy_spectrum_gt.npy", gt_curve.astype(np.float32))
                 _save_energy_spectrum_plot(pred_curve, gt_curve, one_dir / "energy_spectrum_compare.png", title=f"{sid} Energy Spectrum")
-                register_curve(sample_bucket, pred_curve, gt_curve)
+                _save_energy_spectrum_plot(pred_curve, gt_curve, one_dir / "flow_energy_spectrum_compare.png", title=f"{sid} Flow Energy Spectrum")
+                register_curve(sample_bucket, pred_curve, gt_curve, curve_group="flow")
 
                 append_row({
                     "class_name": sample_bucket,
@@ -1404,12 +1434,20 @@ def evaluate_all(
     image_pair_rows = [row for row in rows if row.get("pair_type") in {"previous", "next"}]
     raft_rows = [row for row in rows if row.get("pair_type") == "RAFT"]
 
-    # 根目录下的均值频谱图表示“整个 validate/test loader”的总体表现。
+    # 根目录下分别输出 image_pair / flow 两套均值频谱图，避免图像对和光流频谱混在一起。
     save_mean_spectrum(
-        all_pred_curves,
-        all_gt_curves,
+        all_image_pair_pred_curves,
+        all_image_pair_gt_curves,
         output_root,
-        title=f"{class_name}-{data_type}-x{int(SCALE*SCALE)} Mean Energy Spectrum",
+        title=f"{class_name}-{data_type}-x{int(SCALE*SCALE)} Image Pair Mean Energy Spectrum",
+        file_prefix="image_pair",
+    )
+    save_mean_spectrum(
+        all_flow_pred_curves,
+        all_flow_gt_curves,
+        output_root,
+        title=f"{class_name}-{data_type}-x{int(SCALE*SCALE)} Flow Mean Energy Spectrum",
+        file_prefix="flow",
     )
 
     # 根目录额外保存整套验证集的 Δu / EPE 统计结果，便于做全局误差分布分析。
@@ -1444,13 +1482,22 @@ def evaluate_all(
             write_rows_with_mean(class_root / "metrics_image_pair.csv", class_image_pair_rows, bucket_name)
         if class_raft_rows:
             write_rows_with_mean(class_root / "metrics_raft.csv", class_raft_rows, bucket_name)
-        bucket_curves = curves_by_class.get(bucket_name, {"pred": [], "gt": []})
-        # 每个类别也各自输出一张平均能量谱对比图，方便直接做类间比较。
+        bucket_image_pair_curves = image_pair_curves_by_class.get(bucket_name, {"pred": [], "gt": []})
+        bucket_flow_curves = flow_curves_by_class.get(bucket_name, {"pred": [], "gt": []})
+        # 每个类别也分别输出 image_pair / flow 两套平均能量谱对比图，方便直接做类间比较。
         save_mean_spectrum(
-            bucket_curves["pred"],
-            bucket_curves["gt"],
+            bucket_image_pair_curves["pred"],
+            bucket_image_pair_curves["gt"],
             class_root,
-            title=f"{bucket_name}-{data_type}-x{int(SCALE*SCALE)} Mean Energy Spectrum",
+            title=f"{bucket_name}-{data_type}-x{int(SCALE*SCALE)} Image Pair Mean Energy Spectrum",
+            file_prefix="image_pair",
+        )
+        save_mean_spectrum(
+            bucket_flow_curves["pred"],
+            bucket_flow_curves["gt"],
+            class_root,
+            title=f"{bucket_name}-{data_type}-x{int(SCALE*SCALE)} Flow Mean Energy Spectrum",
+            file_prefix="flow",
         )
 
         # 类别级 Δu / EPE 统计：把该类别所有 sample 的像素误差拼起来，再统一做直方图。
