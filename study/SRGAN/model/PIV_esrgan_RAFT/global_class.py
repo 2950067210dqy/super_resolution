@@ -40,7 +40,7 @@ class global_data:
         # 训练任务标识
         # =========================
         name = "PIV_esrgan_RAFT"  # 当前实验名（用于输出目录/模型名/wandb run名）
-        DESCRIPTION = "v1"  # 实验补充描述（可写损失配置、数据版本等）
+        DESCRIPTION = "v2"  # 实验补充描述（可写损失配置、数据版本等）
         name +=DESCRIPTION
 
         #整体项目注释
@@ -51,7 +51,7 @@ class global_data:
         # mixed 模式下的目录名/日志名
         MIXED_CLASS_TAG = "mixed_all_classes"
         #每个类别加载多少的数据 50%
-        CLASS_SAMPLE_RATIO =0.5
+        CLASS_SAMPLE_RATIO =0.01
         # =========================
         # 设备与模型加载
         # =========================
@@ -65,7 +65,7 @@ class global_data:
         # =========================
         # 训练主超参数
         # =========================
-        EPOCH_NUMS = 50 # 训练轮数 50
+        EPOCH_NUMS = 1 # 训练轮数 50
         BATCH_SIZE = 2 # batch 大小
         PRE_TRIAN_G_EPOCH = 1 #预训练G完成的轮次 从1开始
         TRAIN_DATA_SAVING_STEP =250 #每隔多少steps保存一次生成的图片 50
@@ -193,7 +193,7 @@ class global_data:
                       'raft_loss', 'raft_epe','raft_1px', 'raft_3px','raft_5px',
                       ]
         validate_label = ['VAL_MSE_LOSS','VAL_SSIM_Loss', 'Avg_PSNR',"VAL_energy_spectrum_mse",
-                          "VAL_AEE"]
+                          "VAL_AEE", "VAL_NORM_AEE_PER100PIXEL"]
 
 
         # 存储数据至csv的列名

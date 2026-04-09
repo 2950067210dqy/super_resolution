@@ -307,6 +307,45 @@ def _compute_aee_from_chw(pred_chw: np.ndarray, gt_chw: np.ndarray) -> float:
     return float(np.mean(epe))
 
 
+def _mean_sum_per_100_pixels(values_1d: np.ndarray, group_size: int = 100) -> float:
+    """
+    将一维误差序列按每 100 个像素分组求和，再对所有满 100 像素分组和取平均。
+    最后一组不足 100 个像素时直接丢弃，不参与统计。
+    """
+    values = values_1d.reshape(-1).astype(np.float32)
+    if values.size < group_size:
+        return float("nan")
+    usable_count = (values.size // group_size) * group_size
+    if usable_count <= 0:
+        return float("nan")
+    values = values[:usable_count].reshape(-1, group_size)
+    group_sums = np.sum(values, axis=1, dtype=np.float32)
+    return float(np.mean(group_sums, dtype=np.float32)) if group_sums.size > 0 else float("nan")
+
+
+def _compute_norm_aee_per100_from_flow_tensors(pred_bchw: torch.Tensor, gt_bchw: torch.Tensor) -> float:
+    """
+    用 batch 流场直接计算“每 100 个像素 EPE 累加值的平均”。
+    """
+    if pred_bchw.shape[1] < 2 or gt_bchw.shape[1] < 2:
+        return float("nan")
+    epe_map = torch.sqrt(torch.sum((pred_bchw[:, :2] - gt_bchw[:, :2]) ** 2, dim=1))
+    epe_flat = epe_map.detach().cpu().numpy().reshape(-1)
+    return _mean_sum_per_100_pixels(epe_flat, group_size=100)
+
+
+def _compute_norm_aee_per100_from_chw(pred_chw: np.ndarray, gt_chw: np.ndarray) -> float:
+    """
+    用单样本 CHW 流场计算“每 100 个像素 EPE 累加值的平均”。
+    """
+    if pred_chw.shape[0] < 2 or gt_chw.shape[0] < 2:
+        return float("nan")
+    du = pred_chw[0] - gt_chw[0]
+    dv = pred_chw[1] - gt_chw[1]
+    epe = np.sqrt(du * du + dv * dv)
+    return _mean_sum_per_100_pixels(epe, group_size=100)
+
+
 def _prepare_image_pair_tensor_for_save(
     tensor_bchw: torch.Tensor,
     save_as_gray: bool,
@@ -408,6 +447,68 @@ def _add_headers_to_panel(
     return _pil_rgb_to_tensor01(canvas, panel.device, panel.dtype)
 
 
+def _add_row_and_column_headers_to_panel(
+    panel: torch.Tensor,
+    row_labels: list[str],
+    row_heights: list[int],
+    row_separator_heights: list[int],
+    column_headers: list[str],
+    column_widths: list[int],
+    column_separator_widths: list[int],
+    header_height: int = 22,
+    left_label_width: int = 34,
+) -> torch.Tensor:
+    """
+    同时给拼图补顶部列标题和左侧行标题。
+    这里主要用于 u/v/w 对比面板，保持最右侧色条追加前的主体布局清晰可读。
+    """
+    if len(row_labels) != len(row_heights):
+        raise ValueError("row_labels and row_heights must have the same length")
+    if len(row_separator_heights) != max(0, len(row_labels) - 1):
+        raise ValueError("row_separator_heights length must be len(row_labels)-1")
+    if len(column_headers) != len(column_widths):
+        raise ValueError("column_headers and column_widths must have the same length")
+    if len(column_separator_widths) != max(0, len(column_headers) - 1):
+        raise ValueError("column_separator_widths length must be len(column_headers)-1")
+
+    base = _tensor_to_rgb_pil(panel)
+    canvas = Image.new(
+        "RGB",
+        (base.width + left_label_width, base.height + header_height),
+        color=(255, 255, 255),
+    )
+    canvas.paste(base, (left_label_width, header_height))
+
+    draw = ImageDraw.Draw(canvas)
+    font = ImageFont.load_default()
+
+    x = left_label_width
+    for idx_col, (title, width) in enumerate(zip(column_headers, column_widths)):
+        bbox = draw.textbbox((0, 0), title, font=font)
+        text_w = bbox[2] - bbox[0]
+        text_h = bbox[3] - bbox[1]
+        tx = int(x + max((width - text_w) * 0.5, 0))
+        ty = int(max((header_height - text_h) * 0.5, 0))
+        draw.text((tx, ty), title, fill=(0, 0, 0), font=font)
+        x += width
+        if idx_col < len(column_separator_widths):
+            x += column_separator_widths[idx_col]
+
+    y = header_height
+    for idx_row, (label, height) in enumerate(zip(row_labels, row_heights)):
+        bbox = draw.textbbox((0, 0), label, font=font)
+        text_w = bbox[2] - bbox[0]
+        text_h = bbox[3] - bbox[1]
+        tx = int(max((left_label_width - text_w) * 0.5, 0))
+        ty = int(y + max((height - text_h) * 0.5, 0))
+        draw.text((tx, ty), label, fill=(0, 0, 0), font=font)
+        y += height
+        if idx_row < len(row_separator_heights):
+            y += row_separator_heights[idx_row]
+
+    return _pil_rgb_to_tensor01(canvas, panel.device, panel.dtype)
+
+
 def _make_vertical_colorbar_image(
     height: int,
     vmin: float,
@@ -420,23 +521,31 @@ def _make_vertical_colorbar_image(
     生成单个竖直颜色映射条。
     色条放在最右侧，顶部对应 vmax，底部对应 vmin。
     """
-    grad = np.linspace(1.0, 0.0, height, dtype=np.float32).reshape(height, 1)
+    canvas_w = width + 42
+    canvas = Image.new("RGB", (canvas_w, height), color=(255, 255, 255))
+    draw = ImageDraw.Draw(canvas)
+    font = ImageFont.load_default()
+
+    # 色条上下各留一点边距，避免顶端/底端刻度文字被裁切，
+    # 同时让色条主体比对应图像略矮一点，更利于完整显示文字。
+    inner_pad = min(max(height // 18, 6), 12)
+    bar_h = max(height - 2 * inner_pad, 1)
+    grad = np.linspace(1.0, 0.0, bar_h, dtype=np.float32).reshape(bar_h, 1)
     rgba = plt.get_cmap(cmap_name)(grad)
     rgb = (rgba[..., :3] * 255.0).astype(np.uint8)
     rgb = np.repeat(rgb, width, axis=1)
     bar = Image.fromarray(rgb, mode="RGB")
-
-    canvas_w = width + 42
-    canvas = Image.new("RGB", (canvas_w, height), color=(255, 255, 255))
-    canvas.paste(bar, (0, 0))
-    draw = ImageDraw.Draw(canvas)
-    font = ImageFont.load_default()
+    canvas.paste(bar, (0, inner_pad))
 
     for i in range(tick_count):
-        y = 0 if tick_count == 1 else int(round(i * (height - 1) / (tick_count - 1)))
-        value = vmax - (vmax - vmin) * (y / max(height - 1, 1))
+        y = inner_pad if tick_count == 1 else int(round(inner_pad + i * (bar_h - 1) / max(tick_count - 1, 1)))
+        value = vmax - (vmax - vmin) * (i / max(tick_count - 1, 1))
         draw.line([(width, y), (width + 5, y)], fill=(0, 0, 0), width=1)
-        draw.text((width + 8, max(y - 6, 0)), f"{value:.2f}", fill=(0, 0, 0), font=font)
+        text = f"{value:.2f}"
+        bbox = draw.textbbox((0, 0), text, font=font)
+        text_h = bbox[3] - bbox[1]
+        text_y = min(max(y - text_h // 2, 0), max(height - text_h, 0))
+        draw.text((width + 8, text_y), text, fill=(0, 0, 0), font=font)
     return canvas
 
 
@@ -445,6 +554,9 @@ def _append_colorbar_sections_to_panel(
     sections: list[dict],
     gap: int = 8,
     label_width: int = 68,
+    top_margin: int = 0,
+    section_heights: list[int] | None = None,
+    section_gaps: list[int] | None = None,
 ) -> torch.Tensor:
     """
     在现有拼图最右侧追加一个或多个竖直颜色条。
@@ -454,6 +566,9 @@ def _append_colorbar_sections_to_panel(
     - vmax
     - cmap
     - label
+
+    top_margin / section_heights / section_gaps 用来让色条只覆盖对应图像主体区域，
+    不把顶部标题带和行间空白也算进色条高度。
     """
     base = _tensor_to_rgb_pil(panel)
     total_h = base.height
@@ -466,12 +581,27 @@ def _append_colorbar_sections_to_panel(
     draw = ImageDraw.Draw(canvas)
     font = ImageFont.load_default()
     x0 = base.width + gap
-    y_cursor = 0
-    section_h = total_h // len(sections)
+    y_cursor = int(max(top_margin, 0))
+
+    if section_heights is None:
+        available_h = max(total_h - y_cursor, 1)
+        base_h = available_h // len(sections)
+        section_heights = [base_h] * len(sections)
+        section_heights[-1] += available_h - base_h * len(sections)
+    else:
+        section_heights = [max(int(h), 1) for h in section_heights]
+
+    if section_gaps is None:
+        section_gaps = [0] * max(len(sections) - 1, 0)
+    else:
+        section_gaps = [max(int(g), 0) for g in section_gaps]
+        if len(section_gaps) < max(len(sections) - 1, 0):
+            section_gaps = section_gaps + [0] * (len(sections) - 1 - len(section_gaps))
 
     for idx, section in enumerate(sections):
-        y1 = y_cursor
-        y2 = total_h if idx == len(sections) - 1 else y_cursor + section_h
+        section_h = section_heights[idx] if idx < len(section_heights) else 1
+        y1 = min(y_cursor, total_h)
+        y2 = min(y1 + section_h, total_h)
         bar_img = _make_vertical_colorbar_image(
             height=max(y2 - y1, 1),
             vmin=float(section["vmin"]),
@@ -481,8 +611,12 @@ def _append_colorbar_sections_to_panel(
         canvas.paste(bar_img, (x0, y1))
         label = str(section.get("label", "")).strip()
         if label:
-            draw.text((x0, y1 + 2), label, fill=(0, 0, 0), font=font)
+            bbox = draw.textbbox((0, 0), label, font=font)
+            text_h = bbox[3] - bbox[1]
+            draw.text((x0, y1 + max(((max(y2 - y1, 1)) - text_h) // 2, 0)), label, fill=(0, 0, 0), font=font)
         y_cursor = y2
+        if idx < len(sections) - 1:
+            y_cursor += section_gaps[idx]
 
     return _pil_rgb_to_tensor01(canvas, panel.device, panel.dtype)
 
@@ -509,16 +643,19 @@ def _save_heatmap(arr_2d: np.ndarray, out_png: Path, title: str, cmap: str = "vi
     plt.close()
 
 
-def _compute_flow_error_maps(pred_bchw: torch.Tensor, gt_bchw: torch.Tensor) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _compute_flow_error_maps(pred_bchw: torch.Tensor, gt_bchw: torch.Tensor) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    统一计算水平位移误差、垂直位移误差和端点误差图。
+    统一计算水平位移误差、垂直位移误差、幅值(w)误差和端点误差图。
     """
-    pred_np = _to_np_chw(pred_bchw[0])
-    gt_np = _to_np_chw(gt_bchw[0])
+    pred_flow = pred_bchw if pred_bchw.shape[1] >= 3 else _flow_uv_to_uvw(pred_bchw)
+    gt_flow = gt_bchw if gt_bchw.shape[1] >= 3 else _flow_uv_to_uvw(gt_bchw)
+    pred_np = _to_np_chw(pred_flow[0])
+    gt_np = _to_np_chw(gt_flow[0])
     delta_u = pred_np[0] - gt_np[0]
     delta_v = pred_np[1] - gt_np[1]
+    delta_w = pred_np[2] - gt_np[2]
     epe = np.sqrt(delta_u * delta_u + delta_v * delta_v)
-    return delta_u, delta_v, epe
+    return delta_u, delta_v, delta_w, epe
 
 
 def _save_signed_error_map(
@@ -541,10 +678,11 @@ def _save_signed_error_map(
     ax.set_yticks([])
     if stat_text:
         ax.text(
-            0.02, 0.98, stat_text,
+            0.03, 0.97, stat_text,
             transform=ax.transAxes,
             ha="left", va="top",
             fontsize=18, color="black",
+            bbox=dict(boxstyle="square,pad=0.18", facecolor="white", edgecolor="none", alpha=0.58),
         )
     else:
         ax.set_title(title_text)
@@ -581,24 +719,27 @@ def _save_error_histogram(
     plt.close(fig)
 
 
-def _save_flow_error_visuals(pred_bchw: torch.Tensor, gt_bchw: torch.Tensor, out_dir: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _save_flow_error_visuals(pred_bchw: torch.Tensor, gt_bchw: torch.Tensor, out_dir: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    保存预测光流彩色图、AEE 误差图、Δu/Δv 误差分布图、涡度误差图。
+    保存预测光流彩色图、u/v/w 三张 AEE 风格误差图、Δu/Δv 误差分布图、涡度误差图。
 
     返回：
         delta_u_2d: 水平位移误差图
         delta_v_2d: 垂直位移误差图
+        delta_w_2d: 深度/幅值位移误差图
         epe_2d:     端点误差图
     """
-    pred_np = _to_np_chw(pred_bchw[0])
-    gt_np = _to_np_chw(gt_bchw[0])
+    pred_flow = pred_bchw if pred_bchw.shape[1] >= 3 else _flow_uv_to_uvw(pred_bchw)
+    gt_flow = gt_bchw if gt_bchw.shape[1] >= 3 else _flow_uv_to_uvw(gt_bchw)
+    pred_np = _to_np_chw(pred_flow[0])
+    gt_np = _to_np_chw(gt_flow[0])
 
-    du, dv, epe = _compute_flow_error_maps(pred_bchw, gt_bchw)
+    du, dv, dw, epe = _compute_flow_error_maps(pred_bchw, gt_bchw)
     aee = float(np.mean(epe))
 
-    ref_max_rad = _compute_flow_ref_max_rad(gt_bchw)
-    pred_color = _flow_to_color_preview(pred_bchw[:, :2], ref_max_rad=ref_max_rad)
-    gt_color = _flow_to_color_preview(gt_bchw[:, :2], ref_max_rad=ref_max_rad)
+    ref_max_rad = _compute_flow_ref_max_rad(gt_flow)
+    pred_color = _flow_to_color_preview(pred_flow[:, :2], ref_max_rad=ref_max_rad)
+    gt_color = _flow_to_color_preview(gt_flow[:, :2], ref_max_rad=ref_max_rad)
     pred_color = _append_colorbar_sections_to_panel(
         pred_color,
         [{"vmin": 0.0, "vmax": ref_max_rad, "cmap": "jet", "label": "|V|"}],
@@ -611,14 +752,28 @@ def _save_flow_error_visuals(pred_bchw: torch.Tensor, gt_bchw: torch.Tensor, out
     save_image(pred_color, str(out_dir / "pred_flow.png"), normalize=False)
     save_image(gt_color, str(out_dir / "gt_flow.png"), normalize=False)
 
-    # AEE 仍按标准 EPE 公式计算：sqrt((u_pred-u_gt)^2 + (v_pred-v_gt)^2)，
-    # 这里只把绘图色标固定到 [-0.5, 0.5]，以对齐参考图的视觉风格。
+    # 这里按照“有符号分量误差图 + 左上角显示整体 AEE 数值”的方式保存 u/v/w 三张图。
+    aee_text = rf"$AEE={aee:.4f}$"
     _save_signed_error_map(
-        epe,
-        out_dir / "aee_error.png",
-        title_text="AEE Error",
-        colorbar_label="Abs.error [px]",
-        stat_text=rf"$AEE={aee:.4f}$",
+        du,
+        out_dir / "aee_u_error.png",
+        title_text="AEE-u Error",
+        colorbar_label="u error [px]",
+        stat_text=aee_text,
+    )
+    _save_signed_error_map(
+        dv,
+        out_dir / "aee_v_error.png",
+        title_text="AEE-v Error",
+        colorbar_label="v error [px]",
+        stat_text=aee_text,
+    )
+    _save_signed_error_map(
+        dw,
+        out_dir / "aee_w_error.png",
+        title_text="AEE-w Error",
+        colorbar_label="w error [px]",
+        stat_text=aee_text,
     )
     _save_error_histogram(
         du,
@@ -634,17 +789,20 @@ def _save_flow_error_visuals(pred_bchw: torch.Tensor, gt_bchw: torch.Tensor, out
         xlabel=r"$\Delta v$ displacement [px]",
         color="#4C9F70",
     )
+    _save_error_histogram(
+        dw,
+        out_dir / "delta_w_error.png",
+        title_text=r"$\Delta w$ Error Distribution",
+        xlabel=r"$\Delta w$ displacement [px]",
+        color="#8E6BBE",
+    )
 
     pred_omega = _omega_star_from_uv(pred_np[0], pred_np[1])
     gt_omega = _omega_star_from_uv(gt_np[0], gt_np[1])
-    vorticity_error = pred_omega - gt_omega
-
     np.save(out_dir / "pred_vorticity.npy", pred_omega.astype(np.float32))
     np.save(out_dir / "gt_vorticity.npy", gt_omega.astype(np.float32))
-    np.save(out_dir / "vorticity_error.npy", vorticity_error.astype(np.float32))
-    _save_heatmap(vorticity_error, out_dir / "vorticity_error.png", title="Vorticity Error", cmap="RdBu_r", symmetric=True)
 
-    return du.astype(np.float32), dv.astype(np.float32), epe.astype(np.float32)
+    return du.astype(np.float32), dv.astype(np.float32), dw.astype(np.float32), epe.astype(np.float32)
 
 
 def _histogram_matrix(values: np.ndarray, bins: np.ndarray) -> np.ndarray:
@@ -675,6 +833,16 @@ def _delta_v_histogram_matrix(delta_v_2d: np.ndarray, bins: int = 201) -> np.nda
     max_abs = float(np.max(np.abs(delta_v_2d))) + 1e-12
     edges = np.linspace(-max_abs, max_abs, bins + 1, dtype=np.float32)
     return _histogram_matrix(delta_v_2d, edges)
+
+
+def _delta_w_histogram_matrix(delta_w_2d: np.ndarray, bins: int = 201) -> np.ndarray:
+    """
+    统计 Δw 的像素计数分布。
+    分布区间同样以 0 为中心，便于和 Δu / Δv 采用一致的误差分析口径。
+    """
+    max_abs = float(np.max(np.abs(delta_w_2d))) + 1e-12
+    edges = np.linspace(-max_abs, max_abs, bins + 1, dtype=np.float32)
+    return _histogram_matrix(delta_w_2d, edges)
 
 
 def _epe_histogram_matrix(epe_2d: np.ndarray, bins: int = 201) -> np.ndarray:
@@ -709,7 +877,8 @@ def _ensure_csv_columns(csvOperator, required_columns: list[str]) -> None:
 # 验证函数  RAFT 联合验证
 def validate_raft(model, dataloader, device):
     """
-    在 RAFT 联合验证集上计算平均像素损失、平均 PSNR、平均能量谱 MSE 与平均 AEE。
+    在 RAFT 联合验证集上计算平均像素损失、平均 PSNR、平均能量谱 MSE、平均 AEE，
+    以及“每 100 个像素 EPE 累加值的平均”。
     这里不再区分 image_pair / flo，而是固定走联合模型的一条评估路径。
     """
     model.eval()
@@ -720,6 +889,7 @@ def validate_raft(model, dataloader, device):
     total_psnr = 0.0
     total_energy_spectrum_mse = 0.0
     total_aee = 0.0
+    total_norm_aee_per100 = 0.0
     loss_count = 0
     num_images = 0
 
@@ -768,6 +938,10 @@ def validate_raft(model, dataloader, device):
                 flowl0=flow_gt_uv,
             )
             total_aee += float(outputs["raft_metrics"]["epe"])
+            total_norm_aee_per100 += _compute_norm_aee_per100_from_flow_tensors(
+                outputs["flow_predictions"][-1],
+                flow_gt_uv,
+            )
             #一个batch 就行了 因为训练中的验证只需要1次batch验证
             break
     avg_val_ssim_loss = total_val_ssim_loss / max(loss_count, 1)
@@ -777,7 +951,8 @@ def validate_raft(model, dataloader, device):
     # outputs["raft_metrics"]["epe"] 本身已经是当前验证 batch 的平均 EPE/AEE，
     # 这里不能再按 image_pair 分支累计出来的 loss_count 再除一次，否则会把 AEE 额外缩小。
     avg_aee = total_aee
-    return avg_val_ssim_loss, avg_val_mse_loss, avg_psnr, avg_energy_spectrum_mse, avg_aee
+    avg_norm_aee_per100 = total_norm_aee_per100
+    return avg_val_ssim_loss, avg_val_mse_loss, avg_psnr, avg_energy_spectrum_mse, avg_aee, avg_norm_aee_per100
 
 """
 验证函数 end
@@ -805,7 +980,7 @@ def evaluate(epoch,class_name,data_type,device,
     """
     # 每轮训练结束后进行验证
 
-    avg_val_ssim_loss, avg_val_mse_loss, avg_psnr, avg_val_energy_spectrum_mse, avg_val_aee = validate_raft(
+    avg_val_ssim_loss, avg_val_mse_loss, avg_psnr, avg_val_energy_spectrum_mse, avg_val_aee, avg_val_norm_aee_per100 = validate_raft(
         model, validate_loader, device
     )
 
@@ -820,6 +995,7 @@ def evaluate(epoch,class_name,data_type,device,
         "VAL_AVG_SSIM_LOSS": avg_val_ssim_loss ,
         "VAL_energy_spectrum_mse": avg_val_energy_spectrum_mse,
         "VAL_AEE": avg_val_aee,
+        "VAL_NORM_AEE_PER100PIXEL": avg_val_norm_aee_per100,
         "avg_psnr": avg_psnr,
         "Epoch": epoch,
         **{
@@ -831,7 +1007,8 @@ def evaluate(epoch,class_name,data_type,device,
     logger.info(
         f"Epoch [{epoch + 1}/{global_data.esrgan.EPOCH_NUMS}] |{class_name} {data_type} |running time:{int(current_time - global_data.esrgan.START_TIME )}s | "
         f"VAL_AVG_MSE_LOSS: {avg_val_mse_loss} | VAL_AVG_SSIM_LOSS: {avg_val_ssim_loss} | "
-        f"VAL_energy_spectrum_mse: {avg_val_energy_spectrum_mse} | VAL_AEE: {avg_val_aee} | Avg PSNR: {avg_psnr:.2f}"
+        f"VAL_energy_spectrum_mse: {avg_val_energy_spectrum_mse} | VAL_AEE: {avg_val_aee} | "
+        f"VAL_NORM_AEE_PER100PIXEL: {avg_val_norm_aee_per100} | Avg PSNR: {avg_psnr:.2f}"
     )
     loss_str = "".join([loss_label[index] + ':' + str(metric[index] / train_loader_lens) + "," for index in
                         range(len(loss_label))])
@@ -853,6 +1030,7 @@ def evaluate(epoch,class_name,data_type,device,
         avg_psnr,
         avg_val_energy_spectrum_mse,
         avg_val_aee,
+        avg_val_norm_aee_per100,
     ]
     animator.add(epoch + 1,all_loss_and_val_Datas )
     # 保存到csv文件中
@@ -864,6 +1042,7 @@ def evaluate(epoch,class_name,data_type,device,
     csv_row["Avg_PSNR"] = avg_psnr
     csv_row["VAL_energy_spectrum_mse"] = avg_val_energy_spectrum_mse
     csv_row["VAL_AEE"] = avg_val_aee
+    csv_row["VAL_NORM_AEE_PER100PIXEL"] = avg_val_norm_aee_per100
     csv_row["time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     csvOperator.create(csv_row)
     animator.save_png(
@@ -877,7 +1056,8 @@ def evaluate(epoch,class_name,data_type,device,
             [validate_label[0], validate_label[1], ],
             [validate_label[2]],
             [validate_label[3]],
-            [validate_label[4]]
+            [validate_label[4]],
+            [validate_label[5]]
         ])
     pass
 
@@ -942,7 +1122,7 @@ def evaluate_all(
 
     csv_fields = [
         "class_name", "data_type", "scale", "sample_id", "pair_type",
-        "mse", "psnr", "energy_spectrum_mse", "VAL_AEE", "r2", "ssim", "tke_acc", "nrmse"
+        "mse", "psnr", "energy_spectrum_mse", "VAL_AEE", "VAL_NORM_AEE_PER100PIXEL", "r2", "ssim", "tke_acc", "nrmse"
     ]
 
     # 这些属性是在 load_data 里给 validate/test dataset 动态挂上的。
@@ -964,6 +1144,7 @@ def evaluate_all(
     curves_by_class: dict[str, dict[str, list[np.ndarray]]] = {}
     delta_u_hist_by_class: dict[str, list[np.ndarray]] = {}
     delta_v_hist_by_class: dict[str, list[np.ndarray]] = {}
+    delta_w_hist_by_class: dict[str, list[np.ndarray]] = {}
     epe_hist_by_class: dict[str, list[np.ndarray]] = {}
     all_pred_curves = []
     all_gt_curves = []
@@ -1014,6 +1195,7 @@ def evaluate_all(
             "psnr": _mean_of("psnr"),
             "energy_spectrum_mse": _mean_of("energy_spectrum_mse"),
             "VAL_AEE": _mean_of("VAL_AEE"),
+            "VAL_NORM_AEE_PER100PIXEL": _mean_of("VAL_NORM_AEE_PER100PIXEL"),
             "r2": _mean_of("r2"),
             "ssim": _mean_of("ssim"),
             "tke_acc": _mean_of("tke_acc"),
@@ -1103,11 +1285,6 @@ def evaluate_all(
                     save_image(fk_save, str(pair_dir / "fake.png"), normalize=False)
                     save_image(hr_save, str(pair_dir / "hr.png"), normalize=False)
 
-                    diff = (fk_save - hr_save).abs()
-                    diff_gray = diff if diff.shape[1] == 1 else diff.mean(dim=1, keepdim=True)
-                    save_image(diff, str(pair_dir / "diff_abs.png"), normalize=False)
-                    save_image(diff_gray, str(pair_dir / "diff_abs_gray.png"), normalize=False)
-                    save_image(diff_gray / (diff_gray.max() + 1e-8), str(pair_dir / "diff_abs_gray_norm.png"), normalize=False)
                     _save_triplet(lr_save, fk_save, hr_save, pair_dir / "image_triplet.png")
 
                     p_img = _to_np_chw(fk_eval[0])
@@ -1134,6 +1311,7 @@ def evaluate_all(
                         "psnr": psnr_img,
                         "energy_spectrum_mse": es_mse_img,
                         "VAL_AEE": float("nan"),
+                        "VAL_NORM_AEE_PER100PIXEL": float("nan"),
                         "r2": r2_img,
                         "ssim": ssim_img,
                         "tke_acc": tke_img,
@@ -1167,14 +1345,25 @@ def evaluate_all(
                 flow_pair_panel = _append_colorbar_sections_to_panel(
                     flow_pair_panel,
                     [{"vmin": 0.0, "vmax": ref_max_rad, "cmap": "jet", "label": "|V|"}],
+                    top_margin=22,
+                    section_heights=[fk_color.shape[-2]],
                 )
                 # 流场样本级拼图不再包含 flo 的 LR 图像，只保留 Pred/HR 两列。
                 save_image(flow_pair_panel.clamp(0, 1), str(one_dir / "flow_triplet.png"), normalize=False)
                 # 单独的预测流场彩图已经在 _save_flow_error_visuals 中按统一命名保存为 pred_flow.png，
                 # 这里不再重复落盘，避免同目录下出现语义重复的文件。
 
-                # U/V/S 面板改为 Pred/HR 双列对比，不再包含 flo 的 LR 图像。
+                # U/V/S 面板改为 Pred/HR 双列对比，并补左侧行标题、顶部列标题，最右侧追加色条。
                 uvs_panel = build_flo_uvw_pred_gt_panel(fk1_uvw, hr1)
+                uvs_panel = _add_row_and_column_headers_to_panel(
+                    uvs_panel,
+                    row_labels=["U", "V", "W"],
+                    row_heights=[fk1_uvw.shape[-2], fk1_uvw.shape[-2], fk1_uvw.shape[-2]],
+                    row_separator_heights=[8, 8],
+                    column_headers=["Pred", "HR"],
+                    column_widths=[fk1_uvw.shape[-1], hr1.shape[-1]],
+                    column_separator_widths=[6],
+                )
                 hr_min = hr1[:, :3].amin(dim=(0, 2, 3))
                 hr_max = hr1[:, :3].amax(dim=(0, 2, 3))
                 uvs_panel = _append_colorbar_sections_to_panel(
@@ -1182,22 +1371,27 @@ def evaluate_all(
                     [
                         {"vmin": float(hr_min[0].item()), "vmax": float(hr_max[0].item()), "cmap": "jet", "label": "U"},
                         {"vmin": float(hr_min[1].item()), "vmax": float(hr_max[1].item()), "cmap": "jet", "label": "V"},
-                        {"vmin": float(hr_min[2].item()), "vmax": float(hr_max[2].item()), "cmap": "jet", "label": "S"},
+                        {"vmin": float(hr_min[2].item()), "vmax": float(hr_max[2].item()), "cmap": "jet", "label": "W"},
                     ],
+                    top_margin=22,
+                    section_heights=[fk1_uvw.shape[-2], fk1_uvw.shape[-2], fk1_uvw.shape[-2]],
+                    section_gaps=[8, 8],
                 )
                 save_image(uvs_panel.clamp(0, 1), str(one_dir / "uvs_compare.png"), normalize=False)
                 # 涡度图内部实际只依赖前两个通道 uv，这里传三通道预测和真值保持接口一致。
                 save_vorticity_quiver_compare(fk1_uvw, hr1, str(one_dir / "vorticity_quiver.png"), stride=stride)
                 # 额外保存 AEE 误差图、涡度误差图，并返回像素级误差用于统计分布。
-                delta_u_map, delta_v_map, epe_map = _save_flow_error_visuals(fk1, hr1, one_dir)
+                delta_u_map, delta_v_map, delta_w_map, epe_map = _save_flow_error_visuals(fk1, hr1, one_dir)
 
                 # 逐样本保存 Δu / Δv / EPE 分布。
                 # Δu、Δv 直方图都以 0 为中心，便于横向比较水平/垂直位移误差。
                 sample_delta_u_hist = _delta_u_histogram_matrix(delta_u_map)
                 sample_delta_v_hist = _delta_v_histogram_matrix(delta_v_map)
+                sample_delta_w_hist = _delta_w_histogram_matrix(delta_w_map)
                 sample_epe_hist = _epe_histogram_matrix(epe_map)
                 np.save(one_dir / "delta_u_hist.npy", sample_delta_u_hist)
                 np.save(one_dir / "delta_v_hist.npy", sample_delta_v_hist)
+                np.save(one_dir / "delta_w_hist.npy", sample_delta_w_hist)
                 np.save(one_dir / "epe_hist.npy", sample_epe_hist)
 
                 # 同时把每个 sample 的误差统计登记到所属类别，便于类别级汇总。
@@ -1205,9 +1399,11 @@ def evaluate_all(
                 # 否则像 DNS_turbulence 这类首次出现的类别会在 append 时直接 KeyError。
                 delta_u_hist_by_class.setdefault(sample_bucket, [])
                 delta_v_hist_by_class.setdefault(sample_bucket, [])
+                delta_w_hist_by_class.setdefault(sample_bucket, [])
                 epe_hist_by_class.setdefault(sample_bucket, [])
                 delta_u_hist_by_class[sample_bucket].append(delta_u_map.reshape(-1))
                 delta_v_hist_by_class[sample_bucket].append(delta_v_map.reshape(-1))
+                delta_w_hist_by_class[sample_bucket].append(delta_w_map.reshape(-1))
                 epe_hist_by_class[sample_bucket].append(epe_map.reshape(-1))
 
                 # 数值指标对比统一使用三通道 [u, v, magnitude]。
@@ -1218,6 +1414,7 @@ def evaluate_all(
                 psnr = _psnr_from_mse(mse)
                 es_mse = _energy_spectrum_mse(p, g)
                 aee = _compute_aee_from_chw(p, g)
+                norm_aee_per100 = _compute_norm_aee_per100_from_chw(p, g)
                 r2 = _r2_score(p, g)
                 ssim = _ssim_score(p, g)
                 tke = _tke_reconstruction_accuracy(p, g)
@@ -1239,6 +1436,7 @@ def evaluate_all(
                     "psnr": psnr,
                     "energy_spectrum_mse": es_mse,
                     "VAL_AEE": aee,
+                    "VAL_NORM_AEE_PER100PIXEL": norm_aee_per100,
                     "r2": r2,
                     "ssim": ssim,
                     "tke_acc": tke,
@@ -1259,11 +1457,14 @@ def evaluate_all(
     # 根目录额外保存整套验证集的 Δu / EPE 统计结果，便于做全局误差分布分析。
     all_delta_u_values = [v for values in delta_u_hist_by_class.values() for v in values]
     all_delta_v_values = [v for values in delta_v_hist_by_class.values() for v in values]
+    all_delta_w_values = [v for values in delta_w_hist_by_class.values() for v in values]
     all_epe_values = [v for values in epe_hist_by_class.values() for v in values]
     if all_delta_u_values:
         np.save(output_root / "delta_u_hist_all.npy", _delta_u_histogram_matrix(np.concatenate(all_delta_u_values, axis=0)))
     if all_delta_v_values:
         np.save(output_root / "delta_v_hist_all.npy", _delta_v_histogram_matrix(np.concatenate(all_delta_v_values, axis=0)))
+    if all_delta_w_values:
+        np.save(output_root / "delta_w_hist_all.npy", _delta_w_histogram_matrix(np.concatenate(all_delta_w_values, axis=0)))
     if all_epe_values:
         np.save(output_root / "epe_hist_all.npy", _epe_histogram_matrix(np.concatenate(all_epe_values, axis=0)))
 
@@ -1301,6 +1502,9 @@ def evaluate_all(
         if delta_v_hist_by_class.get(bucket_name):
             class_delta_v_values = np.concatenate(delta_v_hist_by_class[bucket_name], axis=0)
             np.save(class_root / "delta_v_hist_all.npy", _delta_v_histogram_matrix(class_delta_v_values))
+        if delta_w_hist_by_class.get(bucket_name):
+            class_delta_w_values = np.concatenate(delta_w_hist_by_class[bucket_name], axis=0)
+            np.save(class_root / "delta_w_hist_all.npy", _delta_w_histogram_matrix(class_delta_w_values))
         if epe_hist_by_class.get(bucket_name):
             class_epe_values = np.concatenate(epe_hist_by_class[bucket_name], axis=0)
             np.save(class_root / "epe_hist_all.npy", _epe_histogram_matrix(class_epe_values))
@@ -1310,4 +1514,24 @@ def evaluate_all(
     if raft_rows:
         logger.info(f"[evaluate_all] raft metrics csv: {metrics_raft_csv_path}")
     logger.info(f"[evaluate_all] sample outputs: {output_root}")
-    return mean_row
+
+    if raft_rows:
+        return build_mean_row(raft_rows, class_name)
+    if image_pair_rows:
+        return build_mean_row(image_pair_rows, class_name)
+    return build_mean_row(rows, class_name) if rows else {
+        "class_name": class_name,
+        "data_type": data_type,
+        "scale": int(SCALE * SCALE),
+        "sample_id": "MEAN",
+        "pair_type": "all",
+        "mse": float("nan"),
+        "psnr": float("nan"),
+        "energy_spectrum_mse": float("nan"),
+        "VAL_AEE": float("nan"),
+        "VAL_NORM_AEE_PER100PIXEL": float("nan"),
+        "r2": float("nan"),
+        "ssim": float("nan"),
+        "tke_acc": float("nan"),
+        "nrmse": float("nan"),
+    }
