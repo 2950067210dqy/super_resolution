@@ -52,7 +52,7 @@ class global_data:
         # mixed 模式下的目录名/日志名
         MIXED_CLASS_TAG = "mixed_all_classes"
         #每个类别加载多少的数据 50%
-        CLASS_SAMPLE_RATIO =0.01
+        CLASS_SAMPLE_RATIO =0.4
         # =========================
         # 设备与模型加载
         # =========================
@@ -66,7 +66,7 @@ class global_data:
         # =========================
         # 训练主超参数
         # =========================
-        EPOCH_NUMS = 1 # 训练轮数 50
+        EPOCH_NUMS = 50 # 训练轮数 50
         BATCH_SIZE = 2 # batch 大小
         PRE_TRIAN_G_EPOCH = 1 #预训练G完成的轮次 从1开始
         TRAIN_DATA_SAVING_STEP =250 #每隔多少steps保存一次生成的图片 50
