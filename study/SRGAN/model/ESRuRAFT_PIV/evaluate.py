@@ -408,6 +408,85 @@ def _add_headers_to_panel(
     return _pil_rgb_to_tensor01(canvas, panel.device, panel.dtype)
 
 
+def _make_vertical_colorbar_image(
+    height: int,
+    vmin: float,
+    vmax: float,
+    cmap_name: str = "jet",
+    width: int = 26,
+    tick_count: int = 5,
+) -> Image.Image:
+    """
+    生成单个竖直颜色映射条。
+    色条放在最右侧，顶部对应 vmax，底部对应 vmin。
+    """
+    grad = np.linspace(1.0, 0.0, height, dtype=np.float32).reshape(height, 1)
+    rgba = plt.get_cmap(cmap_name)(grad)
+    rgb = (rgba[..., :3] * 255.0).astype(np.uint8)
+    rgb = np.repeat(rgb, width, axis=1)
+    bar = Image.fromarray(rgb, mode="RGB")
+
+    canvas_w = width + 42
+    canvas = Image.new("RGB", (canvas_w, height), color=(255, 255, 255))
+    canvas.paste(bar, (0, 0))
+    draw = ImageDraw.Draw(canvas)
+    font = ImageFont.load_default()
+
+    for i in range(tick_count):
+        y = 0 if tick_count == 1 else int(round(i * (height - 1) / (tick_count - 1)))
+        value = vmax - (vmax - vmin) * (y / max(height - 1, 1))
+        draw.line([(width, y), (width + 5, y)], fill=(0, 0, 0), width=1)
+        draw.text((width + 8, max(y - 6, 0)), f"{value:.2f}", fill=(0, 0, 0), font=font)
+    return canvas
+
+
+def _append_colorbar_sections_to_panel(
+    panel: torch.Tensor,
+    sections: list[dict],
+    gap: int = 8,
+    label_width: int = 68,
+) -> torch.Tensor:
+    """
+    在现有拼图最右侧追加一个或多个竖直颜色条。
+
+    sections 中每个元素包含：
+    - vmin
+    - vmax
+    - cmap
+    - label
+    """
+    base = _tensor_to_rgb_pil(panel)
+    total_h = base.height
+    canvas = Image.new("RGB", (base.width + gap + 26 + label_width, total_h), color=(255, 255, 255))
+    canvas.paste(base, (0, 0))
+
+    if not sections:
+        return _pil_rgb_to_tensor01(canvas, panel.device, panel.dtype)
+
+    draw = ImageDraw.Draw(canvas)
+    font = ImageFont.load_default()
+    x0 = base.width + gap
+    y_cursor = 0
+    section_h = total_h // len(sections)
+
+    for idx, section in enumerate(sections):
+        y1 = y_cursor
+        y2 = total_h if idx == len(sections) - 1 else y_cursor + section_h
+        bar_img = _make_vertical_colorbar_image(
+            height=max(y2 - y1, 1),
+            vmin=float(section["vmin"]),
+            vmax=float(section["vmax"]),
+            cmap_name=str(section.get("cmap", "jet")),
+        )
+        canvas.paste(bar_img, (x0, y1))
+        label = str(section.get("label", "")).strip()
+        if label:
+            draw.text((x0, y1 + 2), label, fill=(0, 0, 0), font=font)
+        y_cursor = y2
+
+    return _pil_rgb_to_tensor01(canvas, panel.device, panel.dtype)
+
+
 def _save_heatmap(arr_2d: np.ndarray, out_png: Path, title: str, cmap: str = "viridis", symmetric: bool = False) -> None:
     """
     保存二维热力图。
@@ -520,6 +599,14 @@ def _save_flow_error_visuals(pred_bchw: torch.Tensor, gt_bchw: torch.Tensor, out
     ref_max_rad = _compute_flow_ref_max_rad(gt_bchw)
     pred_color = _flow_to_color_preview(pred_bchw[:, :2], ref_max_rad=ref_max_rad)
     gt_color = _flow_to_color_preview(gt_bchw[:, :2], ref_max_rad=ref_max_rad)
+    pred_color = _append_colorbar_sections_to_panel(
+        pred_color,
+        [{"vmin": 0.0, "vmax": ref_max_rad, "cmap": "jet", "label": "|V|"}],
+    )
+    gt_color = _append_colorbar_sections_to_panel(
+        gt_color,
+        [{"vmin": 0.0, "vmax": ref_max_rad, "cmap": "jet", "label": "|V|"}],
+    )
     # 统一命名为 pred_flow / gt_flow，避免和别处的 pred_flow.png 重名但语义重复。
     save_image(pred_color, str(out_dir / "pred_flow.png"), normalize=False)
     save_image(gt_color, str(out_dir / "gt_flow.png"), normalize=False)
@@ -933,6 +1020,14 @@ def evaluate_all(
             "nrmse": _mean_of("nrmse"),
         }
 
+    def write_rows_with_mean(csv_path: Path, target_rows: list[dict], bucket_name: str) -> None:
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        mean_row = build_mean_row(target_rows, bucket_name)
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=csv_fields)
+            writer.writeheader()
+            writer.writerows(target_rows + [mean_row])
+
     with torch.no_grad():
         pbar = tqdm(
             data_loader,
@@ -1017,10 +1112,33 @@ def evaluate_all(
 
                     p_img = _to_np_chw(fk_eval[0])
                     g_img = _to_np_chw(hr_eval[0])
+                    mse_img = _mse(p_img, g_img)
+                    psnr_img = _psnr_from_mse(mse_img)
+                    es_mse_img = _energy_spectrum_mse(p_img, g_img)
+                    r2_img = _r2_score(p_img, g_img)
+                    ssim_img = _ssim_score(p_img, g_img)
+                    tke_img = _tke_reconstruction_accuracy(p_img, g_img)
+                    nrmse_img = _nrmse(p_img, g_img)
                     pred_curve, gt_curve = _energy_spectrum_curves(p_img, g_img)
                     np.save(pair_dir / "energy_spectrum_pred.npy", pred_curve.astype(np.float32))
                     np.save(pair_dir / "energy_spectrum_gt.npy", gt_curve.astype(np.float32))
                     _save_energy_spectrum_plot(pred_curve, gt_curve, pair_dir / "energy_spectrum_compare.png", title=f"{sid}-{pair_type} Energy Spectrum")
+
+                    append_row({
+                        "class_name": sample_bucket,
+                        "data_type": data_type,
+                        "scale": int(SCALE * SCALE),
+                        "sample_id": sid,
+                        "pair_type": pair_type,
+                        "mse": mse_img,
+                        "psnr": psnr_img,
+                        "energy_spectrum_mse": es_mse_img,
+                        "VAL_AEE": float("nan"),
+                        "r2": r2_img,
+                        "ssim": ssim_img,
+                        "tke_acc": tke_img,
+                        "nrmse": nrmse_img,
+                    })
 
                 # 保存流场预测及误差分析结果。
                 # lr1 = lr[i:i + 1]
@@ -1039,13 +1157,34 @@ def evaluate_all(
                 # lr_color, _ = flow_to_color_tensor(lr_up1[:, :2], ref_max_rad=ref_max_rad)
                 fk_color = _flow_to_color_preview(fk1[:, :2], ref_max_rad=ref_max_rad)
                 hr_color = _flow_to_color_preview(hr1[:, :2], ref_max_rad=ref_max_rad)
+                flow_pair_panel = build_pair_row(fk_color, hr_color, sep_width=6)
+                flow_pair_panel = _add_headers_to_panel(
+                    flow_pair_panel,
+                    headers=["Pred", "HR"],
+                    column_widths=[fk_color.shape[-1], hr_color.shape[-1]],
+                    separator_widths=[6],
+                )
+                flow_pair_panel = _append_colorbar_sections_to_panel(
+                    flow_pair_panel,
+                    [{"vmin": 0.0, "vmax": ref_max_rad, "cmap": "jet", "label": "|V|"}],
+                )
                 # 流场样本级拼图不再包含 flo 的 LR 图像，只保留 Pred/HR 两列。
-                _save_pair(fk_color, hr_color, one_dir / "flow_triplet.png")
+                save_image(flow_pair_panel.clamp(0, 1), str(one_dir / "flow_triplet.png"), normalize=False)
                 # 单独的预测流场彩图已经在 _save_flow_error_visuals 中按统一命名保存为 pred_flow.png，
                 # 这里不再重复落盘，避免同目录下出现语义重复的文件。
 
                 # U/V/S 面板改为 Pred/HR 双列对比，不再包含 flo 的 LR 图像。
                 uvs_panel = build_flo_uvw_pred_gt_panel(fk1_uvw, hr1)
+                hr_min = hr1[:, :3].amin(dim=(0, 2, 3))
+                hr_max = hr1[:, :3].amax(dim=(0, 2, 3))
+                uvs_panel = _append_colorbar_sections_to_panel(
+                    uvs_panel,
+                    [
+                        {"vmin": float(hr_min[0].item()), "vmax": float(hr_max[0].item()), "cmap": "jet", "label": "U"},
+                        {"vmin": float(hr_min[1].item()), "vmax": float(hr_max[1].item()), "cmap": "jet", "label": "V"},
+                        {"vmin": float(hr_min[2].item()), "vmax": float(hr_max[2].item()), "cmap": "jet", "label": "S"},
+                    ],
+                )
                 save_image(uvs_panel.clamp(0, 1), str(one_dir / "uvs_compare.png"), normalize=False)
                 # 涡度图内部实际只依赖前两个通道 uv，这里传三通道预测和真值保持接口一致。
                 save_vorticity_quiver_compare(fk1_uvw, hr1, str(one_dir / "vorticity_quiver.png"), stride=stride)
@@ -1106,8 +1245,8 @@ def evaluate_all(
                     "nrmse": nrmse,
                 })
 
-    mean_row = build_mean_row(rows, class_name)
-    all_rows_with_mean = rows + [mean_row]
+    image_pair_rows = [row for row in rows if row.get("pair_type") in {"previous", "next"}]
+    raft_rows = [row for row in rows if row.get("pair_type") == "RAFT"]
 
     # 根目录下的均值频谱图表示“整个 validate/test loader”的总体表现。
     save_mean_spectrum(
@@ -1128,20 +1267,24 @@ def evaluate_all(
     if all_epe_values:
         np.save(output_root / "epe_hist_all.npy", _epe_histogram_matrix(np.concatenate(all_epe_values, axis=0)))
 
-    with open(metrics_csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=csv_fields)
-        writer.writeheader()
-        writer.writerows(all_rows_with_mean)
+    metrics_csv_path = Path(metrics_csv_path)
+    metrics_image_pair_csv_path = metrics_csv_path.with_name(f"{metrics_csv_path.stem}_image_pair{metrics_csv_path.suffix}")
+    metrics_raft_csv_path = metrics_csv_path.with_name(f"{metrics_csv_path.stem}_raft{metrics_csv_path.suffix}")
+    if image_pair_rows:
+        write_rows_with_mean(metrics_image_pair_csv_path, image_pair_rows, class_name)
+    if raft_rows:
+        write_rows_with_mean(metrics_raft_csv_path, raft_rows, class_name)
 
     for bucket_name, class_rows in rows_by_class.items():
         class_root = output_root / bucket_name
         class_root.mkdir(parents=True, exist_ok=True)
-        class_mean_row = build_mean_row(class_rows, bucket_name)
-        # 每个类别目录都有自己的 metrics.csv，末尾附一行该类别的均值结果。
-        with open(class_root / "metrics.csv", "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=csv_fields)
-            writer.writeheader()
-            writer.writerows(class_rows + [class_mean_row])
+        class_image_pair_rows = [row for row in class_rows if row.get("pair_type") in {"previous", "next"}]
+        class_raft_rows = [row for row in class_rows if row.get("pair_type") == "RAFT"]
+        # 每个类别目录下也拆成 image_pair / RAFT 两张表，避免图像超分指标和流场指标混在一起。
+        if class_image_pair_rows:
+            write_rows_with_mean(class_root / "metrics_image_pair.csv", class_image_pair_rows, bucket_name)
+        if class_raft_rows:
+            write_rows_with_mean(class_root / "metrics_raft.csv", class_raft_rows, bucket_name)
         bucket_curves = curves_by_class.get(bucket_name, {"pred": [], "gt": []})
         # 每个类别也各自输出一张平均能量谱对比图，方便直接做类间比较。
         save_mean_spectrum(
@@ -1162,6 +1305,9 @@ def evaluate_all(
             class_epe_values = np.concatenate(epe_hist_by_class[bucket_name], axis=0)
             np.save(class_root / "epe_hist_all.npy", _epe_histogram_matrix(class_epe_values))
 
-    logger.info(f"[evaluate_all] metrics csv: {metrics_csv_path}")
+    if image_pair_rows:
+        logger.info(f"[evaluate_all] image pair metrics csv: {metrics_image_pair_csv_path}")
+    if raft_rows:
+        logger.info(f"[evaluate_all] raft metrics csv: {metrics_raft_csv_path}")
     logger.info(f"[evaluate_all] sample outputs: {output_root}")
     return mean_row
