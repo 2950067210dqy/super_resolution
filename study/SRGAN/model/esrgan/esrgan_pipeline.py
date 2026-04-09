@@ -54,7 +54,17 @@ def select_single_class(available_class_names, preset_name=None):
 
 def main():
 
+    logger.add(
+        f"{global_data.esrgan.OUT_PUT_DIR}/running_log/running.log",
+        rotation="100 MB",
+        retention="30 days",
+        level="DEBUG",
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {process.name} | {thread.name} | {name}:{module}:{line} | {message}",
+        enqueue=True,
+        backtrace=True,
+        diagnose=True,
 
+    )
     # 保存超参数
     global_data.esrgan.save_hyper_parameters_txt(f"{global_data.esrgan.OUT_PUT_DIR}/hyper_parameters.txt")
     # 获取类别名

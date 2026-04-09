@@ -1,11 +1,13 @@
 from loguru import logger
-from study.SRGAN.model.basic_srgan.global_class import global_data
+
 from model.basic_srgan import srgan_pipeline
 from study.SRGAN.model.esrgan import esrgan_pipeline as esrgan_pipeline
 from study.SRGAN.model.esrgan_update import pipeline as esrgan_update_pipeline
 from study.SRGAN.model.PIV_esrgan import pipeline as PIV_esrgan_pipeline
 from study.SRGAN.model.PIV_esrgan_RAFT import pipeline as PIV_esrgan_RAFT_pipeline
 from study.SRGAN.model.ESRuRAFT_PIV import pipeline as ESRuRAFT_PIV_pipeline
+
+
 
 
 models = {
@@ -17,17 +19,7 @@ models = {
         "ESRuRAFT_PIV":ESRuRAFT_PIV_pipeline.main,
           }
 def main():
-    logger.add(
-        f"{global_data.srgan.OUT_PUT_DIR}/running_log/running.log",
-        rotation="100 MB",
-        retention="30 days",
-        level="DEBUG",
-        format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {process.name} | {thread.name} | {name}:{module}:{line} | {message}",
-        enqueue=True,
-        backtrace=True,
-        diagnose=True,
 
-    )
     keys = list(models.keys())
     logger.info("==="*10)
     logger.info("可选模型：")

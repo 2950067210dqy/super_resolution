@@ -13,6 +13,12 @@ from torchvision.models import vgg19
 from tqdm import tqdm
 
 import wandb
+from study.SRGAN.compute_cost import (
+    benchmark_latency_for_inputs,
+    count_parameters,
+    estimate_flops_for_inputs,
+    measure_peak_memory_for_inputs,
+)
 from study.SRGAN.data_load import get_class_names, load_data, save_loaders_paths
 
 
@@ -39,6 +45,33 @@ except:
             optimizer.step()
         def update(self):
             pass
+
+
+class ESRuRAFTPIVInferenceWrapper(nn.Module):
+    """为联合模型 profiling 提供纯推理接口，避免把训练损失计算带进基准测试。"""
+
+    def __init__(self, model: ESRuRAFT_PIV):
+        super().__init__()
+        self.model = model
+
+    def forward(self, input_lr_prev, input_lr_next, flowl0):
+        # profiling 时只关心“模型推理本身”的开销，
+        # 所以这里只走 Generator + RAFT 的推理路径，不计算训练损失。
+        if hasattr(self.model.piv_esrgan_generator, "forward_pair"):
+            pred_prev, pred_next = self.model.piv_esrgan_generator.forward_pair(input_lr_prev, input_lr_next)
+        else:
+            pred_prev = self.model.piv_esrgan_generator(input_lr_prev)
+            pred_next = self.model.piv_esrgan_generator(input_lr_next)
+
+        raft_prev = self.model._to_raft_frame(pred_prev)
+        raft_next = self.model._to_raft_frame(pred_next)
+        raft_input = torch.cat([raft_prev, raft_next], dim=1)
+        raft_flow_gt = self.model._to_raft_flow_gt(flowl0)
+        flow_predictions, _ = self.model.piv_RAFT(raft_input, raft_flow_gt)
+        final_flow_prediction = flow_predictions[-1] if isinstance(flow_predictions, (list, tuple)) else flow_predictions
+        return pred_prev, pred_next, final_flow_prediction
+
+
 def select_single_class(available_class_names, preset_name=None):
     """
     单类别训练时选择类别：
@@ -67,9 +100,110 @@ def select_single_class(available_class_names, preset_name=None):
         logger.warning("输入无效，请重新输入。")
 
 
+def _extract_profile_inputs(batch, device):
+    # 从 dataloader 的一个真实 batch 中抽出 profiling 所需输入，
+    # 保证统计出来的耗时 / FLOPs / 显存更接近真实训练数据分布。
+    lr_prev = batch["image_pair"]["previous"]["lr_data"].to(device)
+    hr_prev = batch["image_pair"]["previous"]["gr_data"].to(device)
+    lr_next = batch["image_pair"]["next"]["lr_data"].to(device)
+    hr_next = batch["image_pair"]["next"]["gr_data"].to(device)
+    flow_hr = batch["flo"]["gr_data"].to(device)
+    flow_hr_uv = flow_hr[:, :2, :, :]
+    return (lr_prev, hr_prev, lr_next, hr_next, flow_hr_uv)
+
+
+def _profile_esru_raft_piv_model(model, sample_batch, device, warmup=5, iters=20):
+    was_training = model.training
+    lr_prev, hr_prev, lr_next, hr_next, flow_hr_uv = _extract_profile_inputs(sample_batch, device)
+    # 包一层纯推理 wrapper，避免 forward 里的损失计算把 profiling 结果放大。
+    inference_model = ESRuRAFTPIVInferenceWrapper(model).to(device)
+    inference_model.eval()
+
+    inputs = (lr_prev, lr_next, flow_hr_uv)
+    # 这里记录的是“可训练参数”，更符合实验表格里常见的模型规模口径。
+    _, trainable_params = count_parameters(model)
+    flops = estimate_flops_for_inputs(inference_model, inputs, device)
+    latency_ms, _ = benchmark_latency_for_inputs(inference_model, inputs, device, warmup=warmup, iters=iters)
+    peak_memory_mb = measure_peak_memory_for_inputs(inference_model, inputs, device)
+
+    # profiling 结束后恢复模型原本的 train/eval 状态，避免影响后续流程。
+    if was_training:
+        model.train()
+    else:
+        model.eval()
+    return {
+        "device": str(device),
+        "batch_size": int(lr_prev.shape[0]),
+        "input_lr_shape": tuple(lr_prev.shape),
+        "input_hr_shape": tuple(hr_prev.shape),
+        "flow_shape": tuple(flow_hr_uv.shape),
+        "gpu_memory_usage_gb": float(peak_memory_mb) / 1024.0,
+        "flops_g": float(flops) / 1e9,
+        "inference_time_seconds": float(latency_ms) / 1000.0,
+        "trainable_params_m": float(trainable_params) / 1e6,
+    }
+
+
+def _save_run_metrics_summary(class_name, data_type, scale, metrics_summary):
+    # 汇总指标单独落一份 CSV，和每个 epoch 的 loss CSV 分开，后续做论文表格更方便。
+    summary_csv_path = f"{global_data.esrgan.OUT_PUT_DIR}/metrics_summary.csv"
+    if global_data.esrgan.metricsSummaryCsvOperator is None:
+        global_data.esrgan.metricsSummaryCsvOperator = CsvTable(
+            file_path=summary_csv_path,
+            columns=global_data.esrgan.METRICS_SUMMARY_COLUMNS,
+        )
+    else:
+        global_data.esrgan.metricsSummaryCsvOperator.switch_file(summary_csv_path)
+
+    row = {
+        "run_name": global_data.esrgan.name,
+        "description": global_data.esrgan.DESCRIPTION,
+        "class_name": class_name,
+        "data_type": data_type,
+        "scale": int(scale * scale),
+        "device": metrics_summary["device"],
+        "batch_size": metrics_summary["batch_size"],
+        "input_lr_shape": metrics_summary["input_lr_shape"],
+        "input_hr_shape": metrics_summary["input_hr_shape"],
+        "flow_shape": metrics_summary["flow_shape"],
+        "training_time_hours": metrics_summary["training_time_hours"],
+        "gpu_memory_usage_gb": metrics_summary["gpu_memory_usage_gb"],
+        "flops_g": metrics_summary["flops_g"],
+        "inference_time_seconds": metrics_summary["inference_time_seconds"],
+        "trainable_params_m": metrics_summary["trainable_params_m"],
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    global_data.esrgan.metricsSummaryCsvOperator.create(row)
+    logger.info(f"Metrics summary CSV saved to {summary_csv_path}")
+
+
+def _pick_profile_batch(validate_loader, train_loader):
+    try:
+        # 优先用验证集首个 batch 统计推理指标，更贴近“推理”场景。
+        return next(iter(validate_loader))
+    except StopIteration:
+        logger.warning("validate_loader 为空，profiling 将回退到 train_loader 的首个 batch。")
+        return next(iter(train_loader))
+
+
 
 def main():
+    logger.add(
+        f"{global_data.esrgan.OUT_PUT_DIR}/running_log/running.log",
+        rotation="100 MB",
+        retention="30 days",
+        level="DEBUG",
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {process.name} | {thread.name} | {name}:{module}:{line} | {message}",
+        enqueue=True,
+        backtrace=True,
+        diagnose=True,
 
+    )
+    # 记录整个 pipeline.main() 的开始时间。
+    # 这个时间写入 global_data.esrgan.START_TIME，表示“本次主流程运行开始”，
+    # 不等同于后面单次训练阶段的 training_start_time。
+    start_time = time.time()
+    global_data.esrgan.START_TIME = start_time
 
     # 保存超参数
     global_data.esrgan.save_hyper_parameters_txt(f"{global_data.esrgan.OUT_PUT_DIR}/hyper_parameters.txt")
@@ -211,7 +345,11 @@ def main():
             ESRuRAFT_PIV_model_scaler = GradScaler()
 
 
-            global_data.esrgan.START_TIME = time.time()
+            # 这里单独记录“当前这次训练”的起始时间，
+            # 不覆盖 global_data.esrgan.START_TIME。
+            # global_data.esrgan.START_TIME 表示程序/流程整体开始运行的时间，
+            # training_start_time 只用于统计本次训练耗时（小时）。
+            training_start_time = time.time()
             # 轮数
             """
             训练 start
@@ -253,6 +391,25 @@ def main():
                          model = ESRuRAFT_PIV_model, animator=animator, validate_loader=validate_loader,
                          loss_label=global_data.esrgan.loss_label,validate_label=global_data.esrgan. validate_label, SCALE=SCALE,
                          csvOperator=global_data.esrgan.csvOperator,metric=metric,train_loader_lens=len(train_loader))
+
+            training_end_time = time.time()
+            # 训练总时长统一换算成小时，直接对应你要记录的“训练时间（小时）”。
+            training_time_hours = (training_end_time - training_start_time) / 3600.0
+            sample_batch = _pick_profile_batch(validate_loader, train_loader)
+            # 训练结束后再做一次统一 profiling，得到显存 / FLOPs / 推理时间 / 参数量。
+            metrics_summary = _profile_esru_raft_piv_model(
+                model=ESRuRAFT_PIV_model,
+                sample_batch=sample_batch,
+                device=global_data.esrgan.device,
+            )
+            metrics_summary["training_time_hours"] = training_time_hours
+            # 把这次实验的整体指标写入实验级汇总 CSV。
+            _save_run_metrics_summary(
+                class_name=class_name,
+                data_type=data_type,
+                scale=SCALE,
+                metrics_summary=metrics_summary,
+            )
 
             wandb.finish()
             """

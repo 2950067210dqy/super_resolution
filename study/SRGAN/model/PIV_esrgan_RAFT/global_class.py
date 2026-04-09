@@ -198,8 +198,29 @@ class global_data:
 
         # 存储数据至csv的列名
         CSV_COLUMNS = ['EPOCH'] + loss_label + validate_label + ['time']
+        # 实验级汇总指标 CSV：
+        # 单独记录一次完整训练/评测后的整体开销指标，便于做实验对比表。
+        METRICS_SUMMARY_COLUMNS = [
+            "run_name",
+            "description",
+            "class_name",
+            "data_type",
+            "scale",
+            "device",
+            "batch_size",
+            "input_lr_shape",
+            "input_hr_shape",
+            "flow_shape",
+            "training_time_hours",
+            "gpu_memory_usage_gb",
+            "flops_g",
+            "inference_time_seconds",
+            "trainable_params_m",
+            "timestamp",
+        ]
         # csv操作实例 CsvTable
         csvOperator = None
+        metricsSummaryCsvOperator = None
         # 使用wandb可视化训练过程
         # 初始化 WandB
         # 防止重复 login
