@@ -109,13 +109,13 @@ def esrgan_union_RAFT_train(
     超分辨率与RAFT联合训练。
     """
 
-    lr_prev = batch['image_pair']["previous"]["lr_data"].to(device)
-    hr_prev = batch['image_pair']["previous"]["gr_data"].to(device)
-    lr_next = batch['image_pair']["next"]["lr_data"].to(device)
-    hr_next = batch['image_pair']["next"]["gr_data"].to(device)
+    lr_prev = batch['image_pair']["previous"]["lr_data"].to(device, non_blocking=True)
+    hr_prev = batch['image_pair']["previous"]["gr_data"].to(device, non_blocking=True)
+    lr_next = batch['image_pair']["next"]["lr_data"].to(device, non_blocking=True)
+    hr_next = batch['image_pair']["next"]["gr_data"].to(device, non_blocking=True)
     # flo 原始真值是三通道 [u, v, magnitude]；
     # 这里先保留原始读取方式，再显式只取前两个通道传给 RAFT 监督。
-    flow_hr = batch['flo']["gr_data"].to(device)
+    flow_hr = batch['flo']["gr_data"].to(device, non_blocking=True)
     flow_hr_uv = flow_hr[:, :2, :, :]
     use_adversarial = epoch >= global_data.esrgan.PRE_TRIAN_G_EPOCH - 1
 

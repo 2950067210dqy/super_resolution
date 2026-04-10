@@ -29,7 +29,7 @@ def _tensor_to_rgb_pil(tensor: torch.Tensor) -> Image.Image:
 def _pil_rgb_to_tensor01(image: Image.Image, device, dtype) -> torch.Tensor:
     """将 RGB PIL 图像转回 [1,3,H,W] 的 [0,1] 张量。"""
     arr = np.asarray(image).astype(np.float32) / 255.0
-    return torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(device=device, dtype=dtype)
+    return torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(device=device, dtype=dtype, non_blocking=True)
 
 
 def _add_headers_to_panel(

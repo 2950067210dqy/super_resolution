@@ -103,11 +103,11 @@ def select_single_class(available_class_names, preset_name=None):
 def _extract_profile_inputs(batch, device):
     # 从 dataloader 的一个真实 batch 中抽出 profiling 所需输入，
     # 保证统计出来的耗时 / FLOPs / 显存更接近真实训练数据分布。
-    lr_prev = batch["image_pair"]["previous"]["lr_data"].to(device)
-    hr_prev = batch["image_pair"]["previous"]["gr_data"].to(device)
-    lr_next = batch["image_pair"]["next"]["lr_data"].to(device)
-    hr_next = batch["image_pair"]["next"]["gr_data"].to(device)
-    flow_hr = batch["flo"]["gr_data"].to(device)
+    lr_prev = batch["image_pair"]["previous"]["lr_data"].to(device, non_blocking=True)
+    hr_prev = batch["image_pair"]["previous"]["gr_data"].to(device, non_blocking=True)
+    lr_next = batch["image_pair"]["next"]["lr_data"].to(device, non_blocking=True)
+    hr_next = batch["image_pair"]["next"]["gr_data"].to(device, non_blocking=True)
+    flow_hr = batch["flo"]["gr_data"].to(device, non_blocking=True)
     flow_hr_uv = flow_hr[:, :2, :, :]
     return (lr_prev, hr_prev, lr_next, hr_next, flow_hr_uv)
 
@@ -116,7 +116,7 @@ def _profile_esru_raft_piv_model(model, sample_batch, device, warmup=5, iters=20
     was_training = model.training
     lr_prev, hr_prev, lr_next, hr_next, flow_hr_uv = _extract_profile_inputs(sample_batch, device)
     # 包一层纯推理 wrapper，避免 forward 里的损失计算把 profiling 结果放大。
-    inference_model = ESRuRAFTPIVInferenceWrapper(model).to(device)
+    inference_model = ESRuRAFTPIVInferenceWrapper(model).to(device, non_blocking=True)
     inference_model.eval()
 
     inputs = (lr_prev, lr_next, flow_hr_uv)
@@ -318,7 +318,7 @@ def main():
             animator = Animator(xlabel='epoch', xlim=[1, global_data.esrgan.EPOCH_NUMS], ylim=[0, 0.5],
                                 legend=global_data.esrgan.loss_label + global_data.esrgan.validate_label)
 
-            ESRuRAFT_PIV_model = ESRuRAFT_PIV(inner_chanel=3,batch_size=global_data.esrgan.BATCH_SIZE).to(global_data.esrgan.device)
+            ESRuRAFT_PIV_model = ESRuRAFT_PIV(inner_chanel=3,batch_size=global_data.esrgan.BATCH_SIZE).to(global_data.esrgan.device, non_blocking=True)
             if global_data.esrgan.csvOperator is None:
                 global_data.esrgan.csvOperator = CsvTable(
                     file_path=f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.LOSS_DIR}/loss_{class_name} _{data_type}_scale_{int(SCALE * SCALE)}.csv",

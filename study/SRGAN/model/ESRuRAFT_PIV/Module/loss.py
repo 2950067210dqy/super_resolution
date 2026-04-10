@@ -18,7 +18,7 @@ from study.SRGAN.model.ESRuRAFT_PIV.global_class import global_data
 #         for pa in vgg.parameters():
 #             pa.requires_grad = False
 #         self.vgg = vgg.features[:16]
-#         self.vgg = self.vgg.to(device)
+#         self.vgg = self.vgg.to(device, non_blocking=True)
 #
 #     def forward(self, x):
 #         out = self.vgg(x)
@@ -255,7 +255,7 @@ class SSIMLoss(nn.Module):
                 self.window_size,
                 self.sigma,
                 pred.shape[1]
-            ).to(pred.device)
+            ).to(pred.device, non_blocking=True)
 
         mu_pred = F.conv2d(pred, window, padding=self.window_size // 2, groups=pred.shape[1])
         mu_target = F.conv2d(target, window, padding=self.window_size // 2, groups=target.shape[1])
@@ -454,15 +454,15 @@ pixel_loss = CombinedPixelLoss(
     white_alpha=global_data.esrgan.PIXEL_WHITE_ALPHA,
     lambda_cons=global_data.esrgan.LAMBDA_GRAY_CONS,
     lambda_fft=global_data.esrgan.LAMBDA_PIXEL_FFT,
-).to(global_data.esrgan.device)
+).to(global_data.esrgan.device, non_blocking=True)
 # 这里vgg是针对三通道RGB图的
 # vgg = vgg19(pretrained=True).features[:15].eval()  # 提取 VGG 特征 srgan 用的vgg
 vgg =vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1).features[:15]
 # vgg模型预测模式
-vgg = vgg.to(global_data.esrgan.device).eval()
+vgg = vgg.to(global_data.esrgan.device, non_blocking=True).eval()
 
 # 感知损失
-perceptual_loss = PerceptualLoss(vgg=vgg).to(global_data.esrgan.device)
+perceptual_loss = PerceptualLoss(vgg=vgg).to(global_data.esrgan.device, non_blocking=True)
 # 归一化损失 正则化损失
 # regularization_loss = RegularizationLoss().to(global_data.esrgan.device)
 
@@ -470,6 +470,6 @@ perceptual_loss = PerceptualLoss(vgg=vgg).to(global_data.esrgan.device)
 image_pair_temporal_loss = ImagePairTemporalConsistencyLoss(
     delta_weight=global_data.esrgan.LAMBDA_PAIR_DELTA,
     gradient_weight=global_data.esrgan.LAMBDA_PAIR_GRADIENT,
-).to(global_data.esrgan.device)
+).to(global_data.esrgan.device, non_blocking=True)
 #判别器损失
-descriminator_loss = Discriminator_loss().to(global_data.esrgan.device)
+descriminator_loss = Discriminator_loss().to(global_data.esrgan.device, non_blocking=True)

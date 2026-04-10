@@ -1334,6 +1334,9 @@ def _build_loader_from_samples(
     )
     return DataLoader(
         dataset,
+        pin_memory=True,#让 CPU 到 GPU 的拷贝更快，尤其你训练时有 .to(device, non_blocking=True) 的话更有用。
+        persistent_workers=True,#每个 epoch 不反复重建 worker，减少开销。适合长时间训练。
+        prefetch_factor=2,#每个 worker 提前准备后面的 batch，减少 GPU 等待。
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
@@ -1771,6 +1774,9 @@ def load_data(
 
     train_dataloader = DataLoader(
         train_dataset,
+        pin_memory=True,  # 让 CPU 到 GPU 的拷贝更快，尤其你训练时有 .to(device, non_blocking=True) 的话更有用。
+        persistent_workers=True,  # 每个 epoch 不反复重建 worker，减少开销。适合长时间训练。
+        prefetch_factor=2,  # 每个 worker 提前准备后面的 batch，减少 GPU 等待。
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
@@ -1778,6 +1784,9 @@ def load_data(
     )
     validate_dataloader = DataLoader(
         validate_dataset,
+        pin_memory=True,  # 让 CPU 到 GPU 的拷贝更快，尤其你训练时有 .to(device, non_blocking=True) 的话更有用。
+        persistent_workers=True,  # 每个 epoch 不反复重建 worker，减少开销。适合长时间训练。
+        prefetch_factor=2,  # 每个 worker 提前准备后面的 batch，减少 GPU 等待。
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
@@ -1785,6 +1794,9 @@ def load_data(
     )
     test_dataloader = DataLoader(
         test_dataset,
+        pin_memory=True,  # 让 CPU 到 GPU 的拷贝更快，尤其你训练时有 .to(device, non_blocking=True) 的话更有用。
+        persistent_workers=True,  # 每个 epoch 不反复重建 worker，减少开销。适合长时间训练。
+        prefetch_factor=2,  # 每个 worker 提前准备后面的 batch，减少 GPU 等待。
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,

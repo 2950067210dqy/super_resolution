@@ -55,11 +55,11 @@ def validate_and_save(result_dir, model, val_dataloader, device, epoch, data_typ
     with torch.no_grad():
         for batch_idx, batch in enumerate(val_dataloader):
             # RAFT 联合评估固定同时读取图像对与流场真值，不再按 data_type 做 image_pair/flo 分叉。
-            lr_prev = batch["image_pair"]["previous"]["lr_data"].to(device)
-            hr_prev = batch["image_pair"]["previous"]["gr_data"].to(device)
-            lr_next = batch["image_pair"]["next"]["lr_data"].to(device)
-            hr_next = batch["image_pair"]["next"]["gr_data"].to(device)
-            hr_images = batch["flo"]["gr_data"].to(device)
+            lr_prev = batch["image_pair"]["previous"]["lr_data"].to(device, non_blocking=True)
+            hr_prev = batch["image_pair"]["previous"]["gr_data"].to(device, non_blocking=True)
+            lr_next = batch["image_pair"]["next"]["lr_data"].to(device, non_blocking=True)
+            hr_next = batch["image_pair"]["next"]["gr_data"].to(device, non_blocking=True)
+            hr_images = batch["flo"]["gr_data"].to(device, non_blocking=True)
             # RAFT 监督只吃 uv 两个通道；评估对比仍保留三通道真值 [u, v, magnitude]。
             hr_images_uv = hr_images[:, :2, :, :]
 
@@ -387,7 +387,7 @@ def _pil_rgb_to_tensor01(image: Image.Image, device, dtype) -> torch.Tensor:
     将 PIL RGB 图像转回 [1,3,H,W] 且范围为 [0,1] 的张量。
     """
     arr = np.asarray(image).astype(np.float32) / 255.0
-    return torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(device=device, dtype=dtype)
+    return torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(device=device, dtype=dtype, non_blocking=True)
 
 
 def _add_headers_to_panel(
@@ -854,11 +854,11 @@ def validate_raft(model, dataloader, device, epoch):
 
     with torch.no_grad():
         for batch in dataloader:
-            lr_prev = batch["image_pair"]["previous"]["lr_data"].to(device)
-            hr_prev = batch["image_pair"]["previous"]["gr_data"].to(device)
-            lr_next = batch["image_pair"]["next"]["lr_data"].to(device)
-            hr_next = batch["image_pair"]["next"]["gr_data"].to(device)
-            flow_gt = batch["flo"]["gr_data"].to(device)
+            lr_prev = batch["image_pair"]["previous"]["lr_data"].to(device, non_blocking=True)
+            hr_prev = batch["image_pair"]["previous"]["gr_data"].to(device, non_blocking=True)
+            lr_next = batch["image_pair"]["next"]["lr_data"].to(device, non_blocking=True)
+            hr_next = batch["image_pair"]["next"]["gr_data"].to(device, non_blocking=True)
+            flow_gt = batch["flo"]["gr_data"].to(device, non_blocking=True)
             # RAFT 监督只使用 uv 两个通道；这里保留三通道原始真值用于其他评估项。
             flow_gt_uv = flow_gt[:, :2, :, :]
 
@@ -1213,12 +1213,12 @@ def evaluate_all(
             # batch['class_name'] 来自 data_load 的 collate_fn，是当前 batch 每个样本的真实类别名列表。
 
             # RAFT 联合评估固定同时读取图像对与流场，不再按 image_pair / flo 分路。
-            lr_prev = batch["image_pair"]["previous"]["lr_data"].to(device)
-            hr_prev = batch["image_pair"]["previous"]["gr_data"].to(device)
-            lr_next = batch["image_pair"]["next"]["lr_data"].to(device)
-            hr_next = batch["image_pair"]["next"]["gr_data"].to(device)
-            # lr = batch["flo"]["lr_data"].to(device)
-            hr = batch["flo"]["gr_data"].to(device)
+            lr_prev = batch["image_pair"]["previous"]["lr_data"].to(device, non_blocking=True)
+            hr_prev = batch["image_pair"]["previous"]["gr_data"].to(device, non_blocking=True)
+            lr_next = batch["image_pair"]["next"]["lr_data"].to(device, non_blocking=True)
+            hr_next = batch["image_pair"]["next"]["gr_data"].to(device, non_blocking=True)
+            # lr = batch["flo"]["lr_data"].to(device, non_blocking=True)
+            hr = batch["flo"]["gr_data"].to(device, non_blocking=True)
             # RAFT 监督只使用 uv 两个通道；这里保留三通道原始真值用于评估和可视化。
             hr_uv = hr[:, :2, :, :]
 

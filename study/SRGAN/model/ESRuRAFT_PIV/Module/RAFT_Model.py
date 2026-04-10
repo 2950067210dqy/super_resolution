@@ -176,7 +176,7 @@ class CorrBlock:
             dy = torch.linspace(-r, r, 2 * r + 1)
 
             # 生成局部偏移网格，最后一维是 (dy, dx) 对应坐标偏移
-            delta = torch.stack(torch.meshgrid(dy, dx), axis=-1).to(coords.device)
+            delta = torch.stack(torch.meshgrid(dy, dx), axis=-1).to(coords.device, non_blocking=True)
 
             # 当前层的中心坐标
             # 由于金字塔每层分辨率减半，所以坐标也要除以 2**i
@@ -334,9 +334,9 @@ class RAFT(nn.Module):
         N, C, H, W = img.shape
 
         # 基准坐标网格
-        coords0 = coords_grid(N, H, W).to(img.device)
+        coords0 = coords_grid(N, H, W).to(img.device, non_blocking=True)
         # 当前预测坐标网格，初始化为与 coords0 相同
-        coords1 = coords_grid(N, H, W).to(img.device)
+        coords1 = coords_grid(N, H, W).to(img.device, non_blocking=True)
 
         return coords0, coords1
 
@@ -540,8 +540,8 @@ class RAFT256(nn.Module):
     def initialize_flow(self, img):
         """ Flow is represented as difference between two coordinate grids flow = coords1 - coords0"""
         N, C, H, W = img.shape
-        coords0 = coords_grid(N, H // 8, W // 8).to(img.device)
-        coords1 = coords_grid(N, H // 8, W // 8).to(img.device)
+        coords0 = coords_grid(N, H // 8, W // 8).to(img.device, non_blocking=True)
+        coords1 = coords_grid(N, H // 8, W // 8).to(img.device, non_blocking=True)
 
         # optical flow computed as difference: flow = coords1 - coords0
         return coords0, coords1
