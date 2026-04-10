@@ -34,15 +34,16 @@ class global_data:
            ESRuRAFT_PIV_v1 是最差的上采样
            ESRuRAFT_PIV_v2 是batchsize 2
             ESRuRAFT_PIV_v3 是batchsize 4
+            ESRuRAFT_PIV_v4  之前都没有启用对抗损失 现在启用对抗损失
            """
         #运行环境是否是autoDL
-        IS_AUTO_DL = False
+        IS_AUTO_DL = True
         AUTODL_DATA_PATH = rf"/root/autodl-tmp" if IS_AUTO_DL else r""
         # =========================
         # 训练任务标识
         # =========================
         name = "ESRuRAFT_PIV"  # 当前实验名（用于输出目录/模型名/wandb run名）
-        DESCRIPTION = "v2"  # 实验补充描述（可写损失配置、数据版本等）
+        DESCRIPTION = "v4"  # 实验补充描述（可写损失配置、数据版本等）
         name +=DESCRIPTION
 
         #整体项目注释
@@ -69,7 +70,7 @@ class global_data:
         # =========================
         EPOCH_NUMS = 50 # 训练轮数 50
         BATCH_SIZE = 4 # batch 大小
-        PRE_TRIAN_G_EPOCH = 1 #预训练G完成的轮次 从1开始
+        PRE_TRIAN_G_EPOCH = 1 #预训练G完成的轮次 从1开始 就是从第几轮开始弃用对抗损失
         TRAIN_DATA_SAVING_STEP =250 #每隔多少steps保存一次生成的图片 50
         SHUFFLE = True  # 训练集是否打乱
         TARGET_SIZE = None  # 数据加载时是否统一 resize 到该尺寸

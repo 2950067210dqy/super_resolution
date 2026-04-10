@@ -46,6 +46,7 @@ def validate_and_save(result_dir, model, val_dataloader, device, epoch, data_typ
 
     if SAVE_AS_GRAY is None:
         SAVE_AS_GRAY = global_data.esrgan.SAVE_AS_GRAY
+    use_adversarial = epoch >= global_data.esrgan.PRE_TRIAN_G_EPOCH - 1
 
     model.eval()
     generator = model.piv_esrgan_generator
@@ -72,6 +73,7 @@ def validate_and_save(result_dir, model, val_dataloader, device, epoch, data_typ
                 input_gr_next=hr_next,
                 # 这里显式只把 uv 两个通道送给 RAFT，避免 magnitude 参与监督。
                 flowl0=hr_images_uv,
+                is_adversarial=use_adversarial,
             )
 
             fake_prev = outputs["sr_prev"]
@@ -831,7 +833,7 @@ def _ensure_csv_columns(csvOperator, required_columns: list[str]) -> None:
     csvOperator._write_all(old_rows)
 
 # 验证函数  RAFT 联合验证
-def validate_raft(model, dataloader, device):
+def validate_raft(model, dataloader, device, epoch):
     """
     在 RAFT 联合验证集上计算平均像素损失、平均 PSNR、平均能量谱 MSE、平均 AEE，
     以及“每 100 个像素 EPE 累加值的平均”。
@@ -839,6 +841,7 @@ def validate_raft(model, dataloader, device):
     """
     model.eval()
     generator = model.piv_esrgan_generator
+    use_adversarial = epoch >= global_data.esrgan.PRE_TRIAN_G_EPOCH - 1
     total_val_ssim_loss = 0.0
     total_val_mse_loss = 0.0
 
@@ -892,6 +895,7 @@ def validate_raft(model, dataloader, device):
                 input_gr_next=hr_next,
                 # 这里显式只把 uv 两个通道送给 RAFT。
                 flowl0=flow_gt_uv,
+                is_adversarial=use_adversarial,
             )
             total_aee += float(outputs["raft_metrics"]["epe"])
             total_norm_aee_per100 += _compute_norm_aee_per100_from_flow_tensors(
@@ -937,7 +941,7 @@ def evaluate(epoch,class_name,data_type,device,
     # 每轮训练结束后进行验证
 
     avg_val_ssim_loss, avg_val_mse_loss, avg_psnr, avg_val_energy_spectrum_mse, avg_val_aee, avg_val_norm_aee_per100 = validate_raft(
-        model, validate_loader, device
+        model, validate_loader, device, epoch
     )
 
     # # 训练阶段损失 CSV 需要新增验证能量谱误差和 RAFT 的 AEE。
@@ -1064,6 +1068,9 @@ def evaluate_all(
     device = next(generator.parameters()).device
     generator.eval()
     model.eval()
+    # evaluate_all 是训练完成后的全量评估路径，没有 epoch 参数；
+    # 这里默认进入“允许对抗项”的正式评估口径。
+    use_adversarial = True
 
     logger.info(f"[evaluate_all] SAVE_AS_GRAY={global_data.esrgan.SAVE_AS_GRAY}")
 
@@ -1223,6 +1230,7 @@ def evaluate_all(
                 input_gr_next=hr_next,
                 # 这里显式只把 uv 两个通道送给 RAFT。
                 flowl0=hr_uv,
+                is_adversarial=use_adversarial,
             )
 
             fake_prev = outputs["sr_prev"]

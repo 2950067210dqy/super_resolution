@@ -117,6 +117,7 @@ def esrgan_union_RAFT_train(
     # 这里先保留原始读取方式，再显式只取前两个通道传给 RAFT 监督。
     flow_hr = batch['flo']["gr_data"].to(device)
     flow_hr_uv = flow_hr[:, :2, :, :]
+    use_adversarial = epoch >= global_data.esrgan.PRE_TRIAN_G_EPOCH - 1
 
     #更新梯度
     pred_prev,pred_next,flow_predictions,loss_dict = model.train_step(
@@ -130,7 +131,7 @@ def esrgan_union_RAFT_train(
         d_optimizer=d_optimizer,
         raft_optimizer=RAFT_optimizer,
         scaler=scaler,
-
+        is_adversarial=use_adversarial,
     )
     metric.add(
         # 注意这里的记录顺序必须和 global_class.loss_label 完全一致，否则 csv/plot 会错位。
