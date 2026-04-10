@@ -31,11 +31,12 @@ class global_data:
            15）与RAFT联合
            16）将RAFT的epe损失补偿到生成器的g_loss中
            ......
-           
-   
+           ESRuRAFT_PIV_v1 是最差的上采样
+           ESRuRAFT_PIV_v2 是batchsize 2
+            ESRuRAFT_PIV_v3 是batchsize 4
            """
         #运行环境是否是autoDL
-        IS_AUTO_DL = True
+        IS_AUTO_DL = False
         AUTODL_DATA_PATH = rf"/root/autodl-tmp" if IS_AUTO_DL else r""
         # =========================
         # 训练任务标识
@@ -67,7 +68,7 @@ class global_data:
         # 训练主超参数
         # =========================
         EPOCH_NUMS = 50 # 训练轮数 50
-        BATCH_SIZE = 2 # batch 大小
+        BATCH_SIZE = 4 # batch 大小
         PRE_TRIAN_G_EPOCH = 1 #预训练G完成的轮次 从1开始
         TRAIN_DATA_SAVING_STEP =250 #每隔多少steps保存一次生成的图片 50
         SHUFFLE = True  # 训练集是否打乱

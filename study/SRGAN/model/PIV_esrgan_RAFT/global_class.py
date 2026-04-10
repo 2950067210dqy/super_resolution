@@ -31,7 +31,9 @@ class global_data:
            15）与RAFT联合
            ......
            
-   
+            PIV_esrgan_RAFT_v1 是最差的上采样
+            PIV_esrgan_RAFT_v2 是batchsize 2
+            PIV_esrgan_RAFT_v3 是batchsize 4
            """
         #运行环境是否是autoDL
         IS_AUTO_DL = True
@@ -40,7 +42,7 @@ class global_data:
         # 训练任务标识
         # =========================
         name = "PIV_esrgan_RAFT"  # 当前实验名（用于输出目录/模型名/wandb run名）
-        DESCRIPTION = "v2"  # 实验补充描述（可写损失配置、数据版本等）
+        DESCRIPTION = "v3"  # 实验补充描述（可写损失配置、数据版本等）
         name +=DESCRIPTION
 
         #整体项目注释
@@ -66,7 +68,7 @@ class global_data:
         # 训练主超参数
         # =========================
         EPOCH_NUMS = 50 # 训练轮数 50
-        BATCH_SIZE = 2 # batch 大小
+        BATCH_SIZE = 4 # batch 大小
         PRE_TRIAN_G_EPOCH = 1 #预训练G完成的轮次 从1开始
         TRAIN_DATA_SAVING_STEP =250 #每隔多少steps保存一次生成的图片 50
         SHUFFLE = True  # 训练集是否打乱
