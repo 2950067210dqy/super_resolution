@@ -45,7 +45,7 @@ class global_data:
         # 训练任务标识
         # =========================
         name = "ESRuRAFT_PIV"  # 当前实验名（用于输出目录/模型名/wandb run名）
-        DESCRIPTION = "vtest"  # 实验补充描述（可写损失配置、数据版本等）
+        DESCRIPTION = "vtest2"  # 实验补充描述（可写损失配置、数据版本等）
         name +=DESCRIPTION
 
         #整体项目注释
