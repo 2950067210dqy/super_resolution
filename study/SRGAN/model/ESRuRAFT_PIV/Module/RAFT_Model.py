@@ -4,6 +4,7 @@ from torch import nn
 # RAFT 中的更新模块（通常包含 GRU 风格的迭代更新单元）
 from study.SRGAN.model.ESRuRAFT_PIV.Module.subModule.submodules_RAFT_GRU import BasicUpdateBlock
 from study.SRGAN.model.ESRuRAFT_PIV.Module.subModule.submodules_RAFT_GRU256 import BasicUpdateBlock256
+from study.SRGAN.model.ESRuRAFT_PIV.Module.subModule.submodules_RAFT_GRU128 import BasicUpdateBlock128
 # RAFT 中的特征提取网络
 from study.SRGAN.model.ESRuRAFT_PIV.Module.subModule.submodules_RAFT_extractor import BasicEncoder
 
@@ -11,6 +12,7 @@ from study.SRGAN.model.ESRuRAFT_PIV.Module.subModule.submodules_RAFT_extractor i
 import torch.nn.functional as F
 
 from study.SRGAN.model.ESRuRAFT_PIV.Module.subModule.submodules_RAFT_extractor256 import BasicEncoder256
+from study.SRGAN.model.ESRuRAFT_PIV.Module.subModule.submodules_RAFT_extractor128 import BasicEncoder128
 from study.SRGAN.model.ESRuRAFT_PIV.global_class import global_data
 
 try:
@@ -503,6 +505,108 @@ class LanczosUpsampling(nn.Module):
         y_shifted_patch = torch.sum((y_kernel * padded_img_unfold).reshape(B,C,9,-1),dim=2).reshape(new_size)
 
         return y_shifted_patch
+
+
+class RAFT128(nn.Module):
+    """
+    RAFT128：内部在 1/4 分辨率上估计光流，再上采样回原图大小。
+
+    对 256x256 输入来说，内部流场和相关体工作在 64x64，
+    介于 RAFT 全分辨率版本和 RAFT256 的 32x32 版本之间。
+    """
+
+    def __init__(self, upsample, batch_size):
+        super(RAFT128, self).__init__()
+        self.hidden_dim = 128
+        self.context_dim = 128
+        self.corr_levels = 4
+        self.corr_radius = 4
+        self.flow_size = 64
+
+        self.fnet = BasicEncoder128(output_dim=256, norm_fn='instance', dropout=0.)
+        self.cnet = BasicEncoder128(output_dim=self.hidden_dim + self.context_dim, norm_fn='instance', dropout=0.)
+        self.update_block = BasicUpdateBlock128(
+            hidden_dim=self.hidden_dim,
+            corr_levels=self.corr_levels,
+            corr_radius=self.corr_radius,
+            input_dim=self.context_dim,
+        )
+
+        if upsample == 'bicubic':
+            self.upsample_bicubic = nn.Upsample(scale_factor=2, mode='bicubic')
+        elif upsample in {'bicubic4', 'bicubic8'}:
+            # RAFT128 的内部流场是 1/4 分辨率，所以直接上采样倍率应为 4。
+            self.upsample_bicubic4 = nn.Upsample(scale_factor=4, mode='bicubic')
+        elif upsample in {'lanczos4', 'lanczos4_8'}:
+            # 当前项目默认使用 convex。Lanczos 分支保留显式报错，避免误用 1/8 版本的尺寸假设。
+            pass
+
+    def initialize_flow(self, img):
+        """Flow is represented as difference between two coordinate grids flow = coords1 - coords0."""
+        N, C, H, W = img.shape
+        coords0 = coords_grid(N, H // 4, W // 4).to(img.device, non_blocking=True)
+        coords1 = coords_grid(N, H // 4, W // 4).to(img.device, non_blocking=True)
+        return coords0, coords1
+
+    def upsample_flow(self, flow, mask):
+        """Upsample flow field [H/4, W/4, 2] -> [H, W, 2] using convex combination."""
+        N, _, H, W = flow.shape
+        mask = mask.view(N, 1, 9, 4, 4, H, W)
+        mask = torch.softmax(mask, dim=2)
+
+        # 光流数值也要按空间上采样倍率同步乘 4，保持像素位移单位一致。
+        up_flow = F.unfold(4 * flow, [3, 3], padding=1)
+        up_flow = up_flow.view(N, 2, 9, 1, 1, H, W)
+
+        up_flow = torch.sum(mask * up_flow, dim=2)
+        up_flow = up_flow.permute(0, 1, 4, 2, 5, 3)
+        return up_flow.reshape(N, 2, 4 * H, 4 * W)
+
+    def forward(self, input, flowl0, flow_init=None):
+        img1 = torch.unsqueeze(input[:, 0, :, :], dim=1)
+        img2 = torch.unsqueeze(input[:, 1, :, :], dim=1)
+
+        with autocast(enabled=global_data.esrgan.AMP):
+            fmap1, fmap2 = self.fnet([img1, img2])
+
+        corr_fn = CorrBlock(fmap1, fmap2, radius=self.corr_radius, num_levels=self.corr_levels)
+
+        with autocast(enabled=global_data.esrgan.AMP):
+            cnet = self.cnet(img1)
+            net, inp = torch.split(cnet, [self.hidden_dim, self.context_dim], dim=1)
+            net = torch.tanh(net)
+            inp = torch.relu(inp)
+
+        coords0, coords1 = self.initialize_flow(img1)
+
+        if flow_init is not None:
+            flow_init = F.interpolate(flow_init, [coords1.size()[2], coords1.size()[3]], mode='bilinear', align_corners=True)
+            coords1 = coords1 + flow_init
+
+        flow_predictions = []
+        for itr in range(global_data.esrgan.GRU_ITERS):
+            coords1 = coords1.detach()
+            corr = corr_fn(coords1)
+            flow = coords1 - coords0
+
+            with autocast(enabled=global_data.esrgan.AMP):
+                net, up_mask, delta_flow = self.update_block(net, inp, corr, flow)
+
+            coords1 = coords1 + delta_flow
+
+            if global_data.esrgan.RAFT_UPSAMPLE == 'convex':
+                flow_up = self.upsample_flow(coords1 - coords0, up_mask)
+            elif global_data.esrgan.RAFT_UPSAMPLE == 'bicubic':
+                flow_up = self.upsample_bicubic(self.upsample_bicubic(coords1 - coords0))
+            elif global_data.esrgan.RAFT_UPSAMPLE in {'bicubic4', 'bicubic8'}:
+                flow_up = self.upsample_bicubic4(coords1 - coords0)
+            else:
+                raise ValueError('Selected upsample method not supported for RAFT128: ', global_data.esrgan.RAFT_UPSAMPLE)
+
+            flow_predictions.append(flow_up)
+
+        loss = sequence_loss(flow_predictions, flowl0)
+        return flow_predictions, loss
 
 class RAFT256(nn.Module):
     """

@@ -2,7 +2,7 @@ import torch  # 导入 PyTorch 主库
 from torch import nn  # 导入神经网络模块基类和常用层接口
 import torch.nn.functional as F  # 导入函数式接口，便于直接调用 loss / 激活等函数
 
-from study.SRGAN.model.ESRuRAFT_PIV.Module.RAFT_Model import RAFT, RAFT256  # 导入 RAFT 光流估计主网络
+from study.SRGAN.model.ESRuRAFT_PIV.Module.RAFT_Model import RAFT, RAFT128, RAFT256  # 导入 RAFT 光流估计主网络
 from study.SRGAN.model.ESRuRAFT_PIV.Module.loss import (
     descriminator_loss,  # 判别器损失，负责训练 D 区分真/假图像
     image_pair_temporal_loss,  # 图像对时间一致性损失，约束前后帧变化关系
@@ -45,7 +45,7 @@ class ESRuRAFT_PIV(nn.Module):
 
         self.piv_esrgan_generator = Generator(inner_chanel=inner_chanel)  # 初始化超分生成器，输入 LR 图像对，输出 SR 图像对
         self.piv_esrgan_discriminator = Discriminator(inner_chanel=inner_chanel)  # 初始化判别器，用于区分 SR 图像和真实 HR 图像
-        self.piv_RAFT = RAFT256(upsample=global_data.esrgan.RAFT_UPSAMPLE,batch_size=batch_size)  # 初始化 RAFT，用于根据两帧 SR 图像预测 PIV/光流场
+        self.piv_RAFT = RAFT128(upsample=global_data.esrgan.RAFT_UPSAMPLE,batch_size=batch_size)  # 初始化 RAFT128，在 1/4 分辨率上预测 PIV/光流场
 
     @staticmethod
     def _set_requires_grad(module: nn.Module, requires_grad: bool) -> None:

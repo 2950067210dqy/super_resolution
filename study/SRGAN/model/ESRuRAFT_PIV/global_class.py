@@ -35,6 +35,8 @@ class global_data:
            ESRuRAFT_PIV_v2 是batchsize 2
             ESRuRAFT_PIV_v3 是batchsize 4
             ESRuRAFT_PIV_v4  之前都没有启用对抗损失 现在启用对抗损失
+            ESRuRAFT_PIV_vtest  加EPE损失权重到1
+            ESRuRAFT_PIV_vtest2  加EPE损失权重到1 使用RAFT128
            """
         #运行环境是否是autoDL
         IS_AUTO_DL = True
@@ -43,7 +45,7 @@ class global_data:
         # 训练任务标识
         # =========================
         name = "ESRuRAFT_PIV"  # 当前实验名（用于输出目录/模型名/wandb run名）
-        DESCRIPTION = "v4"  # 实验补充描述（可写损失配置、数据版本等）
+        DESCRIPTION = "vtest"  # 实验补充描述（可写损失配置、数据版本等）
         name +=DESCRIPTION
 
         #整体项目注释
@@ -93,7 +95,7 @@ class global_data:
         # 损失项系数
         # =========================
         LAMBDA_CONTENT = 1  # 感知损失中的内容项权重 vgg
-        RAFT_EPE_WEIGHT = 0.1  # 生成器侧附加的 RAFT EPE 反作用权重，用来让更小的 EPE 反向约束 SR 结果
+        RAFT_EPE_WEIGHT = 1  # 生成器侧附加的 RAFT EPE 反作用权重，用来让更小的 EPE 反向约束 SR 结果
         # `LAMBDA_ADVERSARIAL` 作为“当前生效值”保留，
         # 每个 epoch 开始时会由 update_adversarial_weight(...) 动态刷新。
         LAMBDA_ADVERSARIAL = 0.0005

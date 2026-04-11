@@ -1243,6 +1243,18 @@ def evaluate_all(
             writer.writeheader()
             writer.writerows(target_rows + [mean_row])
 
+    def write_all_class_mean_csv(csv_path: Path, mean_rows: list[dict]) -> None:
+        """
+        保存跨类别均值表：每一行对应一个类别的预测结果平均指标。
+        """
+        if not mean_rows:
+            return
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=csv_fields)
+            writer.writeheader()
+            writer.writerows(mean_rows)
+
     with torch.no_grad():
         pbar = tqdm(
             data_loader,
@@ -1517,10 +1529,15 @@ def evaluate_all(
     metrics_csv_path = Path(metrics_csv_path)
     metrics_image_pair_csv_path = metrics_csv_path.with_name(f"{metrics_csv_path.stem}_image_pair{metrics_csv_path.suffix}")
     metrics_raft_csv_path = metrics_csv_path.with_name(f"{metrics_csv_path.stem}_raft{metrics_csv_path.suffix}")
+    all_class_image_pair_csv_path = output_root / "ALL_CLASS_IMAGE_PAIR.CSV"
+    all_class_flow_csv_path = output_root / "ALL_CLASS_flow.CSV"
     if image_pair_rows:
         write_rows_with_mean(metrics_image_pair_csv_path, image_pair_rows, class_name)
     if raft_rows:
         write_rows_with_mean(metrics_raft_csv_path, raft_rows, class_name)
+
+    all_class_image_pair_mean_rows: list[dict] = []
+    all_class_flow_mean_rows: list[dict] = []
 
     for bucket_name, class_rows in rows_by_class.items():
         class_root = output_root / bucket_name
@@ -1530,8 +1547,16 @@ def evaluate_all(
         # 每个类别目录下也拆成 image_pair / RAFT 两张表，避免图像超分指标和流场指标混在一起。
         if class_image_pair_rows:
             write_rows_with_mean(class_root / "metrics_image_pair.csv", class_image_pair_rows, bucket_name)
+            image_pair_mean_row = build_mean_row(class_image_pair_rows, bucket_name)
+            image_pair_mean_row["sample_id"] = "CLASS_MEAN"
+            image_pair_mean_row["pair_type"] = "image_pair"
+            all_class_image_pair_mean_rows.append(image_pair_mean_row)
         if class_raft_rows:
             write_rows_with_mean(class_root / "metrics_raft.csv", class_raft_rows, bucket_name)
+            flow_mean_row = build_mean_row(class_raft_rows, bucket_name)
+            flow_mean_row["sample_id"] = "CLASS_MEAN"
+            flow_mean_row["pair_type"] = "flow"
+            all_class_flow_mean_rows.append(flow_mean_row)
         bucket_image_pair_curves = image_pair_curves_by_class.get(bucket_name, {"pred": [], "gt": []})
         bucket_flow_curves = flow_curves_by_class.get(bucket_name, {"pred": [], "gt": []})
         # 每个类别也分别输出 image_pair / flow 两套平均能量谱对比图，方便直接做类间比较。
@@ -1564,10 +1589,17 @@ def evaluate_all(
             class_epe_values = np.concatenate(epe_hist_by_class[bucket_name], axis=0)
             np.save(class_root / "epe_hist_all.npy", _epe_histogram_matrix(class_epe_values))
 
+    write_all_class_mean_csv(all_class_image_pair_csv_path, all_class_image_pair_mean_rows)
+    write_all_class_mean_csv(all_class_flow_csv_path, all_class_flow_mean_rows)
+
     if image_pair_rows:
         logger.info(f"[evaluate_all] image pair metrics csv: {metrics_image_pair_csv_path}")
     if raft_rows:
         logger.info(f"[evaluate_all] raft metrics csv: {metrics_raft_csv_path}")
+    if all_class_image_pair_mean_rows:
+        logger.info(f"[evaluate_all] all class image pair metrics csv: {all_class_image_pair_csv_path}")
+    if all_class_flow_mean_rows:
+        logger.info(f"[evaluate_all] all class flow metrics csv: {all_class_flow_csv_path}")
     logger.info(f"[evaluate_all] sample outputs: {output_root}")
 
     if raft_rows:
