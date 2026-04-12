@@ -36,7 +36,8 @@ class global_data:
             ESRuRAFT_PIV_v3 是batchsize 4
             ESRuRAFT_PIV_v4  之前都没有启用对抗损失 现在启用对抗损失
             ESRuRAFT_PIV_vtest  加EPE损失权重到1
-            ESRuRAFT_PIV_vtest2  加EPE损失权重到1 使用RAFT128
+           17） ESRuRAFT_PIV_vtest2  加EPE损失权重到1 使用RAFT128
+           18） ESRuRAFT_PIV_v5 将生成器的图像对一致性损失改成 图像一致性不是直接比较两帧原坐标，而是先用光流对齐再比较 基于光流运动对齐的 warp 一致性思想
            """
         #运行环境是否是autoDL
         IS_AUTO_DL = True
@@ -45,7 +46,7 @@ class global_data:
         # 训练任务标识
         # =========================
         name = "ESRuRAFT_PIV"  # 当前实验名（用于输出目录/模型名/wandb run名）
-        DESCRIPTION = "vtest2"  # 实验补充描述（可写损失配置、数据版本等）
+        DESCRIPTION = "_trash_Test"  # 实验补充描述（可写损失配置、数据版本等）
         name +=DESCRIPTION
 
         #整体项目注释
@@ -56,7 +57,7 @@ class global_data:
         # mixed 模式下的目录名/日志名
         MIXED_CLASS_TAG = "mixed_all_classes"
         #每个类别加载多少的数据 50%
-        CLASS_SAMPLE_RATIO =0.4
+        CLASS_SAMPLE_RATIO =0.5
         # =========================
         # 设备与模型加载
         # =========================
@@ -127,8 +128,7 @@ class global_data:
         # =========================
         # 图像对一致性损失超参数
         # =========================
-        LAMBDA_PAIR_DELTA = 0.012  # 图像对前后帧差分一致性权重；直接约束 previous/next 的变化量
-        LAMBDA_PAIR_GRADIENT = 0.008  # 图像对差分梯度一致性权重；约束变化边界和位移轮廓
+        LAMBDA_FLOW_WARP_CONSISTENCY = 0.012  # GT flow 引导的 SR 图像对 warp 一致性权重
 
         # =========================
         # 结构相似性损失超参数
@@ -195,7 +195,7 @@ class global_data:
         loss_label = ['g_loss', 'g_perceptual_loss', "g_content_loss",
                       "g_adversarial_loss",  'g_loss_pixel',
                       "g_loss_pixel_l1", "g_loss_pixel_mse",'g_loss_ssim', 'g_loss_fft',
-                      'g_pair_temporal_loss', 'g_pair_delta_loss', 'g_pair_gradient_loss',
+                       "g_flow_warp_consistency_loss", "g_flow_warp_consistency_weighted_loss",
                       'd_loss', 'd_real_loss', 'd_fake_loss',
                       'raft_loss', 'raft_epe','raft_1px', 'raft_3px','raft_5px',
                       ]

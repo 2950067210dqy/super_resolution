@@ -5,7 +5,7 @@ import torch.nn.functional as F  # 导入函数式接口，便于直接调用 lo
 from study.SRGAN.model.PIV_esrgan_RAFT.Module.RAFT_Model import RAFT, RAFT256  # 导入 RAFT 光流估计主网络
 from study.SRGAN.model.PIV_esrgan_RAFT.Module.loss import (
     descriminator_loss,  # 判别器损失，负责训练 D 区分真/假图像
-    image_pair_temporal_loss,  # 图像对时间一致性损失，约束前后帧变化关系
+    flow_warp_consistency_loss,  # GT flow 引导的 SR 前后帧 warp 一致性损失
     perceptual_loss,  # 感知损失，内部可选带对抗项
 
     pixel_loss,  # 像素域复合损失，包含 L1/MSE/SSIM/FFT 等项
@@ -166,7 +166,7 @@ class PIV_ESRGAN_RAFT(nn.Module):
 
         return d_loss, fake_loss, real_loss  # 返回判别器总损失以及两个监控项
 
-    def _compute_sr_branch(self, input_lr_prev, input_lr_next, input_gr_prev, input_gr_next, is_adversarial: bool):
+    def _compute_sr_branch(self, input_lr_prev, input_lr_next, input_gr_prev, input_gr_next, flowl0, is_adversarial: bool):
         """
         单独计算 ESRGAN 生成器分支。
 
@@ -197,14 +197,13 @@ class PIV_ESRGAN_RAFT(nn.Module):
         pixel_ssim = self._mean_loss_term(prev_terms, next_terms, "pixel_ssim")  # 平均后的 SSIM 损失
         pixel_fft = self._mean_loss_term(prev_terms, next_terms, "pixel_fft")  # 平均后的频域损失
 
-        pair_temporal_total, pair_temporal_dict = image_pair_temporal_loss(
-            pred_prev,  # SR previous 帧
-            pred_next,  # SR next 帧
-            input_gr_prev,  # HR previous 真值
-            input_gr_next,  # HR next 真值
+        flow_warp_total, flow_warp_dict = flow_warp_consistency_loss(
+            pred_prev,  # SR previous 帧，作为 GT flow 对齐后的参考坐标系
+            pred_next,  # SR next 帧，将按 previous->next 的 GT flow 反向采样回 previous 坐标系
+            flowl0,  # 真实光流，只使用 uv 通道指导前后帧颗粒亮度峰一致
         )
 
-        sr_loss = perceptual_total + pixel_total + pair_temporal_total  # ESRGAN 分支总损失
+        sr_loss = perceptual_total + pixel_total + flow_warp_total  # ESRGAN 分支总损失
 
         return pred_prev, pred_next, {
             "sr_loss": sr_loss,  # ESRGAN 侧总损失
@@ -216,9 +215,8 @@ class PIV_ESRGAN_RAFT(nn.Module):
             "pixel_mse": pixel_mse,  # MSE 子项
             "pixel_ssim": pixel_ssim,  # SSIM 子项
             "pixel_fft": pixel_fft,  # FFT 子项
-            "pair_temporal_loss": pair_temporal_total,  # 时间一致性总损失
-            "pair_delta_loss": pair_temporal_dict["pair_delta_loss"],  # 时间一致性中的差分项
-            "pair_gradient_loss": pair_temporal_dict["pair_gradient_loss"],  # 时间一致性中的梯度项
+            "flow_warp_consistency_loss": flow_warp_dict["flow_warp_consistency_loss"],  # 未加权的 GT-flow warp 一致性损失
+            "flow_warp_consistency_weighted_loss": flow_warp_dict["flow_warp_consistency_weighted_loss"],  # 加权后的 GT-flow warp 一致性损失
         }
 
     def _compute_raft_branch(self, pred_prev: torch.Tensor, pred_next: torch.Tensor, flowl0, flow_init=None):
@@ -296,14 +294,13 @@ class PIV_ESRGAN_RAFT(nn.Module):
         pixel_fft = self._mean_loss_term(prev_terms, next_terms, "pixel_fft")  # 平均后的频域损失
 
 
-        pair_temporal_total, pair_temporal_dict = image_pair_temporal_loss(
-            pred_prev,  # SR previous 帧
-            pred_next,  # SR next 帧
-            input_gr_prev,  # HR previous 真值
-            input_gr_next,  # HR next 真值
+        flow_warp_total, flow_warp_dict = flow_warp_consistency_loss(
+            pred_prev,  # SR previous 帧，作为 GT flow 对齐后的参考坐标系
+            pred_next,  # SR next 帧，将按 previous->next 的 GT flow 反向采样回 previous 坐标系
+            flowl0,  # 真实光流，只使用 uv 通道指导前后帧颗粒亮度峰一致
         )
 
-        sr_loss = perceptual_total + pixel_total + pair_temporal_total  # 将所有 ESRGAN 相关项合成统一 SR 侧损失
+        sr_loss = perceptual_total + pixel_total + flow_warp_total  # 将所有 ESRGAN 相关项合成统一 SR 侧损失
 
         # 3. 将 ESRGAN 输出转换为 RAFT 当前实现所需的单通道输入。
         raft_prev = self._to_raft_frame(pred_prev)  # 将前一帧 SR 图转换成 RAFT 可接受的单通道输入
@@ -359,9 +356,8 @@ class PIV_ESRGAN_RAFT(nn.Module):
             "pixel_ssim": pixel_ssim,  # SSIM 子项
             "pixel_fft": pixel_fft,  # FFT 子项
 
-            "pair_temporal_loss": pair_temporal_total,  # 图像对时间一致性总损失
-            "pair_delta_loss": pair_temporal_dict["pair_delta_loss"],  # 时间一致性中的差分项
-            "pair_gradient_loss": pair_temporal_dict["pair_gradient_loss"],  # 时间一致性中的梯度项
+            "flow_warp_consistency_loss": flow_warp_dict["flow_warp_consistency_loss"],  # 未加权的 GT-flow warp 一致性损失
+            "flow_warp_consistency_weighted_loss": flow_warp_dict["flow_warp_consistency_weighted_loss"],  # 加权后的 GT-flow warp 一致性损失
             "raft_loss": raft_loss,  # RAFT 流场序列损失
             "raft_metrics": raft_metrics,  # RAFT 的评估指标字典
             "discriminator_loss": discriminator_loss,  # 判别器总损失
@@ -423,6 +419,7 @@ class PIV_ESRGAN_RAFT(nn.Module):
             input_lr_next=input_lr_next,  # 后一帧 LR 输入
             input_gr_prev=input_gr_prev,  # 前一帧 HR 真值
             input_gr_next=input_gr_next,  # 后一帧 HR 真值
+            flowl0=flowl0,  # 真实光流，用于 GT-flow warp 一致性约束
             is_adversarial=is_adversarial,  # 是否在 G 侧启用对抗项
         )
 
@@ -508,9 +505,8 @@ class PIV_ESRGAN_RAFT(nn.Module):
             "pixel_mse": float(sr_outputs["pixel_mse"].detach().item()),  # MSE 子项
             "pixel_ssim": float(sr_outputs["pixel_ssim"].detach().item()),  # SSIM 子项
             "pixel_fft": float(sr_outputs["pixel_fft"].detach().item()),  # FFT 子项
-            "pair_temporal_loss": float(sr_outputs["pair_temporal_loss"].detach().item()),  # 时间一致性总损失
-            "pair_delta_loss": float(sr_outputs["pair_delta_loss"].detach().item()),  # 时间一致性中的差分项
-            "pair_gradient_loss": float(sr_outputs["pair_gradient_loss"].detach().item()),  # 时间一致性中的梯度项
+            "flow_warp_consistency_loss": float(sr_outputs["flow_warp_consistency_loss"].detach().item()),  # 未加权的 GT-flow warp 一致性损失
+            "flow_warp_consistency_weighted_loss": float(sr_outputs["flow_warp_consistency_weighted_loss"].detach().item()),  # 加权后的 GT-flow warp 一致性损失
             "raft_loss": float(raft_outputs["raft_loss"].detach().item()),  # RAFT 损失
             "discriminator_loss": float(discriminator_loss.detach().item()),  # 判别器总损失
             "d_real_loss": float(d_real_loss.detach().item()),  # 判别器真样本损失

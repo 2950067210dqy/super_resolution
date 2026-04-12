@@ -1,3 +1,5 @@
+import os
+
 from loguru import logger
 
 from model.basic_srgan import srgan_pipeline
@@ -37,4 +39,9 @@ def main():
                 return
         logger.warning("输入无效，请重试。")
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        logger.error(f"{e}")
+    finally:
+        os.system("/usr/bin/shutdown")

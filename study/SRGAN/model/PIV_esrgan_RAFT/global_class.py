@@ -35,6 +35,9 @@ class global_data:
             PIV_esrgan_RAFT_v2 是batchsize 2
             PIV_esrgan_RAFT_v3 是batchsize 4
             PIV_esrgan_RAFT_v4  之前都没有启用对抗损失 现在启用对抗损失
+            
+            !!!!注意：当前仍未切换 RAFT128；图像对一致性损失已改为 GT flow warp 对齐。
+            16）将生成器的图像对一致性损失改成 图像一致性不是直接比较两帧原坐标，而是先用光流对齐再比较 基于光流运动对齐的 warp 一致性思想
            """
         #运行环境是否是autoDL
         IS_AUTO_DL = True
@@ -124,8 +127,7 @@ class global_data:
         # =========================
         # 图像对一致性损失超参数
         # =========================
-        LAMBDA_PAIR_DELTA = 0.012  # 图像对前后帧差分一致性权重；直接约束 previous/next 的变化量
-        LAMBDA_PAIR_GRADIENT = 0.008  # 图像对差分梯度一致性权重；约束变化边界和位移轮廓
+        LAMBDA_FLOW_WARP_CONSISTENCY = 0.012  # GT flow 引导的 SR 图像对 warp 一致性权重
         # =========================
         # 结构相似性损失超参数
         # =========================
@@ -191,7 +193,7 @@ class global_data:
         loss_label = ['g_loss', 'g_perceptual_loss', "g_content_loss",
                       "g_adversarial_loss",  'g_loss_pixel',
                       "g_loss_pixel_l1", "g_loss_pixel_mse",'g_loss_ssim', 'g_loss_fft',
-                      'g_pair_temporal_loss', 'g_pair_delta_loss', 'g_pair_gradient_loss',
+                      "g_flow_warp_consistency_loss", "g_flow_warp_consistency_weighted_loss",
                       'd_loss', 'd_real_loss', 'd_fake_loss',
                       'raft_loss', 'raft_epe','raft_1px', 'raft_3px','raft_5px',
                       ]

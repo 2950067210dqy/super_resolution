@@ -440,7 +440,6 @@ def main():
 
     global_data.esrgan.END_TIME = time.time()
     logger.info(f"一共运行：{global_data.esrgan.END_TIME - global_data.esrgan.START_TIME}秒")
-    #如果是autodl 运行完就直接关机
 
 if __name__ =="__main__":
     try:

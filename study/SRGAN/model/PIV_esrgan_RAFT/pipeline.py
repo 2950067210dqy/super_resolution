@@ -443,4 +443,10 @@ def main():
     logger.info(f"一共运行：{global_data.esrgan.END_TIME - global_data.esrgan.START_TIME}秒")
 
 if __name__ =="__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        logger.error(f"{e}")
+    finally:
+        if global_data.esrgan.IS_AUTO_DL:
+            os.system("/usr/bin/shutdown")

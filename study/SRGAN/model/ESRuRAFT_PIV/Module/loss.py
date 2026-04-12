@@ -389,43 +389,107 @@ class CombinedPixelLoss(nn.Module):
         return total, l1_term, mse_term, SSIM_term, fft_term
 
 
-class ImagePairTemporalConsistencyLoss(nn.Module):
+class FlowWarpConsistencyLoss(nn.Module):
     """
-    图像对时间一致性损失。
+    GT flow 引导的 SR 图像对一致性损失。
 
-    核心思想：
-    1. previous/next 的差分应与 HR 差分一致。
-    2. 差分图的梯度结构也应一致，避免位移颗粒被生成成“糊块”。
+    previous 和 next 两张 PIV 粒子图像不能在同一个像素坐标上直接比较，
+    因为颗粒在两次曝光之间会发生位移。这个损失使用 previous->next 的真实光流，
+    将 SR next 采样回 SR previous 的坐标系，然后约束 SR previous 与对齐后的 SR next 在灰度上保持一致。
     """
 
-    def __init__(self, delta_weight: float = 1.0, gradient_weight: float = 0.5, eps: float = 1e-3):
+    def __init__(self, flow_warp_weight: float = 1.0, eps: float = 1e-3):
         super().__init__()
-        self.delta_weight = delta_weight
-        self.gradient_weight = gradient_weight
-        self.charbonnier = CharbonnierLoss(eps=eps)
-        self.edge = SobelEdgeLoss()
+        self.flow_warp_weight = flow_warp_weight
+        self.eps = eps
+
+    @staticmethod
+    def _resize_flow_to_image(flow: torch.Tensor, image: torch.Tensor) -> torch.Tensor:
+        """
+        将 flow 调整到图像分辨率，并同步缩放像素位移量。
+
+        flow 的数值单位是像素位移。如果空间尺寸发生变化，u 需要按宽度比例缩放，
+        v 需要按高度比例缩放；否则 grid_sample 虽然拿到了正确尺寸的 flow，
+        但使用的物理位移幅值会是错的。
+        """
+        if flow.dim() != 4:
+            raise ValueError(f"Expected flow to be 4D [B, C, H, W], got shape={tuple(flow.shape)}")
+        if flow.size(1) < 2:
+            raise ValueError(f"Expected flow to have at least 2 channels, got shape={tuple(flow.shape)}")
+
+        flow_uv = flow[:, :2, :, :]
+        image_h, image_w = image.shape[-2:]
+        flow_h, flow_w = flow_uv.shape[-2:]
+        if (flow_h, flow_w) == (image_h, image_w):
+            return flow_uv
+
+        resized_flow = F.interpolate(flow_uv, size=(image_h, image_w), mode="bilinear", align_corners=True)
+        resized_flow[:, 0:1, :, :] = resized_flow[:, 0:1, :, :] * (image_w / max(flow_w, 1))
+        resized_flow[:, 1:2, :, :] = resized_flow[:, 1:2, :, :] * (image_h / max(flow_h, 1))
+        return resized_flow
+
+    @staticmethod
+    def _warp_next_to_prev(next_image: torch.Tensor, flow_prev_to_next: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        将 next_image 反向采样到 previous 帧的坐标系中。
+
+        对 previous 帧坐标 (x, y)，previous->next 光流给出它在 next 帧中的对应坐标：
+        (x + u, y + v)。因此采样网格就是 base_grid + flow。
+        同时返回 valid_mask，用来屏蔽越界采样区域，避免边界外像素影响一致性损失。
+        """
+        if next_image.dim() != 4:
+            raise ValueError(f"Expected next_image to be 4D [B, C, H, W], got shape={tuple(next_image.shape)}")
+
+        batch, _, height, width = next_image.shape
+        device = next_image.device
+        dtype = next_image.dtype
+
+        y_coords, x_coords = torch.meshgrid(
+            torch.arange(height, device=device, dtype=dtype),
+            torch.arange(width, device=device, dtype=dtype),
+            indexing="ij",
+        )
+        base_grid = torch.stack((x_coords, y_coords), dim=0).unsqueeze(0).repeat(batch, 1, 1, 1)
+        sample_grid = base_grid + flow_prev_to_next.to(device=device, dtype=dtype)
+
+        valid_x = (sample_grid[:, 0:1, :, :] >= 0) & (sample_grid[:, 0:1, :, :] <= width - 1)
+        valid_y = (sample_grid[:, 1:2, :, :] >= 0) & (sample_grid[:, 1:2, :, :] <= height - 1)
+        valid_mask = (valid_x & valid_y).to(dtype=dtype)
+
+        # grid_sample 要求坐标归一化到 [-1, 1]，并且最后一维顺序必须是 [x, y]。
+        norm_x = 2.0 * sample_grid[:, 0, :, :] / max(width - 1, 1) - 1.0
+        norm_y = 2.0 * sample_grid[:, 1, :, :] / max(height - 1, 1) - 1.0
+        normalized_grid = torch.stack((norm_x, norm_y), dim=-1)
+        warped_next = F.grid_sample(
+            next_image,
+            normalized_grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        )
+        return warped_next, valid_mask
 
     def forward(
         self,
         pred_prev: torch.Tensor,
         pred_next: torch.Tensor,
-        target_prev: torch.Tensor,
-        target_next: torch.Tensor,
+        flow_prev_to_next: torch.Tensor,
     ):
-        pred_delta = _to_gray(pred_next) - _to_gray(pred_prev)
-        target_delta = _to_gray(target_next) - _to_gray(target_prev)
+        pred_prev_gray = _to_gray(pred_prev)
+        pred_next_gray = _to_gray(pred_next)
+        flow_uv = self._resize_flow_to_image(flow_prev_to_next, pred_prev_gray)
+        warped_next_gray, valid_mask = self._warp_next_to_prev(pred_next_gray, flow_uv)
 
-        # delta_loss 关注“变化量本身是否对”。
-        delta_loss = self.charbonnier(pred_delta, target_delta)
-        # gradient_loss 关注“变化发生的位置和边界是否对”。
-        # 两者一起用，能减少前后帧颗粒位移被生成为大面积模糊亮块的问题。
-        gradient_loss = self.edge(pred_delta, target_delta)
-        total_loss = self.delta_weight * delta_loss + self.gradient_weight * gradient_loss
+        # 只统计有效采样区域：先计算 Charbonnier map，再乘 mask，避免无效边界区域贡献 eps 常数项。
+        diff = pred_prev_gray - warped_next_gray
+        valid_count = valid_mask.sum().clamp_min(1.0)
+        loss_map = torch.sqrt(diff * diff + self.eps * self.eps) * valid_mask
+        flow_warp_consistency_loss = loss_map.sum() / valid_count
+        flow_warp_consistency_weighted_loss = self.flow_warp_weight * flow_warp_consistency_loss
 
-        return total_loss, {
-            "pair_delta_loss": delta_loss,
-            "pair_gradient_loss": gradient_loss,
-            "pair_temporal_loss": total_loss,
+        return flow_warp_consistency_weighted_loss, {
+            "flow_warp_consistency_loss": flow_warp_consistency_loss,
+            "flow_warp_consistency_weighted_loss": flow_warp_consistency_weighted_loss,
         }
 class Discriminator_loss(nn.Module):
     """
@@ -466,10 +530,9 @@ perceptual_loss = PerceptualLoss(vgg=vgg).to(global_data.esrgan.device, non_bloc
 # 归一化损失 正则化损失
 # regularization_loss = RegularizationLoss().to(global_data.esrgan.device)
 
-# 这个 loss 只在 image_pair 联合训练时使用；flo 或单帧路径默认不会走这里。
-image_pair_temporal_loss = ImagePairTemporalConsistencyLoss(
-    delta_weight=global_data.esrgan.LAMBDA_PAIR_DELTA,
-    gradient_weight=global_data.esrgan.LAMBDA_PAIR_GRADIENT,
+# 这个 loss 只在 image_pair / RAFT 联合训练时使用；它用 GT flow 将 SR next 对齐回 SR previous。
+flow_warp_consistency_loss = FlowWarpConsistencyLoss(
+    flow_warp_weight=global_data.esrgan.LAMBDA_FLOW_WARP_CONSISTENCY,
 ).to(global_data.esrgan.device, non_blocking=True)
 #判别器损失
 descriminator_loss = Discriminator_loss().to(global_data.esrgan.device, non_blocking=True)
