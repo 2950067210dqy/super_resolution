@@ -41,7 +41,7 @@ class global_data:
             17） PIV_esrgan_RAFT_v5 将生成器的图像对一致性损失改成光流对齐 切换 RAFT128 添加动态学习率根据指标的变化调整
            """
         #运行环境是否是autoDL
-        IS_AUTO_DL = True
+        IS_AUTO_DL = False
         AUTODL_DATA_PATH = rf"/root/autodl-tmp" if IS_AUTO_DL else r""
         # =========================
         # 训练任务标识
