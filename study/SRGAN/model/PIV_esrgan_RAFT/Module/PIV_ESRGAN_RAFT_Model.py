@@ -439,11 +439,14 @@ class PIV_ESRGAN_RAFT(nn.Module):
         self._set_requires_grad(self.piv_esrgan_discriminator, False)  # 判别器保持冻结
         raft_optimizer.zero_grad(set_to_none=True)  # 清空 RAFT 梯度
 
-        if hasattr(self.piv_esrgan_generator, "forward_pair"):  # 用当前 Generator 参数重新生成一份 SR 图给 RAFT 使用
-            pred_prev_r, pred_next_r = self.piv_esrgan_generator.forward_pair(input_lr_prev, input_lr_next)
-        else:
-            pred_prev_r = self.piv_esrgan_generator(input_lr_prev)
-            pred_next_r = self.piv_esrgan_generator(input_lr_next)
+        # Generator 已经冻结，这里只需要给 RAFT 提供当前 G 参数下的 SR 图，
+        # 不需要为 Generator 构建计算图，可以降低显存占用和反向图开销。
+        with torch.no_grad():
+            if hasattr(self.piv_esrgan_generator, "forward_pair"):  # 用当前 Generator 参数重新生成一份 SR 图给 RAFT 使用
+                pred_prev_r, pred_next_r = self.piv_esrgan_generator.forward_pair(input_lr_prev, input_lr_next)
+            else:
+                pred_prev_r = self.piv_esrgan_generator(input_lr_prev)
+                pred_next_r = self.piv_esrgan_generator(input_lr_next)
 
         flow_predictions, raft_outputs = self._compute_raft_branch(
             pred_prev=pred_prev_r,  # 当前 Generator 输出的前一帧 SR 图
@@ -463,18 +466,15 @@ class PIV_ESRGAN_RAFT(nn.Module):
             raft_optimizer.step()  # 只更新 RAFT 参数
 
         # 第三阶段：只更新 Discriminator，严格只使用 discriminator_loss。
-        # 这里同样重新生成一份 SR 图，但判别器损失内部会对 fake 图做 detach，
-        # 因此不会把梯度传回 Generator。
+        # RAFT 阶段之后 Generator 没有再更新，D 阶段可以直接复用刚才的 SR 图，
+        # 避免第三次 Generator 前向；detach 后只让判别器更新。
         self._set_requires_grad(self.piv_esrgan_generator, False)  # 继续冻结 Generator
         self._set_requires_grad(self.piv_RAFT, False)  # 冻结 RAFT
         self._set_requires_grad(self.piv_esrgan_discriminator, True)  # 只开启判别器梯度
         d_optimizer.zero_grad(set_to_none=True)  # 清空判别器梯度
 
-        if hasattr(self.piv_esrgan_generator, "forward_pair"):
-            pred_prev_d, pred_next_d = self.piv_esrgan_generator.forward_pair(input_lr_prev, input_lr_next)
-        else:
-            pred_prev_d = self.piv_esrgan_generator(input_lr_prev)
-            pred_next_d = self.piv_esrgan_generator(input_lr_next)
+        pred_prev_d = pred_prev_r.detach()
+        pred_next_d = pred_next_r.detach()
 
         discriminator_loss, d_fake_loss, d_real_loss = self._compute_discriminator_loss(
             pred_prev_d,  # previous 生成图
