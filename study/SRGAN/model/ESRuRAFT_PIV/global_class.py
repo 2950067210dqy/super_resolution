@@ -38,6 +38,7 @@ class global_data:
             ESRuRAFT_PIV_vtest  加EPE损失权重到1
            17） ESRuRAFT_PIV_vtest2  加EPE损失权重到1 使用RAFT128
            18） ESRuRAFT_PIV_v5 将生成器的图像对一致性损失改成 图像一致性不是直接比较两帧原坐标，而是先用光流对齐再比较 基于光流运动对齐的 warp 一致性思想
+           19） ESRuRAFT_PIV_v6 添加动态学习率根据指标的变化调整
            """
         #运行环境是否是autoDL
         IS_AUTO_DL = True
@@ -46,7 +47,7 @@ class global_data:
         # 训练任务标识
         # =========================
         name = "ESRuRAFT_PIV"  # 当前实验名（用于输出目录/模型名/wandb run名）
-        DESCRIPTION = "_trash_Test"  # 实验补充描述（可写损失配置、数据版本等）
+        DESCRIPTION = "_v6"  # 实验补充描述（可写损失配置、数据版本等）
         name +=DESCRIPTION
 
         #整体项目注释
@@ -71,7 +72,7 @@ class global_data:
         # =========================
         # 训练主超参数
         # =========================
-        EPOCH_NUMS = 50 # 训练轮数 50
+        EPOCH_NUMS = 60 # 训练轮数 50
         BATCH_SIZE = 4 # batch 大小
         PRE_TRIAN_G_EPOCH = 1 #预训练G完成的轮次 从1开始 就是从第几轮开始弃用对抗损失
         TRAIN_DATA_SAVING_STEP =250 #每隔多少steps保存一次生成的图片 50
@@ -152,8 +153,17 @@ class global_data:
         RAFT_optimizer_betas = (0.5, 0.999)
         # 学习率
         G_LR =0.0001 #0.0001
+        G_LR_reduce_factor =0.2 #新学习率 = 原学习率 × factor
+        G_LR_patience_level =2 #容忍指标不改善的 epoch 数量，默认 10，超过该数量后触发学习率衰减
+        G_LR_min=1e-8#学习率下限，衰减后不低于此值
         D_LR = 0.0001 # 0.0001
-        RAFT_LR =0.0001
+        D_LR_reduce_factor =0.2 #新学习率 = 原学习率 × factor
+        D_LR_patience_level =2 #容忍指标不改善的 epoch 数量，默认 10，超过该数量后触发学习率衰减
+        D_LR_min=1e-8#学习率下限，衰减后不低于此值
+        RAFT_LR =0.0001 #0.0001
+        RAFT_LR_reduce_factor =0.2 #新学习率 = 原学习率 × factor
+        RAFT_LR_patience_level =2 #容忍指标不改善的 epoch 数量，默认 10，超过该数量后触发学习率衰减
+        RAFT_LR_min=1e-8#学习率下限，衰减后不低于此值
         # =========================
         # 数据集划分比例
         # =========================

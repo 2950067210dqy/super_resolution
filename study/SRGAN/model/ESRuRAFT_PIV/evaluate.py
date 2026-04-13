@@ -1021,11 +1021,6 @@ def evaluate(epoch,class_name,data_type,device,
     # 每轮训练结束后进行验证，并保存最后一批图像
     validate_and_save(f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.PREDICT_DIR}", model,
                       validate_loader, device, epoch, data_type=data_type)
-    # 保存模型
-    model_save_path = f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.MODEL_DIR}/ESRuRAFT_PIV_model_{global_data.esrgan.name}.pth"
-    torch.save(model.state_dict(), model_save_path)
-    logger.info(
-        f"{class_name} {data_type} |Models saved: v -> {model_save_path}")
 
     # 保存每一epoch的损失
     all_loss_and_val_Datas = [metric[index] / (train_loader_lens)  for index in range(len(loss_label))] + [
@@ -1063,7 +1058,7 @@ def evaluate(epoch,class_name,data_type,device,
             [validate_label[4]],
             [validate_label[5]]
         ])
-    pass
+    return avg_val_mse_loss,avg_val_ssim_loss,avg_psnr,avg_val_energy_spectrum_mse,avg_val_aee,avg_val_norm_aee_per100
 
 def evaluate_all(
     data_loader=None,
