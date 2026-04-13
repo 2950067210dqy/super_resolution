@@ -39,6 +39,7 @@ class global_data:
            17） ESRuRAFT_PIV_vtest2  加EPE损失权重到1 使用RAFT128
            18） ESRuRAFT_PIV_v5 将生成器的图像对一致性损失改成 图像一致性不是直接比较两帧原坐标，而是先用光流对齐再比较 基于光流运动对齐的 warp 一致性思想
            19） ESRuRAFT_PIV_v6 添加动态学习率根据指标的变化调整
+                ESRuRAFT_PIV_v6_v1 添加动态对抗损失权重变化限制在前面10轮
            """
         #运行环境是否是autoDL
         IS_AUTO_DL = True
@@ -47,7 +48,7 @@ class global_data:
         # 训练任务标识
         # =========================
         name = "ESRuRAFT_PIV"  # 当前实验名（用于输出目录/模型名/wandb run名）
-        DESCRIPTION = "_v6"  # 实验补充描述（可写损失配置、数据版本等）
+        DESCRIPTION = "_v6_v1"  # 实验补充描述（可写损失配置、数据版本等）
         name +=DESCRIPTION
 
         #整体项目注释
@@ -107,7 +108,7 @@ class global_data:
         # 注意：这里的 END 不建议再设到 0.2，你已经验证过那会明显放大边界伪影。
         ADVERSARIAL_WEIGHT_START = 0.0005
         ADVERSARIAL_WEIGHT_END = 0.02
-        ADVERSARIAL_WARMUP_EPOCHS = EPOCH_NUMS-10
+        ADVERSARIAL_WARMUP_EPOCHS = 10 #到第几个epoch 结束对砍损失动态提高 EPOCH_NUMS-10
         ADVERSARIAL_WEIGHT_SCHEDULE = "linear"  # 当前支持: linear | constant
 
 

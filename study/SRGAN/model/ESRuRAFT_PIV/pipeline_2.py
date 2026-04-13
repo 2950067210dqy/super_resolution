@@ -342,6 +342,72 @@ def main():
                                            weight_decay=global_data.esrgan.weight_decay)
 
             ESRuRAFT_PIV_model_RAFT_optimizeroptimizer = torch.optim.AdamW(ESRuRAFT_PIV_model.piv_RAFT.parameters(), lr=global_data.esrgan.RAFT_LR, betas=global_data.esrgan.RAFT_optimizer_betas,)
+
+            #是否读取之前存储的优化器
+            if global_data.esrgan.IS_LOAD_EXISTS_MODEL:
+                ESRuRAFT_PIV_g_optimizer_save_path = f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.MODEL_DIR}/ESRuRAFT_PIV_g_optimizer_{global_data.esrgan.name}.pth"
+                if os.path.exists(ESRuRAFT_PIV_g_optimizer_save_path):
+                    ESRuRAFT_PIV_model_g_optimizer.load_state_dict(torch.load(ESRuRAFT_PIV_g_optimizer_save_path, map_location=global_data.esrgan.device))
+                    logger.info(f"Loaded pretrained optimizer ESRuRAFT_PIV_g_optimizer from {ESRuRAFT_PIV_g_optimizer_save_path}")
+                else:
+                    logger.info("No pretrained optimizer ESRuRAFT_PIV_g_optimizer found. Starting training from scratch.")
+
+                ESRuRAFT_PIV_d_optimizer_save_path = f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.MODEL_DIR}/ESRuRAFT_PIV_d_optimizer_{global_data.esrgan.name}.pth"
+                if os.path.exists(ESRuRAFT_PIV_g_optimizer_save_path):
+                    ESRuRAFT_PIV_model_d_optimizer.load_state_dict(
+                        torch.load(ESRuRAFT_PIV_d_optimizer_save_path, map_location=global_data.esrgan.device))
+                    logger.info(
+                        f"Loaded pretrained optimizer ESRuRAFT_PIV_d_optimizer from {ESRuRAFT_PIV_d_optimizer_save_path}")
+                else:
+                    logger.info(
+                        "No pretrained optimizer ESRuRAFT_PIV_d_optimizer found. Starting training from scratch.")
+
+                ESRuRAFT_PIV_RAFT_optimizer_save_path = f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.MODEL_DIR}/ESRuRAFT_PIV_RAFT_optimizer_{global_data.esrgan.name}.pth"
+                if os.path.exists(ESRuRAFT_PIV_RAFT_optimizer_save_path):
+                    ESRuRAFT_PIV_model_RAFT_optimizeroptimizer.load_state_dict(
+                        torch.load(ESRuRAFT_PIV_RAFT_optimizer_save_path, map_location=global_data.esrgan.device))
+                    logger.info(
+                        f"Loaded pretrained optimizer ESRuRAFT_PIV_RAFT_optimizer from {ESRuRAFT_PIV_RAFT_optimizer_save_path}")
+                else:
+                    logger.info(
+                        "No pretrained optimizer ESRuRAFT_PIV_RAFT_optimizer found. Starting training from scratch.")
+
+            #动态学习率 基于监控指标动态调整学习率的调度器
+            g_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(ESRuRAFT_PIV_model_g_optimizer, 'min', factor=global_data.esrgan.G_LR_reduce_factor,
+                                                                   patience=global_data.esrgan.G_LR_patience_level, min_lr=global_data.esrgan.G_LR_min)
+            d_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(ESRuRAFT_PIV_model_d_optimizer, 'min', factor=global_data.esrgan.D_LR_reduce_factor,
+                                                                   patience=global_data.esrgan.D_LR_patience_level, min_lr=global_data.esrgan.D_LR_min)
+            raft_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(ESRuRAFT_PIV_model_RAFT_optimizeroptimizer, 'min', factor=global_data.esrgan.RAFT_LR_reduce_factor,
+                                                                   patience=global_data.esrgan.RAFT_LR_patience_level, min_lr=global_data.esrgan.RAFT_LR_min)
+            # 是否读取之前存储的动态学习率器
+            if global_data.esrgan.IS_LOAD_EXISTS_MODEL:
+                ESRuRAFT_PIV_g_scheduler_save_path = f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.MODEL_DIR}/ESRuRAFT_PIV_g_scheduler_{global_data.esrgan.name}.pth"
+                if os.path.exists(ESRuRAFT_PIV_g_scheduler_save_path):
+                    g_scheduler.load_state_dict(torch.load(ESRuRAFT_PIV_g_scheduler_save_path, map_location=global_data.esrgan.device))
+                    logger.info(f"Loaded pretrained optimizer ESRuRAFT_PIV_g_scheduler from {ESRuRAFT_PIV_g_scheduler_save_path}")
+                else:
+                    logger.info("No pretrained optimizer ESRuRAFT_PIV_g_scheduler found. Starting training from scratch.")
+
+                ESRuRAFT_PIV_d_scheduler_save_path = f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.MODEL_DIR}/ESRuRAFT_PIV_d_scheduler_{global_data.esrgan.name}.pth"
+                if os.path.exists(ESRuRAFT_PIV_d_scheduler_save_path):
+                    d_scheduler.load_state_dict(
+                        torch.load(ESRuRAFT_PIV_d_scheduler_save_path, map_location=global_data.esrgan.device))
+                    logger.info(
+                        f"Loaded pretrained optimizer ESRuRAFT_PIV_d_scheduler from {ESRuRAFT_PIV_d_scheduler_save_path}")
+                else:
+                    logger.info(
+                        "No pretrained optimizer ESRuRAFT_PIV_d_scheduler found. Starting training from scratch.")
+
+                ESRuRAFT_PIV_raft_scheduler_save_path = f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.MODEL_DIR}/ESRuRAFT_PIV_raft_scheduler_{global_data.esrgan.name}.pth"
+                if os.path.exists(ESRuRAFT_PIV_raft_scheduler_save_path):
+                    raft_scheduler.load_state_dict(
+                        torch.load(ESRuRAFT_PIV_raft_scheduler_save_path, map_location=global_data.esrgan.device))
+                    logger.info(
+                        f"Loaded pretrained optimizer ESRuRAFT_PIV_raft_scheduler from {ESRuRAFT_PIV_raft_scheduler_save_path}")
+                else:
+                    logger.info(
+                        "No pretrained optimizer ESRuRAFT_PIV_raft_scheduler found. Starting training from scratch.")
+
             ESRuRAFT_PIV_model_scaler = GradScaler()
 
 
@@ -387,10 +453,46 @@ def main():
 
                     )
                 # 每轮结束后评价一次 验证集只取一轮batch
-                evaluate(epoch=epoch, class_name=class_name, data_type=data_type, device=global_data.esrgan.device,
+                avg_val_mse_loss,avg_val_ssim_loss,avg_psnr,avg_val_energy_spectrum_mse,avg_val_aee,avg_val_norm_aee_per100=evaluate(epoch=epoch, class_name=class_name, data_type=data_type, device=global_data.esrgan.device,
                          model = ESRuRAFT_PIV_model, animator=animator, validate_loader=validate_loader,
                          loss_label=global_data.esrgan.loss_label,validate_label=global_data.esrgan. validate_label, SCALE=SCALE,
                          csvOperator=global_data.esrgan.csvOperator,metric=metric,train_loader_lens=len(train_loader))
+
+                #动态学习率step
+                g_scheduler.step(avg_val_energy_spectrum_mse)
+                raft_scheduler.step(avg_val_aee)
+                #保存动态学习率器
+                ESRuRAFT_PIV_g_scheduler_save_path = f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.MODEL_DIR}/ESRuRAFT_PIV_g_scheduler_{global_data.esrgan.name}.pth"
+                ESRuRAFT_PIV_d_scheduler_save_path = f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.MODEL_DIR}/ESRuRAFT_PIV_d_scheduler_{global_data.esrgan.name}.pth"
+                ESRuRAFT_PIV_raft_scheduler_save_path = f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.MODEL_DIR}/ESRuRAFT_PIV_raft_scheduler_{global_data.esrgan.name}.pth"
+                torch.save(g_scheduler.state_dict(), ESRuRAFT_PIV_g_scheduler_save_path)
+                logger.info(
+                    f"{class_name} {data_type} |g_scheduler saved: v -> {ESRuRAFT_PIV_g_scheduler_save_path}")
+                torch.save(d_scheduler.state_dict(), ESRuRAFT_PIV_d_scheduler_save_path)
+                logger.info(
+                    f"{class_name} {data_type} |d_scheduler saved: v -> {ESRuRAFT_PIV_d_scheduler_save_path}")
+                torch.save(raft_scheduler.state_dict(),
+                           ESRuRAFT_PIV_raft_scheduler_save_path)
+                logger.info(
+                    f"{class_name} {data_type} |RAFT_scheduler saved: v -> {ESRuRAFT_PIV_raft_scheduler_save_path}")
+                # 保存优化器
+                ESRuRAFT_PIV_g_optimizer_save_path = f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.MODEL_DIR}/ESRuRAFT_PIV_g_optimizer_{global_data.esrgan.name}.pth"
+                ESRuRAFT_PIV_d_optimizer_save_path = f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.MODEL_DIR}/ESRuRAFT_PIV_d_optimizer_{global_data.esrgan.name}.pth"
+                ESRuRAFT_PIV_RAFT_optimizer_save_path = f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.MODEL_DIR}/ESRuRAFT_PIV_RAFT_optimizer_{global_data.esrgan.name}.pth"
+                torch.save(ESRuRAFT_PIV_model_g_optimizer.state_dict(), ESRuRAFT_PIV_g_optimizer_save_path)
+                logger.info(
+                    f"{class_name} {data_type} |g_optimizer saved: v -> {ESRuRAFT_PIV_g_optimizer_save_path}")
+                torch.save(ESRuRAFT_PIV_model_d_optimizer.state_dict(), ESRuRAFT_PIV_d_optimizer_save_path)
+                logger.info(
+                    f"{class_name} {data_type} |d_optimizer saved: v -> {ESRuRAFT_PIV_d_optimizer_save_path}")
+                torch.save(ESRuRAFT_PIV_model_RAFT_optimizeroptimizer.state_dict(), ESRuRAFT_PIV_RAFT_optimizer_save_path)
+                logger.info(
+                    f"{class_name} {data_type} |RAFT_optimizer saved: v -> {ESRuRAFT_PIV_RAFT_optimizer_save_path}")
+                # 保存模型
+                model_save_path = f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.MODEL_DIR}/ESRuRAFT_PIV_model_{global_data.esrgan.name}.pth"
+                torch.save(ESRuRAFT_PIV_model.state_dict(), model_save_path)
+                logger.info(
+                    f"{class_name} {data_type} |Models saved: v -> {model_save_path}")
 
             training_end_time = time.time()
             # 训练总时长统一换算成小时，直接对应你要记录的“训练时间（小时）”。
@@ -440,6 +542,7 @@ def main():
 
     global_data.esrgan.END_TIME = time.time()
     logger.info(f"一共运行：{global_data.esrgan.END_TIME - global_data.esrgan.START_TIME}秒")
+    #如果是autodl 运行完就直接关机
 
 if __name__ =="__main__":
     try:
