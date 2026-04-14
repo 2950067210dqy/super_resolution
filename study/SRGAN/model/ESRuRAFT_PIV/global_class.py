@@ -39,11 +39,12 @@ class global_data:
            17） ESRuRAFT_PIV_vtest2  加EPE损失权重到1 使用RAFT128
            18） ESRuRAFT_PIV_v5 ESRuRAFT_PIV_vtest2基础上将生成器的图像对一致性损失改成 图像一致性不是直接比较两帧原坐标，而是先用光流对齐再比较 基于光流运动对齐的 warp 一致性思想
            19） ESRuRAFT_PIV_v6 ESRuRAFT_PIV_v6基础上添加动态学习率根据指标的变化调整 生成器与RAFT都添加动态学习率 超分辨下效果不好，但是RAFT效果好！
-                ESRuRAFT_PIV_v6_v1 ESRuRAFT_PIV_v6基础上添加动态对抗损失权重变化限制在前面10轮  超分辨效果好，但是RAFT效果不好  !运行到这里
-                ESRuRAFT_PIV_v6_v2 ESRuRAFT_PIV_v6_v1基础上添加动态对抗损失权重变化限制在前面10 RAFT_EPE_WEIGHT 1->10  LAMBDA_FLOW_WARP_CONSISTENCY 0.012 ->1.2 
-                ESRuRAFT_PIV_v7 ESRuRAFT_PIV_v6基础上去除生成器动态学习率变化  去除动态对抗损失权重变化限制在前面10轮   
-                ESRuRAFT_PIV_v7_v1  ESRuRAFT_PIV_v7基础上RAFT_EPE_WEIGHT 1->10  LAMBDA_FLOW_WARP_CONSISTENCY 0.012 ->1.2 
-       
+                ESRuRAFT_PIV_v6_v1 ESRuRAFT_PIV_v6基础上添加动态对抗损失权重变化限制在前面10轮  超分辨效果好，但是RAFT效果不好 
+                ESRuRAFT_PIV_v6_v2 ESRuRAFT_PIV_v6_v1基础上 RAFT_EPE_WEIGHT 1->10  LAMBDA_FLOW_WARP_CONSISTENCY 0.012 ->1.2 
+                ESRuRAFT_PIV_v7 ESRuRAFT_PIV_v6基础上去除生成器动态学习率变化  !运行到这里
+                
+                ESRuRAFT_PIV_v6_v3  ESRuRAFT_PIV_v6_v2基础上去除生成器动态学习率变化 
+                ESRuRAFT_PIV_v7_v1 ESRuRAFT_PIV_v7基础上RAFT_EPE_WEIGHT 1->10  LAMBDA_FLOW_WARP_CONSISTENCY 0.012 ->1.2
            """
         #运行环境是否是autoDL
         IS_AUTO_DL = True
@@ -222,6 +223,9 @@ class global_data:
         CSV_COLUMNS = ['EPOCH'] + loss_label + validate_label + ['time']
         # 实验级汇总指标 CSV：
         # 这一份不记录每个 epoch 的 loss，而是记录一次完整训练/评测后的整体开销指标。
+        # 这里同时保留两套 profiling 口径：
+        # - inference_*：只统计 forward 推理过程，适合论文表格里的 Inference Time / FLOPs。
+        # - training_step_*：统计完整 train_step，包含 forward、loss、backward、optimizer.step。
         METRICS_SUMMARY_COLUMNS = [
             "run_name",
             "description",
@@ -234,9 +238,12 @@ class global_data:
             "input_hr_shape",
             "flow_shape",
             "training_time_hours",
-            "gpu_memory_usage_gb",
-            "flops_g",
+            "inference_gpu_memory_usage_gb",
+            "inference_flops_g",
             "inference_time_seconds",
+            "training_step_gpu_memory_usage_gb",
+            "training_step_flops_g",
+            "training_step_time_seconds",
             "trainable_params_m",
             "timestamp",
         ]

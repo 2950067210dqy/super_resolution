@@ -215,6 +215,9 @@ class global_data:
         CSV_COLUMNS = ['EPOCH'] + loss_label + validate_label + ['time']
         # 实验级汇总指标 CSV：
         # 单独记录一次完整训练/评测后的整体开销指标，便于做实验对比表。
+        # 这里同时保留两套 profiling 口径：
+        # - inference_*：只统计 forward 推理过程，适合论文表格里的 Inference Time / FLOPs。
+        # - training_step_*：统计完整 train_step，包含 forward、loss、backward、optimizer.step。
         METRICS_SUMMARY_COLUMNS = [
             "run_name",
             "description",
@@ -227,9 +230,12 @@ class global_data:
             "input_hr_shape",
             "flow_shape",
             "training_time_hours",
-            "gpu_memory_usage_gb",
-            "flops_g",
+            "inference_gpu_memory_usage_gb",
+            "inference_flops_g",
             "inference_time_seconds",
+            "training_step_gpu_memory_usage_gb",
+            "training_step_flops_g",
+            "training_step_time_seconds",
             "trainable_params_m",
             "timestamp",
         ]
