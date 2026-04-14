@@ -459,7 +459,7 @@ def main():
                          csvOperator=global_data.esrgan.csvOperator,metric=metric,train_loader_lens=len(train_loader))
 
                 #动态学习率step
-                g_scheduler.step(avg_val_energy_spectrum_mse)
+                # g_scheduler.step(avg_val_energy_spectrum_mse)
                 raft_scheduler.step(avg_val_aee)
                 #保存动态学习率器
                 ESRuRAFT_PIV_g_scheduler_save_path = f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.MODEL_DIR}/ESRuRAFT_PIV_g_scheduler_{global_data.esrgan.name}.pth"

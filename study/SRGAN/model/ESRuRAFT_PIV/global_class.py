@@ -37,10 +37,13 @@ class global_data:
             ESRuRAFT_PIV_v4  之前都没有启用对抗损失 现在启用对抗损失
             ESRuRAFT_PIV_vtest  加EPE损失权重到1
            17） ESRuRAFT_PIV_vtest2  加EPE损失权重到1 使用RAFT128
-           18） ESRuRAFT_PIV_v5 将生成器的图像对一致性损失改成 图像一致性不是直接比较两帧原坐标，而是先用光流对齐再比较 基于光流运动对齐的 warp 一致性思想
-           19） ESRuRAFT_PIV_v6 添加动态学习率根据指标的变化调整
-                ESRuRAFT_PIV_v6_v1 添加动态对抗损失权重变化限制在前面10轮
-                ESRuRAFT_PIV_v6_v2 RAFT_EPE_WEIGHT 1->10  LAMBDA_FLOW_WARP_CONSISTENCY 0.012 ->1.2
+           18） ESRuRAFT_PIV_v5 ESRuRAFT_PIV_vtest2基础上将生成器的图像对一致性损失改成 图像一致性不是直接比较两帧原坐标，而是先用光流对齐再比较 基于光流运动对齐的 warp 一致性思想
+           19） ESRuRAFT_PIV_v6 ESRuRAFT_PIV_v6基础上添加动态学习率根据指标的变化调整 生成器与RAFT都添加动态学习率 超分辨下效果不好，但是RAFT效果好！
+                ESRuRAFT_PIV_v6_v1 ESRuRAFT_PIV_v6基础上添加动态对抗损失权重变化限制在前面10轮  超分辨效果好，但是RAFT效果不好  !运行到这里
+                ESRuRAFT_PIV_v6_v2 ESRuRAFT_PIV_v6_v1基础上添加动态对抗损失权重变化限制在前面10 RAFT_EPE_WEIGHT 1->10  LAMBDA_FLOW_WARP_CONSISTENCY 0.012 ->1.2 
+                ESRuRAFT_PIV_v7 ESRuRAFT_PIV_v6基础上去除生成器动态学习率变化  去除动态对抗损失权重变化限制在前面10轮   
+                ESRuRAFT_PIV_v7_v1  ESRuRAFT_PIV_v7基础上RAFT_EPE_WEIGHT 1->10  LAMBDA_FLOW_WARP_CONSISTENCY 0.012 ->1.2 
+       
            """
         #运行环境是否是autoDL
         IS_AUTO_DL = True
@@ -49,7 +52,7 @@ class global_data:
         # 训练任务标识
         # =========================
         name = "ESRuRAFT_PIV"  # 当前实验名（用于输出目录/模型名/wandb run名）
-        DESCRIPTION = "_v6_v2"  # 实验补充描述（可写损失配置、数据版本等）
+        DESCRIPTION = "_v7"  # 实验补充描述（可写损失配置、数据版本等）
         name +=DESCRIPTION
 
         #整体项目注释
@@ -99,7 +102,7 @@ class global_data:
         # 损失项系数
         # =========================
         LAMBDA_CONTENT = 1  # 感知损失中的内容项权重 vgg
-        RAFT_EPE_WEIGHT = 10  # 生成器侧附加的 RAFT EPE 反作用权重，用来让更小的 EPE 反向约束 SR 结果 1
+        RAFT_EPE_WEIGHT = 1  # 生成器侧附加的 RAFT EPE 反作用权重，用来让更小的 EPE 反向约束 SR 结果 1
         # `LAMBDA_ADVERSARIAL` 作为“当前生效值”保留，
         # 每个 epoch 开始时会由 update_adversarial_weight(...) 动态刷新。
         LAMBDA_ADVERSARIAL = 0.0005
@@ -109,7 +112,7 @@ class global_data:
         # 注意：这里的 END 不建议再设到 0.2，你已经验证过那会明显放大边界伪影。
         ADVERSARIAL_WEIGHT_START = 0.0005
         ADVERSARIAL_WEIGHT_END = 0.02
-        ADVERSARIAL_WARMUP_EPOCHS = 10 #到第几个epoch 结束对砍损失动态提高 EPOCH_NUMS-10
+        ADVERSARIAL_WARMUP_EPOCHS = EPOCH_NUMS-10 #到第几个epoch 结束对砍损失动态提高 EPOCH_NUMS-10
         ADVERSARIAL_WEIGHT_SCHEDULE = "linear"  # 当前支持: linear | constant
 
 
@@ -131,7 +134,7 @@ class global_data:
         # =========================
         # 图像对一致性损失超参数
         # =========================
-        LAMBDA_FLOW_WARP_CONSISTENCY = 1.2  # GT flow 引导的 SR 图像对 warp 一致性权重 0.012
+        LAMBDA_FLOW_WARP_CONSISTENCY = 0.012  # GT flow 引导的 SR 图像对 warp 一致性权重 0.012
 
         # =========================
         # 结构相似性损失超参数
