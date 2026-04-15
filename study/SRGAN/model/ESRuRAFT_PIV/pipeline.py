@@ -234,7 +234,6 @@ def _measure_training_step_peak_memory(profile_model, inputs, device):
     torch.cuda.synchronize()
     return torch.cuda.max_memory_allocated(device) / (1024 ** 2)
 
-
 def _profile_esru_raft_piv_model(model, sample_batch, device, warmup=5, iters=20):
     was_training = model.training
     lr_prev, hr_prev, lr_next, hr_next, flow_hr_uv = _extract_profile_inputs(sample_batch, device)
@@ -334,7 +333,6 @@ def _save_run_metrics_summary(class_name, data_type, scale, metrics_summary):
     global_data.esrgan.metricsSummaryCsvOperator.create(row)
     logger.info(f"Metrics summary CSV saved to {summary_csv_path}")
 
-
 def _pick_profile_batch(validate_loader, train_loader):
     try:
         # 优先用验证集首个 batch 统计推理指标，更贴近“推理”场景。
@@ -343,6 +341,13 @@ def _pick_profile_batch(validate_loader, train_loader):
         logger.warning("validate_loader 为空，profiling 将回退到 train_loader 的首个 batch。")
         return next(iter(train_loader))
 
+
+def _model_parameters_are_finite(model, model_name: str) -> bool:
+    for name, param in model.named_parameters():
+        if param is not None and not torch.isfinite(param).all():
+            logger.error(f"{model_name} parameter has NaN/Inf: {name}; skip saving model checkpoint.")
+            return False
+    return True
 
 
 def main():
@@ -648,9 +653,10 @@ def main():
                     f"{class_name} {data_type} |RAFT_optimizer saved: v -> {ESRuRAFT_PIV_RAFT_optimizer_save_path}")
                 # 保存模型
                 model_save_path = f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.MODEL_DIR}/ESRuRAFT_PIV_model_{global_data.esrgan.name}.pth"
-                torch.save(ESRuRAFT_PIV_model.state_dict(), model_save_path)
-                logger.info(
-                    f"{class_name} {data_type} |Models saved: v -> {model_save_path}")
+                if _model_parameters_are_finite(ESRuRAFT_PIV_model, "ESRuRAFT_PIV_model"):
+                    torch.save(ESRuRAFT_PIV_model.state_dict(), model_save_path)
+                    logger.info(
+                        f"{class_name} {data_type} |Models saved: v -> {model_save_path}")
 
             training_end_time = time.time()
             # 训练总时长统一换算成小时，直接对应你要记录的“训练时间（小时）”。
@@ -710,5 +716,11 @@ if __name__ =="__main__":
     finally:
         if global_data.esrgan.IS_AUTO_DL:
             os.system("/usr/bin/shutdown")
+
+
+
+
+
+
 
 

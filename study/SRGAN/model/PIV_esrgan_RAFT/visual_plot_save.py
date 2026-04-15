@@ -13,15 +13,11 @@ from study.SRGAN.model.PIV_esrgan_RAFT.visual_plot_init import _omega_star_from_
 from study.SRGAN.util.image_util import build_triplet_row, build_pair_row
 from study.SRGAN.util.tensor_util import _to_np_2d
 
-def _finite_array(array: np.ndarray) -> np.ndarray:
-    return np.nan_to_num(np.asarray(array), nan=0.0, posinf=0.0, neginf=0.0)
-
-
 def _tensor_to_rgb_pil(tensor: torch.Tensor) -> Image.Image:
     """将 [1,C,H,W] 或 [C,H,W] 张量转成 RGB PIL 图像。"""
     if tensor.dim() == 4:
         tensor = tensor[0]
-    tensor = torch.nan_to_num(tensor.detach().cpu(), nan=0.0, posinf=1.0, neginf=0.0).clamp(0, 1)
+    tensor = tensor.detach().cpu().clamp(0, 1)
     if tensor.shape[0] == 1:
         arr = (tensor[0].numpy() * 255.0).astype(np.uint8)
         return Image.fromarray(arr, mode="L").convert("RGB")
@@ -69,8 +65,6 @@ def _save_energy_spectrum_plot(pred_curve: np.ndarray, gt_curve: np.ndarray, out
     """保存能量谱对比图（log-log）。"""
     k = np.arange(1, len(pred_curve) + 1)
     plt.figure(figsize=(6, 4), dpi=160)
-    gt_curve = _finite_array(gt_curve)
-    pred_curve = _finite_array(pred_curve)
     plt.loglog(k, np.maximum(gt_curve, 1e-12), label="GT", linewidth=2)
     plt.loglog(k, np.maximum(pred_curve, 1e-12), label="Pred", linewidth=2, linestyle="--")
     plt.xlabel("Wavenumber k")
@@ -116,20 +110,16 @@ def save_vorticity_quiver_single(fake_bchw: torch.Tensor, save_path: str, stride
     batch_train: 只看生成图效果（fake）
     fake_bchw: [B,3,H,W], channel0=u, channel1=v, channel2=s
     """
-    u = _finite_array(_to_np_2d(fake_bchw[0, 0]))
-    v = _finite_array(_to_np_2d(fake_bchw[0, 1]))
+    u = _to_np_2d(fake_bchw[0, 0])
+    v = _to_np_2d(fake_bchw[0, 1])
     omega_star = _omega_star_from_uv(u, v)
 
     H, W = u.shape
     yy, xx = np.mgrid[0:H, 0:W]
 
     fig, ax = plt.subplots(1, 1, figsize=(4.2, 3.4), dpi=160)
-    vmin = float(np.min(omega_star))
-    vmax = float(np.max(omega_star))
-    if not np.isfinite(vmin):
-        vmin = 0.0
-    if not np.isfinite(vmax) or vmax <= vmin:
-        vmax = vmin + 1e-6
+    vmin = float(omega_star.min())
+    vmax = float(omega_star.max())
 
     im = ax.imshow(omega_star, origin="lower", cmap="RdBu_r", vmin=vmin, vmax=vmax)
     ax.quiver(
@@ -194,20 +184,14 @@ def save_vorticity_quiver_compare(
 
         row_items = []
         for t in triplet:
-            u = _finite_array(_to_np_2d(t[0, 0]))  # [h,w]
-            v = _finite_array(_to_np_2d(t[0, 1]))  # [h,w]
+            u = _to_np_2d(t[0, 0])  # [h,w]
+            v = _to_np_2d(t[0, 1])  # [h,w]
             omega_star = _omega_star_from_uv(u, v)  # 原分辨率算涡量
             row_items.append((u, v, omega_star))
 
         # 同一行共用色标范围
-        row_vmin = min(float(np.min(w)) for _, _, w in row_items)
-        row_vmax = max(float(np.max(w)) for _, _, w in row_items)
-        if not np.isfinite(row_vmin):
-            row_vmin = 0.0
-        if not np.isfinite(row_vmax):
-            row_vmax = row_vmin + 1e-6
-        if row_vmax <= row_vmin:
-            row_vmax = row_vmin + 1e-6
+        row_vmin = min(float(w.min()) for _, _, w in row_items)
+        row_vmax = max(float(w.max()) for _, _, w in row_items)
 
         for j, (title, (u, v, omega_star)) in enumerate(zip(titles, row_items)):
             ax = axes[i, j]
@@ -268,4 +252,7 @@ def save_vorticity_quiver_compare(
 """
 可视化保存 end
 """
+
+
+
 

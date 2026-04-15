@@ -70,7 +70,7 @@ class global_data:
         # =========================
         device = torch.device("cuda")  # 训练设备
         IS_LOAD_EXISTS_MODEL = True  # 是否从已保存模型断点继续训练
-        AMP =True #是否开启混合精度训练
+        AMP =False #是否开启混合精度训练
         # =========================
         # 可视化与保存相关
         # =========================
@@ -406,3 +406,4 @@ class global_data:
         #     print(f"hyper_parameter Saved to {file_path}")
 # 模块导入时只执行一次
 global_data.esrgan.ensure_wandb_login()
+

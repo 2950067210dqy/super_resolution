@@ -31,35 +31,6 @@ from study.SRGAN.util.image_util import flow_to_color_tensor, build_triplet_row,
 验证函数 start
 """
 
-
-def _finite_float(value, default: float = 0.0, min_value: float | None = None) -> float:
-    """
-    将标量整理成有限 float，避免 NaN/inf 继续传到 PIL 或 matplotlib 的整数转换里。
-    """
-    try:
-        value = float(value)
-    except (TypeError, ValueError):
-        value = default
-    if not math.isfinite(value):
-        value = default
-    if min_value is not None:
-        value = max(value, min_value)
-    return value
-
-
-def _sanitize_tensor_finite(tensor: torch.Tensor, nan: float = 0.0) -> torch.Tensor:
-    """
-    清理张量中的 NaN/inf，主要用于评估可视化路径。
-    """
-    return torch.nan_to_num(tensor, nan=nan, posinf=nan, neginf=nan)
-
-
-def _sanitize_array_finite(array: np.ndarray, nan: float = 0.0) -> np.ndarray:
-    """
-    清理 numpy 数组中的 NaN/inf，主要用于热力图、直方图和 .npy 统计。
-    """
-    return np.nan_to_num(np.asarray(array), nan=nan, posinf=nan, neginf=nan)
-
 def validate_and_save(result_dir, model, val_dataloader, device, epoch, data_type, SAVE_AS_GRAY=None):
     """
     每轮验证时保存主对比图，并在 flo 模态下额外保存 U/V/S 与涡量矢量图。 只验证保存loader的第一个batch的图
@@ -384,8 +355,7 @@ def _compute_flow_ref_max_rad(flow_gt_bchw: torch.Tensor) -> float:
     gt_u = flow_gt_bchw[:, 0]
     gt_v = flow_gt_bchw[:, 1]
     gt_mag_uv = torch.sqrt(gt_u * gt_u + gt_v * gt_v)
-    gt_mag_uv = _sanitize_tensor_finite(gt_mag_uv)
-    return _finite_float(torch.quantile(gt_mag_uv.flatten(), 0.99).item(), default=1e-6, min_value=1e-6)
+    return max(torch.quantile(gt_mag_uv.flatten(), 0.99).item(), 1e-6)
 
 
 def _flow_to_color_preview(flow_uv_bchw: torch.Tensor, ref_max_rad: float) -> torch.Tensor:
@@ -403,7 +373,7 @@ def _tensor_to_rgb_pil(tensor: torch.Tensor) -> Image.Image:
     """
     if tensor.dim() == 4:
         tensor = tensor[0]
-    tensor = _sanitize_tensor_finite(tensor.detach().cpu()).clamp(0, 1)
+    tensor = tensor.detach().cpu().clamp(0, 1)
     if tensor.shape[0] == 1:
         arr = (tensor[0].numpy() * 255.0).astype(np.uint8)
         return Image.fromarray(arr, mode="L").convert("RGB")
@@ -529,7 +499,7 @@ def _mean_sum_per_100_pixels(values_1d: np.ndarray, group_size: int = 100) -> fl
     将一维误差序列按每 100 个像素分组求和，再对所有满 100 像素分组和取平均。
     最后一组不足 100 个像素时直接丢弃，不参与统计。
     """
-    values = _sanitize_array_finite(values_1d).reshape(-1).astype(np.float32)
+    values = values_1d.reshape(-1).astype(np.float32)
     if values.size < group_size:
         return float("nan")
     usable_count = (values.size // group_size) * group_size
@@ -552,10 +522,6 @@ def _make_vertical_colorbar_image(
     生成单个竖直颜色映射条。
     色条放在最右侧，顶部对应 vmax，底部对应 vmin。
     """
-    vmin = _finite_float(vmin)
-    vmax = _finite_float(vmax, default=vmin + 1e-6)
-    if vmax <= vmin:
-        vmax = vmin + 1e-6
     canvas_w = width + 42
     canvas = Image.new("RGB", (canvas_w, height), color=(255, 255, 255))
     draw = ImageDraw.Draw(canvas)
@@ -655,7 +621,6 @@ def _save_heatmap(arr_2d: np.ndarray, out_png: Path, title: str, cmap: str = "vi
     保存二维热力图。
     symmetric=True 时，颜色范围关于 0 对称，更适合误差正负分布图。
     """
-    arr_2d = _sanitize_array_finite(arr_2d).astype(np.float32, copy=False)
     plt.figure(figsize=(4.8, 4.0), dpi=160)
     if symmetric:
         vmax = float(np.max(np.abs(arr_2d))) + 1e-12
@@ -702,11 +667,6 @@ def _save_signed_error_map(
     保存带固定对称色标的误差图。
     这里固定到 [-0.5, 0.5]，并采用蓝-白-红渐变，以对齐参考图风格。
     """
-    arr_2d = _sanitize_array_finite(arr_2d).astype(np.float32, copy=False)
-    vmin = _finite_float(vmin, default=-0.5)
-    vmax = _finite_float(vmax, default=0.5)
-    if vmax <= vmin:
-        vmax = vmin + 1e-6
     fig, ax = plt.subplots(1, 1, figsize=(4.8, 3.9), dpi=160)
     im = ax.imshow(arr_2d, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
     ax.set_xticks([])
@@ -740,8 +700,8 @@ def _save_error_histogram(
     """
     保存单组误差直方图，风格对齐参考图的中心对称分布展示。
     """
-    values = _sanitize_array_finite(values_1d).reshape(-1).astype(np.float32)
-    max_abs = _finite_float(np.quantile(np.abs(values), 0.995), default=0.05, min_value=0.0)
+    values = values_1d.reshape(-1).astype(np.float32)
+    max_abs = float(np.quantile(np.abs(values), 0.995))
     max_abs = max(max_abs, 0.05)
     fig, ax = plt.subplots(1, 1, figsize=(4.8, 3.9), dpi=160)
     ax.hist(values, bins=bins, range=(-max_abs, max_abs), color=color, alpha=0.65, edgecolor="none")
@@ -764,8 +724,6 @@ def _save_flow_error_visuals(pred_bchw: torch.Tensor, gt_bchw: torch.Tensor, out
         delta_w_2d: 深度/幅值位移误差图
         epe_2d:     端点误差图
     """
-    pred_bchw = _sanitize_tensor_finite(pred_bchw)
-    gt_bchw = _sanitize_tensor_finite(gt_bchw)
     pred_flow = pred_bchw if pred_bchw.shape[1] >= 3 else _flow_uv_to_uvw(pred_bchw)
     gt_flow = gt_bchw if gt_bchw.shape[1] >= 3 else _flow_uv_to_uvw(gt_bchw)
     pred_np = _to_np_chw(pred_flow[0])
@@ -819,8 +777,7 @@ def _delta_u_histogram_matrix(delta_u_2d: np.ndarray, bins: int = 201) -> np.nda
     统计 Δu 的像素计数分布。
     分布区间以 0 为中心，用来观察误差是否高度集中在零附近。
     """
-    delta_u_2d = _sanitize_array_finite(delta_u_2d).astype(np.float32, copy=False)
-    max_abs = _finite_float(np.max(np.abs(delta_u_2d)), default=0.0, min_value=0.0) + 1e-12
+    max_abs = float(np.max(np.abs(delta_u_2d))) + 1e-12
     edges = np.linspace(-max_abs, max_abs, bins + 1, dtype=np.float32)
     return _histogram_matrix(delta_u_2d, edges)
 
@@ -830,8 +787,7 @@ def _delta_v_histogram_matrix(delta_v_2d: np.ndarray, bins: int = 201) -> np.nda
     统计 Δv 的像素计数分布。
     分布区间同样以 0 为中心，便于和 Δu 采用一致的误差分析口径。
     """
-    delta_v_2d = _sanitize_array_finite(delta_v_2d).astype(np.float32, copy=False)
-    max_abs = _finite_float(np.max(np.abs(delta_v_2d)), default=0.0, min_value=0.0) + 1e-12
+    max_abs = float(np.max(np.abs(delta_v_2d))) + 1e-12
     edges = np.linspace(-max_abs, max_abs, bins + 1, dtype=np.float32)
     return _histogram_matrix(delta_v_2d, edges)
 
@@ -841,8 +797,7 @@ def _delta_w_histogram_matrix(delta_w_2d: np.ndarray, bins: int = 201) -> np.nda
     统计 Δw 的像素计数分布。
     分布区间同样以 0 为中心，便于和 Δu / Δv 采用一致的误差分析口径。
     """
-    delta_w_2d = _sanitize_array_finite(delta_w_2d).astype(np.float32, copy=False)
-    max_abs = _finite_float(np.max(np.abs(delta_w_2d)), default=0.0, min_value=0.0) + 1e-12
+    max_abs = float(np.max(np.abs(delta_w_2d))) + 1e-12
     edges = np.linspace(-max_abs, max_abs, bins + 1, dtype=np.float32)
     return _histogram_matrix(delta_w_2d, edges)
 
@@ -851,8 +806,7 @@ def _epe_histogram_matrix(epe_2d: np.ndarray, bins: int = 201) -> np.ndarray:
     """
     统计端点误差 EPE 的像素计数分布。
     """
-    epe_2d = _sanitize_array_finite(epe_2d).astype(np.float32, copy=False)
-    max_val = _finite_float(np.max(epe_2d), default=0.0, min_value=0.0) + 1e-12
+    max_val = float(np.max(epe_2d)) + 1e-12
     edges = np.linspace(0.0, max_val, bins + 1, dtype=np.float32)
     return _histogram_matrix(epe_2d, edges)
 
@@ -1367,9 +1321,9 @@ def evaluate_all(
                 # 保存流场预测及误差分析结果。
                 # lr1 = lr[i:i + 1]
                 # lr_up1 = lr_up[i:i + 1]
-                fk1 = _sanitize_tensor_finite(fake[i:i + 1])
-                fk1_uvw = _sanitize_tensor_finite(fake_uvw[i:i + 1])
-                hr1 = _sanitize_tensor_finite(hr[i:i + 1])
+                fk1 = fake[i:i + 1]
+                fk1_uvw = fake_uvw[i:i + 1]
+                hr1 = hr[i:i + 1]
 
                 # np.save(one_dir / "lr_flo.npy", _to_np_chw(lr1[0]).transpose(1, 2, 0))
                 # 保存三通道预测流场 [u, v, magnitude]，便于和三通道真值直接对比。
@@ -1410,9 +1364,8 @@ def evaluate_all(
                     column_widths=[fk1_uvw.shape[-1], hr1.shape[-1]],
                     column_separator_widths=[6],
                 )
-                hr_for_scale = _sanitize_tensor_finite(hr1[:, :3])
-                hr_min = hr_for_scale.amin(dim=(0, 2, 3))
-                hr_max = hr_for_scale.amax(dim=(0, 2, 3))
+                hr_min = hr1[:, :3].amin(dim=(0, 2, 3))
+                hr_max = hr1[:, :3].amax(dim=(0, 2, 3))
                 uvs_panel = _append_colorbar_sections_to_panel(
                     uvs_panel,
                     [
@@ -1606,4 +1559,6 @@ def evaluate_all(
     if image_pair_rows:
         return build_mean_row(image_pair_rows, class_name)
     return build_mean_row(rows, class_name)
+
+
 

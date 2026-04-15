@@ -7,11 +7,6 @@ import torch
 
 from study.SRGAN.util.image_util import scalar_to_jet, build_triplet_row, build_pair_row, add_horizontal_separator
 
-def _finite_minmax(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    tensor = torch.nan_to_num(tensor, nan=0.0, posinf=0.0, neginf=0.0)
-    return tensor.amin(dim=(0, 2, 3), keepdim=True), tensor.amax(dim=(0, 2, 3), keepdim=True)
-
-
 def build_flo_uvw_fake_panel(fake_bchw, col_sep=8):
     """
     仅对 fake 的 U/V/S 三通道做伪彩展示并横向拼接。
@@ -22,8 +17,8 @@ def build_flo_uvw_fake_panel(fake_bchw, col_sep=8):
         logger.error(f'Need [B,>=3,H,W], got {tuple(fake_bchw.shape)}')
         raise ValueError(f"Need [B,>=3,H,W], got {tuple(fake_bchw.shape)}")
 
-    fake_bchw = torch.nan_to_num(fake_bchw, nan=0.0, posinf=0.0, neginf=0.0)
-    cmin, cmax = _finite_minmax(fake_bchw[:, :3])
+    cmin = fake_bchw[:, :3].amin(dim=(0, 2, 3), keepdim=True)
+    cmax = fake_bchw[:, :3].amax(dim=(0, 2, 3), keepdim=True)
     den = (cmax - cmin).clamp_min(1e-8)
     x = (fake_bchw[:, :3] - cmin) / den  # [B,3,H,W]
 
@@ -53,10 +48,8 @@ def build_flo_uvw_compare_panel(lr_bchw, fake_bchw, hr_bchw, sep_width=6, row_se
             raise ValueError("Need 3 channels (U,V,S).")
 
     # 统一用 HR 做每通道 min-max，保证可比
-    lr_bchw = torch.nan_to_num(lr_bchw, nan=0.0, posinf=0.0, neginf=0.0)
-    fake_bchw = torch.nan_to_num(fake_bchw, nan=0.0, posinf=0.0, neginf=0.0)
-    hr_bchw = torch.nan_to_num(hr_bchw, nan=0.0, posinf=0.0, neginf=0.0)
-    cmin, cmax = _finite_minmax(hr_bchw[:, :3])
+    cmin = hr_bchw[:, :3].amin(dim=(0, 2, 3), keepdim=True)
+    cmax = hr_bchw[:, :3].amax(dim=(0, 2, 3), keepdim=True)
     den = (cmax - cmin).clamp_min(1e-8)
 
     lr_n = (lr_bchw[:, :3] - cmin) / den
@@ -107,9 +100,8 @@ def build_flo_uvw_pred_gt_panel(pred_bchw, hr_bchw, sep_width=6, row_sep=8, samp
             logger.error('Need 3 channels (U,V,S).')
             raise ValueError("Need 3 channels (U,V,S).")
 
-    pred_bchw = torch.nan_to_num(pred_bchw, nan=0.0, posinf=0.0, neginf=0.0)
-    hr_bchw = torch.nan_to_num(hr_bchw, nan=0.0, posinf=0.0, neginf=0.0)
-    cmin, cmax = _finite_minmax(hr_bchw[:, :3])
+    cmin = hr_bchw[:, :3].amin(dim=(0, 2, 3), keepdim=True)
+    cmax = hr_bchw[:, :3].amax(dim=(0, 2, 3), keepdim=True)
     den = (cmax - cmin).clamp_min(1e-8)
 
     pred_n = (pred_bchw[:, :3] - cmin) / den
@@ -148,7 +140,6 @@ def _omega_star_from_uv(u: np.ndarray, v: np.ndarray, eps: float = 1e-8) -> np.n
     dv_dy, dv_dx = np.gradient(v)
     du_dy, du_dx = np.gradient(u)
     omega = dv_dx - du_dy
-    omega = np.nan_to_num(omega, nan=0.0, posinf=0.0, neginf=0.0)
 
     omin = omega.min()
     omax = omega.max()
@@ -158,4 +149,6 @@ def _omega_star_from_uv(u: np.ndarray, v: np.ndarray, eps: float = 1e-8) -> np.n
 """
 可视化 生成 end
 """
+
+
 
