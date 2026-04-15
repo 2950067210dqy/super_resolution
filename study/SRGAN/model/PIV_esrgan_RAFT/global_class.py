@@ -72,6 +72,7 @@ class global_data:
         # =========================
         # 训练主超参数
         # =========================
+        START_EPOCH = 1  # 从哪个epoch开始 从1开始
         EPOCH_NUMS = 60 # 训练轮数 50
         BATCH_SIZE = 4 # batch 大小
         PRE_TRIAN_G_EPOCH = 1 #预训练G完成的轮次 从1开始 就是从第几轮开始弃用对抗损失

@@ -1,4 +1,5 @@
 import os
+import traceback
 
 from loguru import logger
 
@@ -42,6 +43,6 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        logger.error(f"{e}")
+        logger.error(f"{e}\n{traceback.format_exc()}")
     finally:
         os.system("/usr/bin/shutdown")

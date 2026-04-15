@@ -40,11 +40,11 @@ class global_data:
            18） ESRuRAFT_PIV_v5 ESRuRAFT_PIV_vtest2基础上将生成器的图像对一致性损失改成 图像一致性不是直接比较两帧原坐标，而是先用光流对齐再比较 基于光流运动对齐的 warp 一致性思想
            19） ESRuRAFT_PIV_v6 ESRuRAFT_PIV_v6基础上添加动态学习率根据指标的变化调整 生成器与RAFT都添加动态学习率 超分辨下效果不好，但是RAFT效果好！
                 ESRuRAFT_PIV_v6_v1 ESRuRAFT_PIV_v6基础上添加动态对抗损失权重变化限制在前面10轮  超分辨效果好，但是RAFT效果不好 
-                ESRuRAFT_PIV_v6_v2 ESRuRAFT_PIV_v6_v1基础上 RAFT_EPE_WEIGHT 1->10  LAMBDA_FLOW_WARP_CONSISTENCY 0.012 ->1.2 
+                ESRuRAFT_PIV_v6_v2 ESRuRAFT_PIV_v6_v1基础上 RAFT_EPE_WEIGHT 1->10  LAMBDA_FLOW_WARP_CONSISTENCY 0.012 ->1.2 变成v6那种效果了
                 ESRuRAFT_PIV_v7 ESRuRAFT_PIV_v6基础上去除生成器动态学习率变化  !运行到这里
                 
-                ESRuRAFT_PIV_v6_v3  ESRuRAFT_PIV_v6_v2基础上去除生成器动态学习率变化 
-                ESRuRAFT_PIV_v7_v1 ESRuRAFT_PIV_v7基础上RAFT_EPE_WEIGHT 1->10  LAMBDA_FLOW_WARP_CONSISTENCY 0.012 ->1.2
+                ESRuRAFT_PIV_v6_v3  ESRuRAFT_PIV_v6_v2基础上去除生成器动态学习率变化  RAFT_EPE_WEIGHT 1->3  LAMBDA_FLOW_WARP_CONSISTENCY 0.012 ->1.2
+                ESRuRAFT_PIV_v7_v1 ESRuRAFT_PIV_v7基础上RAFT_EPE_WEIGHT 1->3  LAMBDA_FLOW_WARP_CONSISTENCY 0.012 ->1.2
            """
         #运行环境是否是autoDL
         IS_AUTO_DL = True
@@ -69,7 +69,7 @@ class global_data:
         # 设备与模型加载
         # =========================
         device = torch.device("cuda")  # 训练设备
-        IS_LOAD_EXISTS_MODEL = False  # 是否从已保存模型断点继续训练
+        IS_LOAD_EXISTS_MODEL = True  # 是否从已保存模型断点继续训练
         AMP =True #是否开启混合精度训练
         # =========================
         # 可视化与保存相关
@@ -79,6 +79,7 @@ class global_data:
         # 训练主超参数
         # =========================
         EPOCH_NUMS = 60 # 训练轮数 50
+        START_EPOCH  = 46#从哪个epoch开始 从1开始
         BATCH_SIZE = 4 # batch 大小
         PRE_TRIAN_G_EPOCH = 1 #预训练G完成的轮次 从1开始 就是从第几轮开始弃用对抗损失
         TRAIN_DATA_SAVING_STEP =250 #每隔多少steps保存一次生成的图片 50
@@ -135,7 +136,7 @@ class global_data:
         # =========================
         # 图像对一致性损失超参数
         # =========================
-        LAMBDA_FLOW_WARP_CONSISTENCY = 0.012  # GT flow 引导的 SR 图像对 warp 一致性权重 0.012
+        LAMBDA_FLOW_WARP_CONSISTENCY =0.012  # GT flow 引导的 SR 图像对 warp 一致性权重 0.012
 
         # =========================
         # 结构相似性损失超参数

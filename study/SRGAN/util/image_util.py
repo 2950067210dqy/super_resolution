@@ -1,5 +1,6 @@
 from loguru import logger
 import torch
+import numpy as np
 from matplotlib import cm
 
 from SRGAN.model.esrgan_update.global_class import global_data
@@ -128,12 +129,14 @@ def flow_to_color_tensor(flow: torch.Tensor, ref_max_rad: float | None = None) -
     u = flow[:, 0]
     v = flow[:, 1]
 
-    mag = torch.sqrt(u * u + v * v)
+    mag = torch.nan_to_num(torch.sqrt(u * u + v * v), nan=0.0, posinf=0.0, neginf=0.0)
 
     if ref_max_rad is None:
         max_rad = torch.quantile(mag.flatten(), 0.99).item()
     else:
         max_rad = float(ref_max_rad)
+    if not np.isfinite(max_rad):
+        max_rad = 1e-6
     max_rad = max(max_rad, 1e-6)
 
     # 用 magnitude 做归一化，并复用 fake_uvw_panel 同风格的 jet 伪彩映射。
@@ -146,8 +149,9 @@ def scalar_to_jet(x01: torch.Tensor) -> torch.Tensor:
     x01: [B,1,H,W] in [0,1]
     return: [B,3,H,W] in [0,1], jet colormap
     """
-    x = x01.clamp(0, 1)
+    x = torch.nan_to_num(x01, nan=0.0, posinf=1.0, neginf=0.0).clamp(0, 1)
     x_np = x.detach().cpu().numpy()  # [B,1,H,W]
     rgba = cm.get_cmap("jet")(x_np[:, 0])  # [B,H,W,4]
     rgb = torch.from_numpy(rgba[..., :3]).to(x.device, dtype=x.dtype)  # [B,H,W,3]
     return rgb.permute(0, 3, 1, 2).contiguous()  # [B,3,H,W]
+

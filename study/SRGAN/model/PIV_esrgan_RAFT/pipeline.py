@@ -1,3 +1,5 @@
+import traceback
+
 from loguru import logger
 
 import os
@@ -588,7 +590,7 @@ def main():
             """
             训练 start
             """
-            for epoch in range(global_data.esrgan.EPOCH_NUMS):
+            for epoch in range(global_data.esrgan.START_EPOCH-1,global_data.esrgan.EPOCH_NUMS):
                 #动态更新对抗损失
                 current_lambda_adversarial = global_data.esrgan.update_adversarial_weight(epoch)
                 logger.info(
@@ -719,7 +721,8 @@ if __name__ =="__main__":
     try:
         main()
     except Exception as e:
-        logger.error(f"{e}")
+        logger.error(f"{e}\n{traceback.format_exc()}")
     finally:
         if global_data.esrgan.IS_AUTO_DL:
             os.system("/usr/bin/shutdown")
+
