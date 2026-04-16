@@ -73,7 +73,7 @@ class global_data:
         # 训练主超参数
         # =========================
         START_EPOCH = 1  # 从哪个epoch开始 从1开始
-        EPOCH_NUMS = 60 # 训练轮数 50
+        EPOCH_NUMS = 50 # 训练轮数 50
         BATCH_SIZE = 4 # batch 大小
         PRE_TRIAN_G_EPOCH = 1 #预训练G完成的轮次 从1开始 就是从第几轮开始弃用对抗损失
         TRAIN_DATA_SAVING_STEP =250 #每隔多少steps保存一次生成的图片 50
@@ -98,19 +98,33 @@ class global_data:
         # 损失项系数
         # =========================
         LAMBDA_CONTENT = 1  # 感知损失中的内容项权重
-        # `LAMBDA_ADVERSARIAL` 作为“当前生效值”保留，
-        # 每个 epoch 开始时会由 update_adversarial_weight(...) 动态刷新。
+        # =========================
+        # 动态损失权重调度配置
+        # =========================
+        # 下面三个权重都采用同一套 warm-start 调度规则：
+        # 1. epoch <= *_WARMSTART_EPOCHS 时，权重固定为 *_WEIGHT_START。
+        # 2. *_WARMSTART_EPOCHS < epoch < *_WARMUP_EPOCHS 时，权重按 schedule 从 START 线性涨到 END。
+        # 3. epoch >= *_WARMUP_EPOCHS 时，权重固定为 *_WEIGHT_END。
+        # 注意：训练循环里的 epoch 是 0-based；显示日志里的第 N 轮对应 epoch=N-1。
+        # 因此最后一轮的 epoch index 是 EPOCH_NUMS - 1。
+
+        # `LAMBDA_ADVERSARIAL` 是当前 epoch 真正生效的生成器对抗损失权重。
+        # 按你的设定：从第 0 轮开始由 0.0005 线性增长，到 int(EPOCH_NUMS/2) 达到 0.02，之后保持 0.02。
         LAMBDA_ADVERSARIAL = 0.0005
-        # 动态对抗权重调度：
-        # - 前期让 G 先学稳定重建，避免一上来就被 GAN 拉去造伪纹理
-        # - 中后期再逐步给一点 adversarial，补局部真实感
-        # 注意：这里的 END 不建议再设到 0.2，你已经验证过那会明显放大边界伪影。
         ADVERSARIAL_WEIGHT_START = 0.0005
         ADVERSARIAL_WEIGHT_END = 0.02
-        ADVERSARIAL_WARMUP_EPOCHS = EPOCH_NUMS-10
-        ADVERSARIAL_WEIGHT_SCHEDULE = "linear"  # 当前支持: linear | constant
+        ADVERSARIAL_WARMSTART_EPOCHS = 0
+        ADVERSARIAL_WARMUP_EPOCHS = int(EPOCH_NUMS / 2)
+        ADVERSARIAL_WEIGHT_SCHEDULE = "linear"  # 当前支持: linear | const | constant
 
-
+        # `LAMBDA_FLOW_WARP_CONSISTENCY` 是 GT flow 引导的 SR 图像对 warp 一致性损失权重。
+        # 按你的设定：从第 0 轮开始由 0.012 线性增长，到 int(EPOCH_NUMS/2) 达到 1.2，之后保持 1.2。
+        LAMBDA_FLOW_WARP_CONSISTENCY = 0.012
+        FLOW_WARP_CONSISTENCY_WEIGHT_START = 0.012
+        FLOW_WARP_CONSISTENCY_WEIGHT_END = 1.2
+        FLOW_WARP_CONSISTENCY_WARMSTART_EPOCHS = 0
+        FLOW_WARP_CONSISTENCY_WARMUP_EPOCHS = int(EPOCH_NUMS / 2)
+        FLOW_WARP_CONSISTENCY_WEIGHT_SCHEDULE = "linear"  # 当前支持: linear | const | constant
         LAMBDA_PHYSICAL = 0#感知损失中的内容损失中的物理损失权重 如果需要单独跳里面的参数则设置1
         LAMBDA_STRUCTURE =0#感知损失中内容损失中的结构损失权重 如果需要单独跳里面的参数则设置1
 
@@ -129,7 +143,6 @@ class global_data:
         # =========================
         # 图像对一致性损失超参数
         # =========================
-        LAMBDA_FLOW_WARP_CONSISTENCY = 0.012  # GT flow 引导的 SR 图像对 warp 一致性权重
         # =========================
         # 结构相似性损失超参数
         # =========================
@@ -254,43 +267,112 @@ class global_data:
         #结束时间
         END_TIME = time.time()
         @classmethod
-        def get_adversarial_weight(cls, epoch: int) -> float:
+        def _get_scheduled_weight(
+                cls,
+                epoch: int,
+                start: float,
+                end: float,
+                warmstart_epoch: int,
+                warmup_epoch: int,
+                schedule: str,
+                schedule_name: str,
+        ) -> float:
             """
-            根据当前 epoch 返回生效的对抗损失权重。
+            统一的 warm-start 权重调度函数。
 
-            设计原则：
-            1. 训练早期优先学习内容重建，避免 GAN 过早主导训练。
-            2. 只做小幅升权，把 adversarial 当作“纹理微调项”，不是主损失。
-            3. 当 warmup 结束后，权重固定在 END，方便实验复现。
-            因为 warmup_epochs = ADVERSARIAL_WARMUP_EPOCHS，所以从 epoch=0 到 epoch=ADVERSARIAL_WARMUP_EPOCHS-1
-            一共 ADVERSARIAL_WARMUP_EPOCHS 个点，线性从 ADVERSARIAL_WEIGHT_START 涨到 ADVERSARIAL_WEIGHT_END
+            参数说明：
+            - epoch: 当前训练循环中的 0-based epoch index；例如日志中的第 1 轮对应 epoch=0。
+            - start: warm-start 阶段固定使用的初始权重。
+            - end: warmup 结束后固定使用的目标权重。
+            - warmstart_epoch: 在这个 epoch 及之前，权重保持 start，不做增长。
+            - warmup_epoch: 在这个 epoch 及之后，权重保持 end。
+            - schedule: 当前支持 linear / const / constant。
+
+            分段逻辑：
+            1. epoch <= warmstart_epoch: 返回 start。
+            2. warmstart_epoch < epoch < warmup_epoch: 按线性比例从 start 增长到 end。
+            3. epoch >= warmup_epoch: 返回 end。
+            这样可以明确表达“先稳定一段，再逐步加权，最后固定”的训练策略。
             """
-            schedule = str(cls.ADVERSARIAL_WEIGHT_SCHEDULE).strip().lower()
-            start = float(cls.ADVERSARIAL_WEIGHT_START)
-            end = float(cls.ADVERSARIAL_WEIGHT_END)
-            warmup_epochs = max(1, int(cls.ADVERSARIAL_WARMUP_EPOCHS))
+            schedule = str(schedule).strip().lower()
+            start = float(start)
+            end = float(end)
+            warmstart_epoch = max(0, int(warmstart_epoch))
+            warmup_epoch = max(warmstart_epoch, int(warmup_epoch))
+            current_epoch = max(0, int(epoch))
 
-            if schedule == "constant":
+            # const / constant 用于消融实验：全程固定在 start，不进入线性增长。
+            if schedule in ("const", "constant"):
                 return start
 
             if schedule != "linear":
-                raise ValueError(f"Unsupported ADVERSARIAL_WEIGHT_SCHEDULE: {cls.ADVERSARIAL_WEIGHT_SCHEDULE}")
+                raise ValueError(f"Unsupported {schedule_name}: {schedule}")
 
-            if warmup_epochs == 1:
+            # warmup_epoch 与 warmstart_epoch 相同或更小时，说明没有线性区间，直接在边界后使用 end。
+            if current_epoch <= warmstart_epoch:
+                return start
+            if current_epoch >= warmup_epoch:
+                return end
+            if warmup_epoch == warmstart_epoch:
                 return end
 
-            clamped_epoch = min(max(int(epoch), 0), warmup_epochs - 1)
-            progress = clamped_epoch / float(warmup_epochs - 1)
+            progress = (current_epoch - warmstart_epoch) / float(warmup_epoch - warmstart_epoch)
             return start + (end - start) * progress
 
         @classmethod
-        def update_adversarial_weight(cls, epoch: int) -> float:
+        def get_adversarial_weight(cls, epoch: int) -> float:
             """
-            刷新当前 epoch 使用的对抗损失权重，并同步回运行时配置。
+            返回当前 epoch 的生成器对抗损失权重。
+            当前配置为：0 -> int(EPOCH_NUMS/2) 从 0.0005 线性增长到 0.02，之后保持 0.02。
+            """
+            return cls._get_scheduled_weight(
+                epoch=epoch,
+                start=cls.ADVERSARIAL_WEIGHT_START,
+                end=cls.ADVERSARIAL_WEIGHT_END,
+                warmstart_epoch=cls.ADVERSARIAL_WARMSTART_EPOCHS,
+                warmup_epoch=cls.ADVERSARIAL_WARMUP_EPOCHS,
+                schedule=cls.ADVERSARIAL_WEIGHT_SCHEDULE,
+                schedule_name="ADVERSARIAL_WEIGHT_SCHEDULE",
+            )
+
+        @classmethod
+        def get_flow_warp_consistency_weight(cls, epoch: int) -> float:
+            """
+            返回当前 epoch 的 GT-flow warp 图像对一致性损失权重。
+            当前配置为：0 -> int(EPOCH_NUMS/2) 从 0.012 线性增长到 1.2，之后保持 1.2。
+            """
+            return cls._get_scheduled_weight(
+                epoch=epoch,
+                start=cls.FLOW_WARP_CONSISTENCY_WEIGHT_START,
+                end=cls.FLOW_WARP_CONSISTENCY_WEIGHT_END,
+                warmstart_epoch=cls.FLOW_WARP_CONSISTENCY_WARMSTART_EPOCHS,
+                warmup_epoch=cls.FLOW_WARP_CONSISTENCY_WARMUP_EPOCHS,
+                schedule=cls.FLOW_WARP_CONSISTENCY_WEIGHT_SCHEDULE,
+                schedule_name="FLOW_WARP_CONSISTENCY_WEIGHT_SCHEDULE",
+            )
+
+        @classmethod
+        def update_dynamic_loss_weights(cls, epoch: int) -> dict:
+            """
+            每个 epoch 开始时调用一次，把 PIV_esrgan_RAFT 实际使用的动态权重同步回运行时配置。
+            本模型没有 Generator 侧 RAFT EPE 损失，因此这里只更新：
+            1. LAMBDA_ADVERSARIAL
+            2. LAMBDA_FLOW_WARP_CONSISTENCY
             """
             cls.LAMBDA_ADVERSARIAL = cls.get_adversarial_weight(epoch)
+            cls.LAMBDA_FLOW_WARP_CONSISTENCY = cls.get_flow_warp_consistency_weight(epoch)
+            return {
+                "lambda_adversarial": cls.LAMBDA_ADVERSARIAL,
+                "lambda_flow_warp_consistency": cls.LAMBDA_FLOW_WARP_CONSISTENCY,
+            }
+        @classmethod
+        def update_adversarial_weight(cls, epoch: int) -> float:
+            """
+            兼容旧调用：只返回当前对抗权重。
+            新训练流程请优先调用 update_dynamic_loss_weights(...)，同时刷新对抗和 flow-warp 两项动态权重。
+            """
+            cls.update_dynamic_loss_weights(epoch)
             return cls.LAMBDA_ADVERSARIAL
-
         @classmethod
         def ensure_wandb_login(cls):
             if not cls._wandb_logged_in:
@@ -398,4 +480,8 @@ class global_data:
         #     print(f"hyper_parameter Saved to {file_path}")
 # 模块导入时只执行一次
 global_data.esrgan.ensure_wandb_login()
+
+
+
+
 

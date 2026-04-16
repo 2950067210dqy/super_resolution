@@ -596,10 +596,21 @@ def main():
             训练 start
             """
             for epoch in range(global_data.esrgan.START_EPOCH-1,global_data.esrgan.EPOCH_NUMS):
-                #动态更新对抗损失
-                current_lambda_adversarial = global_data.esrgan.update_adversarial_weight(epoch)
+                # 动态更新 PIV_esrgan_RAFT 实际使用的两类损失权重。
+                # 这些权重在每个 epoch 开始时刷新一次，本 epoch 内所有 batch 保持一致：
+                # 1. LAMBDA_ADVERSARIAL: 生成器对抗损失权重，前半程从 0.0005 增长到 0.02。
+                # 2. LAMBDA_FLOW_WARP_CONSISTENCY: GT-flow warp 图像对一致性损失权重，前半程从 0.012 增长到 1.2。
+                # 注意：PIV_esrgan_RAFT 没有 Generator 侧 EPE 损失项，这里不记录也不调度它。
+                current_dynamic_weights = global_data.esrgan.update_dynamic_loss_weights(epoch)
                 logger.info(
-                    f"[Train] Epoch {epoch + 1}: current adversarial weight = {current_lambda_adversarial:.6f}"
+                    "[Train] Epoch {}/{}: current dynamic loss weights | "
+                    "LAMBDA_ADVERSARIAL={:.6f}, "
+                    "LAMBDA_FLOW_WARP_CONSISTENCY={:.6f}".format(
+                        epoch + 1,
+                        global_data.esrgan.EPOCH_NUMS,
+                        current_dynamic_weights["lambda_adversarial"],
+                        current_dynamic_weights["lambda_flow_warp_consistency"],
+                    )
                 )
                 PIV_ESRGAN_RAFT_model.train()  # 确保在训练模式
                 metric = Accumulator(len(global_data.esrgan.loss_label))
@@ -732,6 +743,8 @@ if __name__ =="__main__":
     finally:
         if global_data.esrgan.IS_AUTO_DL:
             os.system("/usr/bin/shutdown")
+
+
 
 
 

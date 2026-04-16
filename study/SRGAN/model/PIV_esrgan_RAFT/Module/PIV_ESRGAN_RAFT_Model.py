@@ -239,7 +239,6 @@ class PIV_ESRGAN_RAFT(nn.Module):
             raft_flow_gt,  # RAFT 光流真值
             flow_init=flow_init,  # 可选初始光流
         )
-
         return flow_predictions, {
             "raft_input_prev": raft_prev,  # 送入 RAFT 前的前一帧单通道图
             "raft_input_next": raft_next,  # 送入 RAFT 前的后一帧单通道图
@@ -517,3 +516,6 @@ class PIV_ESRGAN_RAFT(nn.Module):
             "raft_3px": float(raft_outputs["raft_metrics"]["3px"]),  # EPE < 3 像素的比例
             "raft_5px": float(raft_outputs["raft_metrics"]["5px"]),  # EPE < 5 像素的比例
         }
+
+
+
