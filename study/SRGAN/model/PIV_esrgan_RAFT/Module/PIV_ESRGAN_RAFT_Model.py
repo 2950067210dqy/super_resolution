@@ -12,6 +12,7 @@ from study.SRGAN.model.PIV_esrgan_RAFT.Module.loss import (
 )
 from study.SRGAN.model.PIV_esrgan_RAFT.Module.piv_esrgan_model import Generator, Discriminator  # 导入 ESRGAN 生成器和判别器
 from study.SRGAN.model.PIV_esrgan_RAFT.global_class import global_data
+from study.SRGAN.util.MTL_METHOD import FAMO  # 导入 FAMO 多任务自适应权重方法
 
 try:
     # 自动混合精度上下文管理器
@@ -47,6 +48,30 @@ class PIV_ESRGAN_RAFT(nn.Module):
         self.piv_esrgan_discriminator = Discriminator(inner_chanel=inner_chanel)  # 初始化判别器，用于区分 SR 图像和真实 HR 图像
         #self.piv_RAFT = RAFT256(upsample=global_data.esrgan.RAFT_UPSAMPLE,batch_size=batch_size)  # 初始化 RAFT，用于根据两帧 SR 图像预测 PIV/光流场
         self.piv_RAFT = RAFT128(upsample=global_data.esrgan.RAFT_UPSAMPLE,batch_size=batch_size)  # 初始化 RAFT，用于根据两帧 SR 图像预测 PIV/光流场
+        self.use_famo = bool(global_data.esrgan.USE_FAMO)  # 是否启用两级 FAMO 自适应加权
+        if self.use_famo:
+            # 第一级 FAMO：只管理 Generator 内部的四个任务损失。
+            # 任务顺序为 content / adversarial / pixel / consistency。
+            # 注意：PIV_esrgan_RAFT 当前没有 Generator 侧 epe 损失，所以这里不放 epe。
+            self.generator_famo = FAMO(
+                n_tasks=len(global_data.esrgan.FAMO_GENERATOR_TASK_NAMES),
+                device=global_data.esrgan.device,
+                gamma=global_data.esrgan.FAMO_GAMMA,
+                w_lr=global_data.esrgan.FAMO_W_LR,
+                max_norm=global_data.esrgan.FAMO_MAX_NORM,
+            )
+            # 第二级 FAMO：管理 SR 分支任务和 RAFT 分支任务之间的权重。
+            # 这里会把第一级 FAMO 得到的 SR 目标，与 RAFT 的 raft_loss 再做一次自适应加权。
+            self.joint_famo = FAMO(
+                n_tasks=len(global_data.esrgan.FAMO_JOINT_TASK_NAMES),
+                device=global_data.esrgan.device,
+                gamma=global_data.esrgan.FAMO_GAMMA,
+                w_lr=global_data.esrgan.FAMO_W_LR,
+                max_norm=global_data.esrgan.FAMO_MAX_NORM,
+            )
+        else:
+            self.generator_famo = None
+            self.joint_famo = None
 
     @staticmethod
     def _set_requires_grad(module: nn.Module, requires_grad: bool) -> None:
@@ -141,6 +166,119 @@ class PIV_ESRGAN_RAFT(nn.Module):
         对前后两帧的同名标量损失做平均。
         """
         return 0.5 * (prev_terms[key] + next_terms[key])  # 对前后两帧的同名损失做平均，保持两帧地位一致
+
+    @staticmethod
+    def _as_loss_tensor(value, reference: torch.Tensor) -> torch.Tensor:
+        """
+        将某个损失值整理成和 reference 同 device / dtype 的标量 Tensor。
+
+        FAMO 需要把多个任务损失 stack 成向量；这里做一层兼容保护，
+        防止某些分支返回 Python float 或 dtype/device 不一致。
+        """
+        if torch.is_tensor(value):
+            return value.to(device=reference.device, dtype=reference.dtype)
+        return torch.tensor(float(value), device=reference.device, dtype=reference.dtype)
+
+    def _build_generator_famo_losses(self, sr_outputs: dict) -> torch.Tensor:
+        """
+        构造第一级 FAMO 的 Generator 四任务损失向量。
+
+        任务顺序：
+        1. content：VGG/content 内容损失
+        2. adversarial：生成器对抗损失
+        3. pixel：像素域复合损失
+        4. consistency：GT-flow warp 图像对一致性损失
+
+        注意：
+        启用 FAMO 后，这里必须放“原始任务损失”，不能再乘全局任务权重。
+        否则就会变成“全局手工权重 + FAMO 自适应权重”的双重加权。
+        """
+        reference = sr_outputs["sr_loss"]
+        return torch.stack(
+            [
+                self._as_loss_tensor(sr_outputs["content_loss"], reference),
+                self._as_loss_tensor(sr_outputs["adversarial_loss"], reference),
+                self._as_loss_tensor(sr_outputs["pixel_total"], reference),
+                self._as_loss_tensor(sr_outputs["flow_warp_consistency_loss"], reference),
+            ]
+        )
+
+    def _compute_famo_losses(self, sr_outputs: dict, raft_outputs: dict):
+        """
+        计算两级 FAMO 的训练损失与权重。
+
+        返回：
+        - joint_training_loss：第二级 FAMO 得到的最终训练损失
+        - famo_info：两级 FAMO 的权重与任务损失，供日志记录
+        """
+        generator_task_losses = self._build_generator_famo_losses(sr_outputs)
+        generator_sr_loss, generator_extra = self.generator_famo.get_weighted_loss(generator_task_losses)
+
+        # 第二级 FAMO 的输入也是一个任务 loss 向量。
+        # 第 0 个任务是第一级 FAMO 得到的 SR 任务目标；第 1 个任务是 RAFT 的 raft_loss。
+        joint_task_losses = torch.stack([
+            generator_sr_loss,
+            self._as_loss_tensor(raft_outputs["raft_loss"], generator_sr_loss),
+        ])
+        joint_training_loss, joint_extra = self.joint_famo.get_weighted_loss(joint_task_losses)
+        famo_info = {
+            "generator_task_losses": generator_task_losses.detach(),
+            "generator_weights": generator_extra["weights"].detach(),
+            "joint_monitor_losses": joint_task_losses.detach(),
+            "joint_weights": joint_extra["weights"].detach(),
+            "generator_sr_loss": generator_sr_loss.detach(),
+            "joint_training_loss": joint_training_loss.detach(),
+        }
+        return joint_training_loss, famo_info
+
+    def _update_famo_after_step(
+        self,
+        input_lr_prev,
+        input_lr_next,
+        input_gr_prev,
+        input_gr_next,
+        flowl0,
+        flow_init,
+        is_adversarial: bool,
+    ) -> None:
+        """
+        参数更新后重算当前任务损失，并用真实下降幅度更新两级 FAMO 权重。
+
+        FAMO 的 update(curr_loss) 需要“优化前任务损失”和“优化后任务损失”之间的变化。
+        优化前的损失已经在 get_weighted_loss(...) 中保存为 prev_loss；
+        这里用 no_grad 重新计算优化后的任务损失，只用于更新 FAMO 权重，不参与模型参数反传。
+        """
+        if not (self.use_famo and global_data.esrgan.FAMO_UPDATE_AFTER_STEP):
+            return
+        with torch.no_grad():
+            pred_prev_curr, pred_next_curr, sr_outputs_curr = self._compute_sr_branch(
+                input_lr_prev=input_lr_prev,
+                input_lr_next=input_lr_next,
+                input_gr_prev=input_gr_prev,
+                input_gr_next=input_gr_next,
+                flowl0=flowl0,
+                is_adversarial=is_adversarial,
+            )
+            _, raft_outputs_curr = self._compute_raft_branch(
+                pred_prev=pred_prev_curr,
+                pred_next=pred_next_curr,
+                flowl0=flowl0,
+                flow_init=flow_init,
+            )
+            curr_generator_task_losses = self._build_generator_famo_losses(sr_outputs_curr)
+            # 参数更新后的第二级任务 loss 也要和训练时保持同一口径：
+            # [当前第一级 FAMO 的 SR 目标, 当前 RAFT loss]。
+            # store_prev=False 很重要：这里只是重算当前 loss，不能覆盖优化前保存的 prev_loss。
+            curr_generator_sr_loss, _ = self.generator_famo.get_weighted_loss(
+                curr_generator_task_losses,
+                store_prev=False,
+            )
+            curr_joint_monitor_losses = torch.stack([
+                curr_generator_sr_loss,
+                self._as_loss_tensor(raft_outputs_curr["raft_loss"], curr_generator_sr_loss),
+            ])
+        self.generator_famo.update(curr_generator_task_losses)
+        self.joint_famo.update(curr_joint_monitor_losses)
 
     def _compute_discriminator_loss(self, pred_prev: torch.Tensor, pred_next: torch.Tensor, target_prev: torch.Tensor, target_next: torch.Tensor):
         """
@@ -408,6 +546,136 @@ class PIV_ESRGAN_RAFT(nn.Module):
         返回:
             包含本次训练主要标量的字典
         """
+        if self.use_famo:
+            # FAMO 分支：一次前向同时构建 SR 与 RAFT 的计算图。
+            # 这样第二级 FAMO 的 RAFT loss 可以通过 pred_prev/pred_next 继续影响 Generator，
+            # 相当于让 PIV_esrgan_RAFT 在没有显式 epe 任务的情况下，仍然通过 RAFT 任务约束超分结果。
+            self._set_requires_grad(self.piv_esrgan_generator, True)  # Generator 需要接收 SR 任务和 RAFT 任务传回来的梯度
+            self._set_requires_grad(self.piv_RAFT, True)  # RAFT 也在同一次 backward 中更新
+            self._set_requires_grad(self.piv_esrgan_discriminator, False)  # 训练 G/RAFT 时冻结判别器
+            generator_optimizer.zero_grad(set_to_none=True)  # 清空 Generator 梯度
+            raft_optimizer.zero_grad(set_to_none=True)  # 清空 RAFT 梯度
+
+            pred_prev, pred_next, sr_outputs = self._compute_sr_branch(
+                input_lr_prev=input_lr_prev,  # 前一帧 LR 输入
+                input_lr_next=input_lr_next,  # 后一帧 LR 输入
+                input_gr_prev=input_gr_prev,  # 前一帧 HR 真值
+                input_gr_next=input_gr_next,  # 后一帧 HR 真值
+                flowl0=flowl0,  # 真实光流，用于 GT-flow warp 一致性约束
+                is_adversarial=is_adversarial,  # 是否在 G 侧启用对抗项
+            )
+            flow_predictions, raft_outputs = self._compute_raft_branch(
+                pred_prev=pred_prev,  # 当前 Generator 输出的前一帧 SR 图
+                pred_next=pred_next,  # 当前 Generator 输出的后一帧 SR 图
+                flowl0=flowl0,  # 光流真值
+                flow_init=flow_init,  # 可选 RAFT 初始流
+            )
+            final_flow_prediction = flow_predictions[-1]  # 训练日志和可视化只使用最后一次迭代的光流预测
+
+            # 两级 FAMO：
+            # 1. generator_famo 接管 content / adversarial / pixel / consistency 四个 Generator 内部任务；
+            # 2. joint_famo 接管 SR 分支任务和 RAFT 分支任务，并返回最终 FAMO 加权训练目标。
+            generator_g_loss, famo_info = self._compute_famo_losses(sr_outputs, raft_outputs)
+
+            # 标准 FAMO 使用方式：
+            # loss_vector -> FAMO weighted loss -> backward -> optimizer.step -> FAMO.update(new_loss_vector)。
+            if scaler is not None:
+                scaler.scale(generator_g_loss).backward()
+                scaler.step(generator_optimizer)
+                scaler.step(raft_optimizer)
+            else:
+                generator_g_loss.backward()
+                generator_optimizer.step()
+                raft_optimizer.step()
+
+            # 模型参数更新后，重算当前任务损失并更新两级 FAMO 的任务权重。
+            self._update_famo_after_step(
+                input_lr_prev=input_lr_prev,
+                input_lr_next=input_lr_next,
+                input_gr_prev=input_gr_prev,
+                input_gr_next=input_gr_next,
+                flowl0=flowl0,
+                flow_init=flow_init,
+                is_adversarial=is_adversarial,
+            )
+
+            # 判别器阶段：G/RAFT 更新后重新生成当前 fake 图像，保证 D 看到的是最新 Generator。
+            self._set_requires_grad(self.piv_esrgan_generator, False)  # 冻结 Generator
+            self._set_requires_grad(self.piv_RAFT, False)  # 冻结 RAFT
+            self._set_requires_grad(self.piv_esrgan_discriminator, True)  # 只开启判别器梯度
+            d_optimizer.zero_grad(set_to_none=True)  # 清空判别器梯度
+
+            if hasattr(self.piv_esrgan_generator, "forward_pair"):
+                pred_prev_d, pred_next_d = self.piv_esrgan_generator.forward_pair(input_lr_prev, input_lr_next)
+            else:
+                pred_prev_d = self.piv_esrgan_generator(input_lr_prev)
+                pred_next_d = self.piv_esrgan_generator(input_lr_next)
+
+            discriminator_loss, d_fake_loss, d_real_loss = self._compute_discriminator_loss(
+                pred_prev_d,  # previous 生成图
+                pred_next_d,  # next 生成图
+                input_gr_prev,  # previous 真值图
+                input_gr_next,  # next 真值图
+            )
+
+            if scaler is not None:
+                scaler.scale(discriminator_loss).backward()
+                scaler.step(d_optimizer)
+                scaler.update()
+            else:
+                discriminator_loss.backward()
+                d_optimizer.step()
+
+            # 恢复三个子模块的梯度开关，避免影响外部后续逻辑。
+            self._set_requires_grad(self.piv_esrgan_generator, True)
+            self._set_requires_grad(self.piv_RAFT, True)
+            self._set_requires_grad(self.piv_esrgan_discriminator, True)
+
+            loss_log = {
+                "sr_loss": float(sr_outputs["sr_loss"].detach().item()),  # ESRGAN 原始 SR 总损失
+                "g_loss": float(generator_g_loss.detach().item()),  # FAMO 后实际回传的 Generator/Joint 总损失
+                "perceptual_loss": float(sr_outputs["perceptual_loss"].detach().item()),  # 感知损失
+                "content_loss": float(sr_outputs["content_loss"].detach().item()),  # 内容损失
+                "adversarial_loss": float(sr_outputs["adversarial_loss"].detach().item()),  # 生成器对抗损失
+                "pixel_total": float(sr_outputs["pixel_total"].detach().item()),  # 像素总损失
+                "pixel_l1": float(sr_outputs["pixel_l1"].detach().item()),  # L1 子项
+                "pixel_mse": float(sr_outputs["pixel_mse"].detach().item()),  # MSE 子项
+                "pixel_ssim": float(sr_outputs["pixel_ssim"].detach().item()),  # SSIM 子项
+                "pixel_fft": float(sr_outputs["pixel_fft"].detach().item()),  # FFT 子项
+                "flow_warp_consistency_loss": float(sr_outputs["flow_warp_consistency_loss"].detach().item()),  # 未加权的 GT-flow warp 一致性损失
+                "flow_warp_consistency_weighted_loss": float(sr_outputs["flow_warp_consistency_weighted_loss"].detach().item()),  # FAMO 模式下等同原始一致性损失
+                "raft_loss": float(raft_outputs["raft_loss"].detach().item()),  # RAFT 损失
+                "discriminator_loss": float(discriminator_loss.detach().item()),  # 判别器总损失
+                "d_real_loss": float(d_real_loss.detach().item()),  # 判别器真样本损失
+                "d_fake_loss": float(d_fake_loss.detach().item()),  # 判别器假样本损失
+                "raft_epe": float(raft_outputs["raft_metrics"]["epe"]),  # RAFT 平均 EPE
+                "raft_1px": float(raft_outputs["raft_metrics"]["1px"]),  # EPE < 1 像素的比例
+                "raft_3px": float(raft_outputs["raft_metrics"]["3px"]),  # EPE < 3 像素的比例
+                "raft_5px": float(raft_outputs["raft_metrics"]["5px"]),  # EPE < 5 像素的比例
+            }
+
+            generator_weights = famo_info["generator_weights"].detach().cpu().tolist()
+            joint_weights = famo_info["joint_weights"].detach().cpu().tolist()
+            generator_task_losses = famo_info["generator_task_losses"].detach().cpu().tolist()
+            joint_monitor_losses = famo_info["joint_monitor_losses"].detach().cpu().tolist()
+            # 这些字段暂时不进入原有 metric.add(...)，但会随 loss_dict 返回；
+            # 后续如果你想画 FAMO 权重曲线，可以再把它们加入 CSV label。
+            loss_log.update({
+                "famo_generator_content_weight": float(generator_weights[0]),
+                "famo_generator_adversarial_weight": float(generator_weights[1]),
+                "famo_generator_pixel_weight": float(generator_weights[2]),
+                "famo_generator_consistency_weight": float(generator_weights[3]),
+                "famo_joint_sr_weight": float(joint_weights[0]),
+                "famo_joint_raft_weight": float(joint_weights[1]),
+                "famo_generator_content_loss": float(generator_task_losses[0]),
+                "famo_generator_adversarial_loss": float(generator_task_losses[1]),
+                "famo_generator_pixel_loss": float(generator_task_losses[2]),
+                "famo_generator_consistency_loss": float(generator_task_losses[3]),
+                "famo_joint_sr_monitor_loss": float(joint_monitor_losses[0]),
+                "famo_joint_raft_monitor_loss": float(joint_monitor_losses[1]),
+            })
+            return pred_prev, pred_next, final_flow_prediction, loss_log
+
         # 第一阶段：只更新 Generator，严格只使用 sr_loss。
         self._set_requires_grad(self.piv_esrgan_generator, True)  # 开启 Generator 梯度
         self._set_requires_grad(self.piv_RAFT, False)  # 冻结 RAFT，保证这一阶段不更新流场网络

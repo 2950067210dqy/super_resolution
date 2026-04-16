@@ -125,6 +125,18 @@ class global_data:
         FLOW_WARP_CONSISTENCY_WARMSTART_EPOCHS = 0
         FLOW_WARP_CONSISTENCY_WARMUP_EPOCHS = int(EPOCH_NUMS / 2)
         FLOW_WARP_CONSISTENCY_WEIGHT_SCHEDULE = "linear"  # 当前支持: linear | const | constant
+
+        # =========================
+        # FAMO 多任务自适应损失权重
+        # =========================
+        USE_FAMO = True  # 是否启用两级 FAMO，让 Generator 内部任务和 SR/RAFT 任务都自适应加权
+        FAMO_GENERATOR_TASK_NAMES = ["content", "adversarial", "pixel", "consistency"]  # 第一级 FAMO 的任务顺序；PIV_esrgan_RAFT 没有 Generator 侧 epe 任务
+        FAMO_JOINT_TASK_NAMES = ["sr", "raft"]  # 第二级 FAMO 的任务顺序：SR 分支任务 与 RAFT 分支任务
+        FAMO_GAMMA = 1e-2  # FAMO 权重优化器的 weight_decay，对应论文/实现中的 gamma 0.01
+        FAMO_W_LR = 0.025  # FAMO 权重 logits 的学习率
+        FAMO_MAX_NORM = 0.0  # 当前在 train_step 中手动 backward，不使用 WeightMethod.backward 的梯度裁剪
+        FAMO_UPDATE_AFTER_STEP = True  # 每次 G/RAFT 更新后重算任务损失，用真实下降幅度更新 FAMO 权重
+
         LAMBDA_PHYSICAL = 0#感知损失中的内容损失中的物理损失权重 如果需要单独跳里面的参数则设置1
         LAMBDA_STRUCTURE =0#感知损失中内容损失中的结构损失权重 如果需要单独跳里面的参数则设置1
 
@@ -359,6 +371,13 @@ class global_data:
             1. LAMBDA_ADVERSARIAL
             2. LAMBDA_FLOW_WARP_CONSISTENCY
             """
+            # 启用 FAMO 后，content / adversarial / pixel / consistency 交给第一级 FAMO 管理，
+            # SR / RAFT 两个总任务交给第二级 FAMO 管理；这里不再更新手工全局权重，避免双重加权。
+            if cls.USE_FAMO:
+                return {
+                    "lambda_adversarial": "managed_by_famo",
+                    "lambda_flow_warp_consistency": "managed_by_famo",
+                }
             cls.LAMBDA_ADVERSARIAL = cls.get_adversarial_weight(epoch)
             cls.LAMBDA_FLOW_WARP_CONSISTENCY = cls.get_flow_warp_consistency_weight(epoch)
             return {

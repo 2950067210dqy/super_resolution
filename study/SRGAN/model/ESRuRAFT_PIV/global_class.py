@@ -49,6 +49,7 @@ class global_data:
                             其中LAMBDA_ADVERSARIAL和LAMBDA_FLOW_WARP_CONSISTENCY按照0-int(EPOCH_NUMS/2) 轮
                             就从0.0005和0.012开始动态增长至0.02和1.2，
                             随后RAFT_EPE_WEIGHT按照int(EPOCH_NUMS/2)+1-EPOCH_NUMS轮从1动态增长至3
+            20）ESRuRAFT_PIV_v8：采用FAMO多任务学习自适应优化
            """
         #运行环境是否是autoDL
         IS_AUTO_DL = True
@@ -57,7 +58,7 @@ class global_data:
         # 训练任务标识
         # =========================
         name = "ESRuRAFT_PIV"  # 当前实验名（用于输出目录/模型名/wandb run名）
-        DESCRIPTION = "_v7_v2"  # 实验补充描述（可写损失配置、数据版本等）
+        DESCRIPTION = "_v8"  # 实验补充描述（可写损失配置、数据版本等）
         name +=DESCRIPTION
 
         #整体项目注释
@@ -73,7 +74,7 @@ class global_data:
         # 设备与模型加载
         # =========================
         device = torch.device("cuda")  # 训练设备
-        IS_LOAD_EXISTS_MODEL = True  # 是否从已保存模型断点继续训练
+        IS_LOAD_EXISTS_MODEL = False  # 是否从已保存模型断点继续训练
         AMP =False #是否开启混合精度训练
         # =========================
         # 可视化与保存相关
@@ -144,6 +145,17 @@ class global_data:
         RAFT_EPE_WARMSTART_EPOCHS = int(EPOCH_NUMS / 2) + 1
         RAFT_EPE_WARMUP_EPOCHS = EPOCH_NUMS - 1
         RAFT_EPE_WEIGHT_SCHEDULE = "linear"  # 当前支持: linear | const | constant
+
+        # =========================
+        # FAMO 多任务自适应损失权重
+        # =========================
+        USE_FAMO = True  # 是否启用两级 FAMO，让 Generator 内部任务和 SR/RAFT 任务都自适应加权
+        FAMO_GENERATOR_TASK_NAMES = ["content", "adversarial", "pixel", "consistency", "epe"]  # 第一级 FAMO 的任务顺序
+        FAMO_JOINT_TASK_NAMES = ["sr", "raft"]  # 第二级 FAMO 的任务顺序：SR 分支任务 与 RAFT 分支任务
+        FAMO_GAMMA = 1e-2  # FAMO 权重优化器的 weight_decay，对应论文/实现中的 gamma 0.01
+        FAMO_W_LR = 0.025  # FAMO 权重 logits 的学习率
+        FAMO_MAX_NORM = 0.0  # 当前在 train_step 中手动 backward，不使用 WeightMethod.backward 的梯度裁剪
+        FAMO_UPDATE_AFTER_STEP = True  # 每次 G/RAFT 更新后重算任务损失，用真实下降幅度更新 FAMO 权重
 
         LAMBDA_PHYSICAL = 0#感知损失中的内容损失中的物理损失权重 如果需要单独跳里面的参数则设置1
         LAMBDA_STRUCTURE =0#感知损失中内容损失中的结构损失权重 如果需要单独跳里面的参数则设置1
@@ -395,6 +407,14 @@ class global_data:
             训练中的 loss 函数直接读取 cls.LAMBDA_ADVERSARIAL、cls.LAMBDA_FLOW_WARP_CONSISTENCY、cls.RAFT_EPE_WEIGHT，
             因此这里更新后，本 epoch 内所有 batch 都会使用同一组固定权重，日志和复现实验也更清晰。
             """
+            if cls.USE_FAMO:
+                # 启用 FAMO 后，content / adversarial / consistency / epe 等任务权重由 FAMO 自适应学习。
+                # 这里不再动态更新旧的全局任务权重，避免“手工 schedule + FAMO”双重加权。
+                return {
+                    "lambda_adversarial": "managed_by_famo",
+                    "lambda_flow_warp_consistency": "managed_by_famo",
+                    "raft_epe_weight": "managed_by_famo",
+                }
             cls.LAMBDA_ADVERSARIAL = cls.get_adversarial_weight(epoch)
             cls.LAMBDA_FLOW_WARP_CONSISTENCY = cls.get_flow_warp_consistency_weight(epoch)
             cls.RAFT_EPE_WEIGHT = cls.get_raft_epe_weight(epoch)

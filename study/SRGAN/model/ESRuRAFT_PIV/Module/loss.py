@@ -168,6 +168,12 @@ class PerceptualLoss(nn.Module):
         # content_loss,_ = self.content_loss(fake, real)
         adversarial_loss = self.adversarial(pred_fake, pred_real)
 
+        # FAMO 启用后，content / adversarial 会作为两个独立任务交给 FAMO 自适应加权。
+        # 因此这里不再乘 LAMBDA_CONTENT / LAMBDA_ADVERSARIAL，避免手工全局权重和 FAMO 权重重复作用。
+        if global_data.esrgan.USE_FAMO:
+            if is_adversarial:
+                return content_loss + adversarial_loss, content_loss, adversarial_loss
+            return content_loss, content_loss, adversarial_loss
 
         #是否启用对抗损失 就是是否预训练生成器
         if is_adversarial:
@@ -532,7 +538,9 @@ perceptual_loss = PerceptualLoss(vgg=vgg).to(global_data.esrgan.device, non_bloc
 
 # 这个 loss 只在 image_pair / RAFT 联合训练时使用；它用 GT flow 将 SR next 对齐回 SR previous。
 flow_warp_consistency_loss = FlowWarpConsistencyLoss(
-    flow_warp_weight=global_data.esrgan.LAMBDA_FLOW_WARP_CONSISTENCY,
+    # FAMO 启用后，consistency 本身就是一个独立任务，应使用原始一致性损失；
+    # 关闭 FAMO 时才沿用原来的全局 LAMBDA_FLOW_WARP_CONSISTENCY。
+    flow_warp_weight=1.0 if global_data.esrgan.USE_FAMO else global_data.esrgan.LAMBDA_FLOW_WARP_CONSISTENCY,
 ).to(global_data.esrgan.device, non_blocking=True)
 #判别器损失
 descriminator_loss = Discriminator_loss().to(global_data.esrgan.device, non_blocking=True)

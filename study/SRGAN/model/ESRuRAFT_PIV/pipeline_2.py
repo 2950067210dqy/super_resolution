@@ -31,6 +31,7 @@ from study.SRGAN.model.ESRuRAFT_PIV.train import esrgan_union_RAFT_train
 from study.SRGAN.util.CSV_operator import CsvTable
 from study.SRGAN.util.accumulator import Accumulator
 from study.SRGAN.util.animator import Animator
+from study.SRGAN.util.famo_weight_logger import append_famo_weight_row, save_famo_weight_plot
 try:
     from torch.cuda.amp import GradScaler
 except:
@@ -46,6 +47,18 @@ except:
             optimizer.step()
         def update(self):
             pass
+
+
+def _format_dynamic_weight_for_log(value):
+    """
+    将动态损失权重格式化为日志字符串。
+
+    FAMO 开启时，global_class.update_dynamic_loss_weights(...) 会返回 managed_by_famo；
+    这个字符串不能用 {:.6f} 格式化，所以这里统一做兼容。
+    """
+    if isinstance(value, str):
+        return value
+    return f"{float(value):.6f}"
 
 
 class ESRuRAFTPIVInferenceWrapper(nn.Module):
@@ -422,6 +435,13 @@ def main():
             # global_data.esrgan.START_TIME 表示程序/流程整体开始运行的时间，
             # training_start_time 只用于统计本次训练耗时（小时）。
             training_start_time = time.time()
+            # FAMO 权重独立保存路径。
+            # 不放入原 loss CSV，避免破坏 global_class.loss_label 和 metric.add(...) 的固定顺序。
+            scale_output_dir = Path(
+                f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}"
+            )
+            famo_weight_csv_path = scale_output_dir / global_data.esrgan.LOSS_DIR.strip("/") / "famo_weights.csv"
+            famo_weight_plot_path = scale_output_dir / global_data.esrgan.LOSS_DIR.strip("/") / "famo_weights.png"
             # 轮数
             """
             训练 start
@@ -435,14 +455,14 @@ def main():
                 current_dynamic_weights = global_data.esrgan.update_dynamic_loss_weights(epoch)
                 logger.info(
                     "[Train] Epoch {}/{}: current dynamic loss weights | "
-                    "LAMBDA_ADVERSARIAL={:.6f}, "
-                    "LAMBDA_FLOW_WARP_CONSISTENCY={:.6f}, "
-                    "RAFT_EPE_WEIGHT={:.6f}".format(
+                    "LAMBDA_ADVERSARIAL={}, "
+                    "LAMBDA_FLOW_WARP_CONSISTENCY={}, "
+                    "RAFT_EPE_WEIGHT={}".format(
                         epoch + 1,
                         global_data.esrgan.EPOCH_NUMS,
-                        current_dynamic_weights["lambda_adversarial"],
-                        current_dynamic_weights["lambda_flow_warp_consistency"],
-                        current_dynamic_weights["raft_epe_weight"],
+                        _format_dynamic_weight_for_log(current_dynamic_weights["lambda_adversarial"]),
+                        _format_dynamic_weight_for_log(current_dynamic_weights["lambda_flow_warp_consistency"]),
+                        _format_dynamic_weight_for_log(current_dynamic_weights["raft_epe_weight"]),
                     )
                 )
                 ESRuRAFT_PIV_model.train()  # 确保在训练模式
@@ -457,7 +477,7 @@ def main():
 
                 for i, batch in enumerate(train_progress_bar):
                     """RAFT 联合训练"""
-                    esrgan_union_RAFT_train(
+                    loss_dict = esrgan_union_RAFT_train(
                         epoch=epoch,
                         batch=batch, i=i,
                         g_optimizer=ESRuRAFT_PIV_model_g_optimizer,
@@ -471,11 +491,27 @@ def main():
                         SCALE=SCALE
 
                     )
+                    # 每个 batch 记录一次 FAMO 权重。
+                    # FAMO 的权重是按训练 step 更新的，逐 batch 保存才能看到真实变化曲线。
+                    append_famo_weight_row(
+                        famo_weight_csv_path,
+                        epoch=epoch,
+                        batch_index=i,
+                        global_step=epoch * len(train_loader) + i,
+                        loss_dict=loss_dict,
+                    )
                 # 每轮结束后评价一次 验证集只取一轮batch
                 avg_val_mse_loss,avg_val_ssim_loss,avg_psnr,avg_val_energy_spectrum_mse,avg_val_aee,avg_val_norm_aee_per100=evaluate(epoch=epoch, class_name=class_name, data_type=data_type, device=global_data.esrgan.device,
                          model = ESRuRAFT_PIV_model, animator=animator, validate_loader=validate_loader,
                          loss_label=global_data.esrgan.loss_label,validate_label=global_data.esrgan. validate_label, SCALE=SCALE,
                          csvOperator=global_data.esrgan.csvOperator,metric=metric,train_loader_lens=len(train_loader))
+                # 每个 epoch 结束后刷新一次折线图。
+                # 这样不会在 batch 内频繁画图拖慢训练，同时训练中断时也能保留已经完成 epoch 的图。
+                save_famo_weight_plot(
+                    famo_weight_csv_path,
+                    famo_weight_plot_path,
+                    title=f"ESRuRAFT_PIV FAMO Weights | {class_name} {data_type} scale_{int(SCALE * SCALE)}",
+                )
 
                 #动态学习率step
                 # g_scheduler.step(avg_val_energy_spectrum_mse)

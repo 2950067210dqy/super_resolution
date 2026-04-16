@@ -163,3 +163,6 @@ def esrgan_union_RAFT_train(
     # flo 预览现在直接接收最后一轮流场预测张量 [B, C, H, W]，
     # 不再在 _save_training_preview 内部对 list 做兼容处理。
     _save_training_preview(epoch, i, train_progress_bar, class_name, data_type,"flo", flow_predictions, flow_hr, "flo", SCALE)
+    # 把 train_step 返回的完整日志继续返回给 pipeline。
+    # 原有 metric.add(...) 仍然只记录固定 loss_label；这里额外返回是为了单独保存 FAMO 权重 CSV 和折线图。
+    return loss_dict
