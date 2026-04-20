@@ -49,8 +49,10 @@ class global_data:
                             其中LAMBDA_ADVERSARIAL和LAMBDA_FLOW_WARP_CONSISTENCY按照0-int(EPOCH_NUMS/2) 轮
                             就从0.0005和0.012开始动态增长至0.02和1.2，
                             随后RAFT_EPE_WEIGHT按照int(EPOCH_NUMS/2)+1-EPOCH_NUMS轮从1动态增长至3
-            20) ESRuRAFT_PIV_v8: 判别器更改为方案C，D_input = torch.cat([prev, next, abs(next - prev)], dim=1)，
+            20) ESRuRAFT_PIV_v8: ESRuRAFT_PIV_v7_v2基础上 判别器更改为方案C，D_input = torch.cat([prev, next, abs(next - prev)], dim=1)，
                 将对抗损失最终权重改成0.0161；后续取消生成器侧自适应多任务权重，恢复为手动全局权重组合。
+                ESRuRAFT_PIV_v8_v1 改FAMO初始权重
+                ESRuRAFT_PIV_v8_v2：去除FAMO权重
            """
         #运行环境是否是autoDL
         IS_AUTO_DL = True
@@ -59,7 +61,7 @@ class global_data:
         # 训练任务标识
         # =========================
         name = "ESRuRAFT_PIV"  # 当前实验名（用于输出目录/模型名/wandb run名）
-        DESCRIPTION = "_v8_v1"  # 实验补充描述（可写损失配置、数据版本等）
+        DESCRIPTION = "_v8_v2"  # 实验补充描述（可写损失配置、数据版本等）
         name +=DESCRIPTION
 
         #整体项目注释

@@ -49,11 +49,12 @@ class global_data:
                             其中LAMBDA_ADVERSARIAL和LAMBDA_FLOW_WARP_CONSISTENCY按照0-int(EPOCH_NUMS/2) 轮
                             就从0.0005和0.012开始动态增长至0.02和1.2，
                             随后RAFT_EPE_WEIGHT按照int(EPOCH_NUMS/2)+1-EPOCH_NUMS轮从1动态增长至3
-            20) ESRuRAFT_PIV_v8: 判别器更改为方案C，D_input = torch.cat([prev, next, abs(next - prev)], dim=1)，
+            20) ESRuRAFT_PIV_v8: ESRuRAFT_PIV_v7_v2基础上 判别器更改为方案C，D_input = torch.cat([prev, next, abs(next - prev)], dim=1)，
                 将对抗损失最终权重改成0.0161；后续取消生成器侧自适应多任务权重，恢复为手动全局权重组合。
+                ESRuRAFT_PIV_v8_v1 改FAMO初始权重
+                ESRuRAFT_PIV_v8_v2：去除FAMO权重
                 
-                ESRuRAFT_PIV_Ground v1 ：RAFT128+HR
-                ESRuRAFT_PIV_Ground v2 ：RAFT256+HR
+                PIV_A_Esrgan v1:将判别器更改为A-ESRGAN的判别器
            """
         #运行环境是否是autoDL
         IS_AUTO_DL = True
@@ -61,26 +62,11 @@ class global_data:
         # =========================
         # 训练任务标识
         # =========================
-        name = "ESRuRAFT_PIV_Ground"  # 当前实验名（用于输出目录/模型名/wandb run名）
-        DESCRIPTION = "_v2"  # 实验补充描述（可写损失配置、数据版本等）
+        name = "PIV_A_Esrgan"  # 当前实验名（用于输出目录/模型名/wandb run名）
+        DESCRIPTION = "_v1"  # 实验补充描述（可写损失配置、数据版本等）
         name +=DESCRIPTION
 
         #整体项目注释
-        # =========================
-        # Ground 实验训练模式
-        # =========================
-        # TRAIN_MODE 用于控制“送入 RAFT 的图像从哪里来”：
-        # 1. "lr_ground": 把低分辨率 previous/next 用最近邻插值对齐到 HR 尺寸后送入 RAFT。
-        #    该模式用于验证“只做最简单尺寸对齐、不做传统/学习型超分”的基线表现。
-        # 2. "hr_ground": 直接把真实高分辨率 previous/next 送入 RAFT，不经过任何超分网络。
-        #    该模式用于验证“RAFT 在理想 HR 图像输入下”的上限参考。
-        # 3. "bicubic": 把低分辨率 previous/next 用传统 bicubic 双三次插值放大到 HR 尺寸后送入 RAFT。
-        #    该模式没有可学习参数，用于和 ESRGAN 这类学习型超分模块做传统插值基线对比。
-        # 4. "esrgan": 使用最原始的 ESRGAN 生成器先把 LR 超分到 HR，再把 SR 图像送入 RAFT。
-        #    该模式保留 ESRGAN + RAFT 的联合训练路径，但超分模块不使用 ESRuRAFT_PIV 的改进结构。
-        TRAIN_MODES = ("lr_ground", "hr_ground", "bicubic", "esrgan")
-        TRAIN_MODE = "hr_ground"
-
         # 类别训练模式: "all" | "single" | "mixed"
         TRAIN_CLASS_MODE = "mixed"
         # 当 TRAIN_CLASS_MODE="single" 时可预设；为 None 则运行时让你输入选择
@@ -95,6 +81,17 @@ class global_data:
         device = torch.device("cuda")  # 训练设备
         IS_LOAD_EXISTS_MODEL = False  # 是否从已保存模型断点继续训练
         AMP =False #是否开启混合精度训练
+        # =========================
+        # 训练模式开关
+        # =========================
+        # USE_RAFT=True:
+        #   保持原来的“超分辨率 Generator + RAFT 光流估计”联合训练路径。
+        #   Generator 除了 SR 重建/对抗损失，还会吃到 RAFT EPE 反作用项。
+        # USE_RAFT=False:
+        #   只训练 PIV 图像对超分辨率，不实例化 RAFT，不创建 RAFT optimizer/scheduler，
+        #   训练日志、验证曲线、evaluate_all 也只输出 image_pair 的超分指标。
+        #   该模式适合单独验证 Attention U-Net 判别器对颗粒图像超分质量的贡献。
+        USE_RAFT = True
         # =========================
         # 可视化与保存相关
         # =========================
@@ -123,6 +120,19 @@ class global_data:
              lanczos4 ->2*        lanczos4_8 ->2*->4*->8*    用的LanczosUpsampling模块
         """
         RAFT_UPSAMPLE = 'convex'
+
+        # =========================
+        # A-ESRGAN 风格判别器配置
+        # =========================
+        # 判别器仍然接收 3 通道输入，但这 3 个通道不是 RGB，而是：
+        # [prev_gray, next_gray, abs(next_gray - prev_gray)]。
+        # 这样 U-Net 判别器的空间 logit map 能同时评价单帧颗粒外观和帧间亮度变化。
+        DISCRIMINATOR_BASE_CHANNELS = 32
+        # 第一阶段建议保持 False，只使用单尺度 Attention U-Net，降低显存和训练震荡风险；
+        # 如果单尺度稳定，再把它切成 True，启用 A-ESRGAN 类似的 1x + 2x 多尺度判别器。
+        DISCRIMINATOR_USE_MULTISCALE = False
+        # spectral normalization 用来稳定 GAN 判别器，尤其适合当前 batch size 较小的颗粒图训练。
+        DISCRIMINATOR_SPECTRAL_NORM = True
 
         # =========================
         # 损失项系数
@@ -158,9 +168,9 @@ class global_data:
 
         # `RAFT_EPE_WEIGHT` 是 Generator 侧附加的 RAFT EPE 反作用权重。
         # 按你的设定：前半程保持 1，从 int(EPOCH_NUMS/2)+1 开始线性增长，最后一轮达到 3。
-        RAFT_EPE_WEIGHT = 1
-        RAFT_EPE_WEIGHT_START = 1
-        RAFT_EPE_WEIGHT_END = 3
+        RAFT_EPE_WEIGHT = 1 if USE_RAFT else 0.0
+        RAFT_EPE_WEIGHT_START = 1 if USE_RAFT else 0.0
+        RAFT_EPE_WEIGHT_END = 3 if USE_RAFT else 0.0
         RAFT_EPE_WARMSTART_EPOCHS = int(EPOCH_NUMS / 2) + 1
         RAFT_EPE_WARMUP_EPOCHS = EPOCH_NUMS - 1
         RAFT_EPE_WEIGHT_SCHEDULE = "linear"  # 当前支持: linear | const | constant
@@ -185,6 +195,28 @@ class global_data:
         SSIM_DATA_RANGE = 1.0  # 图像动态范围，若输入已归一化到[0,1]则设为1.0
         SSIM_K1 = 0.01  # SSIM常数项k1，用于稳定亮度项
         SSIM_K2 = 0.03  # SSIM常数项k2，用于稳定对比度项
+
+        # =========================
+        # FAMO 自适应多任务权重配置
+        # =========================
+        # USE_FAMO 是总开关：
+        # - False: 完全沿用上面的手动全局损失权重，训练行为和不使用 FAMO 时一致。
+        # - True: 仅对生成器的非对抗损失启用 FAMO；GAN 对抗损失仍由 LAMBDA_ADVERSARIAL 动态调度单独控制。
+        USE_FAMO = False
+        FAMO_GAMMA = 1e-5  # 论文实现里的 Adam weight_decay，控制 FAMO logits 的正则强度
+        FAMO_W_LR = 2.5e-2  # 论文示例使用的 FAMO 权重学习率，决定任务权重调整速度
+        FAMO_MAX_NORM = 1.0  # 保留论文接口字段；当前模型中不额外裁剪 Generator 梯度
+        FAMO_UPDATE_AFTER_STEP = True  # Generator 更新后重新前向一次，用新 loss 按论文公式更新 FAMO 权重
+        FAMO_GENERATOR_TASK_NAMES = (
+            ['vgg', 'l1', 'mse', 'ssim', 'fft', 'flow_consistency', 'epe']
+            if USE_RAFT
+            else ['vgg', 'l1', 'mse', 'ssim', 'fft', 'flow_consistency']
+        )
+        FAMO_GENERATOR_INIT_WEIGHTS = (
+            [0.08, 0.18, 0.22, 0.2, 0.07, 0.18, 0.07]
+            if USE_RAFT
+            else [0.1, 0.24, 0.24, 0.22, 0.08, 0.12]
+        )  # 仅作为 softmax 初始比例，启用 FAMO 后权重会自动归一化为 1
 
         # =========================
         # 优化器超参数
@@ -236,7 +268,7 @@ class global_data:
         Path(OUT_PUT_DIR).mkdir(parents=True, exist_ok=True)
 
         # 需要训练的数据类型  # 参与训练的数据模态
-        DATA_TYPES = ['RAFT']
+        DATA_TYPES = ['RAFT'] if USE_RAFT else ['SR']
         # DATA_TYPES = ['image_pair', 'flo']
         # DATA_TYPES = ['image_pair']
         # DATA_TYPES =['flo']
@@ -246,15 +278,19 @@ class global_data:
         """
         # 这里的顺序必须和 train.py 里 metric.add(...) 的顺序一一对应。
         # 任何一边新增/删除/换位，都要同步改另一边。
-        loss_label = ['g_loss', 'g_perceptual_loss', "g_content_loss",
-                      "g_adversarial_loss",  'g_loss_pixel',
-                      "g_loss_pixel_l1", "g_loss_pixel_mse",'g_loss_ssim', 'g_loss_fft',
-                       "g_flow_warp_consistency_loss", "g_flow_warp_consistency_weighted_loss",
-                      'd_loss', 'd_real_loss', 'd_fake_loss',
-                      'raft_loss', 'raft_epe','raft_1px', 'raft_3px','raft_5px',
-                      ]
-        validate_label = ['VAL_MSE_LOSS','VAL_SSIM_Loss', 'Avg_PSNR',"VAL_energy_spectrum_mse",
-                          "VAL_AEE", "VAL_NORM_AEE_PER100PIXEL"]
+        BASE_LOSS_LABEL = [
+            'g_loss', 'g_perceptual_loss', "g_content_loss",
+            "g_adversarial_loss", 'g_loss_pixel',
+            "g_loss_pixel_l1", "g_loss_pixel_mse", 'g_loss_ssim', 'g_loss_fft',
+            "g_flow_warp_consistency_loss", "g_flow_warp_consistency_weighted_loss",
+            'd_loss', 'd_real_loss', 'd_fake_loss',
+        ]
+        RAFT_LOSS_LABEL = ['raft_loss', 'raft_epe', 'raft_1px', 'raft_3px', 'raft_5px']
+        loss_label = BASE_LOSS_LABEL + (RAFT_LOSS_LABEL if USE_RAFT else [])
+
+        BASE_VALIDATE_LABEL = ['VAL_MSE_LOSS', 'VAL_SSIM_Loss', 'Avg_PSNR', "VAL_energy_spectrum_mse"]
+        RAFT_VALIDATE_LABEL = ["VAL_AEE", "VAL_NORM_AEE_PER100PIXEL"]
+        validate_label = BASE_VALIDATE_LABEL + (RAFT_VALIDATE_LABEL if USE_RAFT else [])
 
 
         # 存储数据至csv的列名
@@ -267,7 +303,6 @@ class global_data:
         METRICS_SUMMARY_COLUMNS = [
             "run_name",
             "description",
-            "train_mode",
             "class_name",
             "data_type",
             "scale",
@@ -299,41 +334,6 @@ class global_data:
         START_TIME = time.time()
         #结束时间
         END_TIME = time.time()
-        @classmethod
-        def normalized_train_mode(cls) -> str:
-            """
-            返回规范化后的 Ground 训练模式。
-
-            统一在这里做 strip/lower，是为了允许配置里写成 "LR_GROUND" 或带空格时
-            仍然能够被正确识别；同时所有调用方都只依赖这一个入口，避免分散校验。
-            """
-            return str(cls.TRAIN_MODE).strip().lower()
-
-        @classmethod
-        def validate_train_mode(cls) -> str:
-            """
-            校验 TRAIN_MODE 是否属于允许的三种模式。
-
-            这里选择启动即报错，而不是在训练中间才失败；这样可以避免跑了很久才发现
-            TRAIN_MODE 拼写错误，例如 "lr-groud" 这类肉眼不容易发现的问题。
-            """
-            mode = cls.normalized_train_mode()
-            if mode not in cls.TRAIN_MODES:
-                raise ValueError(
-                    f"TRAIN_MODE 仅支持 {cls.TRAIN_MODES}，当前为: {cls.TRAIN_MODE}"
-                )
-            return mode
-
-        @classmethod
-        def uses_super_resolution(cls) -> bool:
-            """
-            当前模式是否需要训练/调用超分辨率生成器。
-
-            lr_ground/hr_ground/bicubic 都是纯 RAFT 输入基线，不需要 Generator 或 Discriminator；
-            esrgan 才会启用原始 ESRGAN 生成器，并把 SR 结果继续送入 RAFT。
-            """
-            return cls.validate_train_mode() == "esrgan"
-
         @classmethod
         def _get_scheduled_weight(
                 cls,
@@ -444,11 +444,13 @@ class global_data:
             """
             cls.LAMBDA_ADVERSARIAL = cls.get_adversarial_weight(epoch)
             cls.LAMBDA_FLOW_WARP_CONSISTENCY = cls.get_flow_warp_consistency_weight(epoch)
-            cls.RAFT_EPE_WEIGHT = cls.get_raft_epe_weight(epoch)
+            # 只做超分辨率时不再计算 RAFT forward，也就不能再把 RAFT EPE 作为 Generator 反作用项。
+            # 这里显式把权重固定为 0，避免日志里看起来仍有 RAFT 监督在生效。
+            cls.RAFT_EPE_WEIGHT = cls.get_raft_epe_weight(epoch) if cls.USE_RAFT else 0.0
             return {
                 "lambda_adversarial": cls.LAMBDA_ADVERSARIAL,
                 "lambda_flow_warp_consistency": cls.LAMBDA_FLOW_WARP_CONSISTENCY,
-                "raft_epe_weight": cls.RAFT_EPE_WEIGHT,
+                "raft_epe_weight": cls.RAFT_EPE_WEIGHT if cls.USE_RAFT else "disabled",
             }
 
         @classmethod
@@ -562,3 +564,9 @@ class global_data:
         #     print(f"hyper_parameter Saved to {file_path}")
 # 模块导入时只执行一次
 global_data.esrgan.ensure_wandb_login()
+
+
+
+
+
+
