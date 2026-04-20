@@ -97,7 +97,7 @@ class global_data:
         # =========================
         # 损失项系数
         # =========================
-        LAMBDA_CONTENT = 1  # 感知损失中的内容项权重
+        LAMBDA_VGG = 1.0  # VGG 感知损失权重；感知损失现在只表示 VGG feature L1，不再混入对抗损失
         # =========================
         # 动态损失权重调度配置
         # =========================
@@ -109,10 +109,10 @@ class global_data:
         # 因此最后一轮的 epoch index 是 EPOCH_NUMS - 1。
 
         # `LAMBDA_ADVERSARIAL` 是当前 epoch 真正生效的生成器对抗损失权重。
-        # 按你的设定：从第 0 轮开始由 0.0005 线性增长，到 int(EPOCH_NUMS/2) 达到 0.02，之后保持 0.02。
+        # 按你的设定：从第 0 轮开始由 0.0005 线性增长，到 int(EPOCH_NUMS/2) 达到 0.0161，之后保持 0.0161。
         LAMBDA_ADVERSARIAL = 0.0005
         ADVERSARIAL_WEIGHT_START = 0.0005
-        ADVERSARIAL_WEIGHT_END = 0.02
+        ADVERSARIAL_WEIGHT_END = 0.0161
         ADVERSARIAL_WARMSTART_EPOCHS = 0
         ADVERSARIAL_WARMUP_EPOCHS = int(EPOCH_NUMS / 2)
         ADVERSARIAL_WEIGHT_SCHEDULE = "linear"  # 当前支持: linear | const | constant
@@ -126,32 +126,12 @@ class global_data:
         FLOW_WARP_CONSISTENCY_WARMUP_EPOCHS = int(EPOCH_NUMS / 2)
         FLOW_WARP_CONSISTENCY_WEIGHT_SCHEDULE = "linear"  # 当前支持: linear | const | constant
 
-        # =========================
-        # FAMO 多任务自适应损失权重
-        # =========================
-        USE_FAMO = True  # 是否启用两级 FAMO，让 Generator 内部任务和 SR/RAFT 任务都自适应加权
-        FAMO_GENERATOR_TASK_NAMES = ["content", "adversarial", "pixel", "consistency"]  # 第一级 FAMO 的任务顺序；PIV_esrgan_RAFT 没有 Generator 侧 epe 任务
-        FAMO_JOINT_TASK_NAMES = ["sr", "raft"]  # 第二级 FAMO 的任务顺序：SR 分支任务 与 RAFT 分支任务
-        FAMO_GAMMA = 1e-2  # FAMO 权重优化器的 weight_decay，对应论文/实现中的 gamma 0.01
-        FAMO_W_LR = 0.025  # FAMO 权重 logits 的学习率
-        FAMO_MAX_NORM = 0.0  # 当前在 train_step 中手动 backward，不使用 WeightMethod.backward 的梯度裁剪
-        FAMO_UPDATE_AFTER_STEP = True  # 每次 G/RAFT 更新后重算任务损失，用真实下降幅度更新 FAMO 权重
-
-        LAMBDA_PHYSICAL = 0#感知损失中的内容损失中的物理损失权重 如果需要单独跳里面的参数则设置1
-        LAMBDA_STRUCTURE =0#感知损失中内容损失中的结构损失权重 如果需要单独跳里面的参数则设置1
-
-
-        LAMBDA_regularization_loss = 2e-8  # 正则项权重（当前基本未启用）
-        LAMBDA_loss_pixel = 1  # 像素损失总权重 （当前基本未启用）
-
 
 
 
         LAMBDA_PIXEL_L1 = 0.5 # 像素L1权重 0.5；主重建项，保证整体亮度与局部数值不要漂
         LAMBDA_PIXEL_FFT = 0.004  # 频域重建约束，稳住颗粒尺度与高频分布；过大容易让结果发硬
         LAMBDA_PIXEL_MSE = 1e-3  # 像素MSE权重（当前基本未启用）
-        PIXEL_WHITE_ALPHA = 1.0  # 灰度场白点区域加权系数（当前基本未启用）
-        LAMBDA_GRAY_CONS = 1e-2  # 灰度三通道一致性约束权重（当前基本未启用）
         # =========================
         # 图像对一致性损失超参数
         # =========================
@@ -165,6 +145,20 @@ class global_data:
         SSIM_DATA_RANGE = 1.0  # 图像动态范围，若输入已归一化到[0,1]则设为1.0
         SSIM_K1 = 0.01  # SSIM常数项k1，用于稳定亮度项
         SSIM_K2 = 0.03  # SSIM常数项k2，用于稳定对比度项
+
+        # =========================
+        # FAMO 自适应多任务权重配置
+        # =========================
+        # USE_FAMO 是总开关：
+        # - False: 完全沿用上面的手动全局损失权重，训练行为和不使用 FAMO 时一致。
+        # - True: 仅对生成器的非对抗损失启用 FAMO；GAN 对抗损失仍由 LAMBDA_ADVERSARIAL 动态调度单独控制。
+        USE_FAMO = False
+        FAMO_GAMMA = 1e-5  # 论文实现里的 Adam weight_decay，控制 FAMO logits 的正则强度
+        FAMO_W_LR = 2.5e-2  # 论文示例使用的 FAMO 权重学习率，决定任务权重调整速度
+        FAMO_MAX_NORM = 1.0  # 保留论文接口字段；当前模型中不额外裁剪 Generator 梯度
+        FAMO_UPDATE_AFTER_STEP = True  # Generator 更新后重新前向一次，用新 loss 按论文公式更新 FAMO 权重
+        FAMO_GENERATOR_TASK_NAMES = ['vgg', 'l1', 'mse', 'ssim', 'fft', 'flow_consistency']
+        FAMO_GENERATOR_INIT_WEIGHTS = [0.08, 0.18, 0.24, 0.22, 0.07, 0.21]  # 仅作为 softmax 初始比例，启用 FAMO 后权重会自动归一化为 1
 
         # =========================
         # 优化器超参数
@@ -371,13 +365,6 @@ class global_data:
             1. LAMBDA_ADVERSARIAL
             2. LAMBDA_FLOW_WARP_CONSISTENCY
             """
-            # 启用 FAMO 后，content / adversarial / pixel / consistency 交给第一级 FAMO 管理，
-            # SR / RAFT 两个总任务交给第二级 FAMO 管理；这里不再更新手工全局权重，避免双重加权。
-            if cls.USE_FAMO:
-                return {
-                    "lambda_adversarial": "managed_by_famo",
-                    "lambda_flow_warp_consistency": "managed_by_famo",
-                }
             cls.LAMBDA_ADVERSARIAL = cls.get_adversarial_weight(epoch)
             cls.LAMBDA_FLOW_WARP_CONSISTENCY = cls.get_flow_warp_consistency_weight(epoch)
             return {
@@ -465,10 +452,6 @@ class global_data:
         #         f"SCALE = {cls.SCALES}",
         #         "",
         #         f"LAMBDA_ADVERSARIAL = {cls.LAMBDA_ADVERSARIAL}",
-        #         f"LAMBDA_regularization_loss = {cls.LAMBDA_regularization_loss}",
-        #         f"LAMBDA_loss_pixel = {cls.LAMBDA_loss_pixel}",
-        #         f"PIXEL_WHITE_ALPHA:{cls.PIXEL_WHITE_ALPHA}",
-        #         f"LAMBDA_GRAY_CONS:{cls.LAMBDA_GRAY_CONS}",
         #         f"LAMBDA_PIXEL_L1 = {cls.LAMBDA_PIXEL_L1}",
         #         f"LAMBDA_PIXEL_MSE = {cls.LAMBDA_PIXEL_MSE}",
         #
@@ -499,6 +482,9 @@ class global_data:
         #     print(f"hyper_parameter Saved to {file_path}")
 # 模块导入时只执行一次
 global_data.esrgan.ensure_wandb_login()
+
+
+
 
 
 

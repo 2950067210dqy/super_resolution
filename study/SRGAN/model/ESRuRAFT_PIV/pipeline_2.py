@@ -26,6 +26,7 @@ from study.SRGAN.data_load import get_class_names, load_data, save_loaders_paths
 
 from study.SRGAN.model.ESRuRAFT_PIV.Module.PIV_ESRGAN_RAFT_Model import ESRuRAFT_PIV
 from study.SRGAN.model.ESRuRAFT_PIV.evaluate import evaluate, evaluate_all
+from study.SRGAN.util.famo_weight_logger import save_famo_weight_snapshot
 from study.SRGAN.model.ESRuRAFT_PIV.global_class import global_data
 from study.SRGAN.model.ESRuRAFT_PIV.train import esrgan_union_RAFT_train
 from study.SRGAN.util.CSV_operator import CsvTable
@@ -290,12 +291,8 @@ def main():
                     "SCALE": SCALE,
                     "SHUFFLE": global_data.esrgan.SHUFFLE,
                     "LAMBDA_ADVERSARIAL": global_data.esrgan.LAMBDA_ADVERSARIAL,
-                    "LAMBDA_regularization_loss": global_data.esrgan.LAMBDA_regularization_loss,
-                    "LAMBDA_loss_pixel": global_data.esrgan.LAMBDA_loss_pixel,
                     "LAMBDA_PIXEL_L1": global_data.esrgan.LAMBDA_PIXEL_L1,
                     "LAMBDA_PIXEL_MSE": global_data.esrgan.LAMBDA_PIXEL_MSE,
-                    "PIXEL_WHITE_ALPHA": global_data.esrgan.PIXEL_WHITE_ALPHA,
-                    "LAMBDA_GRAY_CONS": global_data.esrgan.LAMBDA_GRAY_CONS,
                     "SAVE_AS_GRAY": global_data.esrgan.SAVE_AS_GRAY,
                     "weight_decay": global_data.esrgan.weight_decay,
                     "g_optimizer_betas": global_data.esrgan.g_optimizer_betas,
@@ -513,6 +510,16 @@ def main():
                     title=f"ESRuRAFT_PIV FAMO Weights | {class_name} {data_type} scale_{int(SCALE * SCALE)}",
                 )
 
+                # FAMO 权重快照只在 global_data.esrgan.USE_FAMO=True 且模型持有 generator_famo 时写入。
+                # 关闭 FAMO 时该函数会直接返回，因此不会改变普通手动权重训练的输出行为。
+                save_famo_weight_snapshot(
+                    model=ESRuRAFT_PIV_model,
+                    epoch=epoch + 1,
+                    output_dir=f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.LOSS_DIR}",
+                    file_prefix=f"famo_weights_ESRuRAFT_PIV_{global_data.esrgan.name}",
+                    logger=logger,
+                )
+
                 #动态学习率step
                 # g_scheduler.step(avg_val_energy_spectrum_mse)
                 raft_scheduler.step(avg_val_aee)
@@ -608,6 +615,9 @@ if __name__ =="__main__":
     finally:
         if global_data.esrgan.IS_AUTO_DL:
             os.system("/usr/bin/shutdown")
+
+
+
 
 
 

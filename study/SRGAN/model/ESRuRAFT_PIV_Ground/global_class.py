@@ -169,20 +169,6 @@ class global_data:
         SSIM_K2 = 0.03  # SSIM常数项k2，用于稳定对比度项
 
         # =========================
-        # FAMO 自适应多任务权重配置
-        # =========================
-        # USE_FAMO 是总开关：
-        # - False: 完全沿用上面的手动全局损失权重，训练行为和不使用 FAMO 时一致。
-        # - True: 仅对生成器的非对抗损失启用 FAMO；GAN 对抗损失仍由 LAMBDA_ADVERSARIAL 动态调度单独控制。
-        USE_FAMO = False
-        FAMO_GAMMA = 1e-5  # 论文实现里的 Adam weight_decay，控制 FAMO logits 的正则强度
-        FAMO_W_LR = 2.5e-2  # 论文示例使用的 FAMO 权重学习率，决定任务权重调整速度
-        FAMO_MAX_NORM = 1.0  # 保留论文接口字段；当前模型中不额外裁剪 Generator 梯度
-        FAMO_UPDATE_AFTER_STEP = True  # Generator 更新后重新前向一次，用新 loss 按论文公式更新 FAMO 权重
-        FAMO_GENERATOR_TASK_NAMES = ['vgg', 'l1', 'mse', 'ssim', 'fft', 'flow_consistency', 'epe']
-        FAMO_GENERATOR_INIT_WEIGHTS = [0.08, 0.18, 0.22, 0.2, 0.07, 0.18, 0.07]  # 仅作为 softmax 初始比例，启用 FAMO 后权重会自动归一化为 1
-
-        # =========================
         # 优化器超参数
         # =========================
         # 正则项

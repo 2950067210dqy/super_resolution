@@ -26,13 +26,11 @@ from study.SRGAN.data_load import get_class_names, load_data, save_loaders_paths
 
 from study.SRGAN.model.ESRuRAFT_PIV.Module.PIV_ESRGAN_RAFT_Model import ESRuRAFT_PIV
 from study.SRGAN.model.ESRuRAFT_PIV.evaluate import evaluate, evaluate_all
-from study.SRGAN.util.famo_weight_logger import save_famo_weight_snapshot
 from study.SRGAN.model.ESRuRAFT_PIV.global_class import global_data
 from study.SRGAN.model.ESRuRAFT_PIV.train import esrgan_union_RAFT_train
 from study.SRGAN.util.CSV_operator import CsvTable
 from study.SRGAN.util.accumulator import Accumulator
 from study.SRGAN.util.animator import Animator
-from study.SRGAN.util.famo_weight_logger import append_famo_weight_row, save_famo_weight_plot
 try:
     from torch.cuda.amp import GradScaler
 except:
@@ -50,28 +48,16 @@ except:
             pass
 
 
-def _format_dynamic_weight_for_log(value):
-    """
-    将动态损失权重格式化为日志字符串。
-
-    FAMO 开启时，global_class.update_dynamic_loss_weights(...) 会返回 managed_by_famo；
-    这个字符串不能用 {:.6f} 格式化，所以这里统一做兼容。
-    """
-    if isinstance(value, str):
-        return value
-    return f"{float(value):.6f}"
-
-
 class ESRuRAFTPIVInferenceWrapper(nn.Module):
-    """为联合模型 profiling 提供纯 forward 推理接口，只统计模型输出，不包含 loss/backward/优化器。"""
+    """为联合模型 profiling 提供纯推理接口，避免把训练损失计算带进基准测试。"""
 
     def __init__(self, model: ESRuRAFT_PIV):
         super().__init__()
         self.model = model
 
     def forward(self, input_lr_prev, input_lr_next, flowl0):
-        # Inference Time 的标准口径只包含 forward。
-        # 这里走 Generator + RAFT 输出路径，不计算 SR loss、RAFT loss、判别器 loss，也不做 backward。
+        # profiling 时只关心“模型推理本身”的开销，
+        # 所以这里只走 Generator + RAFT 的推理路径，不计算训练损失。
         if hasattr(self.model.piv_esrgan_generator, "forward_pair"):
             pred_prev, pred_next = self.model.piv_esrgan_generator.forward_pair(input_lr_prev, input_lr_next)
         else:
@@ -85,54 +71,6 @@ class ESRuRAFTPIVInferenceWrapper(nn.Module):
         flow_predictions, _ = self.model.piv_RAFT(raft_input, raft_flow_gt)
         final_flow_prediction = flow_predictions[-1] if isinstance(flow_predictions, (list, tuple)) else flow_predictions
         return pred_prev, pred_next, final_flow_prediction
-
-
-class ESRuRAFTPIVTrainingStepWrapper(nn.Module):
-    """为联合模型 profiling 提供完整 train_step 接口，把训练损失与反向传播都纳入统计。"""
-
-    def __init__(self, model: ESRuRAFT_PIV):
-        super().__init__()
-        self.model = model
-        # profiling 只想测一次真实 train_step 的计算成本，不希望改变训练好的模型参数。
-        # 因此这里创建 lr=0 的临时优化器：backward / optimizer.step 的流程照常执行，
-        # 但参数值不会因为 profiling 发生更新。
-        self.g_optimizer = torch.optim.Adam(
-            self.model.piv_esrgan_generator.parameters(),
-            lr=0.0,
-            betas=global_data.esrgan.g_optimizer_betas,
-        )
-        self.d_optimizer = torch.optim.Adam(
-            self.model.piv_esrgan_discriminator.parameters(),
-            lr=0.0,
-            betas=global_data.esrgan.d_optimizer_betas,
-        )
-        self.raft_optimizer = torch.optim.AdamW(
-            self.model.piv_RAFT.parameters(),
-            lr=0.0,
-            betas=global_data.esrgan.RAFT_optimizer_betas,
-        )
-
-    def forward(self, input_lr_prev, input_lr_next, input_gr_prev, input_gr_next, flowl0):
-        # 这里故意调用完整 train_step，而不是纯 forward。
-        # 这样显存 / FLOPs / 时间会包含：
-        # 1. Generator 前向与 SR 损失
-        # 2. RAFT 前向与光流损失
-        # 3. Generator / RAFT / Discriminator 的 backward
-        # 4. 三个 optimizer.step 的训练流程开销
-        pred_prev, pred_next, final_flow_prediction, loss_dict = self.model.train_step(
-            input_lr_prev=input_lr_prev,
-            input_lr_next=input_lr_next,
-            input_gr_prev=input_gr_prev,
-            input_gr_next=input_gr_next,
-            flowl0=flowl0,
-            generator_optimizer=self.g_optimizer,
-            raft_optimizer=self.raft_optimizer,
-            d_optimizer=self.d_optimizer,
-            scaler=None,
-            # 训练结束后的 profiling 按“完整训练阶段”统计，因此启用对抗分支。
-            is_adversarial=True,
-        )
-        return pred_prev, pred_next, final_flow_prediction, loss_dict["g_loss"], loss_dict["raft_loss"]
 
 
 def select_single_class(available_class_names, preset_name=None):
@@ -174,122 +112,19 @@ def _extract_profile_inputs(batch, device):
     flow_hr_uv = flow_hr[:, :2, :, :]
     return (lr_prev, hr_prev, lr_next, hr_next, flow_hr_uv)
 
-
-def _snapshot_model_buffers(model):
-    # BatchNorm 等层的 running_mean / running_var 属于 buffer，不是参数。
-    # profiling 时 model.train() 会更新这些 buffer；这里先克隆一份，结束后恢复，
-    # 避免一次基准测试污染已经训练好的模型状态。
-    return {name: buffer.detach().clone() for name, buffer in model.named_buffers()}
-
-
-def _restore_model_buffers(model, buffer_snapshot):
-    # 将 profiling 前保存的 buffer 原样拷回去。
-    # 使用 copy_ 可以保持原 buffer 对象不变，只恢复其中的数值。
-    for name, buffer in model.named_buffers():
-        if name in buffer_snapshot:
-            buffer.copy_(buffer_snapshot[name])
-
-
-def _clear_model_grads(model):
-    # train_step 会产生梯度；profiling 结束后清空，避免后续保存或评估看到残留 grad。
-    for param in model.parameters():
-        param.grad = None
-
-
-def _estimate_training_step_flops(profile_model, inputs, device):
-    # torch.profiler 的 FLOPs 统计需要真正执行一次训练步骤。
-    # 这里不能使用 torch.no_grad()，因为 train_step 内部包含 backward。
-    activities = [torch.profiler.ProfilerActivity.CPU]
-    if device.type == "cuda":
-        activities.append(torch.profiler.ProfilerActivity.CUDA)
-    with torch.profiler.profile(
-        activities=activities,
-        record_shapes=False,
-        profile_memory=False,
-        with_flops=True,
-    ) as prof:
-        _ = profile_model(*inputs)
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-    total_flops = 0
-    for event in prof.key_averages():
-        event_flops = getattr(event, "flops", 0)
-        if event_flops is not None:
-            total_flops += event_flops
-    return total_flops
-
-
-def _benchmark_training_step_latency(profile_model, inputs, device, warmup, iters):
-    # 训练步骤计时需要包含 forward、loss、backward、optimizer.step。
-    # 每轮调用都会走完整 train_step，因此不能包 no_grad。
-    batch_size = inputs[0].shape[0] if inputs and hasattr(inputs[0], "shape") else 1
-    for _ in range(warmup):
-        _ = profile_model(*inputs)
-    if device.type == "cuda":
-        torch.cuda.synchronize()
-    start = time.perf_counter()
-    for _ in range(iters):
-        _ = profile_model(*inputs)
-    if device.type == "cuda":
-        torch.cuda.synchronize()
-    elapsed = time.perf_counter() - start
-    latency_ms = elapsed * 1000.0 / iters
-    throughput = iters * batch_size / elapsed
-    return latency_ms, throughput
-
-
-def _measure_training_step_peak_memory(profile_model, inputs, device):
-    # 峰值显存统计同样执行完整 train_step，包含训练损失、反向传播和优化器步骤。
-    if device.type != "cuda":
-        return 0.0
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats(device)
-    _ = profile_model(*inputs)
-    torch.cuda.synchronize()
-    return torch.cuda.max_memory_allocated(device) / (1024 ** 2)
-
 def _profile_esru_raft_piv_model(model, sample_batch, device, warmup=5, iters=20):
     was_training = model.training
     lr_prev, hr_prev, lr_next, hr_next, flow_hr_uv = _extract_profile_inputs(sample_batch, device)
-    # 第一套口径：纯 forward 推理指标。
-    # 这套结果对应论文表格里常见的 Inference Time / Inference FLOPs。
+    # 包一层纯推理 wrapper，避免 forward 里的损失计算把 profiling 结果放大。
     inference_model = ESRuRAFTPIVInferenceWrapper(model).to(device, non_blocking=True)
     inference_model.eval()
-    inference_inputs = (lr_prev, lr_next, flow_hr_uv)
 
-    # 第二套口径：完整训练 step 指标。
-    # 这套结果包含 forward、loss、backward、optimizer.step，更接近单个 batch 的训练成本。
-    training_step_model = ESRuRAFTPIVTrainingStepWrapper(model).to(device, non_blocking=True)
-    training_step_model.train()
-    training_step_inputs = (lr_prev, lr_next, hr_prev, hr_next, flow_hr_uv)
-
+    inputs = (lr_prev, lr_next, flow_hr_uv)
     # 这里记录的是“可训练参数”，更符合实验表格里常见的模型规模口径。
     _, trainable_params = count_parameters(model)
-    buffer_snapshot = _snapshot_model_buffers(model)
-    try:
-        inference_flops = estimate_flops_for_inputs(inference_model, inference_inputs, device)
-        inference_latency_ms, _ = benchmark_latency_for_inputs(
-            inference_model,
-            inference_inputs,
-            device,
-            warmup=warmup,
-            iters=iters,
-        )
-        inference_peak_memory_mb = measure_peak_memory_for_inputs(inference_model, inference_inputs, device)
-
-        training_step_flops = _estimate_training_step_flops(training_step_model, training_step_inputs, device)
-        training_step_latency_ms, _ = _benchmark_training_step_latency(
-            training_step_model,
-            training_step_inputs,
-            device,
-            warmup=warmup,
-            iters=iters,
-        )
-        training_step_peak_memory_mb = _measure_training_step_peak_memory(training_step_model, training_step_inputs, device)
-    finally:
-        # 无论 profiling 是否中途失败，都尽量恢复模型状态，避免影响后续保存 / evaluate_all。
-        _restore_model_buffers(model, buffer_snapshot)
-        _clear_model_grads(model)
+    flops = estimate_flops_for_inputs(inference_model, inputs, device)
+    latency_ms, _ = benchmark_latency_for_inputs(inference_model, inputs, device, warmup=warmup, iters=iters)
+    peak_memory_mb = measure_peak_memory_for_inputs(inference_model, inputs, device)
 
     # profiling 结束后恢复模型原本的 train/eval 状态，避免影响后续流程。
     if was_training:
@@ -302,12 +137,9 @@ def _profile_esru_raft_piv_model(model, sample_batch, device, warmup=5, iters=20
         "input_lr_shape": tuple(lr_prev.shape),
         "input_hr_shape": tuple(hr_prev.shape),
         "flow_shape": tuple(flow_hr_uv.shape),
-        "inference_gpu_memory_usage_gb": float(inference_peak_memory_mb) / 1024.0,
-        "inference_flops_g": float(inference_flops) / 1e9,
-        "inference_time_seconds": float(inference_latency_ms) / 1000.0,
-        "training_step_gpu_memory_usage_gb": float(training_step_peak_memory_mb) / 1024.0,
-        "training_step_flops_g": float(training_step_flops) / 1e9,
-        "training_step_time_seconds": float(training_step_latency_ms) / 1000.0,
+        "gpu_memory_usage_gb": float(peak_memory_mb) / 1024.0,
+        "flops_g": float(flops) / 1e9,
+        "inference_time_seconds": float(latency_ms) / 1000.0,
         "trainable_params_m": float(trainable_params) / 1e6,
     }
 
@@ -335,12 +167,9 @@ def _save_run_metrics_summary(class_name, data_type, scale, metrics_summary):
         "input_hr_shape": metrics_summary["input_hr_shape"],
         "flow_shape": metrics_summary["flow_shape"],
         "training_time_hours": metrics_summary["training_time_hours"],
-        "inference_gpu_memory_usage_gb": metrics_summary["inference_gpu_memory_usage_gb"],
-        "inference_flops_g": metrics_summary["inference_flops_g"],
+        "gpu_memory_usage_gb": metrics_summary["gpu_memory_usage_gb"],
+        "flops_g": metrics_summary["flops_g"],
         "inference_time_seconds": metrics_summary["inference_time_seconds"],
-        "training_step_gpu_memory_usage_gb": metrics_summary["training_step_gpu_memory_usage_gb"],
-        "training_step_flops_g": metrics_summary["training_step_flops_g"],
-        "training_step_time_seconds": metrics_summary["training_step_time_seconds"],
         "trainable_params_m": metrics_summary["trainable_params_m"],
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
@@ -589,13 +418,6 @@ def main():
             # global_data.esrgan.START_TIME 表示程序/流程整体开始运行的时间，
             # training_start_time 只用于统计本次训练耗时（小时）。
             training_start_time = time.time()
-            # FAMO 权重独立保存路径。
-            # 不放入原 loss CSV，避免破坏 global_class.loss_label 和 metric.add(...) 的固定顺序。
-            scale_output_dir = Path(
-                f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}"
-            )
-            famo_weight_csv_path = scale_output_dir / global_data.esrgan.LOSS_DIR.strip("/") / "famo_weights.csv"
-            famo_weight_plot_path = scale_output_dir / global_data.esrgan.LOSS_DIR.strip("/") / "famo_weights.png"
             # 轮数
             """
             训练 start
@@ -609,14 +431,14 @@ def main():
                 current_dynamic_weights = global_data.esrgan.update_dynamic_loss_weights(epoch)
                 logger.info(
                     "[Train] Epoch {}/{}: current dynamic loss weights | "
-                    "LAMBDA_ADVERSARIAL={}, "
-                    "LAMBDA_FLOW_WARP_CONSISTENCY={}, "
-                    "RAFT_EPE_WEIGHT={}".format(
+                    "LAMBDA_ADVERSARIAL={:.6f}, "
+                    "LAMBDA_FLOW_WARP_CONSISTENCY={:.6f}, "
+                    "RAFT_EPE_WEIGHT={:.6f}".format(
                         epoch + 1,
                         global_data.esrgan.EPOCH_NUMS,
-                        _format_dynamic_weight_for_log(current_dynamic_weights["lambda_adversarial"]),
-                        _format_dynamic_weight_for_log(current_dynamic_weights["lambda_flow_warp_consistency"]),
-                        _format_dynamic_weight_for_log(current_dynamic_weights["raft_epe_weight"]),
+                        current_dynamic_weights["lambda_adversarial"],
+                        current_dynamic_weights["lambda_flow_warp_consistency"],
+                        current_dynamic_weights["raft_epe_weight"],
                     )
                 )
                 ESRuRAFT_PIV_model.train()  # 确保在训练模式
@@ -631,7 +453,7 @@ def main():
 
                 for i, batch in enumerate(train_progress_bar):
                     """RAFT 联合训练"""
-                    loss_dict = esrgan_union_RAFT_train(
+                    esrgan_union_RAFT_train(
                         epoch=epoch,
                         batch=batch, i=i,
                         g_optimizer=ESRuRAFT_PIV_model_g_optimizer,
@@ -645,37 +467,11 @@ def main():
                         SCALE=SCALE
 
                     )
-                    # 每个 batch 记录一次 FAMO 权重。
-                    # FAMO 的权重是按训练 step 更新的，逐 batch 保存才能看到真实变化曲线。
-                    append_famo_weight_row(
-                        famo_weight_csv_path,
-                        epoch=epoch,
-                        batch_index=i,
-                        global_step=epoch * len(train_loader) + i,
-                        loss_dict=loss_dict,
-                    )
                 # 每轮结束后评价一次 验证集只取一轮batch
                 avg_val_mse_loss,avg_val_ssim_loss,avg_psnr,avg_val_energy_spectrum_mse,avg_val_aee,avg_val_norm_aee_per100=evaluate(epoch=epoch, class_name=class_name, data_type=data_type, device=global_data.esrgan.device,
                          model = ESRuRAFT_PIV_model, animator=animator, validate_loader=validate_loader,
                          loss_label=global_data.esrgan.loss_label,validate_label=global_data.esrgan. validate_label, SCALE=SCALE,
                          csvOperator=global_data.esrgan.csvOperator,metric=metric,train_loader_lens=len(train_loader))
-                # 每个 epoch 结束后刷新一次折线图。
-                # 这样不会在 batch 内频繁画图拖慢训练，同时训练中断时也能保留已经完成 epoch 的图。
-                save_famo_weight_plot(
-                    famo_weight_csv_path,
-                    famo_weight_plot_path,
-                    title=f"ESRuRAFT_PIV FAMO Weights | {class_name} {data_type} scale_{int(SCALE * SCALE)}",
-                )
-
-                # FAMO 权重快照只在 global_data.esrgan.USE_FAMO=True 且模型持有 generator_famo 时写入。
-                # 关闭 FAMO 时该函数会直接返回，因此不会改变普通手动权重训练的输出行为。
-                save_famo_weight_snapshot(
-                    model=ESRuRAFT_PIV_model,
-                    epoch=epoch + 1,
-                    output_dir=f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.LOSS_DIR}",
-                    file_prefix=f"famo_weights_ESRuRAFT_PIV_{global_data.esrgan.name}",
-                    logger=logger,
-                )
 
                 #动态学习率step
                 # g_scheduler.step(avg_val_energy_spectrum_mse)
@@ -772,7 +568,6 @@ if __name__ =="__main__":
     finally:
         if global_data.esrgan.IS_AUTO_DL:
             os.system("/usr/bin/shutdown")
-
 
 
 

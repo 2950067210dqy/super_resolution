@@ -151,36 +151,19 @@ class AdversarialLoss(nn.Module):
         return adversarial_loss
 class PerceptualLoss(nn.Module):
     """
-    感知损失 = 内容损失+1e-3 * 对抗损失
+    感知损失现在只表示 VGG 特征空间的 L1 距离。
+
+    注意：
+        1. 对抗损失不再混在 perceptual loss 里，避免日志里的“感知/内容/对抗”语义错位。
+        2. adversarial 模块仍挂在这里，模型会在构造方案 C 的时序判别器输入后单独调用。
     """
     def __init__(self, vgg):
         super(PerceptualLoss,self).__init__()
         self.vgg_loss = ContentLoss(vgg)
-        # self.content_loss = ParticleTotalLoss(
-        #     lambda_structure=global_data.esrgan.LAMBDA_STRUCTURE,
-        #     lambda_physical=global_data.esrgan.LAMBDA_PHYSICAL
-        # )
         self.adversarial = AdversarialLoss()
 
-    def forward(self, fake, real, pred_fake,pred_real,is_adversarial=False):
-        content_loss = self.vgg_loss(fake, real)
-
-        # content_loss,_ = self.content_loss(fake, real)
-        adversarial_loss = self.adversarial(pred_fake, pred_real)
-
-        # FAMO 启用后，content / adversarial 会作为两个独立任务交给 FAMO 自适应加权。
-        # 因此这里不再乘 LAMBDA_CONTENT / LAMBDA_ADVERSARIAL，避免手工全局权重和 FAMO 权重重复作用。
-        if global_data.esrgan.USE_FAMO:
-            if is_adversarial:
-                return content_loss + adversarial_loss, content_loss, adversarial_loss
-            return content_loss, content_loss, adversarial_loss
-
-        #是否启用对抗损失 就是是否预训练生成器
-        if is_adversarial:
-            # return vgg_loss +global_data.esrgan.LAMBDA_ADVERSARIAL*adversarial_loss,vgg_loss,adversarial_loss
-            return global_data.esrgan.LAMBDA_CONTENT*content_loss +global_data.esrgan.LAMBDA_ADVERSARIAL*adversarial_loss,content_loss,adversarial_loss
-        else:
-            return global_data.esrgan.LAMBDA_CONTENT*content_loss,content_loss,adversarial_loss
+    def forward(self, fake, real):
+        return self.vgg_loss(fake, real)
 # class RegularizationLoss(nn.Module):
 #     """
 #     图像平滑正则：惩罚相邻像素突变，抑制高频噪声。
@@ -334,12 +317,10 @@ class CombinedPixelLoss(nn.Module):
       - 普通 RGB L1 + MSE
     返回: total, l1_term, mse_term
     """
-    def __init__(self, lambda_l1=2e-2, lambda_mse=1e-3, white_alpha=4.0, lambda_cons=1e-2, lambda_fft=1e-2):
+    def __init__(self, lambda_l1=2e-2, lambda_mse=1e-3, lambda_fft=1e-2):
         super().__init__()
         self.lambda_l1 = lambda_l1
         self.lambda_mse = lambda_mse
-        self.white_alpha = white_alpha
-        self.lambda_cons = lambda_cons
         self.lambda_fft = lambda_fft
         self.l1 = nn.SmoothL1Loss()
         self.mse = nn.MSELoss()
@@ -521,8 +502,6 @@ class Discriminator_loss(nn.Module):
 pixel_loss = CombinedPixelLoss(
     lambda_l1=global_data.esrgan.LAMBDA_PIXEL_L1,
     lambda_mse=global_data.esrgan.LAMBDA_PIXEL_MSE,
-    white_alpha=global_data.esrgan.PIXEL_WHITE_ALPHA,
-    lambda_cons=global_data.esrgan.LAMBDA_GRAY_CONS,
     lambda_fft=global_data.esrgan.LAMBDA_PIXEL_FFT,
 ).to(global_data.esrgan.device, non_blocking=True)
 # 这里vgg是针对三通道RGB图的
@@ -538,9 +517,8 @@ perceptual_loss = PerceptualLoss(vgg=vgg).to(global_data.esrgan.device, non_bloc
 
 # 这个 loss 只在 image_pair / RAFT 联合训练时使用；它用 GT flow 将 SR next 对齐回 SR previous。
 flow_warp_consistency_loss = FlowWarpConsistencyLoss(
-    # FAMO 启用后，consistency 本身就是一个独立任务，应使用原始一致性损失；
-    # 关闭 FAMO 时才沿用原来的全局 LAMBDA_FLOW_WARP_CONSISTENCY。
-    flow_warp_weight=1.0 if global_data.esrgan.USE_FAMO else global_data.esrgan.LAMBDA_FLOW_WARP_CONSISTENCY,
+    flow_warp_weight=global_data.esrgan.LAMBDA_FLOW_WARP_CONSISTENCY,
 ).to(global_data.esrgan.device, non_blocking=True)
 #判别器损失
 descriminator_loss = Discriminator_loss().to(global_data.esrgan.device, non_blocking=True)
+
