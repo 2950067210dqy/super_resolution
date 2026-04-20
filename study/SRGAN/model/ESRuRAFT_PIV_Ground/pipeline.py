@@ -24,10 +24,10 @@ from study.SRGAN.data_load import get_class_names, load_data, save_loaders_paths
 
 
 
-from study.SRGAN.model.ESRuRAFT_PIV.Module.PIV_ESRGAN_RAFT_Model import ESRuRAFT_PIV
-from study.SRGAN.model.ESRuRAFT_PIV.evaluate import evaluate, evaluate_all
-from study.SRGAN.model.ESRuRAFT_PIV.global_class import global_data
-from study.SRGAN.model.ESRuRAFT_PIV.train import esrgan_union_RAFT_train
+from study.SRGAN.model.ESRuRAFT_PIV_Ground.Module.PIV_ESRGAN_RAFT_Model import ESRuRAFT_PIV
+from study.SRGAN.model.ESRuRAFT_PIV_Ground.evaluate import evaluate, evaluate_all
+from study.SRGAN.model.ESRuRAFT_PIV_Ground.global_class import global_data
+from study.SRGAN.model.ESRuRAFT_PIV_Ground.train import esrgan_union_RAFT_train
 from study.SRGAN.util.CSV_operator import CsvTable
 from study.SRGAN.util.accumulator import Accumulator
 from study.SRGAN.util.animator import Animator
@@ -48,6 +48,22 @@ except:
             pass
 
 
+def _trainable_parameters_or_dummy(module: nn.Module, device: torch.device):
+    """
+    返回模块的可训练参数；如果模块没有参数，则返回一个 optimizer 专用 dummy 参数。
+
+    lr_ground/hr_ground/bicubic 下 Generator/Discriminator 是 nn.Identity，没有任何参数。
+    PyTorch optimizer 不接受空参数列表，因此这里创建一个不属于模型的 0 维 dummy 参数：
+    - 它不会计入模型参数量；
+    - train_step 的 ground 分支不会使用 G/D optimizer；
+    - 但可以让 pipeline 里统一的 optimizer/scheduler/save 逻辑继续工作。
+    """
+    params = [p for p in module.parameters() if p.requires_grad]
+    if params:
+        return params
+    return [nn.Parameter(torch.zeros((), device=device), requires_grad=True)]
+
+
 class ESRuRAFTPIVInferenceWrapper(nn.Module):
     """为联合模型 profiling 提供纯 forward 推理接口，只统计模型输出，不包含 loss/backward/优化器。"""
 
@@ -55,20 +71,41 @@ class ESRuRAFTPIVInferenceWrapper(nn.Module):
         super().__init__()
         self.model = model
 
-    def forward(self, input_lr_prev, input_lr_next, flowl0):
+    def forward(self, input_lr_prev, input_lr_next, input_gr_prev, input_gr_next, flowl0):
         # Inference Time 的标准口径只包含 forward。
-        # 这里走 Generator + RAFT 输出路径，不计算 SR loss、RAFT loss、判别器 loss，也不做 backward。
-        if hasattr(self.model.piv_esrgan_generator, "forward_pair"):
-            pred_prev, pred_next = self.model.piv_esrgan_generator.forward_pair(input_lr_prev, input_lr_next)
+        # 这里不调用完整 model.forward，因为 forward 会额外计算图像损失/判别器损失。
+        # profiling 只需要“当前 TRAIN_MODE 的图像来源 + RAFT 推理”这条主链路。
+        if self.model.train_mode == "lr_ground":
+            pred_prev = self.model._resize_image_to_target(input_lr_prev, input_gr_prev, mode="nearest")
+            pred_next = self.model._resize_image_to_target(input_lr_next, input_gr_next, mode="nearest")
+            # lr_ground 不经过超分网络，但 profiling 时也要和训练一致：
+            # 先把 LR 用最近邻插值对齐到 HR/RAFT 尺寸，再送入 RAFT。
+            raft_prev_source = pred_prev
+            raft_next_source = pred_next
+        elif self.model.train_mode == "bicubic":
+            # bicubic 是传统插值超分 baseline，同样不经过 Generator。
+            # 这里用双三次插值把 LR 放大到 HR/RAFT 尺寸，再把结果送入 RAFT；
+            # profiling 口径必须和真实 train_step 保持一致。
+            pred_prev = self.model._resize_image_to_target(input_lr_prev, input_gr_prev, mode="bicubic")
+            pred_next = self.model._resize_image_to_target(input_lr_next, input_gr_next, mode="bicubic")
+            raft_prev_source = pred_prev
+            raft_next_source = pred_next
+        elif self.model.train_mode == "hr_ground":
+            pred_prev = input_gr_prev
+            pred_next = input_gr_next
+            raft_prev_source = input_gr_prev
+            raft_next_source = input_gr_next
         else:
             pred_prev = self.model.piv_esrgan_generator(input_lr_prev)
             pred_next = self.model.piv_esrgan_generator(input_lr_next)
+            raft_prev_source = pred_prev
+            raft_next_source = pred_next
 
-        raft_prev = self.model._to_raft_frame(pred_prev)
-        raft_next = self.model._to_raft_frame(pred_next)
-        raft_input = torch.cat([raft_prev, raft_next], dim=1)
-        raft_flow_gt = self.model._to_raft_flow_gt(flowl0)
-        flow_predictions, _ = self.model.piv_RAFT(raft_input, raft_flow_gt)
+        flow_predictions, _ = self.model._compute_raft_branch(
+            raft_prev_source=raft_prev_source,
+            raft_next_source=raft_next_source,
+            flowl0=flowl0,
+        )
         final_flow_prediction = flow_predictions[-1] if isinstance(flow_predictions, (list, tuple)) else flow_predictions
         return pred_prev, pred_next, final_flow_prediction
 
@@ -82,13 +119,14 @@ class ESRuRAFTPIVTrainingStepWrapper(nn.Module):
         # profiling 只想测一次真实 train_step 的计算成本，不希望改变训练好的模型参数。
         # 因此这里创建 lr=0 的临时优化器：backward / optimizer.step 的流程照常执行，
         # 但参数值不会因为 profiling 发生更新。
+        device = next(self.model.parameters()).device
         self.g_optimizer = torch.optim.Adam(
-            self.model.piv_esrgan_generator.parameters(),
+            _trainable_parameters_or_dummy(self.model.piv_esrgan_generator, device),
             lr=0.0,
             betas=global_data.esrgan.g_optimizer_betas,
         )
         self.d_optimizer = torch.optim.Adam(
-            self.model.piv_esrgan_discriminator.parameters(),
+            _trainable_parameters_or_dummy(self.model.piv_esrgan_discriminator, device),
             lr=0.0,
             betas=global_data.esrgan.d_optimizer_betas,
         )
@@ -241,7 +279,7 @@ def _profile_esru_raft_piv_model(model, sample_batch, device, warmup=5, iters=20
     # 这套结果对应论文表格里常见的 Inference Time / Inference FLOPs。
     inference_model = ESRuRAFTPIVInferenceWrapper(model).to(device, non_blocking=True)
     inference_model.eval()
-    inference_inputs = (lr_prev, lr_next, flow_hr_uv)
+    inference_inputs = (lr_prev, lr_next, hr_prev, hr_next, flow_hr_uv)
 
     # 第二套口径：完整训练 step 指标。
     # 这套结果包含 forward、loss、backward、optimizer.step，更接近单个 batch 的训练成本。
@@ -312,6 +350,7 @@ def _save_run_metrics_summary(class_name, data_type, scale, metrics_summary):
     row = {
         "run_name": global_data.esrgan.name,
         "description": global_data.esrgan.DESCRIPTION,
+        "train_mode": global_data.esrgan.validate_train_mode(),
         "class_name": class_name,
         "data_type": data_type,
         "scale": int(scale * scale),
@@ -443,7 +482,8 @@ def main():
                     "Train_nums_rate": global_data.esrgan.Train_nums_rate,
                     "Validate_nums_rate": global_data.esrgan.Validate_nums_rate,
                     "Test_nums_rate": global_data.esrgan.Test_nums_rate,
-                    "train_mode": mode,
+                    "train_class_mode": mode,
+                    "TRAIN_MODE": global_data.esrgan.validate_train_mode(),
                     "selected_classes": selected_classes if selected_classes is not None else "ALL_MIXED",
                 },
             )
@@ -495,9 +535,9 @@ def main():
 
 
 
-            ESRuRAFT_PIV_model_g_optimizer = torch.optim.Adam(ESRuRAFT_PIV_model.piv_esrgan_generator.parameters(), lr=global_data.esrgan.G_LR, betas=global_data.esrgan.g_optimizer_betas,
+            ESRuRAFT_PIV_model_g_optimizer = torch.optim.Adam(_trainable_parameters_or_dummy(ESRuRAFT_PIV_model.piv_esrgan_generator, global_data.esrgan.device), lr=global_data.esrgan.G_LR, betas=global_data.esrgan.g_optimizer_betas,
                                            weight_decay=global_data.esrgan.weight_decay)
-            ESRuRAFT_PIV_model_d_optimizer = torch.optim.Adam(ESRuRAFT_PIV_model.piv_esrgan_discriminator.parameters(), lr=global_data.esrgan.D_LR, betas=global_data.esrgan.d_optimizer_betas,
+            ESRuRAFT_PIV_model_d_optimizer = torch.optim.Adam(_trainable_parameters_or_dummy(ESRuRAFT_PIV_model.piv_esrgan_discriminator, global_data.esrgan.device), lr=global_data.esrgan.D_LR, betas=global_data.esrgan.d_optimizer_betas,
                                            weight_decay=global_data.esrgan.weight_decay)
 
             ESRuRAFT_PIV_model_RAFT_optimizeroptimizer = torch.optim.AdamW(ESRuRAFT_PIV_model.piv_RAFT.parameters(), lr=global_data.esrgan.RAFT_LR, betas=global_data.esrgan.RAFT_optimizer_betas,)
@@ -725,15 +765,3 @@ if __name__ =="__main__":
     finally:
         if global_data.esrgan.IS_AUTO_DL:
             os.system("/usr/bin/shutdown")
-
-
-
-
-
-
-
-
-
-
-
-

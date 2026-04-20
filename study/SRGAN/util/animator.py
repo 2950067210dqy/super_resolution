@@ -1,4 +1,5 @@
 from loguru import logger
+import math
 from matplotlib import pyplot as plt
 from matplotlib.animation import FuncAnimation, PillowWriter
 
@@ -105,20 +106,43 @@ class Animator:
             name = self.legend[i] if i < len(self.legend) else f"series_{i}"
             if name in exclude_legends:
                 continue
+            # 有些指标在数学上可能得到 inf/nan，例如 MSE 为 0 时 PSNR 会是 inf。
+            # 这些值可以继续写入 CSV/W&B，但 matplotlib 不能拿它们计算坐标轴范围，
+            # 因此绘图缓存里只保留有限的 y 值，避免保存曲线图时中断训练。
+            clean_x = []
+            clean_y = []
+            for a, b in zip(xx, yy):
+                if b is None:
+                    continue
+                try:
+                    is_finite_y = math.isfinite(float(b))
+                except (TypeError, ValueError):
+                    is_finite_y = False
+                if not is_finite_y:
+                    continue
+                clean_x.append(a)
+                clean_y.append(b)
             filtered.append({
                 "idx": i,
                 "name": name,
-                "x": xx,
-                "y": yy,
+                "x": clean_x,
+                "y": clean_y,
                 "fmt": self.fmts[i % len(self.fmts)],
             })
         return filtered
 
     def _series_scale(self, y):
         """计算单条序列的尺度（绝对值最大值），用于分组。"""
-        if not y:
+        finite_y = []
+        for v in y:
+            try:
+                if math.isfinite(float(v)):
+                    finite_y.append(v)
+            except (TypeError, ValueError):
+                continue
+        if not finite_y:
             return 0.0
-        return max(abs(v) for v in y)
+        return max(abs(v) for v in finite_y)
 
     def _group_series_by_scale(self, series_list, split_ratio=8.0):
         """按量级自动分组，避免大/小量级曲线互相遮蔽。"""

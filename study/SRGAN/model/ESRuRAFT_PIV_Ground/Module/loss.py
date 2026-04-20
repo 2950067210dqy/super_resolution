@@ -8,7 +8,7 @@ from torchvision.models import vgg19
 import torch.nn.functional as F
 
 from study.SRGAN.util.image_util import _select_metric_or_save_channels, _to_gray
-from study.SRGAN.model.ESRuRAFT_PIV.global_class import global_data
+from study.SRGAN.model.ESRuRAFT_PIV_Ground.global_class import global_data
 
 
 # class VGG(nn.Module):
@@ -521,4 +521,3 @@ flow_warp_consistency_loss = FlowWarpConsistencyLoss(
 ).to(global_data.esrgan.device, non_blocking=True)
 #判别器损失
 descriminator_loss = Discriminator_loss().to(global_data.esrgan.device, non_blocking=True)
-

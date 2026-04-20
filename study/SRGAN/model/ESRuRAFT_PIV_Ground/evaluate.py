@@ -15,17 +15,18 @@ import matplotlib.pyplot as plt
 from types import SimpleNamespace
 from PIL import Image, ImageDraw, ImageFont
 
-from study.SRGAN.model.ESRuRAFT_PIV.Module.loss import pixel_loss
-from study.SRGAN.model.ESRuRAFT_PIV.global_class import global_data
-from study.SRGAN.model.ESRuRAFT_PIV.judge_delicators import _to_np_chw, _mse, _psnr_from_mse, _energy_spectrum_mse, \
+from study.SRGAN.model.ESRuRAFT_PIV_Ground.Module.loss import pixel_loss
+from study.SRGAN.model.ESRuRAFT_PIV_Ground.global_class import global_data
+from study.SRGAN.model.ESRuRAFT_PIV_Ground.judge_delicators import _to_np_chw, _mse, _psnr_from_mse, _energy_spectrum_mse, \
     _r2_score, _ssim_score, _tke_reconstruction_accuracy, _nrmse, _energy_spectrum_curves
 
 
-from study.SRGAN.model.ESRuRAFT_PIV.visual_plot_init import build_flo_uvw_pred_gt_panel, _omega_star_from_uv
-from study.SRGAN.model.ESRuRAFT_PIV.visual_plot_save import save_vorticity_quiver_compare, _save_triplet, _save_pair, \
+from study.SRGAN.model.ESRuRAFT_PIV_Ground.visual_plot_init import build_flo_uvw_pred_gt_panel, _omega_star_from_uv
+from study.SRGAN.model.ESRuRAFT_PIV_Ground.visual_plot_save import save_vorticity_quiver_compare, _save_triplet, _save_pair, \
     _save_energy_spectrum_plot
 from study.SRGAN.util.image_util import flow_to_color_tensor, build_triplet_row, add_vertical_separator, \
     add_horizontal_separator, build_pair_row, _select_metric_or_save_channels
+
 
 """
 验证函数 start
@@ -883,7 +884,6 @@ def validate_raft(model, dataloader, device, epoch):
     这里不再区分 image_pair / flo，而是固定走联合模型的一条评估路径。
     """
     model.eval()
-    generator = model.piv_esrgan_generator
     use_adversarial = epoch >= global_data.esrgan.PRE_TRIAN_G_EPOCH - 1
     total_val_ssim_loss = 0.0
     total_val_mse_loss = 0.0
@@ -905,11 +905,22 @@ def validate_raft(model, dataloader, device, epoch):
             # RAFT 监督只使用 uv 两个通道；这里保留三通道原始真值用于其他评估项。
             flow_gt_uv = flow_gt[:, :2, :, :]
 
-            if hasattr(generator, "forward_pair"):
-                fake_prev, fake_next = generator.forward_pair(lr_prev, lr_next)
-            else:
-                fake_prev = generator(lr_prev)
-                fake_next = generator(lr_next)
+            # Ground 模式的图像输出和 RAFT 输入来源由 model.forward 内部根据 TRAIN_MODE 统一决定：
+            # - lr_ground: sr_prev/sr_next 是 LR 最近邻对齐到 HR 的 baseline，RAFT 也吃最近邻对齐后的 HR 尺寸图；
+            # - hr_ground: sr_prev/sr_next 就是真实 HR 图像，RAFT 也吃 HR；
+            # - bicubic: sr_prev/sr_next 是 LR 经 bicubic 双三次插值到 HR 尺寸后的传统超分图，RAFT 吃 bicubic 图；
+            # - esrgan: sr_prev/sr_next 是原始 ESRGAN 的超分输出，RAFT 吃 SR。
+            _, _, _, outputs = model.forward(
+                input_lr_prev=lr_prev,
+                input_lr_next=lr_next,
+                input_gr_prev=hr_prev,
+                input_gr_next=hr_next,
+                # 这里显式只把 uv 两个通道送给 RAFT。
+                flowl0=flow_gt_uv,
+                is_adversarial=use_adversarial,
+            )
+            fake_prev = outputs["sr_prev"]
+            fake_next = outputs["sr_next"]
 
             for fake_images, hr_images in ((fake_prev, hr_prev), (fake_next, hr_next)):
                 _, _, mse_total, ssim_total, _ = pixel_loss(fake_images, hr_images, global_data.esrgan.SAVE_AS_GRAY)
@@ -929,17 +940,7 @@ def validate_raft(model, dataloader, device, epoch):
                     total_energy_spectrum_mse += _energy_spectrum_mse(_to_np_chw(fake_image), _to_np_chw(hr_image))
                     num_images += 1
 
-            # 联合模型下直接顺带评估 RAFT 的 AEE。
-            # 联合模型 forward 当前返回 4 个值；这里取最后一个 outputs 字典读取 RAFT 指标。
-            _, _, _, outputs = model.forward(
-                input_lr_prev=lr_prev,
-                input_lr_next=lr_next,
-                input_gr_prev=hr_prev,
-                input_gr_next=hr_next,
-                # 这里显式只把 uv 两个通道送给 RAFT。
-                flowl0=flow_gt_uv,
-                is_adversarial=use_adversarial,
-            )
+            # 联合模型下直接顺带评估 RAFT 的 AEE；outputs["flow_predictions"] 已经按 HR flow 尺寸还原。
             total_aee += float(outputs["raft_metrics"]["epe"])
             total_norm_aee_per100 += _compute_norm_aee_per100_from_flow_tensors(
                 outputs["flow_predictions"][-1],
@@ -1102,9 +1103,7 @@ def evaluate_all(
     # 1. 按类别写子目录
     # 2. 按类别写 metrics.csv
     # 3. 额外汇总 전체 metrics_all.csv
-    generator = model.piv_esrgan_generator
-    device = next(generator.parameters()).device
-    generator.eval()
+    device = next(model.parameters()).device
     model.eval()
     # evaluate_all 是训练完成后的全量评估路径，没有 epoch 参数；
     # 这里默认进入“允许对抗项”的正式评估口径。
@@ -1616,9 +1615,3 @@ def evaluate_all(
         "tke_acc": float("nan"),
         "nrmse": float("nan"),
     }
-
-
-
-
-
-

@@ -58,11 +58,26 @@ class global_data:
         # =========================
         # 训练任务标识
         # =========================
-        name = "ESRuRAFT_PIV"  # 当前实验名（用于输出目录/模型名/wandb run名）
-        DESCRIPTION = "_v8_v1"  # 实验补充描述（可写损失配置、数据版本等）
+        name = "ESRuRAFT_PIV_Ground"  # 当前实验名（用于输出目录/模型名/wandb run名）
+        DESCRIPTION = "_v1"  # 实验补充描述（可写损失配置、数据版本等）
         name +=DESCRIPTION
 
         #整体项目注释
+        # =========================
+        # Ground 实验训练模式
+        # =========================
+        # TRAIN_MODE 用于控制“送入 RAFT 的图像从哪里来”：
+        # 1. "lr_ground": 把低分辨率 previous/next 用最近邻插值对齐到 HR 尺寸后送入 RAFT。
+        #    该模式用于验证“只做最简单尺寸对齐、不做传统/学习型超分”的基线表现。
+        # 2. "hr_ground": 直接把真实高分辨率 previous/next 送入 RAFT，不经过任何超分网络。
+        #    该模式用于验证“RAFT 在理想 HR 图像输入下”的上限参考。
+        # 3. "bicubic": 把低分辨率 previous/next 用传统 bicubic 双三次插值放大到 HR 尺寸后送入 RAFT。
+        #    该模式没有可学习参数，用于和 ESRGAN 这类学习型超分模块做传统插值基线对比。
+        # 4. "esrgan": 使用最原始的 ESRGAN 生成器先把 LR 超分到 HR，再把 SR 图像送入 RAFT。
+        #    该模式保留 ESRGAN + RAFT 的联合训练路径，但超分模块不使用 ESRuRAFT_PIV 的改进结构。
+        TRAIN_MODES = ("lr_ground", "hr_ground", "bicubic", "esrgan")
+        TRAIN_MODE = "hr_ground"
+
         # 类别训练模式: "all" | "single" | "mixed"
         TRAIN_CLASS_MODE = "mixed"
         # 当 TRAIN_CLASS_MODE="single" 时可预设；为 None 则运行时让你输入选择
@@ -249,6 +264,7 @@ class global_data:
         METRICS_SUMMARY_COLUMNS = [
             "run_name",
             "description",
+            "train_mode",
             "class_name",
             "data_type",
             "scale",
@@ -280,6 +296,41 @@ class global_data:
         START_TIME = time.time()
         #结束时间
         END_TIME = time.time()
+        @classmethod
+        def normalized_train_mode(cls) -> str:
+            """
+            返回规范化后的 Ground 训练模式。
+
+            统一在这里做 strip/lower，是为了允许配置里写成 "LR_GROUND" 或带空格时
+            仍然能够被正确识别；同时所有调用方都只依赖这一个入口，避免分散校验。
+            """
+            return str(cls.TRAIN_MODE).strip().lower()
+
+        @classmethod
+        def validate_train_mode(cls) -> str:
+            """
+            校验 TRAIN_MODE 是否属于允许的三种模式。
+
+            这里选择启动即报错，而不是在训练中间才失败；这样可以避免跑了很久才发现
+            TRAIN_MODE 拼写错误，例如 "lr-groud" 这类肉眼不容易发现的问题。
+            """
+            mode = cls.normalized_train_mode()
+            if mode not in cls.TRAIN_MODES:
+                raise ValueError(
+                    f"TRAIN_MODE 仅支持 {cls.TRAIN_MODES}，当前为: {cls.TRAIN_MODE}"
+                )
+            return mode
+
+        @classmethod
+        def uses_super_resolution(cls) -> bool:
+            """
+            当前模式是否需要训练/调用超分辨率生成器。
+
+            lr_ground/hr_ground/bicubic 都是纯 RAFT 输入基线，不需要 Generator 或 Discriminator；
+            esrgan 才会启用原始 ESRGAN 生成器，并把 SR 结果继续送入 RAFT。
+            """
+            return cls.validate_train_mode() == "esrgan"
+
         @classmethod
         def _get_scheduled_weight(
                 cls,
@@ -508,9 +559,3 @@ class global_data:
         #     print(f"hyper_parameter Saved to {file_path}")
 # 模块导入时只执行一次
 global_data.esrgan.ensure_wandb_login()
-
-
-
-
-
-

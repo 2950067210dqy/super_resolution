@@ -9,7 +9,7 @@ from matplotlib import pyplot as plt
 from torchvision.utils import save_image
 from PIL import Image, ImageDraw, ImageFont
 
-from study.SRGAN.model.ESRuRAFT_PIV.visual_plot_init import _omega_star_from_uv
+from study.SRGAN.model.ESRuRAFT_PIV_Ground.visual_plot_init import _omega_star_from_uv
 from study.SRGAN.util.image_util import build_triplet_row, build_pair_row
 from study.SRGAN.util.tensor_util import _to_np_2d
 
@@ -252,7 +252,3 @@ def save_vorticity_quiver_compare(
 """
 可视化保存 end
 """
-
-
-
-

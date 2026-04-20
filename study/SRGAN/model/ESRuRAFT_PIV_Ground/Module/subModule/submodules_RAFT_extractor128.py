@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from study.SRGAN.model.ESRuRAFT_PIV.Module.subModule.submodules_RAFT_extractor256 import ResidualBlock
+from study.SRGAN.model.ESRuRAFT_PIV_Ground.Module.subModule.submodules_RAFT_extractor256 import ResidualBlock
 
 
 class BasicEncoder128(nn.Module):

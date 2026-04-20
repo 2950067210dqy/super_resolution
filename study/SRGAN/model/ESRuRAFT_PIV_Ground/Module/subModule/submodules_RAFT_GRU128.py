@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from study.SRGAN.model.ESRuRAFT_PIV.Module.subModule.submodules_RAFT_GRU256 import (
+from study.SRGAN.model.ESRuRAFT_PIV_Ground.Module.subModule.submodules_RAFT_GRU256 import (
     BasicMotionEncoder,
     FlowHead,
     SepConvGRU,
