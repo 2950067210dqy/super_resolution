@@ -1,7 +1,9 @@
 import torch  # 导入 PyTorch 主库
 from torch import nn  # 导入神经网络模块基类和常用层接口
 import torch.nn.functional as F  # 导入函数式接口，便于直接调用 loss / 激活等函数
+from pathlib import Path  # 用于解析 RAFT256 checkpoint 的相对路径
 
+from loguru import logger
 from study.SRGAN.model.PIV_A_Esrgan.Module.RAFT_Model import RAFT, RAFT128, RAFT256  # 导入 RAFT 光流估计主网络
 from study.SRGAN.model.PIV_A_Esrgan.Module.loss import (
     descriminator_loss,  # 判别器损失，负责训练 D 区分真/假图像
@@ -32,6 +34,104 @@ except:
         def __exit__(self, *args):
             pass
 
+
+def _resolve_raft256_pretrain_path(path_text: str | Path) -> Path:
+    """
+    解析 RAFT256 预训练 checkpoint 路径。
+
+    配置中默认写成 "RAFT_CHECKPOINT/ckpt_256.tar"，这是相对 SRGAN 根目录的路径；
+    如果用户传入绝对路径，则直接使用绝对路径。这样从 PyCharm、命令行或 notebook
+    不同工作目录启动时，都不会因为 cwd 不同而找错 checkpoint。
+    """
+    path = Path(path_text)
+    if path.is_absolute():
+        return path
+    srgan_root = Path(__file__).resolve().parents[3]
+    return srgan_root / path
+
+
+def _init_raft128_from_raft256_if_enabled(model: nn.Module) -> None:
+    """
+    可选：用 RAFT256 checkpoint 中 shape 一致的权重初始化 RAFT128。
+
+    这是一个“预训练初始化”而不是无损结构迁移：
+    - RAFT256 的 update_block.mask.2 输出通道是 8*8*9=576；
+    - RAFT128 的 update_block.mask.2 输出通道是 4*4*9=144；
+    - 这类 shape 不一致的层必须跳过，保留 RAFT128 自身初始化。
+
+    因此该功能只在：
+    1. global_data.esrgan.RAFT128_INIT_FROM_RAFT256=True；
+    2. global_data.esrgan.RAFT_MODEL_TYPE="RAFT128"；
+    时生效。迁移后建议继续训练/微调，让 RAFT128 适应 1/4 分辨率的内部特征网格。
+    """
+    if not bool(global_data.esrgan.RAFT128_INIT_FROM_RAFT256):
+        return
+
+    checkpoint_path = _resolve_raft256_pretrain_path(global_data.esrgan.RAFT128_INIT_FROM_RAFT256_CKPT)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"RAFT256 预训练 checkpoint 不存在: {checkpoint_path}")
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    source_state = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else None
+    if not isinstance(source_state, dict):
+        raise ValueError(f"无法从 checkpoint 中读取 RAFT256 state_dict: {checkpoint_path}")
+
+    target_state = model.state_dict()
+    matched_state = {}
+    skipped = []
+    for name, value in source_state.items():
+        target_value = target_state.get(name)
+        if target_value is not None and hasattr(value, "shape") and target_value.shape == value.shape:
+            matched_state[name] = value
+        else:
+            source_shape = tuple(value.shape) if hasattr(value, "shape") else type(value).__name__
+            target_shape = tuple(target_value.shape) if target_value is not None else None
+            skipped.append((name, source_shape, target_shape))
+
+    # target_state 本身已经包含 RAFT128 的完整随机初始化权重。
+    # 这里只覆盖 shape 完全相同的层；被跳过的层保持 RAFT128 初始化，相当于“重建”不兼容层。
+    target_state.update(matched_state)
+    model.load_state_dict(target_state)
+
+    logger.info(
+        "[PIV_A_Esrgan] RAFT128 initialized from RAFT256 checkpoint | "
+        f"checkpoint={checkpoint_path}, loaded={len(matched_state)}, skipped={len(skipped)}"
+    )
+    for name, source_shape, target_shape in skipped[:20]:
+        logger.info(
+            "[PIV_A_Esrgan] skipped RAFT256->RAFT128 weight | "
+            f"name={name}, source_shape={source_shape}, target_shape={target_shape}"
+        )
+    if len(skipped) > 20:
+        logger.info(f"[PIV_A_Esrgan] skipped weights truncated: {len(skipped) - 20} more")
+
+
+def _build_piv_raft(batch_size: int) -> nn.Module:
+    """
+    根据全局配置创建 piv_RAFT。
+
+    这个函数只替代原来硬编码的 RAFT128 实例化，不改变后续 forward / train_step 接口。
+    默认 RAFT_MODEL_TYPE="RAFT128"，因此用户不改配置时，行为与原来完全一致。
+    """
+    raft_model_type = global_data.esrgan.validate_raft_model_type()
+    if raft_model_type == "raft":
+        model = RAFT()
+    elif raft_model_type == "raft128":
+        model = RAFT128(upsample=global_data.esrgan.RAFT_UPSAMPLE, batch_size=batch_size)
+        _init_raft128_from_raft256_if_enabled(model)
+    elif raft_model_type == "raft256":
+        model = RAFT256(upsample=global_data.esrgan.RAFT_UPSAMPLE, batch_size=batch_size)
+    else:
+        # validate_raft_model_type 已经拦截非法值；这里保留防御式分支，便于未来扩展时定位问题。
+        raise ValueError(f"Unsupported RAFT_MODEL_TYPE: {global_data.esrgan.RAFT_MODEL_TYPE}")
+
+    logger.info(
+        "[PIV_A_Esrgan] piv_RAFT created | "
+        f"type={raft_model_type}, upsample={global_data.esrgan.RAFT_UPSAMPLE}"
+    )
+    return model
+
+
 class ESRuRAFT_PIV(nn.Module):
     """
     ESRuRAFT_PIV 主网络。
@@ -56,7 +156,7 @@ class ESRuRAFT_PIV(nn.Module):
             spectral_norm=global_data.esrgan.DISCRIMINATOR_SPECTRAL_NORM,
         )  # 初始化 A-ESRGAN 风格的时序 Attention U-Net 判别器
         self.piv_RAFT = (
-            RAFT128(upsample=global_data.esrgan.RAFT_UPSAMPLE,batch_size=batch_size)
+            _build_piv_raft(batch_size=batch_size)
             if self.use_raft
             else None
         )  # USE_RAFT=False 时不实例化 RAFT，避免无意义显存占用

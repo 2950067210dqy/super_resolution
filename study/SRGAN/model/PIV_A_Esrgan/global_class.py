@@ -119,7 +119,29 @@ class global_data:
              bicubic 上采样2倍 bicubic8 上采样8倍  #nn.Upsample(scale_factor=2, mode='bicubic')
              lanczos4 ->2*        lanczos4_8 ->2*->4*->8*    用的LanczosUpsampling模块
         """
+        # RAFT_MODEL_TYPE 控制 PIV_ESRGAN_RAFT_Model 里 self.piv_RAFT 的具体网络结构。
+        # 可选值：
+        # - "RAFT":    最早的基础 RAFT 实现，保持原接口；
+        # - "RAFT128": 内部在 1/4 分辨率估计光流，适合更细的相关体/GRU 网格；
+        # - "RAFT256": 内部在 1/8 分辨率估计光流，显存更省，和 ckpt_256.tar 的结构一致。
+        # 本分支之前硬编码为 RAFT128，所以默认仍为 "RAFT128"，保证旧实验不改配置时行为不变。
+        RAFT_MODEL_TYPES = ("raft", "raft128", "raft256")
+        RAFT_MODEL_TYPE = "RAFT128"
         RAFT_UPSAMPLE = 'convex'
+        # 仅 PIV_A_Esrgan 支持这个迁移开关：
+        # True 时，如果 RAFT_MODEL_TYPE="RAFT128"，会尝试把一个 RAFT256 checkpoint 中 shape 完全一致的权重
+        # 迁移到 RAFT128，shape 不一致的层会跳过并保留 RAFT128 自身随机初始化。
+        # 这不是无损迁移，尤其 update_block.mask.2 的 576 通道(8x8x9)无法直接装入 RAFT128 的
+        # 144 通道(4x4x9)，因此建议只作为预训练初始化，之后继续 fine-tune。
+        RAFT128_INIT_FROM_RAFT256 = False
+        #相对 SRGAN 根目录的路径；
+        RAFT128_INIT_FROM_RAFT256_CKPT = "RAFT_CHECKPOINT/ckpt_256.tar"
+        # 下列两个开关只在 RAFT128_INIT_FROM_RAFT256=True 时生效。
+        # optimizer 迁移会按参数名和 shape 做安全过滤：只迁移 shape 匹配参数的 AdamW 状态；
+        # scheduler 迁移则直接读取 checkpoint 里的 ReduceLROnPlateau 状态。
+        # 如果当前实验已经成功从 OUT_PUT_DIR 恢复了自己的 optimizer/scheduler，pipeline 会优先保留恢复结果。
+        RAFT128_INIT_FROM_RAFT256_OPTIMIZER = True
+        RAFT128_INIT_FROM_RAFT256_SCHEDULER = True
 
         # =========================
         # A-ESRGAN 风格判别器配置
@@ -130,7 +152,7 @@ class global_data:
         DISCRIMINATOR_BASE_CHANNELS = 32
         # 第一阶段建议保持 False，只使用单尺度 Attention U-Net，降低显存和训练震荡风险；
         # 如果单尺度稳定，再把它切成 True，启用 A-ESRGAN 类似的 1x + 2x 多尺度判别器。
-        DISCRIMINATOR_USE_MULTISCALE = False
+        DISCRIMINATOR_USE_MULTISCALE = True
         # spectral normalization 用来稳定 GAN 判别器，尤其适合当前 batch size 较小的颗粒图训练。
         DISCRIMINATOR_SPECTRAL_NORM = True
 
@@ -181,9 +203,6 @@ class global_data:
         LAMBDA_PIXEL_L1 = 0.5 # 像素L1权重 0.5；主重建项，保证整体亮度与局部数值不要漂
         LAMBDA_PIXEL_FFT = 0.004  # 频域重建约束，稳住颗粒尺度与高频分布；过大容易让结果发硬
         LAMBDA_PIXEL_MSE = 1e-3  # 像素MSE权重（当前基本未启用）
-        # =========================
-        # 图像对一致性损失超参数
-        # =========================
 
         # =========================
         # 结构相似性损失超参数
@@ -334,6 +353,32 @@ class global_data:
         START_TIME = time.time()
         #结束时间
         END_TIME = time.time()
+
+        @classmethod
+        def normalized_raft_model_type(cls) -> str:
+            """
+            返回规范化后的 RAFT 网络类型。
+
+            统一在配置层做 strip/lower，允许用户写 "RAFT128"、"raft128" 或带空格的值，
+            其它代码只依赖这个入口，避免不同文件里各自写字符串判断导致拼写不一致。
+            """
+            return str(cls.RAFT_MODEL_TYPE).strip().lower()
+
+        @classmethod
+        def validate_raft_model_type(cls) -> str:
+            """
+            校验 RAFT_MODEL_TYPE 是否属于允许的三种结构。
+
+            这里启动即报错，可以避免训练跑到模型实例化或 checkpoint 加载时才发现
+            "RAFT_128"、"raft-256" 这类拼写错误。
+            """
+            mode = cls.normalized_raft_model_type()
+            if mode not in cls.RAFT_MODEL_TYPES:
+                raise ValueError(
+                    f"RAFT_MODEL_TYPE 仅支持 {cls.RAFT_MODEL_TYPES}，当前为: {cls.RAFT_MODEL_TYPE}"
+                )
+            return mode
+
         @classmethod
         def _get_scheduled_weight(
                 cls,

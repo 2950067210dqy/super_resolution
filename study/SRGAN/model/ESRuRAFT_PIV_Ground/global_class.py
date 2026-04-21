@@ -53,7 +53,13 @@ class global_data:
                 将对抗损失最终权重改成0.0161；后续取消生成器侧自适应多任务权重，恢复为手动全局权重组合。
                 
                 ESRuRAFT_PIV_Ground v1 ：RAFT128+HR
+                ESRuRAFT_PIV_Ground v1_v1 ：RAFT128+bicubic
                 ESRuRAFT_PIV_Ground v2 ：RAFT256+HR
+                ESRuRAFT_PIV_Ground v2_v1 ：RAFT256+bicubic
+                ESRuRAFT_PIV_Ground v3 ：使用论文训练好的RAFT256+HR
+                ESRuRAFT_PIV_Ground v4 ：使用论文训练好的RAFT256+HR 重复实验 多了参数打印
+                ESRuRAFT_PIV_Ground v5 ：RAFT128（使用论文训练好的RAFT256部分迁移训练）+HR  
+                
            """
         #运行环境是否是autoDL
         IS_AUTO_DL = True
@@ -62,7 +68,7 @@ class global_data:
         # 训练任务标识
         # =========================
         name = "ESRuRAFT_PIV_Ground"  # 当前实验名（用于输出目录/模型名/wandb run名）
-        DESCRIPTION = "_v2"  # 实验补充描述（可写损失配置、数据版本等）
+        DESCRIPTION = "v2_v1"  # 实验补充描述（可写损失配置、数据版本等）
         name +=DESCRIPTION
 
         #整体项目注释
@@ -79,7 +85,7 @@ class global_data:
         # 4. "esrgan": 使用最原始的 ESRGAN 生成器先把 LR 超分到 HR，再把 SR 图像送入 RAFT。
         #    该模式保留 ESRGAN + RAFT 的联合训练路径，但超分模块不使用 ESRuRAFT_PIV 的改进结构。
         TRAIN_MODES = ("lr_ground", "hr_ground", "bicubic", "esrgan")
-        TRAIN_MODE = "hr_ground"
+        TRAIN_MODE = "bicubic"
 
         # 类别训练模式: "all" | "single" | "mixed"
         TRAIN_CLASS_MODE = "mixed"
@@ -122,6 +128,28 @@ class global_data:
              bicubic 上采样2倍 bicubic8 上采样8倍  #nn.Upsample(scale_factor=2, mode='bicubic')
              lanczos4 ->2*        lanczos4_8 ->2*->4*->8*    用的LanczosUpsampling模块
         """
+        # RAFT_MODEL_TYPE 控制 PIV_ESRGAN_RAFT_Model 里 self.piv_RAFT 的具体网络结构。
+        # 可选值：
+        # - "RAFT":    最早的基础 RAFT 实现；
+        # - "RAFT128": 内部在 1/4 分辨率估计光流；
+        # - "RAFT256": 内部在 1/8 分辨率估计光流。
+        # Ground 分支当前硬编码为 RAFT256，所以默认仍为 "RAFT256"，保证 ckpt_256 和旧实验逻辑不变。
+        RAFT_MODEL_TYPES = ("raft", "raft128", "raft256")
+        RAFT_MODEL_TYPE = "RAFT256"
+        # Ground 分支专用迁移学习开关：
+        # True 时，如果 RAFT_MODEL_TYPE="RAFT128"，会尝试把 RAFT256 checkpoint 中 shape 完全一致的权重
+        # 迁移到 RAFT128；shape 不一致的层会跳过并保留 RAFT128 自身随机初始化。
+        # 这不是无损迁移，尤其 update_block.mask.2 的 576 通道(8x8x9)无法直接装入 RAFT128 的
+        # 144 通道(4x4x9)，因此建议只作为预训练初始化，之后继续 fine-tune。
+        RAFT128_INIT_FROM_RAFT256 = True
+        #相对 SRGAN 根目录的路径；
+        RAFT128_INIT_FROM_RAFT256_CKPT = "RAFT_CHECKPOINT/ckpt_256.tar"
+        # 下列两个开关只在 RAFT128_INIT_FROM_RAFT256=True 时生效。
+        # optimizer 迁移会按参数名和 shape 做安全过滤：只迁移 shape 匹配参数的 AdamW 状态；
+        # scheduler 迁移则直接读取 checkpoint 里的 ReduceLROnPlateau 状态。
+        # 如果当前实验已经成功从 OUT_PUT_DIR 恢复了自己的 optimizer/scheduler，pipeline 会优先保留恢复结果。
+        RAFT128_INIT_FROM_RAFT256_OPTIMIZER = True
+        RAFT128_INIT_FROM_RAFT256_SCHEDULER = True
         RAFT_UPSAMPLE = 'convex'
 
         # =========================
@@ -299,6 +327,32 @@ class global_data:
         START_TIME = time.time()
         #结束时间
         END_TIME = time.time()
+
+        @classmethod
+        def normalized_raft_model_type(cls) -> str:
+            """
+            返回规范化后的 RAFT 网络类型。
+
+            统一在配置层做 strip/lower，允许用户写 "RAFT256"、"raft256" 或带空格的值，
+            其它代码只依赖这个入口，避免不同文件里各自写字符串判断导致拼写不一致。
+            """
+            return str(cls.RAFT_MODEL_TYPE).strip().lower()
+
+        @classmethod
+        def validate_raft_model_type(cls) -> str:
+            """
+            校验 RAFT_MODEL_TYPE 是否属于允许的三种结构。
+
+            这里启动即报错，可以避免训练跑到模型实例化或 checkpoint 加载时才发现
+            "RAFT_128"、"raft-256" 这类拼写错误。
+            """
+            mode = cls.normalized_raft_model_type()
+            if mode not in cls.RAFT_MODEL_TYPES:
+                raise ValueError(
+                    f"RAFT_MODEL_TYPE 仅支持 {cls.RAFT_MODEL_TYPES}，当前为: {cls.RAFT_MODEL_TYPE}"
+                )
+            return mode
+
         @classmethod
         def normalized_train_mode(cls) -> str:
             """

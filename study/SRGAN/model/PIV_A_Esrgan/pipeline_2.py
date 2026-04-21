@@ -62,6 +62,213 @@ def _format_dynamic_weight_for_log(value):
     return f"{float(value):.6f}"
 
 
+def _resolve_raft256_pretrain_path(path_text: str | Path) -> Path:
+    """
+    解析 PIV_A_Esrgan 的 RAFT256 预训练 checkpoint 路径。
+
+    global_class 里默认写成 "RAFT_CHECKPOINT/ckpt_256.tar"，表示相对 SRGAN 根目录。
+    这里统一转为绝对路径，避免从 PyCharm、命令行、notebook 等不同 cwd 启动时找错文件。
+    """
+    path = Path(path_text)
+    if path.is_absolute():
+        return path
+    srgan_root = Path(__file__).resolve().parents[2]
+    return srgan_root / path
+
+
+def _clone_optimizer_state_value(value):
+    """
+    深拷贝 optimizer/scheduler state 中的值。
+
+    AdamW state 里既有 tensor(exp_avg/exp_avg_sq)，也有 step、lr、betas 等普通值；
+    这里递归复制，避免直接引用 checkpoint 字典导致后续 optimizer 修改污染原始对象。
+    """
+    if torch.is_tensor(value):
+        return value.detach().clone()
+    if isinstance(value, dict):
+        return {key: _clone_optimizer_state_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_clone_optimizer_state_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_optimizer_state_value(item) for item in value)
+    return value
+
+
+def _optimizer_state_is_compatible(state_entry: dict, target_param: torch.nn.Parameter) -> bool:
+    """
+    判断 checkpoint 中某个参数的 optimizer state 能否迁移到当前 RAFT128 参数。
+
+    AdamW 的 exp_avg / exp_avg_sq 必须和目标参数 shape 完全一致；
+    step 这种 0 维 tensor 或普通数值可以迁移。若不做这个检查，RAFT256 的
+    update_block.mask.2 相关状态会在 optimizer.step() 时因为 576 vs 144 通道不匹配而报错。
+    """
+    for value in state_entry.values():
+        if torch.is_tensor(value) and value.ndim > 0 and value.shape != target_param.shape:
+            return False
+    return True
+
+
+def _migrate_raft_optimizer_from_raft256_checkpoint(
+    model: ESRuRAFT_PIV,
+    optimizer: torch.optim.Optimizer | None,
+    checkpoint: dict,
+) -> None:
+    """
+    将 RAFT256 checkpoint 中可兼容的 AdamW 状态迁移到当前 RAFT128 optimizer。
+
+    迁移策略：
+    1. 用 checkpoint["model_state_dict"] 的 key 顺序和 optimizer param_groups 里的参数 id 建立源参数名映射；
+    2. 用当前 model.piv_RAFT.named_parameters() 建立目标参数名映射；
+    3. 只迁移“同名 + 权重 shape 相同 + optimizer state shape 相同”的参数状态；
+    4. 不兼容参数保留当前 optimizer 的初始状态，后续训练会自然重新累计动量。
+    """
+    if optimizer is None or not bool(global_data.esrgan.RAFT128_INIT_FROM_RAFT256_OPTIMIZER):
+        return
+
+    source_state = checkpoint.get("model_state_dict")
+    source_optimizer_state = checkpoint.get("optimizer_state_dict")
+    if not isinstance(source_state, dict) or not isinstance(source_optimizer_state, dict):
+        logger.warning("[PIV_A_Esrgan] RAFT256 checkpoint 中没有可迁移的 optimizer_state_dict，跳过 optimizer 迁移。")
+        return
+
+    current_optimizer_state = optimizer.state_dict()
+    source_param_ids = [
+        param_id
+        for group in source_optimizer_state.get("param_groups", [])
+        for param_id in group.get("params", [])
+    ]
+    current_param_ids = [
+        param_id
+        for group in current_optimizer_state.get("param_groups", [])
+        for param_id in group.get("params", [])
+    ]
+    target_named_params = list(model.piv_RAFT.named_parameters())
+    target_name_to_id = {
+        name: param_id
+        for (name, _), param_id in zip(target_named_params, current_param_ids)
+    }
+    target_name_to_param = dict(target_named_params)
+
+    # state_dict 基本按 named_parameters 的顺序保存。这里只保留当前 RAFT128 也存在的名字，
+    # 即使 checkpoint 中未来出现 buffer 或额外字段，也不会参与 optimizer 状态迁移。
+    source_param_names = [name for name in source_state.keys() if name in target_name_to_param]
+    source_name_to_id = {
+        name: param_id
+        for name, param_id in zip(source_param_names, source_param_ids)
+    }
+
+    migrated_state = {}
+    skipped = []
+    for name, target_param in target_named_params:
+        source_value = source_state.get(name)
+        source_id = source_name_to_id.get(name)
+        target_id = target_name_to_id.get(name)
+        source_state_entry = source_optimizer_state.get("state", {}).get(source_id)
+        if (
+            source_id is not None
+            and target_id is not None
+            and torch.is_tensor(source_value)
+            and source_value.shape == target_param.shape
+            and isinstance(source_state_entry, dict)
+            and _optimizer_state_is_compatible(source_state_entry, target_param)
+        ):
+            migrated_state[target_id] = _clone_optimizer_state_value(source_state_entry)
+        else:
+            source_shape = tuple(source_value.shape) if torch.is_tensor(source_value) else None
+            skipped.append((name, source_shape, tuple(target_param.shape)))
+
+    # param_groups 保留当前 optimizer 的目标参数 id；lr/betas/weight_decay 等超参数使用 checkpoint 中的值，
+    # 这样“迁移 optimizer”时能延续 ckpt_256.tar 当时的学习率状态，同时不会引用旧模型参数 id。
+    migrated_groups = []
+    source_groups = source_optimizer_state.get("param_groups", [])
+    for idx, current_group in enumerate(current_optimizer_state.get("param_groups", [])):
+        migrated_group = dict(current_group)
+        if idx < len(source_groups):
+            for key, value in source_groups[idx].items():
+                if key != "params":
+                    migrated_group[key] = _clone_optimizer_state_value(value)
+        migrated_group["params"] = list(current_group["params"])
+        migrated_groups.append(migrated_group)
+
+    optimizer.load_state_dict({
+        "state": migrated_state,
+        "param_groups": migrated_groups,
+    })
+    logger.info(
+        "[PIV_A_Esrgan] RAFT optimizer initialized from RAFT256 checkpoint | "
+        f"migrated={len(migrated_state)}, skipped={len(skipped)}"
+    )
+    for name, source_shape, target_shape in skipped[:20]:
+        logger.info(
+            "[PIV_A_Esrgan] skipped RAFT optimizer state | "
+            f"name={name}, source_shape={source_shape}, target_shape={target_shape}"
+        )
+
+
+def _migrate_raft_scheduler_from_raft256_checkpoint(
+    scheduler: torch.optim.lr_scheduler.ReduceLROnPlateau | None,
+    checkpoint: dict,
+) -> None:
+    """
+    将 RAFT256 checkpoint 中的 scheduler 状态迁移到当前 RAFT128 scheduler。
+
+    ReduceLROnPlateau 的状态不包含参数形状，主要是 best、num_bad_epochs、last_epoch、_last_lr 等标量，
+    因此可以直接 load_state_dict。optimizer 的参数状态仍由上面的安全迁移函数单独处理。
+    """
+    if scheduler is None or not bool(global_data.esrgan.RAFT128_INIT_FROM_RAFT256_SCHEDULER):
+        return
+
+    scheduler_state = checkpoint.get("scheduler_state_dict")
+    if not isinstance(scheduler_state, dict):
+        logger.warning("[PIV_A_Esrgan] RAFT256 checkpoint 中没有 scheduler_state_dict，跳过 scheduler 迁移。")
+        return
+    scheduler.load_state_dict(scheduler_state)
+    logger.info("[PIV_A_Esrgan] RAFT scheduler initialized from RAFT256 checkpoint.")
+
+
+def _maybe_migrate_raft_optimizer_scheduler_from_raft256(
+    model: ESRuRAFT_PIV,
+    optimizer: torch.optim.Optimizer | None,
+    scheduler: torch.optim.lr_scheduler.ReduceLROnPlateau | None,
+    optimizer_loaded_from_resume: bool,
+    scheduler_loaded_from_resume: bool,
+) -> None:
+    """
+    在 PIV_A_Esrgan 中可选迁移 RAFT256 的 optimizer/scheduler 到 RAFT128。
+
+    只在以下条件同时满足时执行：
+    - USE_RAFT=True；
+    - RAFT_MODEL_TYPE="RAFT128"；
+    - RAFT128_INIT_FROM_RAFT256=True；
+    - 当前实验没有成功恢复自己的 RAFT optimizer/scheduler。
+
+    这样既满足“用 ckpt_256 做 RAFT128 预训练初始化”的需求，又不会覆盖已有断点恢复。
+    """
+    if not global_data.esrgan.USE_RAFT:
+        return
+    if global_data.esrgan.validate_raft_model_type() != "raft128":
+        return
+    if not bool(global_data.esrgan.RAFT128_INIT_FROM_RAFT256):
+        return
+
+    checkpoint_path = _resolve_raft256_pretrain_path(global_data.esrgan.RAFT128_INIT_FROM_RAFT256_CKPT)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"RAFT256 预训练 checkpoint 不存在: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    if not isinstance(checkpoint, dict):
+        raise ValueError(f"RAFT256 checkpoint 格式不正确: {checkpoint_path}")
+
+    if optimizer_loaded_from_resume:
+        logger.info("[PIV_A_Esrgan] 当前实验已恢复 RAFT optimizer，跳过 RAFT256 optimizer 迁移。")
+    else:
+        _migrate_raft_optimizer_from_raft256_checkpoint(model, optimizer, checkpoint)
+
+    if scheduler_loaded_from_resume:
+        logger.info("[PIV_A_Esrgan] 当前实验已恢复 RAFT scheduler，跳过 RAFT256 scheduler 迁移。")
+    else:
+        _migrate_raft_scheduler_from_raft256_checkpoint(scheduler, checkpoint)
+
+
 class ESRuRAFTPIVInferenceWrapper(nn.Module):
     """为联合模型 profiling 提供纯推理接口，避免把训练损失计算带进基准测试。"""
 
@@ -385,6 +592,11 @@ def main():
                 if global_data.esrgan.USE_RAFT
                 else None
             )
+            # 这两个标记用来保护已有断点恢复：
+            # 如果当前实验自己的 RAFT optimizer/scheduler 已经从 OUT_PUT_DIR 成功恢复，
+            # 后面就不再用 RAFT256 checkpoint 覆盖它们。
+            raft_optimizer_loaded_from_resume = False
+            raft_scheduler_loaded_from_resume = False
 
             #是否读取之前存储的优化器
             if global_data.esrgan.IS_LOAD_EXISTS_MODEL:
@@ -410,6 +622,7 @@ def main():
                     if os.path.exists(ESRuRAFT_PIV_RAFT_optimizer_save_path):
                         ESRuRAFT_PIV_model_RAFT_optimizeroptimizer.load_state_dict(
                             torch.load(ESRuRAFT_PIV_RAFT_optimizer_save_path, map_location=global_data.esrgan.device))
+                        raft_optimizer_loaded_from_resume = True
                         logger.info(
                             f"Loaded pretrained optimizer ESRuRAFT_PIV_RAFT_optimizer from {ESRuRAFT_PIV_RAFT_optimizer_save_path}")
                     else:
@@ -456,11 +669,23 @@ def main():
                     if os.path.exists(ESRuRAFT_PIV_raft_scheduler_save_path):
                         raft_scheduler.load_state_dict(
                             torch.load(ESRuRAFT_PIV_raft_scheduler_save_path, map_location=global_data.esrgan.device))
+                        raft_scheduler_loaded_from_resume = True
                         logger.info(
                             f"Loaded pretrained optimizer ESRuRAFT_PIV_raft_scheduler from {ESRuRAFT_PIV_raft_scheduler_save_path}")
                     else:
                         logger.info(
                             "No pretrained optimizer ESRuRAFT_PIV_raft_scheduler found. Starting training from scratch.")
+
+            # PIV_A_Esrgan 专用：当 RAFT_MODEL_TYPE="RAFT128" 且 RAFT128_INIT_FROM_RAFT256=True 时，
+            # 除了模型权重，RAFT optimizer / scheduler 也可以从 ckpt_256.tar 做安全迁移。
+            # 已经成功恢复当前实验断点时，上面的 loaded_from_resume 标记会阻止这里覆盖恢复结果。
+            _maybe_migrate_raft_optimizer_scheduler_from_raft256(
+                model=ESRuRAFT_PIV_model,
+                optimizer=ESRuRAFT_PIV_model_RAFT_optimizeroptimizer,
+                scheduler=raft_scheduler,
+                optimizer_loaded_from_resume=raft_optimizer_loaded_from_resume,
+                scheduler_loaded_from_resume=raft_scheduler_loaded_from_resume,
+            )
 
             ESRuRAFT_PIV_model_scaler = GradScaler()
 

@@ -379,6 +379,27 @@ def _prepare_image_pair_tensor_for_save(
     ).clamp(0, 1)
 
 
+def _batch_to_np_chw(tensor_bchw: torch.Tensor) -> np.ndarray:
+    """
+    将整个 batch 一次性转成 CPU numpy，形状保持为 [B,C,H,W]。
+
+    evaluate_all 会为每个样本同时保存 png/npy 并计算多个 numpy 指标。
+    旧写法在样本循环里多次调用 tensor.cpu().numpy()，每次都会触发一次
+    GPU/CPU 同步；batch 级转换会多占一些内存，但可以显著减少同步次数。
+    """
+    return tensor_bchw.detach().float().cpu().numpy()
+
+
+def _energy_spectrum_mse_from_curves(pred_curve: np.ndarray, gt_curve: np.ndarray) -> float:
+    """
+    复用已经算出的能量谱曲线计算 log1p 谱差 MSE。
+
+    原逻辑先调用 _energy_spectrum_mse，再调用 _energy_spectrum_curves 保存曲线，
+    等于同一张图重复做两次 FFT。这里保持公式完全一致，只把第二次 FFT 省掉。
+    """
+    return float(np.mean((np.log1p(pred_curve) - np.log1p(gt_curve)) ** 2))
+
+
 def _compute_flow_ref_max_rad(flow_gt_bchw: torch.Tensor) -> float:
     """
     用 GT 的 uv 通道统一计算彩色光流图的参考半径，
@@ -390,6 +411,22 @@ def _compute_flow_ref_max_rad(flow_gt_bchw: torch.Tensor) -> float:
     gt_v = flow_gt_bchw[:, 1]
     gt_mag_uv = torch.sqrt(gt_u * gt_u + gt_v * gt_v)
     return max(torch.quantile(gt_mag_uv.flatten(), 0.99).item(), 1e-6)
+
+
+def _compute_flow_ref_max_rad_batch(flow_gt_bchw: torch.Tensor) -> list[float]:
+    """
+    batch 级计算每个样本的光流彩图参考半径。
+
+    每个样本仍然使用自己 GT 的 0.99 分位数，输出颜色尺度与旧逻辑一致；
+    区别只是把 B 次 quantile/sync 合并为一次 batch 运算，更适合内存充足的全量评估。
+    """
+    if flow_gt_bchw.dim() != 4 or flow_gt_bchw.shape[1] < 2:
+        raise ValueError(f"Expected GT flow with shape [B, >=2, H, W], got {tuple(flow_gt_bchw.shape)}")
+    gt_u = flow_gt_bchw[:, 0]
+    gt_v = flow_gt_bchw[:, 1]
+    gt_mag_uv = torch.sqrt(gt_u * gt_u + gt_v * gt_v)
+    ref_max = torch.quantile(gt_mag_uv.flatten(1), 0.99, dim=1).clamp_min(1e-6)
+    return [float(v) for v in ref_max.detach().cpu().tolist()]
 
 
 def _flow_to_color_preview(flow_uv_bchw: torch.Tensor, ref_max_rad: float) -> torch.Tensor:
@@ -662,14 +699,25 @@ def _save_heatmap(arr_2d: np.ndarray, out_png: Path, title: str, cmap: str = "vi
     plt.close()
 
 
-def _compute_flow_error_maps(pred_bchw: torch.Tensor, gt_bchw: torch.Tensor) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def _compute_flow_error_maps(
+    pred_bchw: torch.Tensor,
+    gt_bchw: torch.Tensor,
+    pred_np_chw: np.ndarray | None = None,
+    gt_np_chw: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     统一计算水平位移误差、垂直位移误差、幅值(w)误差和端点误差图。
     """
-    pred_flow = pred_bchw if pred_bchw.shape[1] >= 3 else _flow_uv_to_uvw(pred_bchw)
-    gt_flow = gt_bchw if gt_bchw.shape[1] >= 3 else _flow_uv_to_uvw(gt_bchw)
-    pred_np = _to_np_chw(pred_flow[0])
-    gt_np = _to_np_chw(gt_flow[0])
+    if pred_np_chw is None or gt_np_chw is None:
+        # 兼容旧调用：没有传入 batch 级 numpy 缓存时，仍在函数内部完成转换。
+        # evaluate_all 的新路径会传入缓存，避免同一个样本在指标、npy、误差图里反复 cpu().numpy()。
+        pred_flow = pred_bchw if pred_bchw.shape[1] >= 3 else _flow_uv_to_uvw(pred_bchw)
+        gt_flow = gt_bchw if gt_bchw.shape[1] >= 3 else _flow_uv_to_uvw(gt_bchw)
+        pred_np = _to_np_chw(pred_flow[0])
+        gt_np = _to_np_chw(gt_flow[0])
+    else:
+        pred_np = pred_np_chw
+        gt_np = gt_np_chw
     delta_u = pred_np[0] - gt_np[0]
     delta_v = pred_np[1] - gt_np[1]
     delta_w = pred_np[2] - gt_np[2]
@@ -738,7 +786,14 @@ def _save_error_histogram(
     plt.close(fig)
 
 
-def _save_flow_error_visuals(pred_bchw: torch.Tensor, gt_bchw: torch.Tensor, out_dir: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def _save_flow_error_visuals(
+    pred_bchw: torch.Tensor,
+    gt_bchw: torch.Tensor,
+    out_dir: Path,
+    pred_np_chw: np.ndarray | None = None,
+    gt_np_chw: np.ndarray | None = None,
+    ref_max_rad: float | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     保存预测光流彩色图、u/v/w 三张 AEE 风格误差图、Δu/Δv 误差分布图、涡度误差图。
 
@@ -750,13 +805,20 @@ def _save_flow_error_visuals(pred_bchw: torch.Tensor, gt_bchw: torch.Tensor, out
     """
     pred_flow = pred_bchw if pred_bchw.shape[1] >= 3 else _flow_uv_to_uvw(pred_bchw)
     gt_flow = gt_bchw if gt_bchw.shape[1] >= 3 else _flow_uv_to_uvw(gt_bchw)
-    pred_np = _to_np_chw(pred_flow[0])
-    gt_np = _to_np_chw(gt_flow[0])
+    if pred_np_chw is None or gt_np_chw is None:
+        # 兼容旧调用，同时保证涡度 npy 与误差图使用同一份 CHW 数据。
+        pred_np = _to_np_chw(pred_flow[0])
+        gt_np = _to_np_chw(gt_flow[0])
+    else:
+        # evaluate_all 已经在 batch 维度做过 CPU 缓存，这里直接复用。
+        pred_np = pred_np_chw
+        gt_np = gt_np_chw
 
-    du, dv, dw, epe = _compute_flow_error_maps(pred_bchw, gt_bchw)
+    du, dv, dw, epe = _compute_flow_error_maps(pred_bchw, gt_bchw, pred_np, gt_np)
     aee = float(np.mean(epe))
 
-    ref_max_rad = _compute_flow_ref_max_rad(gt_flow)
+    if ref_max_rad is None:
+        ref_max_rad = _compute_flow_ref_max_rad(gt_flow)
     pred_color = _flow_to_color_preview(pred_flow[:, :2], ref_max_rad=ref_max_rad)
     gt_color = _flow_to_color_preview(gt_flow[:, :2], ref_max_rad=ref_max_rad)
     pred_color = _append_colorbar_sections_to_panel(
@@ -1286,7 +1348,7 @@ def evaluate_all(
             writer.writeheader()
             writer.writerows(mean_rows)
 
-    with torch.no_grad():
+    with torch.inference_mode():
         pbar = tqdm(
             data_loader,
             desc=f"{class_name} {data_type} scale_{int(SCALE * SCALE)} Validating(all)",
@@ -1342,6 +1404,43 @@ def evaluate_all(
             lr_next_up = F.interpolate(lr_next, size=hr_next.shape[2:], mode="nearest")
             # lr_up = F.interpolate(lr, size=hr.shape[2:], mode="nearest")
 
+            # evaluate_all 的耗时大头不只在网络 forward，还在每个样本反复做保存和 numpy 指标。
+            # 这里把 image_pair 分支的保存张量一次性裁剪/转 CPU，并把指标数组一次性缓存。
+            # 这样会占用更多内存，但用户机器内存充足时，可以减少大量逐样本 GPU->CPU 同步。
+            save_as_gray = global_data.esrgan.SAVE_AS_GRAY
+            image_pair_batches = {
+                "previous": {
+                    "lr": _prepare_image_pair_tensor_for_save(lr_prev_up, save_as_gray).detach().cpu(),
+                    "fake": _prepare_image_pair_tensor_for_save(fake_prev, save_as_gray).detach().cpu(),
+                    "hr": _prepare_image_pair_tensor_for_save(hr_prev, save_as_gray).detach().cpu(),
+                },
+                "next": {
+                    "lr": _prepare_image_pair_tensor_for_save(lr_next_up, save_as_gray).detach().cpu(),
+                    "fake": _prepare_image_pair_tensor_for_save(fake_next, save_as_gray).detach().cpu(),
+                    "hr": _prepare_image_pair_tensor_for_save(hr_next, save_as_gray).detach().cpu(),
+                },
+            }
+            for pair_cache in image_pair_batches.values():
+                pair_cache["fake_np"] = _batch_to_np_chw(pair_cache["fake"])
+                pair_cache["hr_np"] = _batch_to_np_chw(pair_cache["hr"])
+
+            if global_data.esrgan.USE_RAFT:
+                # flow 分支同样把每个 batch 的预测/真值缓存到 CPU：
+                # 1. fake_cpu / hr_cpu 继续用于原有 png 可视化函数；
+                # 2. fake_uvw_np_batch / hr_np_batch 直接用于 npy 保存和指标计算；
+                # 3. flow_ref_max_rads 提前按 batch 计算，避免 flow_triplet 和 pred_flow/gt_flow 重复 quantile。
+                flow_ref_max_rads = _compute_flow_ref_max_rad_batch(hr)
+                fake_cpu = fake.detach().cpu()
+                fake_uvw_cpu = fake_uvw.detach().cpu()
+                hr_cpu = hr.detach().cpu()
+                fake_uvw_np_batch = _batch_to_np_chw(fake_uvw_cpu)
+                hr_np_batch = _batch_to_np_chw(hr_cpu)
+            else:
+                # SR-only 评估不产生 flow 输出，保留这些占位变量只为让下面的分支逻辑更清晰。
+                flow_ref_max_rads = []
+                fake_cpu = fake_uvw_cpu = hr_cpu = None
+                fake_uvw_np_batch = hr_np_batch = None
+
             B = hr.shape[0]
             for i in range(B):
                 sample_bucket = bucket_class_name(batch_class_names[i] if i < len(batch_class_names) else None)
@@ -1353,21 +1452,13 @@ def evaluate_all(
                 one_dir.mkdir(parents=True, exist_ok=True)
 
                 # 保存 previous / next 两个超分结果。
-                for pair_type, lr1_up, fk1, hr1 in [
-                    ("previous", lr_prev_up[i:i + 1], fake_prev[i:i + 1], hr_prev[i:i + 1]),
-                    ("next", lr_next_up[i:i + 1], fake_next[i:i + 1], hr_next[i:i + 1]),
-                ]:
+                for pair_type, pair_cache in image_pair_batches.items():
                     pair_dir = one_dir / pair_type
                     pair_dir.mkdir(parents=True, exist_ok=True)
 
-                    lr_save = _prepare_image_pair_tensor_for_save(lr1_up, global_data.esrgan.SAVE_AS_GRAY)
-                    fk_save = _prepare_image_pair_tensor_for_save(fk1, global_data.esrgan.SAVE_AS_GRAY)
-                    hr_save = _prepare_image_pair_tensor_for_save(hr1, global_data.esrgan.SAVE_AS_GRAY)
-
-                    # 频谱等数值指标继续复用统一通道选择后的结果，避免保存和计算口径不一致。
-                    lr_eval = lr_save
-                    fk_eval = fk_save
-                    hr_eval = hr_save
+                    lr_save = pair_cache["lr"][i:i + 1]
+                    fk_save = pair_cache["fake"][i:i + 1]
+                    hr_save = pair_cache["hr"][i:i + 1]
 
                     save_image(lr_save, str(pair_dir / "lr.png"), normalize=False)
                     save_image(fk_save, str(pair_dir / "fake.png"), normalize=False)
@@ -1375,16 +1466,17 @@ def evaluate_all(
 
                     _save_triplet(lr_save, fk_save, hr_save, pair_dir / "image_triplet.png")
 
-                    p_img = _to_np_chw(fk_eval[0])
-                    g_img = _to_np_chw(hr_eval[0])
+                    # 指标直接使用 batch 级 numpy 缓存，避免每张 previous/next 图再次触发 CPU 拷贝。
+                    p_img = pair_cache["fake_np"][i]
+                    g_img = pair_cache["hr_np"][i]
                     mse_img = _mse(p_img, g_img)
                     psnr_img = _psnr_from_mse(mse_img)
-                    es_mse_img = _energy_spectrum_mse(p_img, g_img)
                     r2_img = _r2_score(p_img, g_img)
                     ssim_img = _ssim_score(p_img, g_img)
                     tke_img = _tke_reconstruction_accuracy(p_img, g_img)
                     nrmse_img = _nrmse(p_img, g_img)
                     pred_curve, gt_curve = _energy_spectrum_curves(p_img, g_img)
+                    es_mse_img = _energy_spectrum_mse_from_curves(pred_curve, gt_curve)
                     np.save(pair_dir / "energy_spectrum_pred.npy", pred_curve.astype(np.float32))
                     np.save(pair_dir / "energy_spectrum_gt.npy", gt_curve.astype(np.float32))
                     _save_energy_spectrum_plot(pred_curve, gt_curve, pair_dir / "energy_spectrum_compare.png", title=f"{sid}-{pair_type} Energy Spectrum")
@@ -1415,16 +1507,18 @@ def evaluate_all(
                 # 保存流场预测及误差分析结果。
                 # lr1 = lr[i:i + 1]
                 # lr_up1 = lr_up[i:i + 1]
-                fk1 = fake[i:i + 1]
-                fk1_uvw = fake_uvw[i:i + 1]
-                hr1 = hr[i:i + 1]
+                fk1 = fake_cpu[i:i + 1]
+                fk1_uvw = fake_uvw_cpu[i:i + 1]
+                hr1 = hr_cpu[i:i + 1]
+                p = fake_uvw_np_batch[i]
+                g = hr_np_batch[i]
 
                 # np.save(one_dir / "lr_flo.npy", _to_np_chw(lr1[0]).transpose(1, 2, 0))
                 # 保存三通道预测流场 [u, v, magnitude]，便于和三通道真值直接对比。
-                np.save(one_dir / "fake_flo.npy", _to_np_chw(fk1_uvw[0]).transpose(1, 2, 0))
-                np.save(one_dir / "hr_flo.npy", _to_np_chw(hr1[0]).transpose(1, 2, 0))
+                np.save(one_dir / "fake_flo.npy", p.transpose(1, 2, 0))
+                np.save(one_dir / "hr_flo.npy", g.transpose(1, 2, 0))
 
-                ref_max_rad = _compute_flow_ref_max_rad(hr1)
+                ref_max_rad = flow_ref_max_rads[i]
 
                 # lr_color, _ = flow_to_color_tensor(lr_up1[:, :2], ref_max_rad=ref_max_rad)
                 fk_color = _flow_to_color_preview(fk1[:, :2], ref_max_rad=ref_max_rad)
@@ -1458,14 +1552,14 @@ def evaluate_all(
                     column_widths=[fk1_uvw.shape[-1], hr1.shape[-1]],
                     column_separator_widths=[6],
                 )
-                hr_min = hr1[:, :3].amin(dim=(0, 2, 3))
-                hr_max = hr1[:, :3].amax(dim=(0, 2, 3))
+                hr_min = g[:3].min(axis=(1, 2))
+                hr_max = g[:3].max(axis=(1, 2))
                 uvs_panel = _append_colorbar_sections_to_panel(
                     uvs_panel,
                     [
-                        {"vmin": float(hr_min[0].item()), "vmax": float(hr_max[0].item()), "cmap": "jet", "label": "U"},
-                        {"vmin": float(hr_min[1].item()), "vmax": float(hr_max[1].item()), "cmap": "jet", "label": "V"},
-                        {"vmin": float(hr_min[2].item()), "vmax": float(hr_max[2].item()), "cmap": "jet", "label": "W"},
+                        {"vmin": float(hr_min[0]), "vmax": float(hr_max[0]), "cmap": "jet", "label": "U"},
+                        {"vmin": float(hr_min[1]), "vmax": float(hr_max[1]), "cmap": "jet", "label": "V"},
+                        {"vmin": float(hr_min[2]), "vmax": float(hr_max[2]), "cmap": "jet", "label": "W"},
                     ],
                     top_margin=22,
                     section_heights=[fk1_uvw.shape[-2], fk1_uvw.shape[-2], fk1_uvw.shape[-2]],
@@ -1475,7 +1569,14 @@ def evaluate_all(
                 # 涡度图内部实际只依赖前两个通道 uv，这里传三通道预测和真值保持接口一致。
                 save_vorticity_quiver_compare(fk1_uvw, hr1, str(one_dir / "vorticity_quiver.png"), stride=stride)
                 # 额外保存 AEE 误差图、涡度误差图，并返回像素级误差用于统计分布。
-                delta_u_map, delta_v_map, delta_w_map, epe_map = _save_flow_error_visuals(fk1, hr1, one_dir)
+                delta_u_map, delta_v_map, delta_w_map, epe_map = _save_flow_error_visuals(
+                    fk1,
+                    hr1,
+                    one_dir,
+                    pred_np_chw=p,
+                    gt_np_chw=g,
+                    ref_max_rad=ref_max_rad,
+                )
 
                 # 逐样本保存 Δu / Δv / EPE 分布。
                 # Δu、Δv 直方图都以 0 为中心，便于横向比较水平/垂直位移误差。
@@ -1501,20 +1602,18 @@ def evaluate_all(
                 epe_hist_by_class[sample_bucket].append(epe_map.reshape(-1))
 
                 # 数值指标对比统一使用三通道 [u, v, magnitude]。
-                p = _to_np_chw(fk1_uvw[0])
-                g = _to_np_chw(hr1[0])
-
+                # p/g 已经来自 batch 级 numpy 缓存；AEE 和每 100 像素 EPE 直接复用上面生成的 epe_map。
                 mse = _mse(p, g)
                 psnr = _psnr_from_mse(mse)
-                es_mse = _energy_spectrum_mse(p, g)
-                aee = _compute_aee_from_chw(p, g)
-                norm_aee_per100 = _compute_norm_aee_per100_from_chw(p, g)
+                aee = float(np.mean(epe_map))
+                norm_aee_per100 = _mean_sum_per_100_pixels(epe_map, group_size=100)
                 r2 = _r2_score(p, g)
                 ssim = _ssim_score(p, g)
                 tke = _tke_reconstruction_accuracy(p, g)
                 nrmse = _nrmse(p, g)
 
                 pred_curve, gt_curve = _energy_spectrum_curves(p, g)
+                es_mse = _energy_spectrum_mse_from_curves(pred_curve, gt_curve)
                 np.save(one_dir / "energy_spectrum_pred.npy", pred_curve.astype(np.float32))
                 np.save(one_dir / "energy_spectrum_gt.npy", gt_curve.astype(np.float32))
                 np.save(one_dir / "flow_energy_spectrum_pred.npy", pred_curve.astype(np.float32))

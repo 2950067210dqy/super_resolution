@@ -32,6 +32,25 @@ except:
         def __exit__(self, *args):
             pass
 
+
+def _build_piv_raft(batch_size: int) -> nn.Module:
+    """
+    根据 global_data.esrgan.RAFT_MODEL_TYPE 创建 piv_RAFT。
+
+    这个函数只替代原来硬编码的 RAFT128 实例化，不改变后续 forward / train_step 接口。
+    默认 RAFT_MODEL_TYPE="RAFT128"，因此用户不改配置时，行为与原来完全一致。
+    """
+    raft_model_type = global_data.esrgan.validate_raft_model_type()
+    if raft_model_type == "raft":
+        return RAFT()
+    if raft_model_type == "raft128":
+        return RAFT128(upsample=global_data.esrgan.RAFT_UPSAMPLE, batch_size=batch_size)
+    if raft_model_type == "raft256":
+        return RAFT256(upsample=global_data.esrgan.RAFT_UPSAMPLE, batch_size=batch_size)
+    # validate_raft_model_type 已经拦截非法值；这里保留防御式分支，便于未来扩展时定位问题。
+    raise ValueError(f"Unsupported RAFT_MODEL_TYPE: {global_data.esrgan.RAFT_MODEL_TYPE}")
+
+
 class ESRuRAFT_PIV(nn.Module):
     """
     ESRuRAFT_PIV 主网络。
@@ -46,7 +65,7 @@ class ESRuRAFT_PIV(nn.Module):
 
         self.piv_esrgan_generator = Generator(inner_chanel=inner_chanel)  # 初始化超分生成器，输入 LR 图像对，输出 SR 图像对
         self.piv_esrgan_discriminator = Discriminator(inner_chanel=inner_chanel)  # 初始化判别器，用于区分 SR 图像和真实 HR 图像
-        self.piv_RAFT = RAFT128(upsample=global_data.esrgan.RAFT_UPSAMPLE,batch_size=batch_size)  # 初始化 RAFT128，在 1/4 分辨率上预测 PIV/光流场
+        self.piv_RAFT = _build_piv_raft(batch_size=batch_size)  # 按 RAFT_MODEL_TYPE 选择 RAFT / RAFT128 / RAFT256
 
         # Generator 侧 FAMO 只在 USE_FAMO=True 时启用。
         # 默认保持 None，训练就会完全走手动权重组合，不改变当前实验行为。

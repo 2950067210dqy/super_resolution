@@ -92,6 +92,14 @@ class global_data:
              bicubic 上采样2倍 bicubic8 上采样8倍  #nn.Upsample(scale_factor=2, mode='bicubic')
              lanczos4 ->2*        lanczos4_8 ->2*->4*->8*    用的LanczosUpsampling模块
         """
+        # RAFT_MODEL_TYPE 控制 PIV_ESRGAN_RAFT_Model 里 self.piv_RAFT 的具体网络结构。
+        # 可选值：
+        # - "RAFT":    最早的基础 RAFT 实现；
+        # - "RAFT128": 内部在 1/4 分辨率估计光流；
+        # - "RAFT256": 内部在 1/8 分辨率估计光流。
+        # 本分支之前硬编码为 RAFT128，所以默认仍为 "RAFT128"，保证旧实验不改配置时行为不变。
+        RAFT_MODEL_TYPES = ("raft", "raft128", "raft256")
+        RAFT_MODEL_TYPE = "RAFT128"
         RAFT_UPSAMPLE = 'convex'
 
         # =========================
@@ -272,6 +280,32 @@ class global_data:
         START_TIME = time.time()
         #结束时间
         END_TIME = time.time()
+
+        @classmethod
+        def normalized_raft_model_type(cls) -> str:
+            """
+            返回规范化后的 RAFT 网络类型。
+
+            统一在配置层做 strip/lower，允许用户写 "RAFT128"、"raft128" 或带空格的值，
+            其它代码只依赖这个入口，避免不同文件里各自写字符串判断导致拼写不一致。
+            """
+            return str(cls.RAFT_MODEL_TYPE).strip().lower()
+
+        @classmethod
+        def validate_raft_model_type(cls) -> str:
+            """
+            校验 RAFT_MODEL_TYPE 是否属于允许的三种结构。
+
+            这里启动即报错，可以避免训练跑到模型实例化时才发现
+            "RAFT_128"、"raft-256" 这类拼写错误。
+            """
+            mode = cls.normalized_raft_model_type()
+            if mode not in cls.RAFT_MODEL_TYPES:
+                raise ValueError(
+                    f"RAFT_MODEL_TYPE 仅支持 {cls.RAFT_MODEL_TYPES}，当前为: {cls.RAFT_MODEL_TYPE}"
+                )
+            return mode
+
         @classmethod
         def _get_scheduled_weight(
                 cls,
