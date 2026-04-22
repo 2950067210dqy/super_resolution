@@ -54,7 +54,8 @@ class global_data:
                 ESRuRAFT_PIV_v8_v1 改FAMO初始权重
                 ESRuRAFT_PIV_v8_v2：去除FAMO权重
                 
-                PIV_A_Esrgan v1:将判别器更改为A-ESRGAN的判别器
+                PIV_A_Esrgan v1:ESRuRAFT_PIV_v8基础上将判别器更改为A-ESRGAN的判别器
+                PIV_A_Esrgan v2:PIV_A_Esrgan v1基础上RAFT128（使用论文训练好的RAFT256部分迁移训练） 
            """
         #运行环境是否是autoDL
         IS_AUTO_DL = True
@@ -63,7 +64,7 @@ class global_data:
         # 训练任务标识
         # =========================
         name = "PIV_A_Esrgan"  # 当前实验名（用于输出目录/模型名/wandb run名）
-        DESCRIPTION = "_v1"  # 实验补充描述（可写损失配置、数据版本等）
+        DESCRIPTION = "_v2"  # 实验补充描述（可写损失配置、数据版本等）
         name +=DESCRIPTION
 
         #整体项目注释
@@ -133,7 +134,7 @@ class global_data:
         # 迁移到 RAFT128，shape 不一致的层会跳过并保留 RAFT128 自身随机初始化。
         # 这不是无损迁移，尤其 update_block.mask.2 的 576 通道(8x8x9)无法直接装入 RAFT128 的
         # 144 通道(4x4x9)，因此建议只作为预训练初始化，之后继续 fine-tune。
-        RAFT128_INIT_FROM_RAFT256 = False
+        RAFT128_INIT_FROM_RAFT256 = True
         #相对 SRGAN 根目录的路径；
         RAFT128_INIT_FROM_RAFT256_CKPT = "RAFT_CHECKPOINT/ckpt_256.tar"
         # 下列两个开关只在 RAFT128_INIT_FROM_RAFT256=True 时生效。

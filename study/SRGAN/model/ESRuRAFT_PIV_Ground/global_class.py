@@ -68,7 +68,7 @@ class global_data:
         # 训练任务标识
         # =========================
         name = "ESRuRAFT_PIV_Ground"  # 当前实验名（用于输出目录/模型名/wandb run名）
-        DESCRIPTION = "v2_v1"  # 实验补充描述（可写损失配置、数据版本等）
+        DESCRIPTION = "v1_v1"  # 实验补充描述（可写损失配置、数据版本等）
         name +=DESCRIPTION
 
         #整体项目注释
@@ -135,21 +135,21 @@ class global_data:
         # - "RAFT256": 内部在 1/8 分辨率估计光流。
         # Ground 分支当前硬编码为 RAFT256，所以默认仍为 "RAFT256"，保证 ckpt_256 和旧实验逻辑不变。
         RAFT_MODEL_TYPES = ("raft", "raft128", "raft256")
-        RAFT_MODEL_TYPE = "RAFT256"
+        RAFT_MODEL_TYPE = "RAFT128"
         # Ground 分支专用迁移学习开关：
         # True 时，如果 RAFT_MODEL_TYPE="RAFT128"，会尝试把 RAFT256 checkpoint 中 shape 完全一致的权重
         # 迁移到 RAFT128；shape 不一致的层会跳过并保留 RAFT128 自身随机初始化。
         # 这不是无损迁移，尤其 update_block.mask.2 的 576 通道(8x8x9)无法直接装入 RAFT128 的
         # 144 通道(4x4x9)，因此建议只作为预训练初始化，之后继续 fine-tune。
-        RAFT128_INIT_FROM_RAFT256 = True
+        RAFT128_INIT_FROM_RAFT256 = False
         #相对 SRGAN 根目录的路径；
         RAFT128_INIT_FROM_RAFT256_CKPT = "RAFT_CHECKPOINT/ckpt_256.tar"
         # 下列两个开关只在 RAFT128_INIT_FROM_RAFT256=True 时生效。
         # optimizer 迁移会按参数名和 shape 做安全过滤：只迁移 shape 匹配参数的 AdamW 状态；
         # scheduler 迁移则直接读取 checkpoint 里的 ReduceLROnPlateau 状态。
         # 如果当前实验已经成功从 OUT_PUT_DIR 恢复了自己的 optimizer/scheduler，pipeline 会优先保留恢复结果。
-        RAFT128_INIT_FROM_RAFT256_OPTIMIZER = True
-        RAFT128_INIT_FROM_RAFT256_SCHEDULER = True
+        RAFT128_INIT_FROM_RAFT256_OPTIMIZER = False
+        RAFT128_INIT_FROM_RAFT256_SCHEDULER = False
         RAFT_UPSAMPLE = 'convex'
 
         # =========================
