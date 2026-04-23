@@ -20,12 +20,13 @@ from study.SRGAN.compute_cost import (
     estimate_flops_for_inputs,
     measure_peak_memory_for_inputs,
 )
-from study.SRGAN.data_load import get_class_names, load_data, save_loaders_paths
+from study.SRGAN.data_load import filter_excluded_class_names, get_class_names, load_data, save_loaders_paths
 
 
 
 from study.SRGAN.model.ESRuRAFT_PIV.Module.PIV_ESRGAN_RAFT_Model import ESRuRAFT_PIV
 from study.SRGAN.model.ESRuRAFT_PIV.evaluate import evaluate, evaluate_all
+from study.SRGAN.model.ESRuRAFT_PIV.test import test_all
 from study.SRGAN.util.famo_weight_logger import save_famo_weight_snapshot
 from study.SRGAN.model.ESRuRAFT_PIV.global_class import global_data
 from study.SRGAN.model.ESRuRAFT_PIV.train import esrgan_union_RAFT_train
@@ -232,11 +233,24 @@ def main():
 
     logger.info(f"一共{len(available_class_names)}个类别：{available_class_names}")
 
-    # 训练模式: all | single | mixed
-    mode = global_data.esrgan.TRAIN_CLASS_MODE.lower().strip()
-    if mode not in {"all", "single", "mixed"}:
-        logger.error(f'TRAIN_CLASS_MODE 仅支持 all/single/mixed，当前为: {global_data.esrgan.TRAIN_CLASS_MODE}')
-        raise ValueError(f"TRAIN_CLASS_MODE 仅支持 all/single/mixed，当前为: {global_data.esrgan.TRAIN_CLASS_MODE}")
+    # 训练模式: all | single | mixed | fixed
+    # 统一通过 global_class 的校验入口读取，避免新增 fixed 后各 pipeline 的字符串判断不一致。
+    mode = global_data.esrgan.validate_train_class_mode()
+    if mode == "fixed":
+        # fixed 模式下，真实划分由 FlowData_train/test.list 决定。
+        # 这里先按 list 行数同步比例超参数，只用于日志、wandb 和 hyper_parameters.txt 展示。
+        global_data.esrgan.update_fixed_split_rates()
+        # hyper_parameters.txt 在上面已经按默认比例写过一次；fixed 需要覆盖为 list 行数反推后的真实比例。
+        global_data.esrgan.save_hyper_parameters_txt(f"{global_data.esrgan.OUT_PUT_DIR}/hyper_parameters.txt")
+    if mode in {"all", "mixed", "fixed"}:
+        # EXCLUDE_CLASS 只对 all/mixed/fixed 生效：这里先过滤任务列表，
+        # 后面 load_data 也会收到同一份排除配置，确保真正的数据收集阶段不读取这些类别。
+        available_class_names = filter_excluded_class_names(
+            available_class_names,
+            global_data.esrgan.EXCLUDE_CLASS,
+            context=f"{global_data.esrgan.name}:{mode}",
+        )
+        logger.info(f"排除类别后剩余{len(available_class_names)}个类别：{available_class_names}")
 
     run_jobs = []
     if mode == "all":
@@ -247,9 +261,12 @@ def main():
         chosen = select_single_class(available_class_names, global_data.esrgan.SINGLE_CLASS_NAME)
         # 每个类别读取数据并且训练验证和保存模型
         run_jobs.append({"run_class_name": chosen, "selected_classes": [chosen]})
-    else:
+    elif mode == "mixed":
         # 每个类别读取数据并且训练验证和保存模型
         run_jobs.append({"run_class_name": global_data.esrgan.MIXED_CLASS_TAG, "selected_classes": None})
+    else:
+        # fixed 只训练一个任务：先收集所有类别，再由 data_load 按两个 list 文件固定筛选 train/validate。
+        run_jobs.append({"run_class_name": global_data.esrgan.FIXED_CLASS_TAG, "selected_classes": None})
 
     for job in run_jobs:
         class_name = job["run_class_name"]
@@ -263,14 +280,19 @@ def main():
                 gr_data_root_dir=global_data.esrgan.GR_DATA_ROOT_DIR,
                 lr_data_root_dir=f"{global_data.esrgan.LR_DATA_ROOT_DIR}/x{int(SCALE * SCALE)}/data",
                 batch_size=global_data.esrgan.BATCH_SIZE,
-                shuffle=global_data.esrgan.SHUFFLE,
+                # fixed 模式必须保留 FlowData_train.list 的顺序，因此无论 SHUFFLE 如何配置都传 False。
+                shuffle=False if mode == "fixed" else global_data.esrgan.SHUFFLE,
                 target_size=global_data.esrgan.TARGET_SIZE,
                 train_nums_rate=global_data.esrgan.Train_nums_rate,
                 validate_nums_rate=global_data.esrgan.Validate_nums_rate,
                 test_nums_rate=global_data.esrgan.Test_nums_rate,
                 random_seed=global_data.esrgan.RANDOM_SEED,
                 selected_classes=selected_classes,
+                excluded_classes=global_data.esrgan.EXCLUDE_CLASS if mode in {"all", "mixed", "fixed"} else None,
                 class_sample_ratio=global_data.esrgan.CLASS_SAMPLE_RATIO,
+                fixed_split=mode == "fixed",
+                fixed_train_list_path=global_data.esrgan.FIXED_TRAIN_LIST_PATH,
+                fixed_validate_list_path=global_data.esrgan.FIXED_VALIDATE_LIST_PATH,
                 return_test_loader=True
             )
             # 每个类别的图像对和flo文件分别训练验证和保存模型 ！！！！！已经去除
@@ -584,18 +606,39 @@ def main():
             """
             验证集全部验证一遍 start
             """
-            evaluate_all(
-                model = ESRuRAFT_PIV_model,
-                data_loader=validate_loader,
-                class_name=class_name,
-                data_type=data_type,
-                SCALE=SCALE,
-                output_root=f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.PREDICT_ALL_DIR}",
-                metrics_csv_path=f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.PREDICT_ALL_DIR}/metrics_all.csv",
-                stride=6,
-            )
+            if global_data.esrgan.IS_VALIDATE_ALL:
+                # 完整验证可能比较耗时，使用 IS_VALIDATE_ALL 做总开关；默认 True，保持原有流程。
+                evaluate_all(
+                    model = ESRuRAFT_PIV_model,
+                    data_loader=validate_loader,
+                    class_name=class_name,
+                    data_type=data_type,
+                    SCALE=SCALE,
+                    output_root=f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.PREDICT_ALL_DIR}",
+                    metrics_csv_path=f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.PREDICT_ALL_DIR}/metrics_all.csv",
+                    stride=6,
+                )
+            else:
+                logger.info("IS_VALIDATE_ALL=False，跳过 evaluate_all 完整验证。")
             """
             验证集全部验证一遍 end
+            """
+            """
+            RAFT256-PIV 风格 TFRecord 全数据集测试 start
+            """
+            if global_data.esrgan.IS_TEST:
+                # test_all 使用单 GPU 顺序测试 TEST_DATASETS；默认 IS_TEST=False，不改变原训练流程。
+                test_all(
+                    model=ESRuRAFT_PIV_model,
+                    class_name=class_name,
+                    data_type=data_type,
+                    SCALE=SCALE,
+                    device=global_data.esrgan.device,
+                )
+            else:
+                logger.info("IS_TEST=False，跳过 test_all TFRecord 全数据集测试。")
+            """
+            RAFT256-PIV 风格 TFRecord 全数据集测试 end
             """
             """
             保存 训练集 验证集 测试集的引用地址json合集 方便查看用了哪些数据 而且也可以重新load 

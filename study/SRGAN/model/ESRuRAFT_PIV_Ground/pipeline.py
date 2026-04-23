@@ -20,12 +20,13 @@ from study.SRGAN.compute_cost import (
     estimate_flops_for_inputs,
     measure_peak_memory_for_inputs,
 )
-from study.SRGAN.data_load import get_class_names, load_data, save_loaders_paths
+from study.SRGAN.data_load import filter_excluded_class_names, get_class_names, load_data, save_loaders_paths
 
 
 
 from study.SRGAN.model.ESRuRAFT_PIV_Ground.Module.PIV_ESRGAN_RAFT_Model import ESRuRAFT_PIV
 from study.SRGAN.model.ESRuRAFT_PIV_Ground.evaluate import evaluate, evaluate_all
+from study.SRGAN.model.ESRuRAFT_PIV_Ground.test import test_all
 from study.SRGAN.model.ESRuRAFT_PIV_Ground.global_class import global_data
 from study.SRGAN.model.ESRuRAFT_PIV_Ground.train import esrgan_union_RAFT_train
 from study.SRGAN.util.CSV_operator import CsvTable
@@ -52,7 +53,7 @@ def _trainable_parameters_or_dummy(module: nn.Module, device: torch.device):
     """
     返回模块的可训练参数；如果模块没有参数，则返回一个 optimizer 专用 dummy 参数。
 
-    lr_ground/hr_ground/bicubic 下 Generator/Discriminator 是 nn.Identity，没有任何参数。
+    lr_ground_raft/hr_ground_raft/bicubic_raft/bicubic_widim/bicubic_hs 下 Generator/Discriminator 是 nn.Identity，没有任何参数。
     PyTorch optimizer 不接受空参数列表，因此这里创建一个不属于模型的 0 维 dummy 参数：
     - 它不会计入模型参数量；
     - train_step 的 ground 分支不会使用 G/D optimizer；
@@ -279,37 +280,27 @@ class ESRuRAFTPIVInferenceWrapper(nn.Module):
         # Inference Time 的标准口径只包含 forward。
         # 这里不调用完整 model.forward，因为 forward 会额外计算图像损失/判别器损失。
         # profiling 只需要“当前 TRAIN_MODE 的图像来源 + RAFT 推理”这条主链路。
-        if self.model.train_mode == "lr_ground":
-            pred_prev = self.model._resize_image_to_target(input_lr_prev, input_gr_prev, mode="nearest")
-            pred_next = self.model._resize_image_to_target(input_lr_next, input_gr_next, mode="nearest")
-            # lr_ground 不经过超分网络，但 profiling 时也要和训练一致：
-            # 先把 LR 用最近邻插值对齐到 HR/RAFT 尺寸，再送入 RAFT。
-            raft_prev_source = pred_prev
-            raft_next_source = pred_next
-        elif self.model.train_mode == "bicubic":
-            # bicubic 是传统插值超分 baseline，同样不经过 Generator。
-            # 这里用双三次插值把 LR 放大到 HR/RAFT 尺寸，再把结果送入 RAFT；
-            # profiling 口径必须和真实 train_step 保持一致。
-            pred_prev = self.model._resize_image_to_target(input_lr_prev, input_gr_prev, mode="bicubic")
-            pred_next = self.model._resize_image_to_target(input_lr_next, input_gr_next, mode="bicubic")
-            raft_prev_source = pred_prev
-            raft_next_source = pred_next
-        elif self.model.train_mode == "hr_ground":
-            pred_prev = input_gr_prev
-            pred_next = input_gr_next
-            raft_prev_source = input_gr_prev
-            raft_next_source = input_gr_next
-        else:
-            pred_prev = self.model.piv_esrgan_generator(input_lr_prev)
-            pred_next = self.model.piv_esrgan_generator(input_lr_next)
-            raft_prev_source = pred_prev
-            raft_next_source = pred_next
-
-        flow_predictions, _ = self.model._compute_raft_branch(
-            raft_prev_source=raft_prev_source,
-            raft_next_source=raft_next_source,
+        pred_prev, pred_next, piv_prev_source, piv_next_source, _ = self.model._compute_sr_branch(
+            input_lr_prev=input_lr_prev,
+            input_lr_next=input_lr_next,
+            input_gr_prev=input_gr_prev,
+            input_gr_next=input_gr_next,
             flowl0=flowl0,
+            is_adversarial=False,
         )
+        if self.model._uses_traditional_piv():
+            # WIDIM/HS profiling 只统计传统 PIV/光流估计的推理开销，不调用 RAFT。
+            flow_predictions, _ = self.model._compute_traditional_piv_branch(
+                piv_prev_source=piv_prev_source,
+                piv_next_source=piv_next_source,
+                flowl0=flowl0,
+            )
+        else:
+            flow_predictions, _ = self.model._compute_raft_branch(
+                raft_prev_source=piv_prev_source,
+                raft_next_source=piv_next_source,
+                flowl0=flowl0,
+            )
         final_flow_prediction = flow_predictions[-1] if isinstance(flow_predictions, (list, tuple)) else flow_predictions
         return pred_prev, pred_next, final_flow_prediction
 
@@ -618,11 +609,24 @@ def main():
 
     logger.info(f"一共{len(available_class_names)}个类别：{available_class_names}")
 
-    # 训练模式: all | single | mixed
-    mode = global_data.esrgan.TRAIN_CLASS_MODE.lower().strip()
-    if mode not in {"all", "single", "mixed"}:
-        logger.error(f'TRAIN_CLASS_MODE 仅支持 all/single/mixed，当前为: {global_data.esrgan.TRAIN_CLASS_MODE}')
-        raise ValueError(f"TRAIN_CLASS_MODE 仅支持 all/single/mixed，当前为: {global_data.esrgan.TRAIN_CLASS_MODE}")
+    # 训练模式: all | single | mixed | fixed
+    # 统一通过 global_class 的校验入口读取，避免新增 fixed 后各 pipeline 的字符串判断不一致。
+    mode = global_data.esrgan.validate_train_class_mode()
+    if mode == "fixed":
+        # fixed 模式下，真实划分由 FlowData_train/test.list 决定。
+        # 这里先按 list 行数同步比例超参数，只用于日志、wandb 和 hyper_parameters.txt 展示。
+        global_data.esrgan.update_fixed_split_rates()
+        # hyper_parameters.txt 在上面已经按默认比例写过一次；fixed 需要覆盖为 list 行数反推后的真实比例。
+        global_data.esrgan.save_hyper_parameters_txt(f"{global_data.esrgan.OUT_PUT_DIR}/hyper_parameters.txt")
+    if mode in {"all", "mixed", "fixed"}:
+        # EXCLUDE_CLASS 只对 all/mixed/fixed 生效：这里先过滤任务列表，
+        # 后面 load_data 也会收到同一份排除配置，确保真正的数据收集阶段不读取这些类别。
+        available_class_names = filter_excluded_class_names(
+            available_class_names,
+            global_data.esrgan.EXCLUDE_CLASS,
+            context=f"{global_data.esrgan.name}:{mode}",
+        )
+        logger.info(f"排除类别后剩余{len(available_class_names)}个类别：{available_class_names}")
 
     run_jobs = []
     if mode == "all":
@@ -633,9 +637,12 @@ def main():
         chosen = select_single_class(available_class_names, global_data.esrgan.SINGLE_CLASS_NAME)
         # 每个类别读取数据并且训练验证和保存模型
         run_jobs.append({"run_class_name": chosen, "selected_classes": [chosen]})
-    else:
+    elif mode == "mixed":
         # 每个类别读取数据并且训练验证和保存模型
         run_jobs.append({"run_class_name": global_data.esrgan.MIXED_CLASS_TAG, "selected_classes": None})
+    else:
+        # fixed 只训练一个任务：先收集所有类别，再由 data_load 按两个 list 文件固定筛选 train/validate。
+        run_jobs.append({"run_class_name": global_data.esrgan.FIXED_CLASS_TAG, "selected_classes": None})
 
     for job in run_jobs:
         class_name = job["run_class_name"]
@@ -649,14 +656,19 @@ def main():
                 gr_data_root_dir=global_data.esrgan.GR_DATA_ROOT_DIR,
                 lr_data_root_dir=f"{global_data.esrgan.LR_DATA_ROOT_DIR}/x{int(SCALE * SCALE)}/data",
                 batch_size=global_data.esrgan.BATCH_SIZE,
-                shuffle=global_data.esrgan.SHUFFLE,
+                # fixed 模式必须保留 FlowData_train.list 的顺序，因此无论 SHUFFLE 如何配置都传 False。
+                shuffle=False if mode == "fixed" else global_data.esrgan.SHUFFLE,
                 target_size=global_data.esrgan.TARGET_SIZE,
                 train_nums_rate=global_data.esrgan.Train_nums_rate,
                 validate_nums_rate=global_data.esrgan.Validate_nums_rate,
                 test_nums_rate=global_data.esrgan.Test_nums_rate,
                 random_seed=global_data.esrgan.RANDOM_SEED,
                 selected_classes=selected_classes,
+                excluded_classes=global_data.esrgan.EXCLUDE_CLASS if mode in {"all", "mixed", "fixed"} else None,
                 class_sample_ratio=global_data.esrgan.CLASS_SAMPLE_RATIO,
+                fixed_split=mode == "fixed",
+                fixed_train_list_path=global_data.esrgan.FIXED_TRAIN_LIST_PATH,
+                fixed_validate_list_path=global_data.esrgan.FIXED_VALIDATE_LIST_PATH,
                 return_test_loader=True
             )
             # 每个类别的图像对和flo文件分别训练验证和保存模型 ！！！！！已经去除
@@ -956,18 +968,39 @@ def main():
             """
             验证集全部验证一遍 start
             """
-            evaluate_all(
-                model = ESRuRAFT_PIV_model,
-                data_loader=validate_loader,
-                class_name=class_name,
-                data_type=data_type,
-                SCALE=SCALE,
-                output_root=f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.PREDICT_ALL_DIR}",
-                metrics_csv_path=f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.PREDICT_ALL_DIR}/metrics_all.csv",
-                stride=6,
-            )
+            if global_data.esrgan.IS_VALIDATE_ALL:
+                # 完整验证可能比较耗时，使用 IS_VALIDATE_ALL 做总开关；默认 True，保持原有流程。
+                evaluate_all(
+                    model = ESRuRAFT_PIV_model,
+                    data_loader=validate_loader,
+                    class_name=class_name,
+                    data_type=data_type,
+                    SCALE=SCALE,
+                    output_root=f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.PREDICT_ALL_DIR}",
+                    metrics_csv_path=f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.PREDICT_ALL_DIR}/metrics_all.csv",
+                    stride=6,
+                )
+            else:
+                logger.info("IS_VALIDATE_ALL=False，跳过 evaluate_all 完整验证。")
             """
             验证集全部验证一遍 end
+            """
+            """
+            RAFT256-PIV 风格 TFRecord 全数据集测试 start
+            """
+            if global_data.esrgan.IS_TEST:
+                # test_all 使用单 GPU 顺序测试 TEST_DATASETS；默认 IS_TEST=False，不改变原训练流程。
+                test_all(
+                    model=ESRuRAFT_PIV_model,
+                    class_name=class_name,
+                    data_type=data_type,
+                    SCALE=SCALE,
+                    device=global_data.esrgan.device,
+                )
+            else:
+                logger.info("IS_TEST=False，跳过 test_all TFRecord 全数据集测试。")
+            """
+            RAFT256-PIV 风格 TFRecord 全数据集测试 end
             """
             """
             保存 训练集 验证集 测试集的引用地址json合集 方便查看用了哪些数据 而且也可以重新load 

@@ -31,7 +31,7 @@ PROJECT_ROOT = CURRENT_FILE.parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from study.SRGAN.data_load import get_class_names, load_data
+from study.SRGAN.data_load import filter_excluded_class_names, get_class_names, load_data
 from study.SRGAN.model.ESRuRAFT_PIV_Ground.Module.PIV_ESRGAN_RAFT_Model import ESRuRAFT_PIV
 from study.SRGAN.model.ESRuRAFT_PIV_Ground.evaluate import evaluate_all
 from study.SRGAN.model.ESRuRAFT_PIV_Ground.global_class import global_data
@@ -281,10 +281,23 @@ def _build_run_jobs() -> list[dict]:
 
     - mixed: 所有类别混合成一个 validate_loader，evaluate_all 内部再按真实 class_name 分桶输出；
     - all: 每个类别单独跑一遍；
-    - single: 只跑 SINGLE_CLASS_NAME 指定的类别。
+    - single: 只跑 SINGLE_CLASS_NAME 指定的类别；
+    - fixed: 使用 fixed train/validate list，其中 evaluate_all 默认跑固定验证列表。
     """
-    mode = str(global_data.esrgan.TRAIN_CLASS_MODE).strip().lower()
+    mode = global_data.esrgan.validate_train_class_mode()
     available_class_names = get_class_names(global_data.esrgan.GR_DATA_ROOT_DIR)
+    if mode in {"all", "mixed", "fixed"}:
+        # 与 Ground pipeline 保持一致：评估入口也尊重 EXCLUDE_CLASS，避免 fixed/all/mixed 评估读入被排除类别。
+        available_class_names = filter_excluded_class_names(
+            available_class_names,
+            global_data.esrgan.EXCLUDE_CLASS,
+            context=f"RAFT_CHECKPOINT_EVALUATE:{mode}",
+        )
+
+    if mode == "fixed":
+        # fixed 模式真实验证集由 FlowData_test.list 决定；先同步比例，便于日志/summary 保存真实划分。
+        global_data.esrgan.update_fixed_split_rates()
+        return [{"run_class_name": global_data.esrgan.FIXED_CLASS_TAG, "selected_classes": None}]
 
     if mode == "all":
         return [
@@ -303,7 +316,7 @@ def _build_run_jobs() -> list[dict]:
     if mode == "mixed":
         return [{"run_class_name": global_data.esrgan.MIXED_CLASS_TAG, "selected_classes": None}]
 
-    raise ValueError("TRAIN_CLASS_MODE 仅支持 'all'、'single'、'mixed'。")
+    raise ValueError(f"TRAIN_CLASS_MODE 仅支持 {global_data.esrgan.TRAIN_CLASS_MODES}。")
 
 
 def _pick_eval_loader(validate_loader, test_loader):
@@ -529,14 +542,22 @@ def main() -> None:
                 batch_size=global_data.esrgan.BATCH_SIZE,
                 # 虽然这里只使用 validate/test loader，但这里仍沿用 Ground 配置，
                 # 让 load_data 的整体构造逻辑和 ESRuRAFT_PIV_Ground pipeline 保持一致。
-                shuffle=global_data.esrgan.SHUFFLE,
+                # fixed 模式必须保留 FlowData_train.list 的顺序；虽然评估默认用验证集，
+                # train loader 仍会被 load_data 构造，所以这里同样关闭 fixed 下的训练集 shuffle。
+                shuffle=False if global_data.esrgan.validate_train_class_mode() == "fixed" else global_data.esrgan.SHUFFLE,
                 target_size=global_data.esrgan.TARGET_SIZE,
                 train_nums_rate=global_data.esrgan.Train_nums_rate,
                 validate_nums_rate=global_data.esrgan.Validate_nums_rate,
                 test_nums_rate=global_data.esrgan.Test_nums_rate,
                 random_seed=global_data.esrgan.RANDOM_SEED,
                 selected_classes=selected_classes,
+                excluded_classes=global_data.esrgan.EXCLUDE_CLASS
+                if global_data.esrgan.validate_train_class_mode() in {"all", "mixed", "fixed"}
+                else None,
                 class_sample_ratio=global_data.esrgan.CLASS_SAMPLE_RATIO,
+                fixed_split=global_data.esrgan.validate_train_class_mode() == "fixed",
+                fixed_train_list_path=global_data.esrgan.FIXED_TRAIN_LIST_PATH,
+                fixed_validate_list_path=global_data.esrgan.FIXED_VALIDATE_LIST_PATH,
                 return_test_loader=True,
             )
             eval_loader = _pick_eval_loader(validate_loader, test_loader)

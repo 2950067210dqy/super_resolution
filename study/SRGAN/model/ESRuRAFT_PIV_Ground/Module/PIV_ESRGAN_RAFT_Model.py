@@ -15,7 +15,11 @@ from study.SRGAN.model.ESRuRAFT_PIV_Ground.Module.loss import (
 from study.SRGAN.model.ESRuRAFT_PIV_Ground.Module.original_esrgan_model import (
     Discriminator as OriginalESRGANDiscriminator,
     Generator as OriginalESRGANGenerator,
-)  # TRAIN_MODE="esrgan" 使用最原始 ESRGAN 结构，不使用 ESRuRAFT_PIV 的改进双帧生成器
+)  # TRAIN_MODE="esrgan_raft" 使用最原始 ESRGAN 结构，不使用 ESRuRAFT_PIV 的改进双帧生成器
+from study.SRGAN.model.basic_srgan.Module.model import (
+    Discriminator as SRGANDiscriminator,
+    Generator as SRGANGenerator,
+)  # TRAIN_MODE="srgan_raft" 使用传统 SRGAN 生成器，然后接 RAFT
 from study.SRGAN.model.ESRuRAFT_PIV_Ground.global_class import global_data
 
 try:
@@ -132,25 +136,33 @@ class ESRuRAFT_PIV(nn.Module):
     """
     ESRuRAFT_PIV_Ground 主网络。
 
-    Ground 版本和 ESRuRAFT_PIV 的训练/评估外壳保持一致，但通过 TRAIN_MODE 切换 RAFT 输入：
-    1. lr_ground: 低分辨率图像用最近邻插值对齐到 RAFT/HR 尺寸后送入 RAFT，不经过超分辨率。
-    2. hr_ground: 真实高分辨率图像直接送入 RAFT，不经过超分辨率。
-    3. bicubic: 低分辨率图像用传统 bicubic 双三次插值放大到 RAFT/HR 尺寸后送入 RAFT。
-    4. esrgan: 使用最原始 ESRGAN 对 LR 做超分辨，再把 SR 图像送入 RAFT。
+    Ground 版本和 ESRuRAFT_PIV 的训练/评估外壳保持一致，但通过 TRAIN_MODE 切换图像来源和 PIV 估计器：
+    1. lr_ground_raft: LR 最近邻对齐到 HR 后送入 RAFT。
+    2. hr_ground_raft: HR 真值图像直接送入 RAFT。
+    3. bicubic_raft: LR 经 bicubic 上采样后送入 RAFT。
+    4. esrgan_raft: 原始 ESRGAN 超分后送入 RAFT。
+    5. bicubic_widim: LR 经 bicubic 上采样后进入传统 WIDIM/窗口互相关 PIV。
+    6. bicubic_hs: LR 经 bicubic 上采样后进入 Horn-Schunck 光流法。
+    7. srgan_raft: 传统 SRGAN 超分后送入 RAFT。
     """
 
     def __init__(self,inner_chanel,batch_size):
         super(ESRuRAFT_PIV, self).__init__()  # 调用父类初始化
 
         self.train_mode = global_data.esrgan.validate_train_mode()
-        if self.train_mode == "esrgan":
-            # esrgan 模式明确要求“超分模块换成最原始的 esrgan”。
+        if self.train_mode == "esrgan_raft":
+            # esrgan_raft 模式明确要求“超分模块换成最原始的 ESRGAN”。
             # 因此这里使用从 model/esrgan/Module/model.py 复制过来的原始单帧 Generator/Discriminator，
             # 不再使用 ESRuRAFT_PIV 的双帧特征融合生成器。
             self.piv_esrgan_generator = OriginalESRGANGenerator(inner_chanel=inner_chanel)
             self.piv_esrgan_discriminator = OriginalESRGANDiscriminator(inner_chanel=inner_chanel)
+        elif self.train_mode == "srgan_raft":
+            # srgan_raft 使用传统 SRGAN 生成器，再把 SR 图像送入 RAFT。
+            # 这样可以和 esrgan_raft 的 RRDB/ESRGAN 生成器做结构基线对比。
+            self.piv_esrgan_generator = SRGANGenerator(inner_chanel=inner_chanel)
+            self.piv_esrgan_discriminator = SRGANDiscriminator(inner_chanel=inner_chanel)
         else:
-            # lr_ground / hr_ground / bicubic 是纯 RAFT 输入基线，不训练也不调用超分网络。
+            # ground / bicubic / WIDIM / HS 是无学习型 SR 生成器的 baseline。
             # 仍然保留同名属性，是为了让 pipeline/evaluate 里已有的统一接口不需要大面积分叉。
             self.piv_esrgan_generator = nn.Identity()
             self.piv_esrgan_discriminator = nn.Identity()
@@ -174,10 +186,17 @@ class ESRuRAFT_PIV(nn.Module):
         """
         当前模式是否需要 Generator/Discriminator 参与训练。
 
-        只有 TRAIN_MODE="esrgan" 才有可学习的超分模块；其余 baseline 模式只训练 RAFT，
-        因此后续训练步骤会用这个判断来跳过 G/D 的 backward 和 optimizer.step。
+        只有 esrgan_raft / srgan_raft 才有可学习的超分模块；其余 baseline 模式不更新 G/D。
         """
-        return self.train_mode == "esrgan"
+        return self.train_mode in {"esrgan_raft", "srgan_raft"}
+
+    def _uses_traditional_piv(self) -> bool:
+        """
+        当前模式是否使用传统 PIV/光流估计器而不是 RAFT。
+
+        WIDIM/HS 没有可学习参数，也不需要 optimizer.step；训练循环中只计算预测和指标。
+        """
+        return self.train_mode in {"bicubic_widim", "bicubic_hs"}
 
     @staticmethod
     def _zero_like_loss(reference: torch.Tensor) -> torch.Tensor:
@@ -202,7 +221,7 @@ class ESRuRAFT_PIV(nn.Module):
             image: 需要放大的 LR 图像，例如 [B, C, 64, 64]。
             target: 尺寸参考图像，例如真实 HR 图像 [B, C, 256, 256]。
             mode:
-                - "nearest": 最近邻插值，用于 lr_ground，表示只做最朴素的尺寸对齐；
+                - "nearest": 最近邻插值，用于 lr_ground_raft，表示只做最朴素的尺寸对齐；
                 - "bicubic": bicubic 双三次插值，用于传统超分 baseline。
 
         注意:
@@ -261,6 +280,126 @@ class ESRuRAFT_PIV(nn.Module):
         restored[:, 0:1] = restored[:, 0:1] * (dst_w / max(src_w, 1))
         restored[:, 1:2] = restored[:, 1:2] * (dst_h / max(src_h, 1))
         return restored
+
+    @staticmethod
+    def _standardize_frame_for_traditional_piv(frame: torch.Tensor) -> torch.Tensor:
+        """
+        给传统 PIV/光流法使用的亮度标准化。
+
+        WIDIM 互相关和 Horn-Schunck 都依赖亮度变化；不同 batch 的颗粒图强度范围可能略有差异。
+        这里按每张图自身的均值/方差做标准化，提升互相关和梯度法的数值稳定性。
+        """
+        mean = frame.mean(dim=(-2, -1), keepdim=True)
+        std = frame.std(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
+        return (frame - mean) / std
+
+    @staticmethod
+    def _sample_with_integer_displacement(image: torch.Tensor, dx: int, dy: int) -> torch.Tensor:
+        """
+        按整数位移采样后一帧图像，用于窗口互相关搜索。
+
+        约定：
+            shifted[..., y, x] = image[..., y + dy, x + dx]
+
+        因此如果后一帧相对前一帧向右移动 2 像素，最佳 dx 会接近 +2。
+        边界之外用 0 填充，避免 torch.roll 的环绕伪影污染边缘窗口。
+        """
+        shifted = torch.zeros_like(image)
+        _, _, height, width = image.shape
+
+        src_y0 = max(dy, 0)
+        src_y1 = min(height + dy, height)
+        dst_y0 = max(-dy, 0)
+        dst_y1 = dst_y0 + max(src_y1 - src_y0, 0)
+
+        src_x0 = max(dx, 0)
+        src_x1 = min(width + dx, width)
+        dst_x0 = max(-dx, 0)
+        dst_x1 = dst_x0 + max(src_x1 - src_x0, 0)
+
+        if src_y1 > src_y0 and src_x1 > src_x0:
+            shifted[:, :, dst_y0:dst_y1, dst_x0:dst_x1] = image[:, :, src_y0:src_y1, src_x0:src_x1]
+        return shifted
+
+    def _estimate_widim_flow(self, prev: torch.Tensor, next_frame: torch.Tensor) -> torch.Tensor:
+        """
+        传统 WIDIM/窗口互相关 PIV baseline。
+
+        说明：
+            完整 WIDIM 会包含多级窗口形变和亚像素峰值拟合；这里实现的是工程内可复现、
+            无外部依赖的核心互相关版本：在重叠 interrogation window 上做整数位移搜索，
+            再把粗网格位移场插值成全分辨率 flow。它用于和 RAFT/SR+RAFT 做传统 PIV 基线对比。
+        """
+        prev = self._standardize_frame_for_traditional_piv(prev.detach())
+        next_frame = self._standardize_frame_for_traditional_piv(next_frame.detach())
+
+        window_size = int(global_data.esrgan.WIDIM_WINDOW_SIZE)
+        stride = int(global_data.esrgan.WIDIM_STRIDE)
+        search_radius = int(global_data.esrgan.WIDIM_SEARCH_RADIUS)
+        padding = window_size // 2
+
+        best_score = None
+        best_dx = None
+        best_dy = None
+        for dy in range(-search_radius, search_radius + 1):
+            for dx in range(-search_radius, search_radius + 1):
+                shifted_next = self._sample_with_integer_displacement(next_frame, dx=dx, dy=dy)
+                # 以窗口平均乘积作为互相关分数；输入已标准化，分数越大表示局部匹配越好。
+                score = F.avg_pool2d(prev * shifted_next, kernel_size=window_size, stride=stride, padding=padding)
+                if best_score is None:
+                    best_score = score
+                    best_dx = torch.full_like(score, float(dx))
+                    best_dy = torch.full_like(score, float(dy))
+                    continue
+                update_mask = score > best_score
+                best_score = torch.where(update_mask, score, best_score)
+                best_dx = torch.where(update_mask, torch.full_like(best_dx, float(dx)), best_dx)
+                best_dy = torch.where(update_mask, torch.full_like(best_dy, float(dy)), best_dy)
+
+        coarse_flow = torch.cat([best_dx, best_dy], dim=1)
+        return F.interpolate(coarse_flow, size=prev.shape[-2:], mode="bilinear", align_corners=True)
+
+    def _estimate_horn_schunck_flow(self, prev: torch.Tensor, next_frame: torch.Tensor) -> torch.Tensor:
+        """
+        传统 Horn-Schunck 光流 baseline。
+
+        该方法假设亮度守恒并通过全局平滑项约束 flow，适合作为“非学习光流法”的参考。
+        输出通道同 RAFT 保持一致：[u, v]。
+        """
+        prev = self._standardize_frame_for_traditional_piv(prev.detach())
+        next_frame = self._standardize_frame_for_traditional_piv(next_frame.detach())
+        avg_frame = 0.5 * (prev + next_frame)
+
+        sobel_x = avg_frame.new_tensor(
+            [[[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]]
+        ).view(1, 1, 3, 3) / 8.0
+        sobel_y = avg_frame.new_tensor(
+            [[[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]]
+        ).view(1, 1, 3, 3) / 8.0
+        smooth_kernel = avg_frame.new_tensor(
+            [[[1.0 / 12.0, 1.0 / 6.0, 1.0 / 12.0],
+              [1.0 / 6.0, 0.0, 1.0 / 6.0],
+              [1.0 / 12.0, 1.0 / 6.0, 1.0 / 12.0]]]
+        ).view(1, 1, 3, 3)
+
+        ix = F.conv2d(avg_frame, sobel_x, padding=1)
+        iy = F.conv2d(avg_frame, sobel_y, padding=1)
+        it = next_frame - prev
+
+        alpha = float(global_data.esrgan.HS_ALPHA)
+        iterations = int(global_data.esrgan.HS_ITERS)
+        u = torch.zeros_like(prev)
+        v = torch.zeros_like(prev)
+        denom = alpha * alpha + ix * ix + iy * iy + 1e-6
+
+        for _ in range(iterations):
+            u_avg = F.conv2d(u, smooth_kernel, padding=1)
+            v_avg = F.conv2d(v, smooth_kernel, padding=1)
+            residual = ix * u_avg + iy * v_avg + it
+            u = u_avg - ix * residual / denom
+            v = v_avg - iy * residual / denom
+
+        return torch.cat([u, v], dim=1)
 
     @staticmethod
     def _flow_metrics_from_prediction(pred_flow_uv: torch.Tensor, target_flow_uv: torch.Tensor) -> dict:
@@ -388,7 +527,7 @@ class ESRuRAFT_PIV(nn.Module):
         """
         计算 ground 模式的图像诊断项。
 
-        lr_ground/hr_ground/bicubic 没有 Generator，不应该对图像损失反传；但保留这些数值日志有两个好处：
+        lr_ground_raft/hr_ground_raft/bicubic_raft/bicubic_widim/bicubic_hs 没有 Generator，不应该对图像损失反传；但保留这些数值日志有两个好处：
         1. CSV 字段继续和 ESRuRAFT_PIV 对齐；
         2. 可以直观看到最近邻 LR、bicubic LR 或 HR ground 图像与真实 HR 的图像差异。
         """
@@ -430,11 +569,11 @@ class ESRuRAFT_PIV(nn.Module):
 
         返回值包含四个核心对象：
         - pred_prev/pred_next: 对外保存和图像指标使用的图像，空间大小始终对齐 HR；
-        - raft_prev/raft_next: 真正送进 RAFT 的图像，lr_ground/bicubic 下会用非学习插值对齐到 HR 尺寸；
+        - raft_prev/raft_next: 真正送进 RAFT 或传统 PIV 的图像，非学习 baseline 会用插值对齐到 HR 尺寸；
         - sr_outputs: 与 ESRuRAFT_PIV 原 CSV 对齐的图像/GAN/一致性损失字典。
         """
-        if self.train_mode == "lr_ground":
-            # 低分辨率 ground：不经过任何可学习超分辨率模块。
+        if self.train_mode == "lr_ground_raft":
+            # 低分辨率 ground + RAFT：不经过任何可学习超分辨率模块。
             # 由于当前 RAFT/flow 监督按 HR 尺寸组织，例如 256x256，
             # 这里只做最近邻插值把 64x64 LR 图像对齐到 HR 尺寸后送入 RAFT。
             # 这仍然是 LR baseline，而不是 ESRGAN/SR 结果。
@@ -446,13 +585,13 @@ class ESRuRAFT_PIV(nn.Module):
                 pred_prev, pred_next, input_gr_prev, input_gr_next
             )
 
-        if self.train_mode == "bicubic":
+        if self.train_mode in {"bicubic_raft", "bicubic_widim", "bicubic_hs"}:
             # 传统 bicubic 超分 baseline：
             # 1. 不调用 Generator，不产生任何可学习的 SR 参数；
             # 2. 只用 PyTorch bicubic 双三次插值把 LR previous/next 放大到 HR 尺寸；
             # 3. 放大后的 bicubic 图像既作为 pred_prev/pred_next 参与图像诊断日志，
-            #    也作为 raft_prev/raft_next 真正送入 RAFT。
-            # 这样可以单独观察“传统插值超分 + RAFT”和“ESRGAN + RAFT”的差异。
+            #    也作为后续 RAFT/WIDIM/HS 的输入图像。
+            # 这样可以单独观察“传统插值超分 + 不同 PIV 估计器”的差异。
             pred_prev = self._resize_image_to_target(input_lr_prev, input_gr_prev, mode="bicubic")
             pred_next = self._resize_image_to_target(input_lr_next, input_gr_next, mode="bicubic")
             raft_prev = pred_prev
@@ -461,8 +600,8 @@ class ESRuRAFT_PIV(nn.Module):
                 pred_prev, pred_next, input_gr_prev, input_gr_next
             )
 
-        if self.train_mode == "hr_ground":
-            # 高分辨率 ground：RAFT 直接看真实 HR 图像，相当于给 RAFT 最理想的图像输入。
+        if self.train_mode == "hr_ground_raft":
+            # 高分辨率 ground + RAFT：RAFT 直接看真实 HR 图像，相当于给 RAFT 最理想的图像输入。
             raft_prev = input_gr_prev
             raft_next = input_gr_next
             pred_prev = input_gr_prev
@@ -471,8 +610,8 @@ class ESRuRAFT_PIV(nn.Module):
                 pred_prev, pred_next, input_gr_prev, input_gr_next
             )
 
-        # esrgan 模式：使用原始 ESRGAN 单帧生成器分别超分 previous/next。
-        # 原始 ESRGAN 没有 forward_pair，因此这里显式逐帧调用，避免误用 ESRuRAFT_PIV 的双帧融合结构。
+        # esrgan_raft / srgan_raft 模式：使用对应单帧生成器分别超分 previous/next。
+        # 这两个生成器都没有 forward_pair，因此这里显式逐帧调用，避免误用 ESRuRAFT_PIV 的双帧融合结构。
         pred_prev = self.piv_esrgan_generator(input_lr_prev)
         pred_next = self.piv_esrgan_generator(input_lr_next)
 
@@ -572,6 +711,41 @@ class ESRuRAFT_PIV(nn.Module):
             "raft_epe_tensor": raft_epe_tensor,  # 可反向传播的平均 EPE Tensor
         }
 
+    def _compute_traditional_piv_branch(self, piv_prev_source: torch.Tensor, piv_next_source: torch.Tensor, flowl0):
+        """
+        计算传统 PIV/光流 baseline 分支。
+
+        与 _compute_raft_branch 保持同样的返回字段名，这样 evaluate/train_step 不需要为 WIDIM/HS
+        单独维护一套 CSV 和指标字段。这里的 "raft_loss" 字段实际表示传统方法最终 flow 的 EPE，
+        仅用于日志兼容；WIDIM/HS 没有可学习参数，不会执行 backward。
+        """
+        piv_prev = self._to_raft_frame(piv_prev_source)
+        piv_next = self._to_raft_frame(piv_next_source)
+        flow_gt_full_size = self._to_raft_flow_gt(flowl0)
+
+        with torch.no_grad():
+            if self.train_mode == "bicubic_widim":
+                flow_prediction = self._estimate_widim_flow(piv_prev, piv_next)
+            elif self.train_mode == "bicubic_hs":
+                flow_prediction = self._estimate_horn_schunck_flow(piv_prev, piv_next)
+            else:
+                raise ValueError(f"Unsupported traditional PIV mode: {self.train_mode}")
+
+        flow_prediction = self._restore_flow_to_target_size(flow_prediction, flow_gt_full_size)
+        piv_epe_tensor = torch.sum((flow_prediction - flow_gt_full_size) ** 2, dim=1).sqrt().mean()
+        piv_metrics = self._flow_metrics_from_prediction(flow_prediction, flow_gt_full_size)
+        flow_predictions = [flow_prediction]
+
+        return flow_predictions, {
+            "raft_input_prev": piv_prev,  # 为了兼容保存逻辑，字段名沿用 raft_input_prev
+            "raft_input_next": piv_next,  # 为了兼容保存逻辑，字段名沿用 raft_input_next
+            "flow_predictions": flow_predictions,
+            "raft_loss": piv_epe_tensor,  # WIDIM/HS 无序列损失，这里用最终 EPE 作为日志 loss
+            "raft_metrics": piv_metrics,
+            "raft_epe_tensor": piv_epe_tensor,
+            "traditional_piv_method": self.train_mode,
+        }
+
 
     def _compute_generator_loss(self, sr_outputs: dict, raft_outputs: dict) -> tuple[torch.Tensor, dict]:
         """
@@ -615,9 +789,25 @@ class ESRuRAFT_PIV(nn.Module):
         pred_prev, pred_next, raft_prev_source, raft_next_source, sr_outputs = self._compute_sr_branch(
             input_lr_prev, input_lr_next, input_gr_prev, input_gr_next, flowl0, is_adversarial
         )
-        flow_predictions, raft_outputs = self._compute_raft_branch(raft_prev_source, raft_next_source, flowl0, flow_init=flow_init)
-        g_loss, generator_loss_logs = self._compute_generator_loss(sr_outputs, raft_outputs)
-        total_loss = g_loss + raft_outputs["raft_loss"]
+        if self._uses_traditional_piv():
+            # WIDIM/HS 是传统无参数 PIV/光流方法，不走 RAFT，也不参与反向传播。
+            flow_predictions, raft_outputs = self._compute_traditional_piv_branch(
+                piv_prev_source=raft_prev_source,
+                piv_next_source=raft_next_source,
+                flowl0=flowl0,
+            )
+            g_loss = self._zero_like_loss(raft_outputs["raft_loss"])
+            generator_loss_logs = {
+                "generator_non_adversarial_loss": g_loss,
+                "generator_raft_epe_weighted_loss": g_loss,
+            }
+            total_loss = raft_outputs["raft_loss"]
+        else:
+            flow_predictions, raft_outputs = self._compute_raft_branch(
+                raft_prev_source, raft_next_source, flowl0, flow_init=flow_init
+            )
+            g_loss, generator_loss_logs = self._compute_generator_loss(sr_outputs, raft_outputs)
+            total_loss = g_loss + raft_outputs["raft_loss"]
         if self._uses_super_resolution():
             discriminator_loss, d_fake_loss, d_real_loss = self._compute_discriminator_loss(
                 pred_prev, pred_next, input_gr_prev, input_gr_next
@@ -697,8 +887,61 @@ class ESRuRAFT_PIV(nn.Module):
         返回:
             包含本次训练主要标量的字典
         """
+        if self._uses_traditional_piv():
+            # bicubic_widim / bicubic_hs 是传统无参数 baseline：
+            # - LR 先经 bicubic 上采样到 HR；
+            # - 再通过 WIDIM 互相关或 Horn-Schunck 光流法得到 PIV；
+            # - 不更新 Generator / RAFT / Discriminator，只记录同一套日志字段。
+            self._set_requires_grad(self.piv_esrgan_generator, False)
+            self._set_requires_grad(self.piv_esrgan_discriminator, False)
+            self._set_requires_grad(self.piv_RAFT, False)
+
+            pred_prev, pred_next, piv_prev_source, piv_next_source, sr_outputs = self._compute_sr_branch(
+                input_lr_prev=input_lr_prev,
+                input_lr_next=input_lr_next,
+                input_gr_prev=input_gr_prev,
+                input_gr_next=input_gr_next,
+                flowl0=flowl0,
+                is_adversarial=False,
+            )
+            flow_predictions, raft_outputs = self._compute_traditional_piv_branch(
+                piv_prev_source=piv_prev_source,
+                piv_next_source=piv_next_source,
+                flowl0=flowl0,
+            )
+
+            zero = self._zero_like_loss(raft_outputs["raft_loss"])
+            final_flow_prediction = flow_predictions[-1]
+            return pred_prev, pred_next, final_flow_prediction, {
+                "sr_loss": float(sr_outputs["sr_loss"].detach().item()),
+                "g_loss": 0.0,
+                "perceptual_loss": float(sr_outputs["perceptual_loss"].detach().item()),
+                "content_loss": float(sr_outputs["content_loss"].detach().item()),
+                "adversarial_loss": 0.0,
+                "pixel_total": float(sr_outputs["pixel_total"].detach().item()),
+                "pixel_l1": float(sr_outputs["pixel_l1"].detach().item()),
+                "pixel_mse": float(sr_outputs["pixel_mse"].detach().item()),
+                "pixel_ssim": float(sr_outputs["pixel_ssim"].detach().item()),
+                "pixel_fft": float(sr_outputs["pixel_fft"].detach().item()),
+                "flow_warp_consistency_loss": 0.0,
+                "flow_warp_consistency_weighted_loss": 0.0,
+                "raft_loss": float(raft_outputs["raft_loss"].detach().item()),
+                "discriminator_loss": 0.0,
+                "d_real_loss": 0.0,
+                "d_fake_loss": 0.0,
+                "raft_epe": float(raft_outputs["raft_metrics"]["epe"]),
+                "generator_raft_epe": 0.0,
+                "raft_epe_weight": 0.0,
+                "adversarial_weighted_loss": 0.0,
+                "generator_non_adversarial_loss": float(zero.detach().item()),
+                "generator_raft_epe_weighted_loss": float(zero.detach().item()),
+                "raft_1px": float(raft_outputs["raft_metrics"]["1px"]),
+                "raft_3px": float(raft_outputs["raft_metrics"]["3px"]),
+                "raft_5px": float(raft_outputs["raft_metrics"]["5px"]),
+            }
+
         if not self._uses_super_resolution():
-            # lr_ground / hr_ground / bicubic 只训练 RAFT：
+            # lr_ground_raft / hr_ground_raft / bicubic_raft 只训练 RAFT：
             # - 不调用 Generator backward；
             # - 不更新 Discriminator；
             # - 仍然计算图像诊断项，保持 CSV 字段和 ESRuRAFT_PIV 对齐。

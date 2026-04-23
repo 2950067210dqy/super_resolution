@@ -956,7 +956,7 @@ def _ensure_csv_columns(csvOperator, required_columns: list[str]) -> None:
     csvOperator._write_all(old_rows)
 
 # 验证函数  RAFT 联合验证
-def validate_raft(model, dataloader, device, epoch):
+def validate_raft(model, dataloader, device, epoch, result_dir=None, data_type="RAFT", SAVE_AS_GRAY=None):
     """
     验证阶段的统一入口。
 
@@ -968,6 +968,10 @@ def validate_raft(model, dataloader, device, epoch):
 
     这里保留函数名 validate_raft 是为了减少外部调用改动，
     但内部已经按 USE_RAFT 自动切换联合评估或纯 SR 评估。
+
+    result_dir 不为 None 时，validate_raft 会把原来的 validate_and_save 合并进来：
+    - 指标统计会遍历完整个验证集，不再只跑一个 batch；
+    - 预览图只保存第一个 batch，保持旧功能的可视化输出，同时避免每个 batch 都写图拖慢验证。
     """
     model.eval()
     generator = model.piv_esrgan_generator
@@ -981,9 +985,26 @@ def validate_raft(model, dataloader, device, epoch):
     total_norm_aee_per100 = 0.0
     loss_count = 0
     num_images = 0
+    raft_batch_count = 0
+    preview_saved = False
 
     with torch.no_grad():
-        for batch in dataloader:
+        for batch_idx, batch in enumerate(dataloader):
+            if result_dir is not None and not preview_saved:
+                # validate_and_save 的职责现在并入 validate_raft：
+                # 只把当前第一个 batch 包成单 batch iterable 交给旧保存逻辑，
+                # 这样不会再次遍历完整 validate_loader，也不会每个 batch 都保存图片。
+                validate_and_save(
+                    result_dir,
+                    model,
+                    (batch,),
+                    device,
+                    epoch,
+                    data_type=data_type,
+                    SAVE_AS_GRAY=SAVE_AS_GRAY,
+                )
+                preview_saved = True
+
             lr_prev = batch["image_pair"]["previous"]["lr_data"].to(device, non_blocking=True)
             hr_prev = batch["image_pair"]["previous"]["gr_data"].to(device, non_blocking=True)
             lr_next = batch["image_pair"]["next"]["lr_data"].to(device, non_blocking=True)
@@ -1033,8 +1054,7 @@ def validate_raft(model, dataloader, device, epoch):
                     outputs["flow_predictions"][-1],
                     flow_gt_uv,
                 )
-            #一个batch 就行了 因为训练中的验证只需要1次batch验证
-            break
+                raft_batch_count += 1
     avg_val_ssim_loss = total_val_ssim_loss / max(loss_count, 1)
     avg_val_mse_loss = total_val_mse_loss / max(loss_count, 1)
     avg_psnr = total_psnr / max(num_images, 1)
@@ -1042,8 +1062,8 @@ def validate_raft(model, dataloader, device, epoch):
     # outputs["raft_metrics"]["epe"] 本身已经是当前验证 batch 的平均 EPE/AEE，
     # 这里不能再按 image_pair 分支累计出来的 loss_count 再除一次，否则会把 AEE 额外缩小。
     # SR-only 模式没有 RAFT 预测，用 NaN 明确表示该指标不适用，后续 CSV/plot 不会包含这些列。
-    avg_aee = total_aee if global_data.esrgan.USE_RAFT else float("nan")
-    avg_norm_aee_per100 = total_norm_aee_per100 if global_data.esrgan.USE_RAFT else float("nan")
+    avg_aee = total_aee / max(raft_batch_count, 1) if global_data.esrgan.USE_RAFT else float("nan")
+    avg_norm_aee_per100 = total_norm_aee_per100 / max(raft_batch_count, 1) if global_data.esrgan.USE_RAFT else float("nan")
     return avg_val_ssim_loss, avg_val_mse_loss, avg_psnr, avg_energy_spectrum_mse, avg_aee, avg_norm_aee_per100
 
 """
@@ -1072,8 +1092,14 @@ def evaluate(epoch,class_name,data_type,device,
     """
     # 每轮训练结束后进行验证
 
+    preview_result_dir = (
+        f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/"
+        f"scale_{int(SCALE * SCALE)}/{global_data.esrgan.PREDICT_DIR}"
+    )
     avg_val_ssim_loss, avg_val_mse_loss, avg_psnr, avg_val_energy_spectrum_mse, avg_val_aee, avg_val_norm_aee_per100 = validate_raft(
-        model, validate_loader, device, epoch
+        model, validate_loader, device, epoch,
+        result_dir=preview_result_dir,
+        data_type=data_type,
     )
 
     # # 训练阶段损失 CSV 需要新增验证能量谱误差和 RAFT 的 AEE。
@@ -1113,10 +1139,6 @@ def evaluate(epoch,class_name,data_type,device,
     loss_str = "".join([loss_label[index] + ':' + str(metric[index] / train_loader_lens) + "," for index in
                         range(len(loss_label))])
     logger.info(loss_str)
-
-    # 每轮训练结束后进行验证，并保存最后一批图像
-    validate_and_save(f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.PREDICT_DIR}", model,
-                      validate_loader, device, epoch, data_type=data_type)
 
     # 保存每一epoch的损失
     all_loss_and_val_Datas = [metric[index] / (train_loader_lens)  for index in range(len(loss_label))] + [

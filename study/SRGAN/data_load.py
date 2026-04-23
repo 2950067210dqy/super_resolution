@@ -449,6 +449,87 @@ def normalize_selected_classes(
     return normalized
 
 
+def normalize_excluded_classes(
+    excluded_classes: str | list[str] | tuple[str, ...] | set[str] | None,
+) -> list[str]:
+    """
+    标准化类别排除列表。
+
+    EXCLUDE_CLASS 是一个“可选超参数”：None 或 [] 表示不排除任何类别；
+    同时兼容传入单个字符串，方便临时只排除一个类别时不用写列表。
+    """
+    if excluded_classes is None:
+        return []
+    if isinstance(excluded_classes, str):
+        raw_names = [excluded_classes]
+    else:
+        raw_names = list(excluded_classes)
+
+    normalized: list[str] = []
+    seen_lower: set[str] = set()
+    for class_name in raw_names:
+        name = str(class_name).strip()
+        if not name:
+            continue
+        lower_name = name.lower()
+        if lower_name in seen_lower:
+            continue
+        seen_lower.add(lower_name)
+        normalized.append(name)
+    return normalized
+
+
+def filter_excluded_class_names(
+    available_class_names: list[str],
+    excluded_classes: str | list[str] | tuple[str, ...] | set[str] | None,
+    *,
+    context: str = "load_data",
+) -> list[str]:
+    """
+    根据 EXCLUDE_CLASS 过滤类别列表，并保留原始类别顺序。
+
+    这个函数只负责“类别目录是否参与收集”；具体文件如何配对仍走原来的
+    pair_sr_class_samples / load_data 逻辑，因此不会改变未排除类别的读取方式。
+    """
+    normalized_excludes = normalize_excluded_classes(excluded_classes)
+    if not normalized_excludes:
+        return available_class_names
+
+    available_lookup = {class_name.lower(): class_name for class_name in available_class_names}
+    excluded_lookup = {class_name.lower() for class_name in normalized_excludes}
+    matched_excludes = [
+        available_lookup[class_name.lower()]
+        for class_name in normalized_excludes
+        if class_name.lower() in available_lookup
+    ]
+    unknown_excludes = [
+        class_name
+        for class_name in normalized_excludes
+        if class_name.lower() not in available_lookup
+    ]
+    filtered_class_names = [
+        class_name
+        for class_name in available_class_names
+        if class_name.lower() not in excluded_lookup
+    ]
+
+    logger.info(
+        f"[ExcludeClass] context={context}, requested={normalized_excludes}, "
+        f"matched={matched_excludes}, kept={len(filtered_class_names)}/{len(available_class_names)}"
+    )
+    if unknown_excludes:
+        logger.warning(
+            f"[ExcludeClass] context={context}, these excluded classes were not found and are ignored: "
+            f"{unknown_excludes}"
+        )
+    if not filtered_class_names:
+        raise ValueError(
+            f"EXCLUDE_CLASS removed all available classes in {context}; "
+            f"available={available_class_names}, excluded={normalized_excludes}"
+        )
+    return filtered_class_names
+
+
 # ==============================
 # 样本键标准化
 # ==============================
@@ -730,6 +811,278 @@ def split_samples_global(
     test_samples = shuffled[n_train + n_val:]
 
     return train_samples, validate_samples, test_samples
+
+
+def _fixed_split_sample_key_from_path(raw_path: str, *, is_flow_path: bool) -> str:
+    """
+    从 fixed 列表里的“文件名”恢复当前工程内部使用的 sample_key。
+
+    fixed 列表里的目录前缀可能和本机训练数据目录不一致，所以这里刻意只取文件名：
+    - 图像文件继续复用 infer_image_pair_key，用 img1/img2 推回同一个样本主键；
+    - flo 文件复用 normalize_pair_key，去掉 `_flow` / `_flow_lr` 等尾缀；
+    - 最终真正读取的路径仍由 pair_sr_class_samples 在 GR/LR 根目录下按类别和文件名收集。
+    """
+    stem = Path(raw_path).stem
+    if is_flow_path:
+        return normalize_pair_key(stem)
+    return normalize_pair_key(infer_image_pair_key(stem))
+
+
+def _fixed_split_class_hints(
+    raw_paths: tuple[str, str, str],
+    available_class_names: list[str],
+) -> list[str]:
+    """
+    从 fixed 列表行里的目录片段提取可能的类别名。
+
+    这些路径不作为真实磁盘路径使用，只作为“这个样本属于哪个 class”的提示。
+    如果列表路径中没有可识别类别，后续会退回到 sample_key 全局唯一匹配。
+    """
+    class_lookup = {class_name.lower(): class_name for class_name in available_class_names}
+    hints: list[str] = []
+    for raw_path in raw_paths:
+        # 统一反斜杠，避免 Windows/Unix 路径分隔符混用时 Path.parts 拆不出来。
+        normalized_path = str(raw_path).replace("\\", "/")
+        for part in Path(normalized_path).parts:
+            class_name = class_lookup.get(part.lower())
+            if class_name is not None and class_name not in hints:
+                hints.append(class_name)
+    return hints
+
+
+def load_fixed_split_entries(list_path: str | Path, split_name: str) -> list[dict]:
+    """
+    读取 fixed 模式的样本列表。
+
+    每个有效行必须至少包含 3 列：img1、img2、flow。列之间用 tab 或空白分隔都可以。
+    空行和 `#` 开头的注释行会跳过，方便在列表中临时备注。
+    """
+    path = Path(list_path).expanduser()
+    if not path.exists():
+        logger.error(f"[FixedSplit] {split_name} list does not exist: {path}")
+        raise FileNotFoundError(f"{split_name} fixed split list does not exist: {path}")
+
+    entries: list[dict] = []
+    with path.open("r", encoding="utf-8") as file_obj:
+        for line_number, line in enumerate(file_obj, start=1):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+
+            parts = stripped.split()
+            if len(parts) < 3:
+                raise ValueError(
+                    f"{split_name} fixed split list line {line_number} must contain "
+                    f"img1/img2/flow, got: {stripped}"
+                )
+
+            img1_path, img2_path, flow_path = parts[:3]
+            img1_key = _fixed_split_sample_key_from_path(img1_path, is_flow_path=False)
+            img2_key = _fixed_split_sample_key_from_path(img2_path, is_flow_path=False)
+            flow_key = _fixed_split_sample_key_from_path(flow_path, is_flow_path=True)
+            if len({img1_key, img2_key, flow_key}) != 1:
+                raise ValueError(
+                    f"{split_name} fixed split list line {line_number} has mismatched keys: "
+                    f"img1={img1_key}, img2={img2_key}, flow={flow_key}"
+                )
+
+            entries.append(
+                {
+                    "sample_key": img1_key,
+                    "raw_paths": (img1_path, img2_path, flow_path),
+                    "line_number": line_number,
+                }
+            )
+
+    if not entries:
+        raise ValueError(f"{split_name} fixed split list has no valid samples: {path}")
+
+    logger.info(f"[FixedSplit] Loaded {len(entries)} {split_name} entries from: {path}")
+    return entries
+
+
+def _index_samples_for_fixed_split(samples: list[dict]) -> tuple[dict[tuple[str, str], dict], dict[str, list[dict]]]:
+    """
+    为 fixed 列表建立两套索引：
+    - (class_name, sample_key)：优先使用，能准确区分不同类别下同名样本；
+    - sample_key：当列表路径中没有可识别类别时使用，只有全局唯一才允许匹配。
+    """
+    sample_by_class_key: dict[tuple[str, str], dict] = {}
+    samples_by_key: dict[str, list[dict]] = defaultdict(list)
+
+    for sample in samples:
+        class_name = str(sample["class_name"])
+        sample_key = str(sample["sample_key"])
+        class_key = (class_name.lower(), sample_key)
+        if class_key in sample_by_class_key:
+            raise ValueError(f"Duplicated paired sample for fixed split: class={class_name}, key={sample_key}")
+        sample_by_class_key[class_key] = sample
+        samples_by_key[sample_key].append(sample)
+
+    return sample_by_class_key, samples_by_key
+
+
+def _match_fixed_split_entry(
+    entry: dict,
+    split_name: str,
+    list_path: str | Path,
+    available_class_names: list[str],
+    sample_by_class_key: dict[tuple[str, str], dict],
+    samples_by_key: dict[str, list[dict]],
+) -> dict:
+    """
+    将 fixed 列表中的一行映射到真实收集到的 sample。
+
+    先用路径片段里的类别名精确匹配；如果列表路径前缀不包含当前工程类别名，
+    再用 sample_key 做全局唯一匹配。这样既能兼容“路径不正确”的列表，又能避免同名样本误配。
+    """
+    sample_key = entry["sample_key"]
+    class_hints = _fixed_split_class_hints(entry["raw_paths"], available_class_names)
+
+    for class_name in class_hints:
+        sample = sample_by_class_key.get((class_name.lower(), sample_key))
+        if sample is not None:
+            return sample
+
+    candidates = samples_by_key.get(sample_key, [])
+    if len(candidates) == 1:
+        return candidates[0]
+
+    line_info = f"{list_path}:{entry['line_number']}"
+    if not candidates:
+        raise ValueError(
+            f"[FixedSplit] Cannot find sample from {split_name} list at {line_info}, "
+            f"sample_key={sample_key}, class_hints={class_hints}"
+        )
+
+    candidate_classes = [sample["class_name"] for sample in candidates]
+    raise ValueError(
+        f"[FixedSplit] Ambiguous sample_key from {split_name} list at {line_info}, "
+        f"sample_key={sample_key}, class_hints={class_hints}, candidate_classes={candidate_classes}"
+    )
+
+
+def _fixed_split_entry_is_excluded(
+    entry: dict,
+    all_available_class_names: list[str],
+    excluded_classes: str | list[str] | tuple[str, ...] | set[str] | None,
+) -> bool:
+    """
+    判断 fixed list 的一行是否属于被排除类别。
+
+    fixed list 的路径前缀不用于真实读取，但通常包含类别目录名；这里只把这些目录片段当作类别提示。
+    如果某行提示的类别命中 EXCLUDE_CLASS，就在进入样本匹配前跳过，避免 fixed 模式因为未收集该类而报错。
+    """
+    excluded_lookup = {class_name.lower() for class_name in normalize_excluded_classes(excluded_classes)}
+    if not excluded_lookup:
+        return False
+
+    # 第一层判断：直接看 fixed list 原始路径片段。
+    # 这不依赖当前数据根目录是否真的发现了该 class，所以能处理“类别已经被排除/不存在于根目录”的情况。
+    for raw_path in entry["raw_paths"]:
+        normalized_path = str(raw_path).replace("\\", "/")
+        for part in Path(normalized_path).parts:
+            if part.lower() in excluded_lookup:
+                return True
+
+    # 第二层判断：看 sample_key 是否以被排除类别名开头。
+    # 例如 sample_key=jhtdb_isotropic1024_hd_00469 时，也应该命中
+    # EXCLUDE_CLASS=["JHTDB_isotropic1024_hd"]，即使路径提示没有成功提取出来。
+    sample_key = str(entry.get("sample_key", "")).lower()
+    for excluded_class in excluded_lookup:
+        if sample_key == excluded_class or sample_key.startswith(f"{excluded_class}_"):
+            return True
+
+    # 最后一层兜底：如果路径片段能映射到完整类别列表，也继续使用类别 hint 判断。
+    class_hints = _fixed_split_class_hints(entry["raw_paths"], all_available_class_names)
+    return any(class_name.lower() in excluded_lookup for class_name in class_hints)
+
+
+def split_samples_by_fixed_lists(
+    samples: list[dict],
+    class_names: list[str],
+    available_class_names: list[str],
+    train_list_path: str | Path,
+    validate_list_path: str | Path,
+    all_available_class_names: list[str] | None = None,
+    excluded_classes: str | list[str] | tuple[str, ...] | set[str] | None = None,
+) -> tuple[list[dict], list[dict], list[dict], dict[str, dict[str, int]], float, float]:
+    """
+    fixed 模式：完全按照两个外部 list 文件决定训练集和验证集。
+
+    这个函数不会随机打乱，也不会按比例抽样；列表中出现的顺序就是 DataLoader 看到的样本顺序。
+    Test 集没有单独列表，因此固定为空，test_nums_rate 在 load_data 中同步置为 0。
+    """
+    train_entries = load_fixed_split_entries(train_list_path, "train")
+    validate_entries = load_fixed_split_entries(validate_list_path, "validate")
+    sample_by_class_key, samples_by_key = _index_samples_for_fixed_split(samples)
+    class_names_for_hints = all_available_class_names or available_class_names
+
+    def build_split(entries: list[dict], split_name: str, list_path: str | Path) -> tuple[list[dict], int]:
+        split_samples: list[dict] = []
+        skipped_by_exclude = 0
+        seen: set[tuple[str, str]] = set()
+        for entry in entries:
+            if _fixed_split_entry_is_excluded(entry, class_names_for_hints, excluded_classes):
+                skipped_by_exclude += 1
+                continue
+
+            sample = _match_fixed_split_entry(
+                entry=entry,
+                split_name=split_name,
+                list_path=list_path,
+                available_class_names=available_class_names,
+                sample_by_class_key=sample_by_class_key,
+                samples_by_key=samples_by_key,
+            )
+            identity = (sample["class_name"], sample["sample_key"])
+            if identity in seen:
+                raise ValueError(
+                    f"[FixedSplit] Duplicated sample in {split_name} list: "
+                    f"class={identity[0]}, sample_key={identity[1]}"
+            )
+            seen.add(identity)
+            split_samples.append(sample)
+        return split_samples, skipped_by_exclude
+
+    train_samples, train_skipped_by_exclude = build_split(train_entries, "train", train_list_path)
+    validate_samples, validate_skipped_by_exclude = build_split(validate_entries, "validate", validate_list_path)
+    test_samples: list[dict] = []
+
+    train_identities = {(sample["class_name"], sample["sample_key"]) for sample in train_samples}
+    validate_identities = {(sample["class_name"], sample["sample_key"]) for sample in validate_samples}
+    overlap = train_identities & validate_identities
+    if overlap:
+        overlap_preview = sorted(overlap)[:20]
+        raise ValueError(f"[FixedSplit] Train/validate lists overlap: {overlap_preview}")
+
+    total_fixed = len(train_samples) + len(validate_samples)
+    if total_fixed <= 0:
+        raise ValueError("[FixedSplit] Fixed train/validate lists produced no samples.")
+    train_nums_rate = len(train_samples) / total_fixed
+    validate_nums_rate = len(validate_samples) / total_fixed
+
+    train_counter = Counter([sample["class_name"] for sample in train_samples])
+    val_counter = Counter([sample["class_name"] for sample in validate_samples])
+    total_counter = Counter([sample["class_name"] for sample in train_samples + validate_samples])
+    split_summary = {
+        class_name: {
+            "total": total_counter.get(class_name, 0),
+            "train": train_counter.get(class_name, 0),
+            "val": val_counter.get(class_name, 0),
+            "test": 0,
+        }
+        for class_name in class_names
+    }
+
+    logger.info(
+        "[FixedSplit] Split by list order: "
+        f"train={len(train_samples)}, validate={len(validate_samples)}, test=0, "
+        f"skipped_by_exclude(train={train_skipped_by_exclude}, validate={validate_skipped_by_exclude}), "
+        f"computed train_nums_rate={train_nums_rate:.8f}, "
+        f"computed validate_nums_rate={validate_nums_rate:.8f}"
+    )
+    return train_samples, validate_samples, test_samples, split_summary, train_nums_rate, validate_nums_rate
 
 
 
@@ -1503,6 +1856,7 @@ def load_data(
     lr_data_root_dir: str,
     lr_data_variant: str = "default",
     selected_classes: str | list[str] | tuple[str, ...] | None = None,
+    excluded_classes: str | list[str] | tuple[str, ...] | set[str] | None = None,
     class_sample_ratio: float = 1.0,
     batch_size: int = 4,
     num_workers: int = 24,
@@ -1518,6 +1872,9 @@ def load_data(
     cache_transformed_samples: bool = False,
     use_disk_tensor_cache: bool = False,
     return_test_loader: bool = False,
+    fixed_split: bool = False,
+    fixed_train_list_path: str | Path | None = None,
+    fixed_validate_list_path: str | Path | None = None,
 ):
     """
     加载超分辨率 GR/LR 成对数据集。
@@ -1539,6 +1896,7 @@ def load_data(
     参数说明（超参数）:
         - gr_data_root_dir/lr_data_root_dir: GR/LR 数据根目录
         - selected_classes: 只加载指定类别，None 表示全部类别
+        - excluded_classes: 不参与加载的类别列表；None 或 [] 表示不排除任何类别。
         - class_sample_ratio: 每个类别读取比例，1.0 表示全部读取。
           例如 0.25 表示每个类别只保留约 25% 的配对样本，再参与后续 train/val/test 划分。
         - batch_size: DataLoader 批大小
@@ -1555,12 +1913,19 @@ def load_data(
         - cache_transformed_samples: 是否缓存变换后的样本到内存
         - use_disk_tensor_cache: 是否将样本张量缓存到磁盘
         - return_test_loader: 是否在返回值中包含 test_loader
+        - fixed_split: True 时不再随机划分数据，而是完全按照 fixed_train_list_path /
+          fixed_validate_list_path 两个列表指定 train/validate 样本。
+        - fixed_train_list_path/fixed_validate_list_path: fixed 模式的样本列表路径。列表里的目录
+          前缀只用于辅助识别类别，真实 GR/LR/LR-flow 路径仍按本函数原有根目录和文件名收集。
     """
     gr_root = ensure_valid_root_dir(gr_data_root_dir, "gr_data_root_dir")
     resolved_lr_data_root_dir = resolve_lr_data_root_dir(lr_data_root_dir, lr_data_variant)
     lr_root = ensure_valid_root_dir(resolved_lr_data_root_dir, "lr_data_root_dir")
 
     is_global_mix_split = selected_classes is None
+    # fixed_split 的语义是“外部列表已经定义好数据划分”，所以 class_sample_ratio 不应再裁剪样本。
+    # 这里用 effective_class_sample_ratio 参与缓存指纹和样本收集，避免误用之前 0.5 等比例缓存。
+    effective_class_sample_ratio = 1.0 if fixed_split else class_sample_ratio
 
     logger.info("=" * 80)
     logger.info("[Start] Begin loading SR dataset")
@@ -1569,8 +1934,16 @@ def load_data(
     logger.info(f"[Start] batch_size={batch_size}, num_workers={num_workers}, shuffle={shuffle}")
     logger.info(f"[Start] target_size={target_size}, random_seed={random_seed}")
     logger.info(f"[Start] selected_classes={selected_classes}")
+    logger.info(f"[Start] excluded_classes={excluded_classes}")
     logger.info(f"[Start] class_sample_ratio={class_sample_ratio}")
-    logger.info(f"[Start] split_mode={'global_mix' if is_global_mix_split else 'per_class'}")
+    logger.info(
+        f"[Start] effective_class_sample_ratio={effective_class_sample_ratio} "
+        f"({'fixed split ignores CLASS_SAMPLE_RATIO' if fixed_split else 'normal split'})"
+    )
+    logger.info(f"[Start] split_mode={'fixed' if fixed_split else ('global_mix' if is_global_mix_split else 'per_class')}")
+    if fixed_split:
+        logger.info(f"[Start] fixed_train_list_path={fixed_train_list_path}")
+        logger.info(f"[Start] fixed_validate_list_path={fixed_validate_list_path}")
     logger.info(f"[Start] verbose={verbose}")
     logger.info(
         f"[Start] use_metadata_cache={use_metadata_cache}, "
@@ -1580,9 +1953,15 @@ def load_data(
     )
     logger.info("=" * 80)
 
-    available_class_names = get_class_names(gr_data_root_dir)
+    all_available_class_names = get_class_names(gr_data_root_dir)
+    available_class_names = filter_excluded_class_names(
+        all_available_class_names,
+        excluded_classes,
+        context="load_data",
+    )
     class_names = normalize_selected_classes(available_class_names, selected_classes)
 
+    logger.info(f"[Info] Available classes after EXCLUDE_CLASS: {available_class_names}")
     logger.info(f"[Info] Selected {len(class_names)} classes: {class_names}")
     class_to_idx = {name: idx for idx, name in enumerate(class_names)}
     logger.info(f"[Info] class_to_idx mapping: {class_to_idx}")
@@ -1603,7 +1982,7 @@ def load_data(
         gr_root,
         lr_root,
         class_names,
-        class_sample_ratio=class_sample_ratio,
+        class_sample_ratio=effective_class_sample_ratio,
     )
     tensor_cache_root = build_tensor_cache_root(
         cache_dir,
@@ -1617,9 +1996,11 @@ def load_data(
     # - 1 表示完整读取
     # - 小于等于 0 没有语义
     # - 大于 1 会让“比例”这个参数失去直观含义
-    if not 0 < class_sample_ratio <= 1:
+    if not 0 < effective_class_sample_ratio <= 1:
         logger.error(f'class_sample_ratio must be in (0, 1], got {class_sample_ratio}')
         raise ValueError(f"class_sample_ratio must be in (0, 1], got {class_sample_ratio}")
+    if fixed_split and (fixed_train_list_path is None or fixed_validate_list_path is None):
+        raise ValueError("fixed_split=True requires fixed_train_list_path and fixed_validate_list_path.")
 
     samples: list[dict]
     if use_metadata_cache and cache_path.exists():
@@ -1643,14 +2024,14 @@ def load_data(
             original_class_sample_count = len(class_samples)
             class_samples = sample_class_subset(
                 class_samples=class_samples,
-                class_sample_ratio=class_sample_ratio,
+                class_sample_ratio=effective_class_sample_ratio,
                 random_seed=random_seed,
                 class_offset=class_offset,
             )
             samples.extend(class_samples)
             log_info(
                 f"[Summary] Class '{class_name}' contributes {len(class_samples)} paired samples "
-                f"(from {original_class_sample_count}, ratio={class_sample_ratio})",
+                f"(from {original_class_sample_count}, ratio={effective_class_sample_ratio})",
                 verbose,
             )
 
@@ -1662,29 +2043,48 @@ def load_data(
         logger.error('No paired GR/LR samples found.')
         raise ValueError("No paired GR/LR samples found.")
 
-    if validate_nums_rate is None:
-        validate_nums_rate = 1 - train_nums_rate - test_nums_rate
-
-    if not 0 < train_nums_rate < 1:
-        logger.error(f'train_nums_rate must be between 0 and 1, got {train_nums_rate}')
-        raise ValueError(f"train_nums_rate must be between 0 and 1, got {train_nums_rate}")
-    if not 0 <= validate_nums_rate < 1:
-        logger.error(f'validate_nums_rate must be between 0 and 1, got {validate_nums_rate}')
-        raise ValueError(f"validate_nums_rate must be between 0 and 1, got {validate_nums_rate}")
-    if not 0 <= test_nums_rate < 1:
-        logger.error(f'test_nums_rate must be between 0 and 1, got {test_nums_rate}')
-        raise ValueError(f"test_nums_rate must be between 0 and 1, got {test_nums_rate}")
-    if abs((train_nums_rate + validate_nums_rate + test_nums_rate) - 1.0) > 1e-8:
-        logger.error(f'train_nums_rate + validate_nums_rate + test_nums_rate must equal 1.0, got {train_nums_rate + validate_nums_rate + test_nums_rate}')
-        raise ValueError(
-            "train_nums_rate + validate_nums_rate + test_nums_rate must equal 1.0, "
-            f"got {train_nums_rate + validate_nums_rate + test_nums_rate}"
+    if fixed_split:
+        # fixed 模式的 Train/Validate 比例由两个列表的样本数反推，只用于日志和后续保存超参；
+        # SHUFFLE/RANDOM_SEED/Train_nums_rate/Test_nums_rate/Validate_nums_rate 不参与实际划分。
+        train_samples, validate_samples, test_samples, split_summary, train_nums_rate, validate_nums_rate = (
+            split_samples_by_fixed_lists(
+                samples=samples,
+                class_names=class_names,
+                available_class_names=available_class_names,
+                train_list_path=fixed_train_list_path,
+                validate_list_path=fixed_validate_list_path,
+                all_available_class_names=all_available_class_names,
+                excluded_classes=excluded_classes,
+            )
         )
+        test_nums_rate = 0.0
+    else:
+        if validate_nums_rate is None:
+            validate_nums_rate = 1 - train_nums_rate - test_nums_rate
+
+        if not 0 < train_nums_rate < 1:
+            logger.error(f'train_nums_rate must be between 0 and 1, got {train_nums_rate}')
+            raise ValueError(f"train_nums_rate must be between 0 and 1, got {train_nums_rate}")
+        if not 0 <= validate_nums_rate < 1:
+            logger.error(f'validate_nums_rate must be between 0 and 1, got {validate_nums_rate}')
+            raise ValueError(f"validate_nums_rate must be between 0 and 1, got {validate_nums_rate}")
+        if not 0 <= test_nums_rate < 1:
+            logger.error(f'test_nums_rate must be between 0 and 1, got {test_nums_rate}')
+            raise ValueError(f"test_nums_rate must be between 0 and 1, got {test_nums_rate}")
+        if abs((train_nums_rate + validate_nums_rate + test_nums_rate) - 1.0) > 1e-8:
+            logger.error(f'train_nums_rate + validate_nums_rate + test_nums_rate must equal 1.0, got {train_nums_rate + validate_nums_rate + test_nums_rate}')
+            raise ValueError(
+                "train_nums_rate + validate_nums_rate + test_nums_rate must equal 1.0, "
+                f"got {train_nums_rate + validate_nums_rate + test_nums_rate}"
+            )
 
     # 关键修改：
-    # 1) selected_classes is None -> 全局混合三划分
-    # 2) selected_classes is not None -> 按类别三划分（你要求的新逻辑）
-    if is_global_mix_split:
+    # 1) fixed_split=True -> 外部列表固定划分，前面已经完成
+    # 2) selected_classes is None -> 全局混合三划分
+    # 3) selected_classes is not None -> 按类别三划分（你要求的新逻辑）
+    if fixed_split:
+        pass
+    elif is_global_mix_split:
         train_samples, validate_samples, test_samples = split_samples_global(
             samples=samples,
             train_nums_rate=train_nums_rate,
@@ -1778,7 +2178,8 @@ def load_data(
         persistent_workers=True,  # 每个 epoch 不反复重建 worker，减少开销。适合长时间训练。
         prefetch_factor=2,  # 每个 worker 提前准备后面的 batch，减少 GPU 等待。
         batch_size=batch_size,
-        shuffle=shuffle,
+        # fixed 模式需要严格保持 FlowData_train.list 的样本顺序，因此无论全局 SHUFFLE 怎么设都关闭打乱。
+        shuffle=False if fixed_split else shuffle,
         num_workers=num_workers,
         collate_fn=sr_paired_collate_fn,
     )
@@ -1815,7 +2216,7 @@ def load_data(
     logger.info(f"[Done] Validate samples: {val_size}")
     logger.info(f"[Done] Test samples: {test_size}")
 
-    if is_global_mix_split:
+    if is_global_mix_split or fixed_split:
         for bucket_name, bucket_samples in validate_dataset.grouped_samples_by_class.items():
             logger.info(f"[Done] Validate bucket '{bucket_name}': {len(bucket_samples)}")
         if test_dataset is not None:

@@ -54,8 +54,10 @@ class global_data:
                 
                 ESRuRAFT_PIV_Ground v1 ：RAFT128+HR
                 ESRuRAFT_PIV_Ground v1_v1 ：RAFT128+bicubic
+                ESRuRAFT_PIV_Ground v1_v2 ：RAFT128+esrgan
                 ESRuRAFT_PIV_Ground v2 ：RAFT256+HR
                 ESRuRAFT_PIV_Ground v2_v1 ：RAFT256+bicubic
+                ESRuRAFT_PIV_Ground v2_v2 ：RAFT256+esrgan
                 ESRuRAFT_PIV_Ground v3 ：使用论文训练好的RAFT256+HR
                 ESRuRAFT_PIV_Ground v4 ：使用论文训练好的RAFT256+HR 重复实验 多了参数打印
                 ESRuRAFT_PIV_Ground v5 ：RAFT128（使用论文训练好的RAFT256部分迁移训练）+HR  
@@ -68,33 +70,66 @@ class global_data:
         # 训练任务标识
         # =========================
         name = "ESRuRAFT_PIV_Ground"  # 当前实验名（用于输出目录/模型名/wandb run名）
-        DESCRIPTION = "v1_v1"  # 实验补充描述（可写损失配置、数据版本等）
+        DESCRIPTION = "v_test"  # 实验补充描述（可写损失配置、数据版本等）
         name +=DESCRIPTION
 
         #整体项目注释
         # =========================
         # Ground 实验训练模式
         # =========================
-        # TRAIN_MODE 用于控制“送入 RAFT 的图像从哪里来”：
-        # 1. "lr_ground": 把低分辨率 previous/next 用最近邻插值对齐到 HR 尺寸后送入 RAFT。
-        #    该模式用于验证“只做最简单尺寸对齐、不做传统/学习型超分”的基线表现。
-        # 2. "hr_ground": 直接把真实高分辨率 previous/next 送入 RAFT，不经过任何超分网络。
-        #    该模式用于验证“RAFT 在理想 HR 图像输入下”的上限参考。
-        # 3. "bicubic": 把低分辨率 previous/next 用传统 bicubic 双三次插值放大到 HR 尺寸后送入 RAFT。
-        #    该模式没有可学习参数，用于和 ESRGAN 这类学习型超分模块做传统插值基线对比。
-        # 4. "esrgan": 使用最原始的 ESRGAN 生成器先把 LR 超分到 HR，再把 SR 图像送入 RAFT。
-        #    该模式保留 ESRGAN + RAFT 的联合训练路径，但超分模块不使用 ESRuRAFT_PIV 的改进结构。
-        TRAIN_MODES = ("lr_ground", "hr_ground", "bicubic", "esrgan")
-        TRAIN_MODE = "bicubic"
+        # TRAIN_MODE 用于控制“图像来源 + PIV/光流估计器”的组合：
+        # 1. "lr_ground_raft": 把 LR previous/next 用最近邻插值对齐到 HR 尺寸后送入 RAFT。
+        # 2. "hr_ground_raft": 直接把真实 HR previous/next 送入 RAFT，作为 RAFT 理想输入上限参考。
+        # 3. "bicubic_raft": 把 LR previous/next 用 bicubic 双三次插值放大到 HR 尺寸后送入 RAFT。
+        # 4. "esrgan_raft": 使用原始 ESRGAN 生成器把 LR 超分到 HR，再把 SR 图像送入 RAFT。
+        # 5. "bicubic_widim": LR 经 bicubic 上采样后，进入传统 WIDIM/窗口互相关 PIV baseline。
+        # 6. "bicubic_hs": LR 经 bicubic 上采样后，进入传统 Horn-Schunck 光流 baseline。
+        # 7. "srgan_raft": 使用传统 SRGAN 生成器把 LR 超分到 HR，再把 SR 图像送入 RAFT。
+        TRAIN_MODES = (
+            "lr_ground_raft",
+            "hr_ground_raft",
+            "bicubic_raft",
+            "esrgan_raft",
+            "bicubic_widim",
+            "bicubic_hs",
+            "srgan_raft",
+        )
+        # 兼容旧实验配置：外部仍写旧名字时会被 normalized_train_mode 映射成新名字。
+        TRAIN_MODE_ALIASES = {
+            "lr_ground": "lr_ground_raft",
+            "hr_ground": "hr_ground_raft",
+            "bicubic": "bicubic_raft",
+            "esrgan": "esrgan_raft",
+            "bicubic_WIDIM": "bicubic_widim",
+            "bicubic_HS": "bicubic_hs",
+        }
+        TRAIN_MODE = "esrgan_raft"
 
-        # 类别训练模式: "all" | "single" | "mixed"
+        # 类别训练模式:
+        # - "all":    每个类别单独训练一次；
+        # - "single": 只训练 SINGLE_CLASS_NAME 指定的一个类别；
+        # - "mixed":  所有类别混合后按比例随机划分；
+        # - "fixed":  训练/验证样本完全由 FIXED_TRAIN_LIST_PATH 和 FIXED_VALIDATE_LIST_PATH 指定。
+        TRAIN_CLASS_MODES = ("all", "single", "mixed", "fixed")
         TRAIN_CLASS_MODE = "mixed"
         # 当 TRAIN_CLASS_MODE="single" 时可预设；为 None 则运行时让你输入选择
         SINGLE_CLASS_NAME = None
         # mixed 模式下的目录名/日志名
         MIXED_CLASS_TAG = "mixed_all_classes"
+        # fixed 模式下的目录名/日志名；该模式会保留 list 文件中的样本顺序，不使用随机划分。
+        FIXED_CLASS_TAG = "fixed_train_validate"
+        # fixed 模式训练列表。这里仅把 list 文件作为“样本文件名清单”读取，
+        # list 行里的目录前缀不作为真实路径；真实 GR/LR 路径仍沿用原来的数据根目录逻辑。
+        FIXED_TRAIN_LIST_PATH = rf"{AUTODL_DATA_PATH}/study_datas/sr_dataset/class_1/FlowData_train.list"
+        # fixed 模式验证列表。Validate_nums_rate 会由 train/test 两个 list 的有效行数自动反推。
+        FIXED_VALIDATE_LIST_PATH = rf"{AUTODL_DATA_PATH}/study_datas/sr_dataset/class_1/FlowData_test.list"
+        # 排除类别超参数：
+        # - None 或 []：不排除，读取所有类别；
+        # - ["JHTDB_channel_hd", ...]：在 TRAIN_CLASS_MODE 为 all/mixed/fixed 时不加载这些类别。
+        # single 模式保持原语义，不主动应用 EXCLUDE_CLASS，避免用户点名单类训练时被隐式过滤。
+        EXCLUDE_CLASS = ["JHTDB_channel_hd", "JHTDB_isotropic1024_hd", "JHTDB_mhd1024_hd", "uniform"]
         #每个类别加载多少的数据 50%
-        CLASS_SAMPLE_RATIO =0.5
+        CLASS_SAMPLE_RATIO =0.01
         # =========================
         # 设备与模型加载
         # =========================
@@ -108,7 +143,7 @@ class global_data:
         # =========================
         # 训练主超参数
         # =========================
-        EPOCH_NUMS = 50 # 训练轮数 50
+        EPOCH_NUMS = 1 # 训练轮数 50
         START_EPOCH  = 1#从哪个epoch开始 从1开始
         BATCH_SIZE = 4 # batch 大小
         PRE_TRIAN_G_EPOCH = 1 #预训练G完成的轮次 从1开始 就是从第几轮开始弃用对抗损失
@@ -121,7 +156,7 @@ class global_data:
         # =========================
         # RAFT 配置
         # =========================
-        GRU_ITERS = 12 #RAFT的GRU迭代次数 12
+        GRU_ITERS = 12 #RAFT的GRU迭代次数；12
         """
         RAFT的上采样方法
             convex 上采样8倍  是原版 RAFT 最经典的做法。update_block 会额外预测一个 up_mask，然后用 3x3 邻域的加权组合做内容自适应上采样。
@@ -135,7 +170,7 @@ class global_data:
         # - "RAFT256": 内部在 1/8 分辨率估计光流。
         # Ground 分支当前硬编码为 RAFT256，所以默认仍为 "RAFT256"，保证 ckpt_256 和旧实验逻辑不变。
         RAFT_MODEL_TYPES = ("raft", "raft128", "raft256")
-        RAFT_MODEL_TYPE = "RAFT128"
+        RAFT_MODEL_TYPE = "RAFT256"
         # Ground 分支专用迁移学习开关：
         # True 时，如果 RAFT_MODEL_TYPE="RAFT128"，会尝试把 RAFT256 checkpoint 中 shape 完全一致的权重
         # 迁移到 RAFT128；shape 不一致的层会跳过并保留 RAFT128 自身随机初始化。
@@ -151,6 +186,18 @@ class global_data:
         RAFT128_INIT_FROM_RAFT256_OPTIMIZER = False
         RAFT128_INIT_FROM_RAFT256_SCHEDULER = False
         RAFT_UPSAMPLE = 'convex'
+
+        # =========================
+        # 传统 PIV / 光流 baseline 配置
+        # =========================
+        # WIDIM 这里实现为“窗口互相关 + 重叠窗口插值”的无参数 baseline：
+        # 每个 interrogation window 在 [-SEARCH_RADIUS, SEARCH_RADIUS] 内做整数位移搜索。
+        WIDIM_WINDOW_SIZE = 32
+        WIDIM_STRIDE = 16
+        WIDIM_SEARCH_RADIUS = 8
+        # Horn-Schunck 光流法的平滑系数和迭代次数。alpha 越大，流场越平滑。
+        HS_ALPHA = 1.0
+        HS_ITERS = 100
 
         # =========================
         # 损失项系数
@@ -179,7 +226,7 @@ class global_data:
         # 按你的设定：从第 0 轮开始由 0.012 线性增长，到 int(EPOCH_NUMS/2) 达到 1.2，之后保持 1.2。
         LAMBDA_FLOW_WARP_CONSISTENCY = 0.012
         FLOW_WARP_CONSISTENCY_WEIGHT_START = 0.012
-        FLOW_WARP_CONSISTENCY_WEIGHT_END = 1.2
+        FLOW_WARP_CONSISTENCY_WEIGHT_END = 1.057440
         FLOW_WARP_CONSISTENCY_WARMSTART_EPOCHS = 0
         FLOW_WARP_CONSISTENCY_WARMUP_EPOCHS = int(EPOCH_NUMS / 2)
         FLOW_WARP_CONSISTENCY_WEIGHT_SCHEDULE = "linear"  # 当前支持: linear | const | constant
@@ -259,6 +306,75 @@ class global_data:
         MODEL_DIR = "/train_model"  # 模型权重目录
         PREDICT_DIR = "/predict"  # 预测结果目录
         PREDICT_ALL_DIR = "/predict_all"  # 预测全部结果目录
+        # =========================
+        # RAFT256-PIV 风格 TFRecord 测试配置
+        # =========================
+        IS_VALIDATE_ALL = True  # 是否执行 evaluate_all 完整验证；默认 True，保持原有验证流程不变。
+        IS_TEST = True  # 是否在 evaluate_all 之后启用 test_all；默认 False，避免改变原训练/验证流程。
+        is_TEST_CLASS3 = True  # 是否额外测试 tbl/twcf 大图数据集；默认 False，节省显存和测试时间。
+        TEST_DIR = "/test_all"  # test_all 统一输出目录，会在该目录下再按 dataset 名称分文件夹。
+        TEST_BATCH_SIZE = 1  # RAFT256-PIV_test.py 测试默认 batch_size_test=1，这里单 GPU 保持一致。
+        TEST_NUM_THREADS = 8  # DALI TFRecordReader 线程数，和参考测试脚本保持一致。
+        TEST_SPLIT_SIZE = 1  # tbl/twcf 滑窗 patch 每次送入模型的数量；显存很大时可调大。
+        TEST_OFFSET = 256  # tbl/twcf 全图滑窗窗口大小，沿用 RAFT256-PIV_test.py。
+        TEST_SHIFT = 64  # tbl/twcf 全图滑窗步长，沿用 RAFT256-PIV_test.py。
+        TEST_AMP = False  # 测试阶段是否启用 AMP；默认 False，和参考脚本一致。
+        TEST_PLOT_RESULTS = True  # 是否保存每个 sample 的 png 可视化图。
+        TEST_TFRECORD2IDX_SCRIPT = "tfrecord2idx"  # idx 文件缺失时用于生成 idx 的外部工具。
+        PIV_RESULTS_TWCF_PATH = rf"{AUTODL_DATA_PATH}/study_datas/sr_dataset/class_3/TWCF/PIV_results_TWCF.npy"  # twcf PascalPIV 对比结果路径。
+        MASK_TWCF_PATH =  rf"{AUTODL_DATA_PATH}/study_datas/sr_dataset/class_3/TWCF/mask_TWCF.npy"  # twcf 可视化 mask 路径。
+        TEST_DATASETS = {
+            # 下面路径来自 RAFT256-PIV_test.py，统一放到全局变量，后续换数据只改这里。
+            "backstep": {
+                "test_tfrecord":  rf"{AUTODL_DATA_PATH}/study_datas/sr_dataset/test/Test_Dataset_10Imgs_backstep.tfrecord-00000-of-00001",
+                "test_tfrecord_idx":  rf"{AUTODL_DATA_PATH}/study_datas/sr_dataset/test/Test_Dataset_10Imgs_backstep.idx",
+                "image_height": 256,
+                "image_width": 256,
+                "label_shape": [12],
+            },
+            "cylinder": {
+                "test_tfrecord":  rf"{AUTODL_DATA_PATH}/study_datas/sr_dataset/test/Test_Dataset_10Imgs_cylinder.tfrecord-00000-of-00001",
+                "test_tfrecord_idx": rf"{AUTODL_DATA_PATH}/study_datas/sr_dataset/test/Test_Dataset_10Imgs_cylinder.idx",
+                "image_height": 256,
+                "image_width": 256,
+                "label_shape": [12],
+            },
+            "jhtdb": {
+                "test_tfrecord":  rf"{AUTODL_DATA_PATH}/study_datas/sr_dataset/test/Test_Dataset_10Imgs_jhtdb.tfrecord-00000-of-00001",
+                "test_tfrecord_idx":  rf"{AUTODL_DATA_PATH}/study_datas/sr_dataset/test/Test_Dataset_10Imgs_jhtdb.idx",
+                "image_height": 256,
+                "image_width": 256,
+                "label_shape": [12],
+            },
+            "dns_turb": {
+                "test_tfrecord":  rf"{AUTODL_DATA_PATH}/study_datas/sr_dataset/test/Test_Dataset_10Imgs_dns_turb.tfrecord-00000-of-00001",
+                "test_tfrecord_idx":  rf"{AUTODL_DATA_PATH}/study_datas/sr_dataset/test/Test_Dataset_10Imgs_dns_turb.idx",
+                "image_height": 256,
+                "image_width": 256,
+                "label_shape": [12],
+            },
+            "sqg": {
+                "test_tfrecord":  rf"{AUTODL_DATA_PATH}/study_datas/sr_dataset/test/Test_Dataset_10Imgs_sqg.tfrecord-00000-of-00001",
+                "test_tfrecord_idx":  rf"{AUTODL_DATA_PATH}/study_datas/sr_dataset/test/Test_Dataset_10Imgs_sqg.idx",
+                "image_height": 256,
+                "image_width": 256,
+                "label_shape": [12],
+            },
+            "tbl": {
+                "test_tfrecord":  rf"{AUTODL_DATA_PATH}/study_datas/sr_dataset/class_3/TBL/Dataset_TransTBL_Original8px_fullFrame_withGT.tfrecord-00000-of-00001",
+                "test_tfrecord_idx": rf"{AUTODL_DATA_PATH}/study_datas/sr_dataset/class_3/TBL/Dataset_TransTBL_Original8px_withGT_fullFrame.idx",
+                "image_height": 256,
+                "image_width": 3296,
+                "label_shape": [12],
+            },
+            "twcf": {
+                "test_tfrecord":  rf"{AUTODL_DATA_PATH}/study_datas/sr_dataset/class_3/TWCF/Test_Dataset_AR_rawImage.tfrecord-00000-of-00001",
+                "test_tfrecord_idx":  rf"{AUTODL_DATA_PATH}/study_datas/sr_dataset/class_3/TWCF/Test_Dataset_AR_rawImage.idx",
+                "image_height": 2160,
+                "image_width": 2560,
+                "label_shape": [12],
+            },
+        }
         LOG_DIR = "/log" #日志目录
         use_gpu = torch.cuda.is_available()
         Path(OUT_PUT_DIR).mkdir(parents=True, exist_ok=True)
@@ -329,6 +445,134 @@ class global_data:
         END_TIME = time.time()
 
         @classmethod
+        def normalized_train_class_mode(cls) -> str:
+            """
+            返回规范化后的类别训练模式。
+
+            统一做 strip/lower 后，pipeline 只需要依赖这个入口；这样新增 fixed 后，
+            不会出现某个脚本仍只接受 all/single/mixed 的旧判断。
+            """
+            return str(cls.TRAIN_CLASS_MODE).strip().lower()
+
+        @classmethod
+        def validate_train_class_mode(cls) -> str:
+            """
+            校验 TRAIN_CLASS_MODE 是否属于当前支持的模式。
+
+            fixed 也是显式模式：它不会使用随机种子、shuffle 或比例划分，而是完全按两个 list 文件取样。
+            """
+            mode = cls.normalized_train_class_mode()
+            if mode not in cls.TRAIN_CLASS_MODES:
+                raise ValueError(
+                    f"TRAIN_CLASS_MODE 仅支持 {cls.TRAIN_CLASS_MODES}，当前为: {cls.TRAIN_CLASS_MODE}"
+                )
+            return mode
+
+        @classmethod
+        def normalized_exclude_class_names(cls) -> list[str]:
+            """
+            标准化 EXCLUDE_CLASS。
+
+            允许配置为 None、[]、单个字符串或字符串列表；返回去重后的类别名列表。
+            这个方法只处理配置格式，不扫描磁盘，真正的类别存在性校验由 data_load 负责。
+            """
+            excluded = cls.EXCLUDE_CLASS
+            if excluded is None:
+                return []
+            if isinstance(excluded, str):
+                raw_names = [excluded]
+            else:
+                raw_names = list(excluded)
+
+            normalized: list[str] = []
+            seen_lower: set[str] = set()
+            for class_name in raw_names:
+                name = str(class_name).strip()
+                if not name:
+                    continue
+                lower_name = name.lower()
+                if lower_name in seen_lower:
+                    continue
+                seen_lower.add(lower_name)
+                normalized.append(name)
+            return normalized
+
+        @classmethod
+        def _fixed_list_row_is_excluded(cls, stripped_line: str) -> bool:
+            """
+            判断 fixed list 的一行是否命中 EXCLUDE_CLASS。
+
+            list 中的路径前缀不作为真实读取路径，但里面通常带有类别目录名；
+            这里只把这些目录片段用于“统计比例时跳过被排除类别”的判断。
+            """
+            excluded_lookup = {name.lower() for name in cls.normalized_exclude_class_names()}
+            if not excluded_lookup:
+                return False
+
+            for raw_path in stripped_line.split()[:3]:
+                normalized_path = str(raw_path).replace("\\", "/")
+                for part in Path(normalized_path).parts:
+                    if part.lower() in excluded_lookup:
+                        return True
+                # fixed list 里有时即使类别目录片段无法可靠识别，文件名本身也带类别前缀；
+                # 例如 JHTDB_isotropic1024_hd_00469_img1.tif，应命中 JHTDB_isotropic1024_hd。
+                file_stem = Path(normalized_path).stem.lower()
+                for excluded_class in excluded_lookup:
+                    if file_stem == excluded_class or file_stem.startswith(f"{excluded_class}_"):
+                        return True
+            return False
+
+        @classmethod
+        def _count_fixed_split_list_rows(cls, list_path: str | Path, split_name: str) -> int:
+            """
+            统计 fixed list 的有效样本行数。
+
+            这里和 data_load.load_fixed_split_entries 保持同样规则：跳过空行和 `#` 注释行。
+            同时会跳过 EXCLUDE_CLASS 命中的行；该计数只用于把 Train_nums_rate /
+            Validate_nums_rate 反推成当前固定划分的真实比例。
+            """
+            path = Path(list_path).expanduser()
+            if not path.exists():
+                raise FileNotFoundError(f"{split_name} fixed split list does not exist: {path}")
+
+            count = 0
+            with path.open("r", encoding="utf-8") as file_obj:
+                for line in file_obj:
+                    stripped = line.strip()
+                    if stripped and not stripped.startswith("#") and not cls._fixed_list_row_is_excluded(stripped):
+                        count += 1
+            if count <= 0:
+                raise ValueError(f"{split_name} fixed split list has no valid sample rows: {path}")
+            return count
+
+        @classmethod
+        def update_fixed_split_rates(cls) -> dict:
+            """
+            根据 fixed train/validate list 的行数同步比例超参数。
+
+            fixed 模式真实划分由 list 文件决定；这里更新比例只是为了日志、wandb 和 hyper_parameters.txt
+            能显示和固定列表一致的 Train_nums_rate / Validate_nums_rate，Test_nums_rate 固定为 0。
+            """
+            train_count = cls._count_fixed_split_list_rows(cls.FIXED_TRAIN_LIST_PATH, "train")
+            validate_count = cls._count_fixed_split_list_rows(cls.FIXED_VALIDATE_LIST_PATH, "validate")
+            total_count = train_count + validate_count
+            cls.Train_nums_rate = train_count / total_count
+            cls.Validate_nums_rate = validate_count / total_count
+            cls.Test_nums_rate = 0.0
+            logger.info(
+                "[FixedSplit] Update split rates from list rows: "
+                f"train_count={train_count}, validate_count={validate_count}, "
+                f"Train_nums_rate={cls.Train_nums_rate:.8f}, "
+                f"Validate_nums_rate={cls.Validate_nums_rate:.8f}, Test_nums_rate=0.0"
+            )
+            return {
+                "train_count": train_count,
+                "validate_count": validate_count,
+                "train_rate": cls.Train_nums_rate,
+                "validate_rate": cls.Validate_nums_rate,
+            }
+
+        @classmethod
         def normalized_raft_model_type(cls) -> str:
             """
             返回规范化后的 RAFT 网络类型。
@@ -361,12 +605,16 @@ class global_data:
             统一在这里做 strip/lower，是为了允许配置里写成 "LR_GROUND" 或带空格时
             仍然能够被正确识别；同时所有调用方都只依赖这一个入口，避免分散校验。
             """
-            return str(cls.TRAIN_MODE).strip().lower()
+            mode = str(cls.TRAIN_MODE).strip()
+            # 先查原字符串，再查 lower 后的字符串；这样 "bicubic_WIDIM" 这种大小写写法也能兼容。
+            mode = cls.TRAIN_MODE_ALIASES.get(mode, mode)
+            mode = cls.TRAIN_MODE_ALIASES.get(mode.lower(), mode.lower())
+            return mode
 
         @classmethod
         def validate_train_mode(cls) -> str:
             """
-            校验 TRAIN_MODE 是否属于允许的三种模式。
+            校验 TRAIN_MODE 是否属于允许的 Ground 模式。
 
             这里选择启动即报错，而不是在训练中间才失败；这样可以避免跑了很久才发现
             TRAIN_MODE 拼写错误，例如 "lr-groud" 这类肉眼不容易发现的问题。
@@ -383,10 +631,10 @@ class global_data:
             """
             当前模式是否需要训练/调用超分辨率生成器。
 
-            lr_ground/hr_ground/bicubic 都是纯 RAFT 输入基线，不需要 Generator 或 Discriminator；
-            esrgan 才会启用原始 ESRGAN 生成器，并把 SR 结果继续送入 RAFT。
+            只有 esrgan_raft / srgan_raft 需要训练或调用可学习超分辨率生成器；
+            其他模式都是固定图像来源或传统 PIV/光流 baseline。
             """
-            return cls.validate_train_mode() == "esrgan"
+            return cls.validate_train_mode() in {"esrgan_raft", "srgan_raft"}
 
         @classmethod
         def _get_scheduled_weight(

@@ -7,7 +7,7 @@ ESRuRAFT_PIV_Ground 使用的“原始 ESRGAN”超分模块。
 3. 两级 PixelShuffle 上采样；
 4. 普通单帧 forward，不做 ESRuRAFT_PIV 里的双帧特征交互。
 
-这样 TRAIN_MODE="esrgan" 时，Ground 实验只替换超分模块本身，
+这样 TRAIN_MODE="esrgan_raft" 时，Ground 实验只替换超分模块本身，
 后面的 RAFT 接法、训练循环、评估保存逻辑仍然沿用 ESRuRAFT_PIV_Ground。
 """
 from loguru import logger
