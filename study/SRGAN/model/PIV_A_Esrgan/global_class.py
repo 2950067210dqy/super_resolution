@@ -203,16 +203,20 @@ class global_data:
         # 按你的设定：从第 0 轮开始由 0.012 线性增长，到 int(EPOCH_NUMS/2) 达到 1.2，之后保持 1.2。
         LAMBDA_FLOW_WARP_CONSISTENCY = 0.012
         FLOW_WARP_CONSISTENCY_WEIGHT_START = 0.012
-        FLOW_WARP_CONSISTENCY_WEIGHT_END = 1.057440
+        FLOW_WARP_CONSISTENCY_WEIGHT_END = 1.057440 if CLASS_SAMPLE_RATIO!=1 else 0.2
         FLOW_WARP_CONSISTENCY_WARMSTART_EPOCHS = 0
         FLOW_WARP_CONSISTENCY_WARMUP_EPOCHS = int(EPOCH_NUMS / 2)
         FLOW_WARP_CONSISTENCY_WEIGHT_SCHEDULE = "linear"  # 当前支持: linear | const | constant
 
         # `RAFT_EPE_WEIGHT` 是 Generator 侧附加的 RAFT EPE 反作用权重。
         # 按你的设定：前半程保持 1，从 int(EPOCH_NUMS/2)+1 开始线性增长，最后一轮达到 3。
-        RAFT_EPE_WEIGHT = 1 if USE_RAFT else 0.0
-        RAFT_EPE_WEIGHT_START = 1 if USE_RAFT else 0.0
-        RAFT_EPE_WEIGHT_END = 3 if USE_RAFT else 0.0
+        RAFT_EPE_WEIGHT = 1
+        RAFT_EPE_WEIGHT_START = 1
+        RAFT_EPE_WEIGHT_END = 3 if CLASS_SAMPLE_RATIO != 1 else 1.5
+        if not USE_RAFT:
+            RAFT_EPE_WEIGHT = 0
+            RAFT_EPE_WEIGHT_START = 0
+            RAFT_EPE_WEIGHT_END = 0
         RAFT_EPE_WARMSTART_EPOCHS = int(EPOCH_NUMS / 2) + 1
         RAFT_EPE_WARMUP_EPOCHS = EPOCH_NUMS - 1
         RAFT_EPE_WEIGHT_SCHEDULE = "linear"  # 当前支持: linear | const | constant
@@ -306,8 +310,8 @@ class global_data:
         # RAFT256-PIV 风格 TFRecord 测试配置
         # =========================
         IS_VALIDATE_ALL = True  # 是否执行 evaluate_all 完整验证；默认 True，保持原有验证流程不变。
-        IS_TEST = False  # 是否在 evaluate_all 之后启用 test_all；默认 False，避免改变原训练/验证流程。
-        is_TEST_CLASS3 = False  # 是否额外测试 tbl/twcf 大图数据集；默认 False，节省显存和测试时间。
+        IS_TEST = True  # 是否在 evaluate_all 之后启用 test_all；默认 False，避免改变原训练/验证流程。
+        is_TEST_CLASS3 = True  # 是否额外测试 tbl/twcf 大图数据集；默认 False，节省显存和测试时间。
         TEST_DIR = "/test_all"  # test_all 统一输出目录，会在该目录下再按 dataset 名称分文件夹。
         TEST_BATCH_SIZE = 1  # RAFT256-PIV_test.py 测试默认 batch_size_test=1，这里单 GPU 保持一致。
         TEST_NUM_THREADS = 8  # DALI TFRecordReader 线程数，和参考测试脚本保持一致。
@@ -397,7 +401,10 @@ class global_data:
         loss_label = BASE_LOSS_LABEL + (RAFT_LOSS_LABEL if USE_RAFT else [])
 
         BASE_VALIDATE_LABEL = ['VAL_MSE_LOSS', 'VAL_SSIM_Loss', 'Avg_PSNR', "VAL_energy_spectrum_mse"]
-        RAFT_VALIDATE_LABEL = ["VAL_AEE", "VAL_NORM_AEE_PER100PIXEL"]
+        # 新增 VAL_C_AEE：
+        # C-AEE = 0.5 * ESE_norm + 0.5 * AEE_norm
+        # 这里只负责定义训练曲线 / CSV 的列名，真正的数值计算在 evaluate.py 中完成。
+        RAFT_VALIDATE_LABEL = ["VAL_AEE", "VAL_NORM_AEE_PER100PIXEL", "VAL_C_AEE"]
         validate_label = BASE_VALIDATE_LABEL + (RAFT_VALIDATE_LABEL if USE_RAFT else [])
 
 

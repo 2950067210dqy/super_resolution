@@ -10,10 +10,12 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from loguru import logger
 from tqdm import tqdm
 
+from study.SRGAN.model.c_aee_metric_common import attach_c_aee_to_raft_rows
 from study.SRGAN.data_downscal import DOWNSAMPLE_METHOD, INTERPOLATION_MODE, downsample_tif
 
 try:
@@ -32,6 +34,354 @@ except Exception:
 
 
 _CACHED_2D_WINDOWS = {}
+
+
+def _match_common_channels(pred_chw, gt_chw):
+    """
+    对齐预测/真值的公共通道数，避免不同分支的 SR 输出通道数不一致时直接报 shape 错误。
+
+    说明：
+        test_all 的 HR 输入大多是单通道颗粒图，但个别生成器可能输出多通道结果。
+        evaluate_all 的指标本质上都只依赖“可对齐的公共通道”，因此这里统一截到两者共同拥有的最小通道数。
+    """
+    pred = np.asarray(pred_chw, dtype=np.float32)
+    gt = np.asarray(gt_chw, dtype=np.float32)
+    if pred.ndim != 3 or gt.ndim != 3:
+        raise ValueError(f"Expected CHW arrays, got pred={pred.shape}, gt={gt.shape}")
+    cnum = min(int(pred.shape[0]), int(gt.shape[0]))
+    if cnum <= 0:
+        raise ValueError(f"No common channels for metrics: pred={pred.shape}, gt={gt.shape}")
+    return pred[:cnum], gt[:cnum]
+
+
+def _mse(pred_chw, gt_chw):
+    """计算均方误差 MSE。"""
+    pred, gt = _match_common_channels(pred_chw, gt_chw)
+    return float(np.mean((pred - gt) ** 2))
+
+
+def _psnr_from_mse(mse):
+    """由 MSE 计算 PSNR，假设图像范围已经在 [0,1]。"""
+    return float("inf") if mse == 0 else 20.0 * math.log10(1.0 / math.sqrt(mse))
+
+
+def _r2_score(pred_chw, gt_chw, eps=1e-12):
+    """计算决定系数 R^2。"""
+    pred, gt = _match_common_channels(pred_chw, gt_chw)
+    y_true = gt.reshape(-1)
+    y_pred = pred.reshape(-1)
+    ss_res = float(np.sum((y_true - y_pred) ** 2))
+    ss_tot = float(np.sum((y_true - np.mean(y_true)) ** 2))
+    return 1.0 - ss_res / (ss_tot + eps)
+
+
+def _nrmse(pred_chw, gt_chw, eps=1e-12):
+    """按真值范围归一化的 RMSE。"""
+    pred, gt = _match_common_channels(pred_chw, gt_chw)
+    rmse = math.sqrt(float(np.mean((pred - gt) ** 2)))
+    den = float(np.max(gt) - np.min(gt))
+    return rmse / (den + eps)
+
+
+def _ssim_score(pred_chw, gt_chw):
+    """
+    计算 SSIM，按公共通道逐通道求值后取平均。
+
+    优先使用 skimage；如果环境里没有 skimage，则回退到一个简化版 SSIM 公式，
+    保证 test_all 在最小依赖环境里也能把指标跑完。
+    """
+    pred, gt = _match_common_channels(pred_chw, gt_chw)
+    try:
+        from skimage.metrics import structural_similarity as sk_ssim
+
+        vals = []
+        for c in range(pred.shape[0]):
+            p = pred[c]
+            g = gt[c]
+            dr = float(np.max(g) - np.min(g))
+            dr = dr if dr > 1e-12 else 1.0
+            vals.append(float(sk_ssim(g, p, data_range=dr)))
+        return float(np.mean(vals))
+    except Exception:
+        vals = []
+        C1, C2 = 0.01**2, 0.03**2
+        for c in range(pred.shape[0]):
+            x = pred[c]
+            y = gt[c]
+            mx, my = float(np.mean(x)), float(np.mean(y))
+            vx, vy = float(np.var(x)), float(np.var(y))
+            cov = float(np.mean((x - mx) * (y - my)))
+            num = (2 * mx * my + C1) * (2 * cov + C2)
+            den = (mx * mx + my * my + C1) * (vx + vy + C2)
+            vals.append(num / den if den != 0 else 0.0)
+        return float(np.mean(vals))
+
+
+def _tke_reconstruction_accuracy(pred_chw, gt_chw, eps=1e-12):
+    """
+    计算 TKE 重建精度。
+
+    对单通道 SR 图像，这个指标没有物理意义，因此会返回 nan；
+    这与 evaluate_all 的行为保持一致。
+    """
+    pred, gt = _match_common_channels(pred_chw, gt_chw)
+    if pred.shape[0] < 2 or gt.shape[0] < 2:
+        return float("nan")
+    up, vp = pred[0], pred[1]
+    ug, vg = gt[0], gt[1]
+    up_p = up - np.mean(up)
+    vp_p = vp - np.mean(vp)
+    ug_p = ug - np.mean(ug)
+    vg_p = vg - np.mean(vg)
+    tke_p = 0.5 * float(np.mean(up_p ** 2 + vp_p ** 2))
+    tke_g = 0.5 * float(np.mean(ug_p ** 2 + vg_p ** 2))
+    return 1.0 - abs(tke_p - tke_g) / (abs(tke_g) + eps)
+
+
+def _radial_spectrum(ch2d):
+    """计算单通道二维场的径向平均能量谱。"""
+    f = np.fft.fftshift(np.fft.fft2(ch2d))
+    p = np.abs(f) ** 2
+    h, w = p.shape
+    cy, cx = h // 2, w // 2
+    yy, xx = np.indices((h, w))
+    r = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2).astype(np.int32)
+    tbin = np.bincount(r.ravel(), p.ravel())
+    nr = np.bincount(r.ravel())
+    return tbin / np.maximum(nr, 1)
+
+
+def _energy_spectrum_curves(pred_chw, gt_chw):
+    """计算公共通道上的平均径向能量谱曲线。"""
+    pred, gt = _match_common_channels(pred_chw, gt_chw)
+    pred_specs = []
+    gt_specs = []
+    min_len = None
+    for c in range(pred.shape[0]):
+        sp = _radial_spectrum(pred[c])
+        sg = _radial_spectrum(gt[c])
+        n = min(len(sp), len(sg))
+        min_len = n if min_len is None else min(min_len, n)
+        pred_specs.append(sp[:n])
+        gt_specs.append(sg[:n])
+    pred_curve = np.mean(np.stack([x[:min_len] for x in pred_specs], axis=0), axis=0)
+    gt_curve = np.mean(np.stack([x[:min_len] for x in gt_specs], axis=0), axis=0)
+    return pred_curve, gt_curve
+
+
+def _energy_spectrum_mse_from_curves(pred_curve, gt_curve):
+    """对已算好的谱曲线计算 log1p 频谱差 MSE。"""
+    return float(np.mean((np.log1p(pred_curve) - np.log1p(gt_curve)) ** 2))
+
+
+def _compute_aee_from_chw(pred_chw, gt_chw):
+    """
+    计算单样本 CHW 流场的 AEE。
+
+    这里和 evaluate_all 保持同口径：AEE 等价于像素级 EPE 的平均值。
+    """
+    pred, gt = _match_common_channels(pred_chw, gt_chw)
+    if pred.shape[0] < 2 or gt.shape[0] < 2:
+        return float("nan")
+    du = pred[0] - gt[0]
+    dv = pred[1] - gt[1]
+    epe = np.sqrt(du * du + dv * dv)
+    return float(np.mean(epe))
+
+
+def _mean_sum_per_100_pixels(values_1d, group_size=100):
+    """
+    将一维误差序列按每 100 个像素分组求和，再对所有满 100 像素分组和取平均。
+
+    这就是 evaluate_all 里 NORM_AEE_PER100PIXEL 的统计口径。
+    最后一组不足 100 个像素时直接丢弃，不参与统计。
+    """
+    values = np.asarray(values_1d, dtype=np.float32).reshape(-1)
+    if values.size < group_size:
+        return float("nan")
+    usable_count = (values.size // group_size) * group_size
+    if usable_count <= 0:
+        return float("nan")
+    values = values[:usable_count].reshape(-1, group_size)
+    group_sums = np.sum(values, axis=1, dtype=np.float32)
+    return float(np.mean(group_sums, dtype=np.float32)) if group_sums.size > 0 else float("nan")
+
+
+def _compute_norm_aee_per100_from_chw(pred_chw, gt_chw):
+    """
+    用单样本 CHW 流场计算“每 100 个像素 EPE 累加值的平均”。
+    """
+    pred, gt = _match_common_channels(pred_chw, gt_chw)
+    if pred.shape[0] < 2 or gt.shape[0] < 2:
+        return float("nan")
+    du = pred[0] - gt[0]
+    dv = pred[1] - gt[1]
+    epe = np.sqrt(du * du + dv * dv)
+    return _mean_sum_per_100_pixels(epe, group_size=100)
+
+
+def _compute_image_metric_row(dataset_name, sample_index, pair_type, pred_chw, gt_chw):
+    """
+    计算单个 previous/next SR 图像对的指标行。
+
+    字段对齐 evaluate_all：mse / psnr / energy_spectrum_mse / r2 / ssim / tke_acc / nrmse。
+    """
+    pred_curve, gt_curve = _energy_spectrum_curves(pred_chw, gt_chw)
+    mse = _mse(pred_chw, gt_chw)
+    return {
+        "dataset": dataset_name,
+        "sample_index": sample_index,
+        "pair_type": pair_type,
+        "mse": mse,
+        "psnr": _psnr_from_mse(mse),
+        "energy_spectrum_mse": _energy_spectrum_mse_from_curves(pred_curve, gt_curve),
+        "r2": _r2_score(pred_chw, gt_chw),
+        "ssim": _ssim_score(pred_chw, gt_chw),
+        "tke_acc": _tke_reconstruction_accuracy(pred_chw, gt_chw),
+        "nrmse": _nrmse(pred_chw, gt_chw),
+    }
+
+
+def _compute_flow_metric_row(dataset_name, sample_index, pred_chw, gt_chw):
+    """
+    计算单个样本的流场指标行。
+
+    按用户当前需求，test_all 的 RAFT 指标包含：
+        1. EPE
+        2. NORM_AEE_PER100PIXEL
+        3. C_AEE
+
+    其中 C_AEE 依赖整个 dataset 的 min-max 归一化，所以这里先放占位值，
+    等整套 dataset 全部跑完后再统一回填真实结果。
+    """
+    return {
+        "dataset": dataset_name,
+        "sample_index": sample_index,
+        "pair_type": "RAFT",
+        "epe": _compute_aee_from_chw(pred_chw, gt_chw),
+        "NORM_AEE_PER100PIXEL": _compute_norm_aee_per100_from_chw(pred_chw, gt_chw),
+        # C-AEE 依赖“整套测试样本内”的 min-max 归一化，
+        # 因此这里先占位为 NaN，等 dataset 全部跑完后再统一回填。
+        "C_AEE": float("nan"),
+    }
+
+
+def _build_mean_row(rows, fixed_fields, metric_keys):
+    """根据给定指标列生成一行均值记录。"""
+    mean_row = dict(fixed_fields)
+    for key in metric_keys:
+        vals = []
+        for row in rows:
+            value = row.get(key, float("nan"))
+            try:
+                value = float(value)
+            except Exception:
+                value = float("nan")
+            if np.isfinite(value):
+                vals.append(value)
+        mean_row[key] = float(np.mean(vals)) if vals else float("nan")
+    return mean_row
+
+
+def _write_rows_with_mean(path, rows, fixed_fields, metric_keys):
+    """
+    写入明细行 + 均值行。
+
+    返回值：
+        mean_row: 方便调用方继续把 dataset 级均值拼到 root metrics_all.csv。
+    """
+    if not rows:
+        return None
+    mean_row = _build_mean_row(rows, fixed_fields, metric_keys)
+    _write_csv(path, rows + [mean_row])
+    return mean_row
+
+
+def _find_first_conv2d(module):
+    """
+    在模块里递归找到第一层 Conv2d。
+
+    test_all 需要知道“这个分支的 SR 生成器训练时期待几通道图像”。
+    对当前四个分支来说，最可靠的信息就是生成器第一层卷积的 in_channels。
+    """
+    if module is None:
+        return None
+    for child in module.modules():
+        if isinstance(child, nn.Conv2d):
+            return child
+    return None
+
+
+def _infer_model_image_channels(model):
+    """
+    推断当前模型在 SR 分支期望的图像通道数。
+
+    背景：
+        - TFRecord 测试集里的 target 存的是 2 通道：[prev_gray, next_gray]；
+        - 但这几个分支训练时的 Generator 常常按 inner_chanel=3 初始化，
+          即 previous/next 每帧都会被当成 3 通道图像来处理；
+        - 如果 test_all 直接喂 1 通道 patch，就会在第一层卷积处报
+          “expected input to have 3 channels, but got 1 channels”。
+
+    因此这里统一从 Generator 第一层卷积读取 in_channels，作为测试阶段的适配目标。
+    如果模型上没有 Generator，则回退到 1，保持最保守行为。
+    """
+    generator = getattr(model, "piv_esrgan_generator", None)
+    first_conv = _find_first_conv2d(generator)
+    if first_conv is None:
+        return 1
+    return int(first_conv.in_channels)
+
+
+def _adapt_image_channels_for_model(image_bchw, expected_channels):
+    """
+    把测试图像适配到模型训练时的通道口径。
+
+    当前 test_all 的原始图片是单通道颗粒图 [B, 1, H, W]。如果模型训练时使用
+    inner_chanel=3，那么这里会把单通道复制成 3 通道，再送入 Generator / VGG / GAN
+    分支，保证前向逻辑和训练时一致。
+
+    说明：
+        - 1 -> 3：直接 repeat，最符合“灰度图复制到 RGB 三通道”的训练习惯；
+        - N -> 1：对通道取均值，保持灰度意义；
+        - 其他情况：尽量按 repeat + 截断适配，避免因为测试集通道数和实验口径不同而崩溃。
+    """
+    if image_bchw.ndim != 4:
+        raise ValueError(f"Expected BCHW tensor, got shape={tuple(image_bchw.shape)}")
+
+    current_channels = int(image_bchw.shape[1])
+    expected_channels = int(expected_channels)
+    if current_channels == expected_channels:
+        return image_bchw
+    if expected_channels <= 0:
+        raise ValueError(f"expected_channels must be positive, got {expected_channels}")
+
+    if current_channels == 1 and expected_channels > 1:
+        return image_bchw.repeat(1, expected_channels, 1, 1)
+    if expected_channels == 1 and current_channels > 1:
+        return image_bchw.mean(dim=1, keepdim=True)
+    if expected_channels < current_channels:
+        return image_bchw[:, :expected_channels, :, :]
+
+    repeat_times = int(math.ceil(expected_channels / current_channels))
+    return image_bchw.repeat(1, repeat_times, 1, 1)[:, :expected_channels, :, :]
+
+
+def _collapse_image_to_single_channel_for_test(image_bchw):
+    """
+    把模型输出图像压回 test_all 统一使用的单通道口径。
+
+    test_all 的保存图、图像指标、对比图都围绕“单通道 prev / next 颗粒图”设计。
+    因此如果某个分支的 Generator 输出为 3 通道，这里统一做通道均值，得到单通道图：
+        1. 与 TFRecord 的原始 ground truth 口径一致；
+        2. 不改模型内部 RAFT / loss 的真实计算逻辑；
+        3. 避免后续可视化代码只取第 0 通道时混入通道偏差。
+    """
+    if image_bchw.ndim != 4:
+        raise ValueError(f"Expected BCHW tensor, got shape={tuple(image_bchw.shape)}")
+    if int(image_bchw.shape[1]) == 1:
+        return image_bchw
+    return image_bchw.mean(dim=1, keepdim=True)
 
 
 def _load_dali_modules():
@@ -292,21 +642,40 @@ def _predict_patch(model, images_hr, flows_hr, factor, device, flow_init=None):
 
     target 的第 0 通道是 prev，第 1 通道是 next；这里先拆 HR，再用 data_downscal.py
     生成 prev_lr/next_lr，最后仍通过 PIV_ESRGAN_RAFT_Model.forward 得到 SR+RAFT 预测。
+
+    额外兼容：
+        当前四个分支训练时很多 Generator 是按 inner_chanel=3 初始化的，但 test_all 的
+        TFRecord target 是灰度双帧 [prev_gray, next_gray]。因此这里会：
+        1. 保留原始单通道 prev/next，供 test_all 的图片保存和指标统计使用；
+        2. 自动把 prev/next 的 LR/HR 复制到模型期望的通道数后再送入 forward；
+        3. 模型生成出的多通道 SR 图再压回单通道，统一交给 test_all 做后处理。
     """
+    # TFRecord 原始双帧是单通道灰度图；这两份 tensor 会原样保留给保存图片/算指标。
     prev_hr = images_hr[:, 0:1, :, :]
     next_hr = images_hr[:, 1:2, :, :]
     prev_lr = _make_lr_from_hr_tensor(prev_hr, factor, device)
     next_lr = _make_lr_from_hr_tensor(next_hr, factor, device)
 
+    # 生成器/VGG/GAN 分支前向必须吃到与训练时一致的通道数，否则会在第一层卷积报错。
+    expected_channels = _infer_model_image_channels(model)
+    prev_hr_for_model = _adapt_image_channels_for_model(prev_hr, expected_channels)
+    next_hr_for_model = _adapt_image_channels_for_model(next_hr, expected_channels)
+    prev_lr_for_model = _adapt_image_channels_for_model(prev_lr, expected_channels)
+    next_lr_for_model = _adapt_image_channels_for_model(next_lr, expected_channels)
+
     pred_prev, pred_next, flow_predictions, _ = model(
-        input_lr_prev=prev_lr,
-        input_lr_next=next_lr,
-        input_gr_prev=prev_hr,
-        input_gr_next=next_hr,
+        input_lr_prev=prev_lr_for_model,
+        input_lr_next=next_lr_for_model,
+        input_gr_prev=prev_hr_for_model,
+        input_gr_next=next_hr_for_model,
         flowl0=flows_hr,
         flow_init=flow_init,
         is_adversarial=False,
     )
+    # test_all 的图像输出、对比图和 SR 图像指标都以单通道颗粒图为基准；
+    # 这里把多通道 Generator 输出压回单通道，避免后续保存/评估继续带着 3 通道口径。
+    pred_prev = _collapse_image_to_single_channel_for_test(pred_prev)
+    pred_next = _collapse_image_to_single_channel_for_test(pred_next)
     return {
         "flow": _last_flow_prediction(flow_predictions),  # 最终 RAFT flow 预测
         "prev_lr": prev_lr,  # 用 data_downscal.py 从 HR prev 生成的 LR prev
@@ -404,53 +773,234 @@ def _predict_full_frame_with_folding(model, images, flows, factor, device, test_
     }
 
 
-def _plot_twcf(out_path, u_pred, v_pred, piv_results, mask_twcf, sample_index):
-    """保存 TWCF 的 PascalPIV 对比图，布局沿用 RAFT256-PIV_test.py。"""
-    u_pascal = piv_results[sample_index, 0, :, :]
-    v_pascal = piv_results[sample_index, 1, :, :]
-
-    plt.figure(num=None, figsize=(24, 16), dpi=120, facecolor="w", edgecolor="k")
-    plt.subplot(2, 2, 1)
-    plt.pcolor(np.squeeze(u_pascal), cmap="Greys", vmin=-2, vmax=12)
-    plt.axis("off")
-    plt.colorbar().ax.set_ylabel("displacement [px]", fontsize=14)
-    plt.subplot(2, 2, 2)
-    plt.pcolor(np.squeeze(v_pascal), cmap="Greys", vmin=-1, vmax=1)
-    plt.axis("off")
-    plt.colorbar().ax.set_ylabel("displacement [px]", fontsize=14)
-    plt.subplot(2, 2, 3)
-    plt.pcolor(u_pred * mask_twcf, cmap="Greys", vmin=-2, vmax=12)
-    plt.axis("off")
-    plt.colorbar().ax.set_ylabel("displacement [px]", fontsize=14)
-    plt.subplot(2, 2, 4)
-    plt.pcolor(v_pred * mask_twcf, cmap="Greys", vmin=-1, vmax=1)
-    plt.axis("off")
-    plt.colorbar().ax.set_ylabel("displacement [px]", fontsize=14)
-    plt.savefig(out_path)
-    plt.close()
+def _mask_field_for_plot(field_2d, mask_2d=None):
+    """
+    按 mask 把无效区域转成 masked array，绘图时显示为空白而不是被最低值颜色染满。
+    """
+    field = np.asarray(field_2d, dtype=np.float32)
+    if mask_2d is None:
+        return field
+    mask = np.asarray(mask_2d)
+    if mask.shape != field.shape:
+        return field
+    return np.ma.masked_where(mask <= 0, field)
 
 
-def _plot_tbl(out_path, u_pred, v_pred, u_gt, v_gt):
-    """保存 TBL 全图测试的预测/真值对比图。"""
-    plt.figure(num=None, figsize=(24, 16), dpi=120, facecolor="w", edgecolor="k")
-    plt.subplot(2, 2, 1)
-    plt.pcolor(np.squeeze(u_pred), cmap="Greys", vmin=2, vmax=8)
-    plt.axis("off")
-    plt.colorbar().ax.set_ylabel("displacement [px]", fontsize=14)
-    plt.subplot(2, 2, 2)
-    plt.pcolor(np.squeeze(v_pred), cmap="Greys", vmin=-0.5, vmax=0.5)
-    plt.axis("off")
-    plt.colorbar().ax.set_ylabel("displacement [px]", fontsize=14)
-    plt.subplot(2, 2, 3)
-    plt.pcolor(u_gt, cmap="Greys", vmin=2, vmax=8)
-    plt.axis("off")
-    plt.colorbar().ax.set_ylabel("displacement [px]", fontsize=14)
-    plt.subplot(2, 2, 4)
-    plt.pcolor(v_gt, cmap="Greys", vmin=-0.5, vmax=0.5)
-    plt.axis("off")
-    plt.colorbar().ax.set_ylabel("displacement [px]", fontsize=14)
-    plt.savefig(out_path)
-    plt.close()
+def _plot_field_with_colorbar(ax, field_2d, title, cmap_name, vmin, vmax, label):
+    """给单个子图统一绘制位移场和色条。"""
+    im = ax.imshow(field_2d, origin="lower", cmap=cmap_name, vmin=vmin, vmax=vmax, aspect="auto")
+    ax.set_title(title, fontsize=14)
+    ax.axis("off")
+    cb = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cb.ax.set_ylabel(label, fontsize=12)
+    return im
+
+
+def _plot_twcf(out_path, u_pred, v_pred, piv_results, mask_twcf, sample_index, cmap_name="viridis"):
+    """
+    保存 TWCF 的 PascalPIV 对比图。
+
+    修改点：
+        旧版色条使用 Greys，视觉上是黑白图；这里改成与用户给定示例一致的 viridis 风格色条，
+        让位移高低在紫-蓝-绿-黄之间连续过渡，更适合看边界层速度梯度。
+    """
+    ref_index = min(int(sample_index), int(piv_results.shape[0]) - 1)
+    u_pascal = np.asarray(piv_results[ref_index, 0, :, :], dtype=np.float32)
+    v_pascal = np.asarray(piv_results[ref_index, 1, :, :], dtype=np.float32)
+    mask_2d = np.asarray(mask_twcf, dtype=np.float32) if mask_twcf is not None else None
+
+    fig, axes = plt.subplots(2, 2, figsize=(24, 16), dpi=120, facecolor="w", edgecolor="k")
+    _plot_field_with_colorbar(
+        axes[0, 0], _mask_field_for_plot(u_pascal, mask_2d), "PascalPIV U",
+        cmap_name, vmin=-2, vmax=12, label="displacement [px]"
+    )
+    _plot_field_with_colorbar(
+        axes[0, 1], _mask_field_for_plot(v_pascal, mask_2d), "PascalPIV V",
+        cmap_name, vmin=-1, vmax=1, label="displacement [px]"
+    )
+    _plot_field_with_colorbar(
+        axes[1, 0], _mask_field_for_plot(u_pred, mask_2d), "Current U",
+        cmap_name, vmin=-2, vmax=12, label="displacement [px]"
+    )
+    _plot_field_with_colorbar(
+        axes[1, 1], _mask_field_for_plot(v_pred, mask_2d), "Current V",
+        cmap_name, vmin=-1, vmax=1, label="displacement [px]"
+    )
+    fig.tight_layout()
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_tbl(out_path, u_pred, v_pred, u_gt, v_gt, cmap_name="viridis"):
+    """
+    保存 TBL 全图测试的预测/真值对比图。
+
+    这里同样把原来的黑白色条改成 viridis，便于直接和论文式位移场热图保持一致。
+    """
+    fig, axes = plt.subplots(2, 2, figsize=(24, 16), dpi=120, facecolor="w", edgecolor="k")
+    _plot_field_with_colorbar(
+        axes[0, 0], np.squeeze(u_pred), "Pred U",
+        cmap_name, vmin=2, vmax=8, label="displacement [px]"
+    )
+    _plot_field_with_colorbar(
+        axes[0, 1], np.squeeze(v_pred), "Pred V",
+        cmap_name, vmin=-0.5, vmax=0.5, label="displacement [px]"
+    )
+    _plot_field_with_colorbar(
+        axes[1, 0], np.squeeze(u_gt), "GT U",
+        cmap_name, vmin=2, vmax=8, label="displacement [px]"
+    )
+    _plot_field_with_colorbar(
+        axes[1, 1], np.squeeze(v_gt), "GT V",
+        cmap_name, vmin=-0.5, vmax=0.5, label="displacement [px]"
+    )
+    fig.tight_layout()
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _resolve_twcf_profile_columns(width, column_ratios):
+    """把 TWCF 论文风格图的三个剖面位置从比例转换成像素列坐标。"""
+    cols = []
+    for ratio in column_ratios:
+        ratio = float(ratio)
+        col = int(round((width - 1) * ratio))
+        cols.append(int(np.clip(col, 0, width - 1)))
+    return cols
+
+
+def _save_twcf_profile_artifacts(
+    dataset_dir,
+    sample_index,
+    u_pred,
+    u_gt,
+    mask_twcf,
+    method_label,
+    cmap_name="viridis",
+    column_ratios=(0.15, 0.24, 0.83),
+    region_names=("Laminar", "Transition", "Turbulent"),
+):
+    """
+    保存 TWCF 的论文风格剖面对比图，并把关键数据落成 .npy 便于和其他方法后处理比较。
+
+    图像结构：
+        1. 上半部分：GT 水平位移场 + 三条红色虚线采样位置；
+        2. 下半部分：三个位置的 y-方向位移剖面，只画 GT 与当前方法。
+    """
+    analysis_dir = dataset_dir / "twcf_profile_analysis" / f"sample_{sample_index:04d}"
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+
+    u_pred = np.asarray(u_pred, dtype=np.float32)
+    u_gt = np.asarray(u_gt, dtype=np.float32)
+    mask_2d = None if mask_twcf is None else np.asarray(mask_twcf, dtype=np.float32)
+    columns = _resolve_twcf_profile_columns(u_gt.shape[1], column_ratios)
+    y_positions = np.arange(u_gt.shape[0], dtype=np.float32)
+
+    profile_gt = np.full((len(columns), u_gt.shape[0]), np.nan, dtype=np.float32)
+    profile_pred = np.full((len(columns), u_gt.shape[0]), np.nan, dtype=np.float32)
+    for idx, col in enumerate(columns):
+        if mask_2d is not None and mask_2d.shape == u_gt.shape:
+            valid = mask_2d[:, col] > 0
+        else:
+            valid = np.ones((u_gt.shape[0],), dtype=bool)
+        profile_gt[idx, valid] = u_gt[valid, col]
+        profile_pred[idx, valid] = u_pred[valid, col]
+
+    # 保存原始场和已经抽好的剖面，后续其他方法只要在同样列位置上取 profile 就能直接对比。
+    np.save(analysis_dir / "u_gt.npy", u_gt.astype(np.float32))
+    np.save(analysis_dir / "u_pred.npy", u_pred.astype(np.float32))
+    if mask_2d is not None:
+        np.save(analysis_dir / "mask.npy", mask_2d.astype(np.float32))
+    np.save(analysis_dir / "profile_columns.npy", np.asarray(columns, dtype=np.int32))
+    np.save(analysis_dir / "profile_y_positions.npy", y_positions)
+    np.save(analysis_dir / "profile_gt.npy", profile_gt)
+    np.save(analysis_dir / "profile_pred.npy", profile_pred)
+
+    masked_gt = _mask_field_for_plot(u_gt, mask_2d)
+    if np.ma.isMaskedArray(masked_gt):
+        valid_values = masked_gt.compressed()
+    else:
+        valid_values = np.asarray(masked_gt).reshape(-1)
+        valid_values = valid_values[np.isfinite(valid_values)]
+    if valid_values.size > 0:
+        vmin = float(np.nanpercentile(valid_values, 1))
+        vmax = float(np.nanpercentile(valid_values, 99))
+    else:
+        vmin, vmax = float(np.min(u_gt)), float(np.max(u_gt))
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
+        vmin, vmax = 0.0, 1.0
+
+    fig = plt.figure(figsize=(14, 14), dpi=160, facecolor="w", edgecolor="k")
+    grid = fig.add_gridspec(2, 3, height_ratios=[1.0, 1.8], hspace=0.35, wspace=0.25)
+
+    ax_top = fig.add_subplot(grid[0, :])
+    im = ax_top.imshow(masked_gt, origin="lower", cmap=cmap_name, vmin=vmin, vmax=vmax, aspect="auto")
+    ax_top.set_title("Ground truth of horizontal direction", fontsize=18)
+    ax_top.set_xticks([])
+    ax_top.set_yticks([])
+    for idx, col in enumerate(columns):
+        ax_top.axvline(col, color="red", linestyle="--", linewidth=2.0)
+        label = region_names[idx] if idx < len(region_names) else f"Region {idx + 1}"
+        ax_top.text(
+            col,
+            u_gt.shape[0] - 8,
+            label,
+            color="red",
+            fontsize=16,
+            ha="center",
+            va="top",
+            bbox={"facecolor": "white", "edgecolor": "none", "pad": 2.5},
+        )
+    cbar = fig.colorbar(im, ax=ax_top, orientation="horizontal", fraction=0.08, pad=0.18)
+    cbar.set_label("Displacement[px]", fontsize=15)
+
+    x_values = np.concatenate(
+        [
+            profile_gt[np.isfinite(profile_gt)],
+            profile_pred[np.isfinite(profile_pred)],
+        ],
+        axis=0,
+    ) if np.isfinite(profile_gt).any() or np.isfinite(profile_pred).any() else np.asarray([0.0, 1.0], dtype=np.float32)
+    x_min = float(np.nanmin(x_values))
+    x_max = float(np.nanmax(x_values))
+    if not np.isfinite(x_min) or not np.isfinite(x_max) or x_min == x_max:
+        x_min, x_max = 0.0, 1.0
+    x_pad = 0.05 * max(x_max - x_min, 1.0)
+
+    for idx, col in enumerate(columns):
+        ax = fig.add_subplot(grid[1, idx])
+        valid_gt = np.isfinite(profile_gt[idx])
+        valid_pred = np.isfinite(profile_pred[idx])
+        if np.any(valid_gt):
+            ax.plot(
+                profile_gt[idx][valid_gt],
+                y_positions[valid_gt],
+                color="black",
+                linewidth=2.0,
+                linestyle=(0, (6, 3)),
+                label="GT",
+            )
+        if np.any(valid_pred):
+            ax.plot(
+                profile_pred[idx][valid_pred],
+                y_positions[valid_pred],
+                color="red",
+                linewidth=2.2,
+                linestyle="-",
+                label=method_label,
+            )
+        title = region_names[idx] if idx < len(region_names) else f"Region {idx + 1}"
+        ax.set_title(title, fontsize=15, fontweight="bold")
+        ax.set_xlabel("Displacement[px]", fontsize=12)
+        if idx == 0:
+            ax.set_ylabel("y-position[px]", fontsize=12)
+            ax.legend(loc="upper left", fontsize=11, frameon=True)
+        ax.set_xlim(x_min - x_pad, x_max + x_pad)
+        ax.set_ylim(0, u_gt.shape[0] - 1)
+        ax.grid(alpha=0.15)
+
+    fig.savefig(analysis_dir / "twcf_profile_compare.png", bbox_inches="tight")
+    plt.close(fig)
 
 
 def _plot_regular(out_path, u_pred, v_pred, u_gt, v_gt):
@@ -593,8 +1143,30 @@ def _save_image_outputs(dataset_dir, image_payload, start_index):
         _plot_image_comparison(sample_dir / "comparison.png", sample_images)
 
 
-def _save_sample_plots(dataset_name, dataset_dir, predicted_np, flow_np, start_index, twcf_payload, image_payload=None):
-    """按 dataset 类别分文件夹保存每个 sample 的 flow 可视化图，并可选保存 LR/HR/SR 图片。"""
+def _save_sample_plots(
+    dataset_name,
+    dataset_dir,
+    predicted_np,
+    flow_np,
+    start_index,
+    twcf_payload,
+    image_payload=None,
+    plot_args=None,
+):
+    """
+    按 dataset 类别分文件夹保存每个 sample 的 flow 可视化图，并可选保存 LR/HR/SR 图片。
+
+    plot_args 用于把 test_all 的一些可视化超参数往下传，例如：
+        - displacement_cmap
+        - method_label
+        - twcf_profile_column_ratios
+        - twcf_profile_region_names
+    """
+    plot_args = plot_args or {}
+    displacement_cmap = str(plot_args.get("displacement_cmap", "viridis"))
+    method_label = str(plot_args.get("method_label", "Current method"))
+    twcf_profile_column_ratios = tuple(plot_args.get("twcf_profile_column_ratios", (0.15, 0.24, 0.83)))
+    twcf_profile_region_names = tuple(plot_args.get("twcf_profile_region_names", ("Laminar", "Transition", "Turbulent")))
     if image_payload is not None:
         _save_image_outputs(dataset_dir, image_payload, start_index)
 
@@ -607,9 +1179,29 @@ def _save_sample_plots(dataset_name, dataset_dir, predicted_np, flow_np, start_i
         v_gt = flow_np[local_idx, 1, :, :]
 
         if dataset_name == "twcf":
-            _plot_twcf(out_path, u_pred, v_pred, twcf_payload["piv_results"], twcf_payload["mask"], sample_index)
+            _plot_twcf(
+                out_path,
+                u_pred,
+                v_pred,
+                twcf_payload["piv_results"],
+                twcf_payload["mask"],
+                sample_index,
+                cmap_name=displacement_cmap,
+            )
+            # 额外生成用户要求的论文风格 TWCF 剖面对比图，并把关键场/剖面存成 .npy。
+            _save_twcf_profile_artifacts(
+                dataset_dir=dataset_dir,
+                sample_index=sample_index,
+                u_pred=u_pred,
+                u_gt=u_gt,
+                mask_twcf=twcf_payload["mask"],
+                method_label=method_label,
+                cmap_name=displacement_cmap,
+                column_ratios=twcf_profile_column_ratios,
+                region_names=twcf_profile_region_names,
+            )
         elif dataset_name == "tbl":
-            _plot_tbl(out_path, u_pred, v_pred, u_gt, v_gt)
+            _plot_tbl(out_path, u_pred, v_pred, u_gt, v_gt, cmap_name=displacement_cmap)
         else:
             _plot_regular(out_path, u_pred, v_pred, u_gt, v_gt)
 
@@ -673,6 +1265,16 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
         "shift": getattr(global_data.esrgan, "TEST_SHIFT", 64),
         "amp": getattr(global_data.esrgan, "TEST_AMP", False),
         "plot_results": getattr(global_data.esrgan, "TEST_PLOT_RESULTS", True),
+        # viridis 与用户提供的彩色位移色条最接近；这里用 getattr 预留后续配置入口，
+        # 这样不改 global_class 也能工作，未来如果用户想换别的 cmap，可以直接在全局变量补同名字段。
+        "displacement_cmap": getattr(global_data.esrgan, "TEST_DISPLACEMENT_CMAP", "viridis"),
+        "method_label": getattr(global_data.esrgan, "name", "Current method"),
+        "twcf_profile_column_ratios": getattr(global_data.esrgan, "TWCF_PROFILE_COLUMN_RATIOS", (0.15, 0.24, 0.83)),
+        "twcf_profile_region_names": getattr(
+            global_data.esrgan,
+            "TWCF_PROFILE_REGION_NAMES",
+            ("Laminar", "Transition", "Turbulent"),
+        ),
     }
 
     twcf_payload = None
@@ -703,6 +1305,9 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
                 width = int(dataset_cfg["image_width"])
                 results = np.empty((dataset_size, 4, height, width), dtype=np.float32)
                 epe_array = np.empty((dataset_size,), dtype=np.float32)
+                norm_aee_per100_array = np.empty((dataset_size,), dtype=np.float32)
+                dataset_image_rows = []
+                dataset_raft_rows = []
 
                 total_samples = 0
                 sum_epe = 0.0
@@ -741,12 +1346,46 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
 
                     predicted_np = predicted_flows.detach().cpu().numpy().astype(np.float32, copy=False)
                     flow_np = flows.detach().cpu().numpy().astype(np.float32, copy=False)
+                    # 图像指标和 evaluate_all 保持一致：统一按 [0,1] 范围统计。
+                    pred_prev_np = _as_numpy_batch(prediction["pred_prev"].clamp(0, 1))
+                    pred_next_np = _as_numpy_batch(prediction["pred_next"].clamp(0, 1))
+                    prev_hr_np = _as_numpy_batch(prediction["prev_hr"].clamp(0, 1))
+                    next_hr_np = _as_numpy_batch(prediction["next_hr"].clamp(0, 1))
                     sample_end = sample_start + valid_size
                     results[sample_start:sample_end, 0, :, :] = predicted_np[:, 0, :, :]
                     results[sample_start:sample_end, 1, :, :] = predicted_np[:, 1, :, :]
                     results[sample_start:sample_end, 2, :, :] = flow_np[:, 0, :, :]
                     results[sample_start:sample_end, 3, :, :] = flow_np[:, 1, :, :]
                     epe_array[sample_start:sample_end] = epe_per_sample.detach().cpu().numpy().astype(np.float32)
+                    # 逐样本补充 test_all 的 SR 图像指标和流场额外指标。
+                    for local_idx in range(valid_size):
+                        sample_index = sample_start + local_idx
+                        dataset_image_rows.append(
+                            _compute_image_metric_row(
+                                dataset_name,
+                                sample_index,
+                                "previous",
+                                pred_prev_np[local_idx],
+                                prev_hr_np[local_idx],
+                            )
+                        )
+                        dataset_image_rows.append(
+                            _compute_image_metric_row(
+                                dataset_name,
+                                sample_index,
+                                "next",
+                                pred_next_np[local_idx],
+                                next_hr_np[local_idx],
+                            )
+                        )
+                        flow_row = _compute_flow_metric_row(
+                            dataset_name,
+                            sample_index,
+                            predicted_np[local_idx],
+                            flow_np[local_idx],
+                        )
+                        dataset_raft_rows.append(flow_row)
+                        norm_aee_per100_array[sample_index] = float(flow_row["NORM_AEE_PER100PIXEL"])
 
                     if bool(test_args["plot_results"]):
                         _save_sample_plots(
@@ -757,6 +1396,7 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
                             sample_start,
                             twcf_payload if dataset_name == "twcf" else None,
                             image_payload=prediction,
+                            plot_args=test_args,
                         )
 
                     logger.info(
@@ -769,32 +1409,89 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
                 elapsed = time.time() - start_time
                 results_path = dataset_dir / "results.npy"
                 epe_path = dataset_dir / "epe_array.npy"
+                norm_aee_per100_path = dataset_dir / "norm_aee_per100_array.npy"
                 np.save(results_path, results)
                 np.save(epe_path, epe_array)
+                np.save(norm_aee_per100_path, norm_aee_per100_array)
 
-                dataset_rows = [
-                    {
+                # C-AEE 需要把 same sample 的 previous/next 图像 ESE 与该 sample 的 RAFT AEE 配对，
+                # 并在当前 dataset 内做 min-max 归一化后再组合，因此必须放到整个 dataset 收集完成后统一回填。
+                attach_c_aee_to_raft_rows(
+                    image_rows=dataset_image_rows,
+                    raft_rows=dataset_raft_rows,
+                    sample_key_fields=("dataset", "sample_index"),
+                    ese_key="energy_spectrum_mse",
+                    aee_key="epe",
+                    output_key="C_AEE",
+                )
+
+                image_metric_keys = ["mse", "psnr", "energy_spectrum_mse", "r2", "ssim", "tke_acc", "nrmse"]
+                raft_metric_keys = ["epe", "NORM_AEE_PER100PIXEL", "C_AEE"]
+                image_mean_row = _write_rows_with_mean(
+                    dataset_dir / "metrics_image_pair.csv",
+                    dataset_image_rows,
+                    fixed_fields={
                         "dataset": dataset_name,
-                        "sample_index": i,
-                        "epe": float(epe_array[i]),
-                    }
-                    for i in range(total_samples)
-                ]
-                _write_csv(dataset_dir / "metrics.csv", dataset_rows)
+                        "sample_index": "MEAN",
+                        "pair_type": "all",
+                    },
+                    metric_keys=image_metric_keys,
+                )
+                raft_mean_row = _write_rows_with_mean(
+                    dataset_dir / "metrics_raft.csv",
+                    dataset_raft_rows,
+                    fixed_fields={
+                        "dataset": dataset_name,
+                        "sample_index": "MEAN",
+                        "pair_type": "RAFT",
+                    },
+                    metric_keys=raft_metric_keys,
+                )
+                # 兼容原有只看 metrics.csv 的脚本：继续保留这个名字，并让它等同于 flow/RAFT 指标表。
+                if dataset_raft_rows:
+                    _write_rows_with_mean(
+                        dataset_dir / "metrics.csv",
+                        dataset_raft_rows,
+                        fixed_fields={
+                            "dataset": dataset_name,
+                            "sample_index": "MEAN",
+                            "pair_type": "RAFT",
+                        },
+                        metric_keys=raft_metric_keys,
+                    )
 
                 summary_rows.append(
                     {
                         "dataset": dataset_name,
                         "samples": total_samples,
                         "mean_epe": mean_epe,
+                        "mean_norm_aee_per100pixel": (
+                            float(raft_mean_row["NORM_AEE_PER100PIXEL"]) if raft_mean_row is not None else float("nan")
+                        ),
+                        "mean_c_aee": float(raft_mean_row["C_AEE"]) if raft_mean_row is not None else float("nan"),
+                        "image_mse_mean": float(image_mean_row["mse"]) if image_mean_row is not None else float("nan"),
+                        "image_psnr_mean": float(image_mean_row["psnr"]) if image_mean_row is not None else float("nan"),
+                        "image_energy_spectrum_mse_mean": (
+                            float(image_mean_row["energy_spectrum_mse"]) if image_mean_row is not None else float("nan")
+                        ),
+                        "image_r2_mean": float(image_mean_row["r2"]) if image_mean_row is not None else float("nan"),
+                        "image_ssim_mean": float(image_mean_row["ssim"]) if image_mean_row is not None else float("nan"),
+                        "image_tke_acc_mean": float(image_mean_row["tke_acc"]) if image_mean_row is not None else float("nan"),
+                        "image_nrmse_mean": float(image_mean_row["nrmse"]) if image_mean_row is not None else float("nan"),
                         "elapsed_seconds": elapsed,
                         "results_npy": str(results_path),
                         "epe_npy": str(epe_path),
+                        "norm_aee_per100_npy": str(norm_aee_per100_path),
+                        "metrics_image_pair_csv": str(dataset_dir / "metrics_image_pair.csv"),
+                        "metrics_raft_csv": str(dataset_dir / "metrics_raft.csv"),
                     }
                 )
                 logger.info(
                     f"[test_all] 完成 dataset={dataset_name}, samples={total_samples}, "
-                    f"mean_epe={mean_epe:.6f}, elapsed={elapsed:.2f}s"
+                    f"mean_epe={mean_epe:.6f}, "
+                    f"mean_norm_aee_per100={summary_rows[-1]['mean_norm_aee_per100pixel']:.6f}, "
+                    f"mean_c_aee={summary_rows[-1]['mean_c_aee']:.6f}, "
+                    f"elapsed={elapsed:.2f}s"
                 )
 
         _write_csv(test_base_dir / "metrics_all.csv", summary_rows)

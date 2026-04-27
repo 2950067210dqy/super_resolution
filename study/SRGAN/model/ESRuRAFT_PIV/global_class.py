@@ -160,7 +160,7 @@ class global_data:
         # 按你的设定：从第 0 轮开始由 0.012 线性增长，到 int(EPOCH_NUMS/2) 达到 1.2，之后保持 1.2。
         LAMBDA_FLOW_WARP_CONSISTENCY = 0.012
         FLOW_WARP_CONSISTENCY_WEIGHT_START = 0.012
-        FLOW_WARP_CONSISTENCY_WEIGHT_END = 1.057440
+        FLOW_WARP_CONSISTENCY_WEIGHT_END = 1.057440 if CLASS_SAMPLE_RATIO != 1 else 0.2
         FLOW_WARP_CONSISTENCY_WARMSTART_EPOCHS = 0
         FLOW_WARP_CONSISTENCY_WARMUP_EPOCHS = int(EPOCH_NUMS / 2)
         FLOW_WARP_CONSISTENCY_WEIGHT_SCHEDULE = "linear"  # 当前支持: linear | const | constant
@@ -169,7 +169,7 @@ class global_data:
         # 按你的设定：前半程保持 1，从 int(EPOCH_NUMS/2)+1 开始线性增长，最后一轮达到 3。
         RAFT_EPE_WEIGHT = 1
         RAFT_EPE_WEIGHT_START = 1
-        RAFT_EPE_WEIGHT_END = 3
+        RAFT_EPE_WEIGHT_END = 3 if CLASS_SAMPLE_RATIO != 1 else 1.5
         RAFT_EPE_WARMSTART_EPOCHS = int(EPOCH_NUMS / 2) + 1
         RAFT_EPE_WARMUP_EPOCHS = EPOCH_NUMS - 1
         RAFT_EPE_WEIGHT_SCHEDULE = "linear"  # 当前支持: linear | const | constant
@@ -346,7 +346,7 @@ class global_data:
                       'raft_loss', 'raft_epe','raft_1px', 'raft_3px','raft_5px',
                       ]
         validate_label = ['VAL_MSE_LOSS','VAL_SSIM_Loss', 'Avg_PSNR',"VAL_energy_spectrum_mse",
-                          "VAL_AEE", "VAL_NORM_AEE_PER100PIXEL"]
+                          "VAL_AEE", "VAL_NORM_AEE_PER100PIXEL", "VAL_C_AEE"]
 
 
         # 存储数据至csv的列名

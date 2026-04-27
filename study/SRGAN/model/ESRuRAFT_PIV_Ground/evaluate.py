@@ -24,6 +24,7 @@ from study.SRGAN.model.ESRuRAFT_PIV_Ground.judge_delicators import _to_np_chw, _
 from study.SRGAN.model.ESRuRAFT_PIV_Ground.visual_plot_init import build_flo_uvw_pred_gt_panel, _omega_star_from_uv
 from study.SRGAN.model.ESRuRAFT_PIV_Ground.visual_plot_save import save_vorticity_quiver_compare, _save_triplet, _save_pair, \
     _save_energy_spectrum_plot
+from study.SRGAN.model.c_aee_metric_common import attach_c_aee_to_raft_rows, compute_c_aee_array
 from study.SRGAN.util.image_util import flow_to_color_tensor, build_triplet_row, add_vertical_separator, \
     add_horizontal_separator, build_pair_row, _select_metric_or_save_channels
 
@@ -275,6 +276,23 @@ def _compute_aee_from_flow_tensors(pred_bchw: torch.Tensor, gt_bchw: torch.Tenso
         return float("nan")
     epe_map = torch.sqrt(torch.sum((pred_bchw[:, :2] - gt_bchw[:, :2]) ** 2, dim=1))
     return float(epe_map.mean().item())
+
+
+def _compute_samplewise_aee_from_flow_tensors(pred_bchw: torch.Tensor, gt_bchw: torch.Tensor) -> np.ndarray:
+    """
+    计算 batch 内每个样本自己的 AEE。
+
+    evaluate() 新增的 C-AEE 不是直接对“整批均值”做归一化，而是：
+        1. 先拿到每个样本自己的 ESE 和 AEE；
+        2. 在当前验证集合内部做 min-max 归一化；
+        3. 再按样本组合成 C-AEE，最后求整体验证均值。
+
+    因此这里需要一个 sample-wise AEE，而不只是 batch 平均 AEE。
+    """
+    if pred_bchw.shape[1] < 2 or gt_bchw.shape[1] < 2:
+        return np.full((pred_bchw.shape[0],), np.nan, dtype=np.float32)
+    epe_map = torch.sqrt(torch.sum((pred_bchw[:, :2] - gt_bchw[:, :2]) ** 2, dim=1))
+    return epe_map.reshape(epe_map.shape[0], -1).mean(dim=1).detach().cpu().numpy().astype(np.float32, copy=False)
 
 
 def _flow_uv_to_uvw(flow_bchw: torch.Tensor) -> torch.Tensor:
@@ -958,6 +976,8 @@ def validate_raft(model, dataloader, device, epoch, result_dir=None, data_type="
     total_energy_spectrum_mse = 0.0
     total_aee = 0.0
     total_norm_aee_per100 = 0.0
+    sample_energy_spectrum_mse_values = []
+    sample_aee_values = []
     loss_count = 0
     num_images = 0
     raft_batch_count = 0
@@ -1004,6 +1024,7 @@ def validate_raft(model, dataloader, device, epoch, result_dir=None, data_type="
             fake_prev = outputs["sr_prev"]
             fake_next = outputs["sr_next"]
 
+            batch_sample_ese_lists = [[] for _ in range(fake_prev.shape[0])]
             for fake_images, hr_images in ((fake_prev, hr_prev), (fake_next, hr_next)):
                 _, _, mse_total, ssim_total, _ = pixel_loss(fake_images, hr_images, global_data.esrgan.SAVE_AS_GRAY)
                 total_val_ssim_loss += ssim_total.item()
@@ -1017,16 +1038,25 @@ def validate_raft(model, dataloader, device, epoch, result_dir=None, data_type="
                     hr_images, "image_pair", global_data.esrgan.SAVE_AS_GRAY
                 )
 
-                for fake_image, hr_image in zip(fake_images_for_metric, hr_images_for_metric):
+                for sample_idx, (fake_image, hr_image) in enumerate(zip(fake_images_for_metric, hr_images_for_metric)):
                     total_psnr += calculate_psnr(fake_image, hr_image)
-                    total_energy_spectrum_mse += _energy_spectrum_mse(_to_np_chw(fake_image), _to_np_chw(hr_image))
+                    energy_spectrum_mse = _energy_spectrum_mse(_to_np_chw(fake_image), _to_np_chw(hr_image))
+                    total_energy_spectrum_mse += energy_spectrum_mse
+                    batch_sample_ese_lists[sample_idx].append(float(energy_spectrum_mse))
                     num_images += 1
+            for sample_ese_list in batch_sample_ese_lists:
+                sample_energy_spectrum_mse_values.append(
+                    float(np.mean(sample_ese_list)) if sample_ese_list else float("nan")
+                )
 
             # 联合模型下直接顺带评估 RAFT 的 AEE；outputs["flow_predictions"] 已经按 HR flow 尺寸还原。
             total_aee += float(outputs["raft_metrics"]["epe"])
             total_norm_aee_per100 += _compute_norm_aee_per100_from_flow_tensors(
                 outputs["flow_predictions"][-1],
                 flow_gt_uv,
+            )
+            sample_aee_values.extend(
+                _compute_samplewise_aee_from_flow_tensors(outputs["flow_predictions"][-1], flow_gt_uv).tolist()
             )
             raft_batch_count += 1
     avg_val_ssim_loss = total_val_ssim_loss / max(loss_count, 1)
@@ -1037,7 +1067,20 @@ def validate_raft(model, dataloader, device, epoch, result_dir=None, data_type="
     # 这里不能再按 image_pair 分支累计出来的 loss_count 再除一次，否则会把 AEE 额外缩小。
     avg_aee = total_aee / max(raft_batch_count, 1)
     avg_norm_aee_per100 = total_norm_aee_per100 / max(raft_batch_count, 1)
-    return avg_val_ssim_loss, avg_val_mse_loss, avg_psnr, avg_energy_spectrum_mse, avg_aee, avg_norm_aee_per100
+    if len(sample_energy_spectrum_mse_values) != len(sample_aee_values):
+        common_len = min(len(sample_energy_spectrum_mse_values), len(sample_aee_values))
+        logger.warning(
+            "[validate_raft] sample-wise ESE/AEE length mismatch: ese_count={}, aee_count={}, truncated_to={}",
+            len(sample_energy_spectrum_mse_values),
+            len(sample_aee_values),
+            common_len,
+        )
+        sample_energy_spectrum_mse_values = sample_energy_spectrum_mse_values[:common_len]
+        sample_aee_values = sample_aee_values[:common_len]
+    sample_c_aee_values = compute_c_aee_array(sample_energy_spectrum_mse_values, sample_aee_values)
+    finite_c_aee = sample_c_aee_values[np.isfinite(sample_c_aee_values)]
+    avg_c_aee = float(np.mean(finite_c_aee)) if finite_c_aee.size > 0 else float("nan")
+    return avg_val_ssim_loss, avg_val_mse_loss, avg_psnr, avg_energy_spectrum_mse, avg_aee, avg_norm_aee_per100, avg_c_aee
 
 """
 验证函数 end
@@ -1069,7 +1112,7 @@ def evaluate(epoch,class_name,data_type,device,
         f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/"
         f"scale_{int(SCALE * SCALE)}/{global_data.esrgan.PREDICT_DIR}"
     )
-    avg_val_ssim_loss, avg_val_mse_loss, avg_psnr, avg_val_energy_spectrum_mse, avg_val_aee, avg_val_norm_aee_per100 = validate_raft(
+    avg_val_ssim_loss, avg_val_mse_loss, avg_psnr, avg_val_energy_spectrum_mse, avg_val_aee, avg_val_norm_aee_per100, avg_val_c_aee = validate_raft(
         model, validate_loader, device, epoch,
         result_dir=preview_result_dir,
         data_type=data_type,
@@ -1087,6 +1130,7 @@ def evaluate(epoch,class_name,data_type,device,
         "VAL_energy_spectrum_mse": avg_val_energy_spectrum_mse,
         "VAL_AEE": avg_val_aee,
         "VAL_NORM_AEE_PER100PIXEL": avg_val_norm_aee_per100,
+        "VAL_C_AEE": avg_val_c_aee,
         "avg_psnr": avg_psnr,
         "Epoch": epoch,
         **{
@@ -1099,7 +1143,7 @@ def evaluate(epoch,class_name,data_type,device,
         f"Epoch [{epoch + 1}/{global_data.esrgan.EPOCH_NUMS}] |{class_name} {data_type} |running time:{int(current_time - global_data.esrgan.START_TIME )}s | "
         f"VAL_AVG_MSE_LOSS: {avg_val_mse_loss} | VAL_AVG_SSIM_LOSS: {avg_val_ssim_loss} | "
         f"VAL_energy_spectrum_mse: {avg_val_energy_spectrum_mse} | VAL_AEE: {avg_val_aee} | "
-        f"VAL_NORM_AEE_PER100PIXEL: {avg_val_norm_aee_per100} | Avg PSNR: {avg_psnr:.2f}"
+        f"VAL_NORM_AEE_PER100PIXEL: {avg_val_norm_aee_per100} | VAL_C_AEE: {avg_val_c_aee} | Avg PSNR: {avg_psnr:.2f}"
     )
     loss_str = "".join([loss_label[index] + ':' + str(metric[index] / train_loader_lens) + "," for index in
                         range(len(loss_label))])
@@ -1113,6 +1157,7 @@ def evaluate(epoch,class_name,data_type,device,
         avg_val_energy_spectrum_mse,
         avg_val_aee,
         avg_val_norm_aee_per100,
+        avg_val_c_aee,
     ]
     animator.add(epoch + 1,all_loss_and_val_Datas )
     # 保存到csv文件中
@@ -1125,6 +1170,7 @@ def evaluate(epoch,class_name,data_type,device,
     csv_row["VAL_energy_spectrum_mse"] = avg_val_energy_spectrum_mse
     csv_row["VAL_AEE"] = avg_val_aee
     csv_row["VAL_NORM_AEE_PER100PIXEL"] = avg_val_norm_aee_per100
+    csv_row["VAL_C_AEE"] = avg_val_c_aee
     csv_row["time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     csvOperator.create(csv_row)
     animator.save_png(
@@ -1139,7 +1185,8 @@ def evaluate(epoch,class_name,data_type,device,
             [validate_label[2]],
             [validate_label[3]],
             [validate_label[4]],
-            [validate_label[5]]
+            [validate_label[5]],
+            [validate_label[6]]
         ])
     return avg_val_mse_loss,avg_val_ssim_loss,avg_psnr,avg_val_energy_spectrum_mse,avg_val_aee,avg_val_norm_aee_per100
 
@@ -1205,7 +1252,7 @@ def evaluate_all(
 
     csv_fields = [
         "class_name", "data_type", "scale", "sample_id", "pair_type",
-        "mse", "psnr", "energy_spectrum_mse", "VAL_AEE", "VAL_NORM_AEE_PER100PIXEL", "r2", "ssim", "tke_acc", "nrmse"
+        "mse", "psnr", "energy_spectrum_mse", "VAL_AEE", "VAL_NORM_AEE_PER100PIXEL", "VAL_C_AEE", "r2", "ssim", "tke_acc", "nrmse"
     ]
 
     # 这些属性是在 load_data 里给 validate/test dataset 动态挂上的。
@@ -1305,6 +1352,7 @@ def evaluate_all(
             "energy_spectrum_mse": _mean_of("energy_spectrum_mse"),
             "VAL_AEE": _mean_of("VAL_AEE"),
             "VAL_NORM_AEE_PER100PIXEL": _mean_of("VAL_NORM_AEE_PER100PIXEL"),
+            "VAL_C_AEE": _mean_of("VAL_C_AEE"),
             "r2": _mean_of("r2"),
             "ssim": _mean_of("ssim"),
             "tke_acc": _mean_of("tke_acc"),
@@ -1459,6 +1507,7 @@ def evaluate_all(
                         "energy_spectrum_mse": es_mse_img,
                         "VAL_AEE": float("nan"),
                         "VAL_NORM_AEE_PER100PIXEL": float("nan"),
+                        "VAL_C_AEE": float("nan"),
                         "r2": r2_img,
                         "ssim": ssim_img,
                         "tke_acc": tke_img,
@@ -1594,6 +1643,7 @@ def evaluate_all(
                     "energy_spectrum_mse": es_mse,
                     "VAL_AEE": aee,
                     "VAL_NORM_AEE_PER100PIXEL": norm_aee_per100,
+                    "VAL_C_AEE": float("nan"),
                     "r2": r2,
                     "ssim": ssim,
                     "tke_acc": tke,
@@ -1602,6 +1652,14 @@ def evaluate_all(
 
     image_pair_rows = [row for row in rows if row.get("pair_type") in {"previous", "next"}]
     raft_rows = [row for row in rows if row.get("pair_type") == "RAFT"]
+    attach_c_aee_to_raft_rows(
+        image_rows=image_pair_rows,
+        raft_rows=raft_rows,
+        sample_key_fields=("class_name", "sample_id"),
+        ese_key="energy_spectrum_mse",
+        aee_key="VAL_AEE",
+        output_key="VAL_C_AEE",
+    )
 
     # 根目录下分别输出 image_pair / flow 两套均值频谱图，避免图像对和光流频谱混在一起。
     save_mean_spectrum(
@@ -1724,6 +1782,7 @@ def evaluate_all(
         "energy_spectrum_mse": float("nan"),
         "VAL_AEE": float("nan"),
         "VAL_NORM_AEE_PER100PIXEL": float("nan"),
+        "VAL_C_AEE": float("nan"),
         "r2": float("nan"),
         "ssim": float("nan"),
         "tke_acc": float("nan"),

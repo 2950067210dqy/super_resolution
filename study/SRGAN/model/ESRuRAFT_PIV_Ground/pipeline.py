@@ -733,7 +733,13 @@ def main():
             animator = Animator(xlabel='epoch', xlim=[1, global_data.esrgan.EPOCH_NUMS], ylim=[0, 0.5],
                                 legend=global_data.esrgan.loss_label + global_data.esrgan.validate_label)
 
-            ESRuRAFT_PIV_model = ESRuRAFT_PIV(inner_chanel=3,batch_size=global_data.esrgan.BATCH_SIZE).to(global_data.esrgan.device, non_blocking=True)
+            ESRuRAFT_PIV_model = ESRuRAFT_PIV(
+                inner_chanel=3,
+                batch_size=global_data.esrgan.BATCH_SIZE,
+                # 当前 SCALE 同时决定 LR 数据目录 x{SCALE*SCALE} 和 ESRGAN/SRGAN 两级 PixelShuffle 的每级倍率。
+                # 这样 esrgan_raft/srgan_raft 的网络结构会直接输出 HR 尺寸，而不是输出后再插值。
+                sr_scale=SCALE,
+            ).to(global_data.esrgan.device, non_blocking=True)
             if global_data.esrgan.csvOperator is None:
                 global_data.esrgan.csvOperator = CsvTable(
                     file_path=f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.LOSS_DIR}/loss_{class_name} _{data_type}_scale_{int(SCALE * SCALE)}.csv",

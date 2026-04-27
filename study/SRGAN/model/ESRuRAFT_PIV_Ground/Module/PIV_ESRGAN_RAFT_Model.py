@@ -132,6 +132,33 @@ def _build_piv_raft(batch_size: int) -> nn.Module:
     raise ValueError(f"Unsupported RAFT_MODEL_TYPE: {global_data.esrgan.RAFT_MODEL_TYPE}")
 
 
+def _resolve_generator_pixel_shuffle_scale(sr_scale=None) -> int:
+    """
+    解析 ESRGAN/SRGAN 生成器每一级 PixelShuffle 的上采样倍率。
+
+    这里不要在 Generator 输出后再插值补尺寸；正确做法是让网络结构本身输出目标尺寸。
+    本工程的目录和数据倍率使用 int(SCALE * SCALE)，而 ESRGAN/SRGAN 生成器内部固定有两级
+    PixelShuffle，因此：
+        - SCALE=2  -> 两级 PixelShuffle(2)，总上采样 x4，对应 lr_data_root_dir/x4；
+        - SCALE=4  -> 两级 PixelShuffle(4)，总上采样 x16，对应 lr_data_root_dir/x16。
+
+    sr_scale 由 pipeline 当前循环里的 SCALE 传入；如果外部旧代码没有传，则退回到
+    global_data.esrgan.SCALES[0]，保持旧实例化方式仍能工作。
+    """
+    if sr_scale is None:
+        configured_scales = getattr(global_data.esrgan, "SCALES", (2,))
+        sr_scale = configured_scales[0] if configured_scales else 2
+
+    scale_value = float(sr_scale)
+    scale_int = int(round(scale_value))
+    if scale_int < 1 or abs(scale_value - scale_int) > 1e-6:
+        raise ValueError(
+            "ESRuRAFT_PIV_Ground 的 esrgan_raft/srgan_raft 生成器使用 PixelShuffle，"
+            f"每级上采样倍率必须是整数；当前 SCALE={sr_scale}。"
+        )
+    return scale_int
+
+
 class ESRuRAFT_PIV(nn.Module):
     """
     ESRuRAFT_PIV_Ground 主网络。
@@ -146,20 +173,32 @@ class ESRuRAFT_PIV(nn.Module):
     7. srgan_raft: 传统 SRGAN 超分后送入 RAFT。
     """
 
-    def __init__(self,inner_chanel,batch_size):
+    def __init__(self,inner_chanel,batch_size,sr_scale=None):
         super(ESRuRAFT_PIV, self).__init__()  # 调用父类初始化
 
         self.train_mode = global_data.esrgan.validate_train_mode()
+        self.generator_pixel_shuffle_scale = _resolve_generator_pixel_shuffle_scale(sr_scale)
+        self.generator_total_upscale = self.generator_pixel_shuffle_scale * self.generator_pixel_shuffle_scale
         if self.train_mode == "esrgan_raft":
             # esrgan_raft 模式明确要求“超分模块换成最原始的 ESRGAN”。
             # 因此这里使用从 model/esrgan/Module/model.py 复制过来的原始单帧 Generator/Discriminator，
             # 不再使用 ESRuRAFT_PIV 的双帧特征融合生成器。
-            self.piv_esrgan_generator = OriginalESRGANGenerator(inner_chanel=inner_chanel)
+            # scale 控制每一级 PixelShuffle 的放大倍率；两级之后总倍率就是 scale*scale。
+            # 例如当前数据使用 x16 LR 时，pipeline 传入 SCALE=4，这里会构造两级 PixelShuffle(4)，
+            # 网络自身直接输出 HR 尺寸，而不是在输出后用插值补尺寸。
+            self.piv_esrgan_generator = OriginalESRGANGenerator(
+                inner_chanel=inner_chanel,
+                scale=self.generator_pixel_shuffle_scale,
+            )
             self.piv_esrgan_discriminator = OriginalESRGANDiscriminator(inner_chanel=inner_chanel)
         elif self.train_mode == "srgan_raft":
             # srgan_raft 使用传统 SRGAN 生成器，再把 SR 图像送入 RAFT。
             # 这样可以和 esrgan_raft 的 RRDB/ESRGAN 生成器做结构基线对比。
-            self.piv_esrgan_generator = SRGANGenerator(inner_chanel=inner_chanel)
+            # 与 esrgan_raft 保持相同的尺度定义：两级 PixelShuffle，每级倍率来自当前 SCALE。
+            self.piv_esrgan_generator = SRGANGenerator(
+                inner_chanel=inner_chanel,
+                scale=self.generator_pixel_shuffle_scale,
+            )
             self.piv_esrgan_discriminator = SRGANDiscriminator(inner_chanel=inner_chanel)
         else:
             # ground / bicubic / WIDIM / HS 是无学习型 SR 生成器的 baseline。
@@ -487,6 +526,19 @@ class ESRuRAFT_PIV(nn.Module):
         - perceptual_loss: 只等于 VGG feature L1。
         - pixel_*: 保留 L1 / MSE / SSIM / FFT 四个原始子项，后面按全局权重手动组合。
         """
+        if pred.shape != target.shape:
+            # 这里选择直接报清晰错误，而不是偷偷插值修正。
+            # esrgan_raft/srgan_raft 的 SR 尺寸应该由 Generator 的 PixelShuffle 结构决定；
+            # 如果这里不一致，说明当前 pipeline 传入的 SCALE、LR 数据目录 x{SCALE*SCALE}、
+            # 或 Generator 的 inner_chanel/scale 配置没有对上。
+            raise ValueError(
+                "[ESRuRAFT_PIV_Ground] Generator output shape does not match HR target: "
+                f"pred_shape={tuple(pred.shape)}, target_shape={tuple(target.shape)}, "
+                f"TRAIN_MODE={self.train_mode}, "
+                f"pixel_shuffle_scale={self.generator_pixel_shuffle_scale}, "
+                f"total_upscale={self.generator_total_upscale}. "
+                "请检查 SCALES 与 LR_DATA_ROOT_DIR/x{int(SCALE*SCALE)} 是否和数据真实倍率一致。"
+            )
         vgg_loss = perceptual_loss(pred, target)
         pixel_total, pixel_l1, pixel_mse, pixel_ssim, pixel_fft = pixel_loss(pred, target)
 
