@@ -83,16 +83,6 @@ def validate_and_save(result_dir, model, val_dataloader, device, epoch, data_typ
             # 这里补一个 magnitude 通道，供评估指标和可视化使用。
             fake_images_uvw = _flow_uv_to_uvw(fake_images)
 
-            resize_lr_prev = F.interpolate(
-                lr_prev,
-                size=hr_prev.shape[2:],
-                mode="nearest",
-            )
-            resize_lr_next = F.interpolate(
-                lr_next,
-                size=hr_next.shape[2:],
-                mode="nearest",
-            )
             if SAVE_AS_GRAY:
                 if hr_prev.shape[1] < 1:
                     logger.error(f'Unsupported previous channel count: {hr_prev.shape[1]}')
@@ -124,7 +114,7 @@ def validate_and_save(result_dir, model, val_dataloader, device, epoch, data_typ
             for i in range(lr_prev.size(0)):
                 # 上半部分：previous / next 的超分三联图。
                 single_lr_prev = _prepare_image_pair_tensor_for_save(
-                    resize_lr_prev[i:i + 1], SAVE_AS_GRAY
+                    lr_prev[i:i + 1], SAVE_AS_GRAY
                 )
                 single_fake_prev = _prepare_image_pair_tensor_for_save(
                     fake_prev[i:i + 1], SAVE_AS_GRAY
@@ -134,7 +124,7 @@ def validate_and_save(result_dir, model, val_dataloader, device, epoch, data_typ
                 )
 
                 single_lr_next = _prepare_image_pair_tensor_for_save(
-                    resize_lr_next[i:i + 1], SAVE_AS_GRAY
+                    lr_next[i:i + 1], SAVE_AS_GRAY
                 )
                 single_fake_next = _prepare_image_pair_tensor_for_save(
                     fake_next[i:i + 1], SAVE_AS_GRAY
@@ -148,11 +138,14 @@ def validate_and_save(result_dir, model, val_dataloader, device, epoch, data_typ
                 group_sep = add_vertical_separator(left_group, sep_width=16, value=1.0)
                 image_row = torch.cat([left_group, group_sep, right_group], dim=3)
                 # 在图像对拼图顶部标注每列含义，便于直接区分 LR / Fake / HR。
-                image_w = single_lr_prev.shape[3]
+                # LR 不再插值放大；build_triplet_row 会把 LR 放进同尺寸画布。
+                # 表头宽度要使用该 triplet 的画布列宽，而不是 LR 自身宽度。
+                prev_col_w = max(single_lr_prev.shape[3], single_fake_prev.shape[3], single_hr_prev.shape[3])
+                next_col_w = max(single_lr_next.shape[3], single_fake_next.shape[3], single_hr_next.shape[3])
                 image_row = _add_headers_to_panel(
                     image_row,
                     headers=["Prev-LR", "Prev-Fake", "Prev-HR", "Next-LR", "Next-Fake", "Next-HR"],
-                    column_widths=[image_w, image_w, image_w, image_w, image_w, image_w],
+                    column_widths=[prev_col_w, prev_col_w, prev_col_w, next_col_w, next_col_w, next_col_w],
                     separator_widths=[6, 6, 16, 6, 6],
                 )
 
@@ -940,20 +933,37 @@ def _ensure_csv_columns(csvOperator, required_columns: list[str]) -> None:
     运行时确保损失 CSV 包含新增列。
     为了不改动外部初始化逻辑，这里在 evaluate 阶段按需扩列并保留已有内容。
     """
-    if csvOperator is None or not hasattr(csvOperator, "columns"):
+    if csvOperator is None or not hasattr(csvOperator, "columns") or not hasattr(csvOperator, "file_path"):
         return
-    missing = [col for col in required_columns if col not in csvOperator.columns]
-    if not missing:
+
+    target_columns = list(csvOperator.columns)
+    file_path = Path(csvOperator.file_path)
+    if not file_path.exists():
+        csvOperator._write_all([])
         return
-    old_rows = csvOperator.read()
-    columns = list(csvOperator.columns)
-    if "time" in columns:
-        time_idx = columns.index("time")
-        columns = columns[:time_idx] + missing + columns[time_idx:]
-    else:
-        columns = columns + missing
-    csvOperator.columns = columns
-    csvOperator._write_all(old_rows)
+
+    with file_path.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        existing_columns = reader.fieldnames or []
+        existing_rows = list(reader)
+
+    if existing_columns == target_columns:
+        return
+
+    missing_required = [col for col in required_columns if col not in existing_columns]
+    if missing_required or existing_columns != target_columns:
+        normalized_rows = [
+            {col: row.get(col, "") for col in target_columns}
+            for row in existing_rows
+        ]
+        csvOperator.columns = target_columns
+        csvOperator._write_all(normalized_rows)
+        logger.info(
+            "[evaluate] Migrated loss CSV schema: {} -> {} | file={}",
+            existing_columns,
+            target_columns,
+            file_path,
+        )
 
 # 验证函数  RAFT 联合验证
 def validate_raft(model, dataloader, device, epoch, result_dir=None, data_type="RAFT", SAVE_AS_GRAY=None):
@@ -1118,9 +1128,7 @@ def evaluate(epoch,class_name,data_type,device,
         data_type=data_type,
     )
 
-    # # 训练阶段损失 CSV 需要新增验证能量谱误差和 RAFT 的 AEE。
-    # required_csv_columns = ["VAL_energy_spectrum_mse", "VAL_AEE"]
-    # _ensure_csv_columns(csvOperator, required_csv_columns)
+    _ensure_csv_columns(csvOperator, ["VAL_C_AEE"])
 
     wandb.log({
         "classname": class_name,
@@ -1422,22 +1430,19 @@ def evaluate_all(
             # 这样后面和三通道真值 [u, v, magnitude] 的评估/可视化才能一一对应。
             fake_uvw = _flow_uv_to_uvw(fake)
 
-            lr_prev_up = F.interpolate(lr_prev, size=hr_prev.shape[2:], mode="nearest")
-            lr_next_up = F.interpolate(lr_next, size=hr_next.shape[2:], mode="nearest")
-            # lr_up = F.interpolate(lr, size=hr.shape[2:], mode="nearest")
-
             # evaluate_all 的耗时大头不只在网络 forward，还在每个样本反复做保存和 numpy 指标。
             # 这里把 image_pair 分支的保存张量一次性裁剪/转 CPU，并把指标数组一次性缓存。
             # 这样会占用更多内存，但用户机器内存充足时，可以减少大量逐样本 GPU->CPU 同步。
             save_as_gray = global_data.esrgan.SAVE_AS_GRAY
             image_pair_batches = {
                 "previous": {
-                    "lr": _prepare_image_pair_tensor_for_save(lr_prev_up, save_as_gray).detach().cpu(),
+                    # LR 保持真实低分辨率尺寸保存；三联图只用 padding 画布对齐，不做插值放大。
+                    "lr": _prepare_image_pair_tensor_for_save(lr_prev, save_as_gray).detach().cpu(),
                     "fake": _prepare_image_pair_tensor_for_save(fake_prev, save_as_gray).detach().cpu(),
                     "hr": _prepare_image_pair_tensor_for_save(hr_prev, save_as_gray).detach().cpu(),
                 },
                 "next": {
-                    "lr": _prepare_image_pair_tensor_for_save(lr_next_up, save_as_gray).detach().cpu(),
+                    "lr": _prepare_image_pair_tensor_for_save(lr_next, save_as_gray).detach().cpu(),
                     "fake": _prepare_image_pair_tensor_for_save(fake_next, save_as_gray).detach().cpu(),
                     "hr": _prepare_image_pair_tensor_for_save(hr_next, save_as_gray).detach().cpu(),
                 },

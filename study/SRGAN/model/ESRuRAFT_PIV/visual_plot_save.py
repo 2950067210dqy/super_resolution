@@ -78,9 +78,9 @@ def _save_energy_spectrum_plot(pred_curve: np.ndarray, gt_curve: np.ndarray, out
 
 
 def _save_triplet(lr_1chw: torch.Tensor, fake_1chw: torch.Tensor, hr_1chw: torch.Tensor, out_png: Path) -> None:
-    """保存三联图 LR|Fake|HR。"""
+    """保存三联图 LR|Fake|HR；LR 保持真实低分辨率，只用画布 padding 对齐列宽。"""
     trip = build_triplet_row(lr_1chw, fake_1chw, hr_1chw, sep_width=6)
-    col_w = int(lr_1chw.shape[-1])
+    col_w = max(int(lr_1chw.shape[-1]), int(fake_1chw.shape[-1]), int(hr_1chw.shape[-1]))
     trip = _add_headers_to_panel(
         trip,
         headers=["LR", "Fake", "HR"],

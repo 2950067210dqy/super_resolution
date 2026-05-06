@@ -17,8 +17,10 @@ from typing import Any
 import numpy as np
 import tifffile
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
+from study.SRGAN.data_downscal import DOWNSAMPLE_METHOD, INTERPOLATION_MODE, downsample_flo, downsample_tif
 
 try:
     from tqdm import tqdm
@@ -63,6 +65,9 @@ PAIR_KEY_PATTERNS = (
 LR_SUFFIX_PATTERN = re.compile(r"([_-]lr)+$")
 FLOW_LR_SUFFIX_PATTERN = re.compile(r"([_-]flow)+([_-]lr)+$")
 FLOW_SUFFIX_PATTERN = re.compile(r"([_-]flow)+$")
+CLASS2_PSEUDO_CLASS_NAME = "problem_class2_raft_piv"
+CLASS2_TRAIN_TFRECORD_NAME = "Training_Dataset_ProblemClass2_RAFT256-PIV.tfrecord-00000-of-00001"
+CLASS2_VALIDATE_TFRECORD_NAME = "Validation_Dataset_ProblemClass2_RAFT256-PIV.tfrecord-00000-of-00001"
 
 
 def resolve_lr_data_root_dir(lr_data_root_dir: str, lr_data_variant: str = "default") -> str:
@@ -394,17 +399,47 @@ def discover_class_names(data_root: Path) -> list[str]:
     return class_names
 
 
-def get_class_names(gr_data_root_dir: str) -> list[str]:
+def get_class_names(
+    gr_data_root_dir: str,
+    *legacy_args,
+    dataset_name: str = "class_1",
+    **legacy_kwargs,
+) -> list[str]:
     """
     对外公开的类别名获取函数（已弃用 lr_data_root_dir）。
 
     当前行为：
-    - 仅扫描 GR 根目录
-    - 返回 GR 拥有的类别名（按字典序）
+    - class_1: 仅扫描 GR 根目录，返回 GR 拥有的类别名（按字典序）
+    - class_2: 返回一个伪类别名，表示“整个 TFRecord 数据集是一个训练任务”
+
+    兼容性说明：
+    - 旧代码有一部分仍会传第二个位置参数 `lr_data_root_dir`；
+    - 新代码会传关键字参数 `dataset_name=...`。
+    这里统一兼容两者，避免在不同脚本/旧缓存入口下因为签名变化直接报错。
     """
     gr_root = ensure_valid_root_dir(gr_data_root_dir, "gr_data_root_dir")
-
-
+    if "dataset_name" in legacy_kwargs:
+        dataset_name = legacy_kwargs["dataset_name"]
+    elif legacy_args:
+        # 向后兼容旧调用：
+        # 1. get_class_names(GR_ROOT, LR_ROOT)   -> 第二个参数其实是旧版 lr_data_root_dir，这里忽略；
+        # 2. get_class_names(GR_ROOT, "class_2") -> 第二个参数可能直接就是 dataset_name，这里识别出来。
+        legacy_second = str(legacy_args[0]).strip().lower()
+        if legacy_second in {"class_1", "class_2"}:
+            dataset_name = legacy_second
+    normalized_dataset_name = str(dataset_name).strip().lower()
+    if normalized_dataset_name == "class_2":
+        train_tfrecord = gr_root / CLASS2_TRAIN_TFRECORD_NAME
+        validate_tfrecord = gr_root / CLASS2_VALIDATE_TFRECORD_NAME
+        missing_files = [str(path) for path in (train_tfrecord, validate_tfrecord) if not path.exists()]
+        if missing_files:
+            raise ValueError(
+                "DATA_SET=class_2 时未在 TFRecord 根目录找到必需文件："
+                f"{missing_files}"
+            )
+        return [CLASS2_PSEUDO_CLASS_NAME]
+    if normalized_dataset_name != "class_1":
+        raise ValueError(f"Unsupported dataset_name: {dataset_name}")
 
     class_names = discover_class_names(gr_root)
 
@@ -413,6 +448,515 @@ def get_class_names(gr_data_root_dir: str) -> list[str]:
         raise ValueError(f"No class folders found under GR root: {gr_root}")
 
     return sorted(class_names)
+
+
+def _load_dali_modules():
+    """
+    延迟导入 DALI，仅在 class_2 TFRecord 分支真正运行时才触发。
+
+    这样可以保证：
+    1. 原有 class_1 目录式数据加载不依赖 DALI；
+    2. 没有安装 DALI 的环境，只要不切到 DATA_SET=class_2，也不会在 import 阶段报错。
+    """
+    from nvidia.dali.pipeline import Pipeline
+    import nvidia.dali.ops as ops
+    import nvidia.dali.tfrecord as tfrec
+    from nvidia.dali.plugin.pytorch import DALIGenericIterator
+
+    return Pipeline, ops, tfrec, DALIGenericIterator
+
+
+def _build_class2_tfrecord_pipeline_class():
+    """
+    构造 class_2 用的 TFRecord DALI pipeline。
+
+    TFRecord 字段口径与 test_all 保持一致：
+    - target: [2, H, W]，第 0 通道是 prev，第 1 通道是 next
+    - flow:   [2, H, W]，保存 u/v 两个分量
+    - label:  读出来但训练流程里不使用，只为了保持 TFRecord 结构兼容
+    """
+    Pipeline, ops, tfrec, _ = _load_dali_modules()
+
+    class TFRecordPipeline(Pipeline):
+        def __init__(
+            self,
+            batch_size,
+            num_threads,
+            device_id,
+            tfrecord,
+            tfrecord_idx,
+            image_shape,
+            label_shape,
+            is_shuffle=False,
+        ):
+            super().__init__(
+                batch_size,
+                num_threads,
+                device_id,
+                exec_pipelined=False,
+                exec_async=False,
+            )
+            self.input = ops.TFRecordReader(
+                path=tfrecord,
+                index_path=tfrecord_idx,
+                random_shuffle=is_shuffle,
+                pad_last_batch=True,
+                shard_id=0,
+                num_shards=1,
+                features={
+                    "target": tfrec.FixedLenFeature([], tfrec.string, ""),
+                    "label": tfrec.FixedLenFeature([], tfrec.string, ""),
+                    "flow": tfrec.FixedLenFeature([], tfrec.string, ""),
+                },
+            )
+            self.decode = ops.PythonFunction(function=self.extract_view, num_outputs=1)
+            self.reshape_image = ops.Reshape(shape=image_shape)
+            self.reshape_label = ops.Reshape(shape=label_shape)
+
+        def extract_view(self, data):
+            return data.view("<f4")
+
+        def define_graph(self):
+            inputs = self.input(name="Reader")
+            images = self.reshape_image(self.decode(inputs["target"]))
+            labels = self.reshape_label(self.decode(inputs["label"]))
+            flows = self.reshape_image(self.decode(inputs["flow"]))
+            return images, labels, flows
+
+    return TFRecordPipeline
+
+
+def _build_class2_dali_iterator(
+    *,
+    tfrecord_path: Path,
+    idx_path: Path,
+    batch_size: int,
+    num_threads: int,
+    device_id: int,
+    image_shape: list[int],
+    label_shape: list[int],
+):
+    """根据 class_2 的 TFRecord/idx 创建一个新的 DALI iterator。"""
+    if not tfrecord_path.exists():
+        raise FileNotFoundError(f"class_2 tfrecord does not exist: {tfrecord_path}")
+    if not idx_path.exists():
+        raise FileNotFoundError(f"class_2 tfrecord idx does not exist: {idx_path}")
+
+    _, _, _, DALIGenericIterator = _load_dali_modules()
+    TFRecordPipeline = _build_class2_tfrecord_pipeline_class()
+    pipe = TFRecordPipeline(
+        batch_size=batch_size,
+        num_threads=num_threads,
+        device_id=device_id,
+        tfrecord=str(tfrecord_path),
+        tfrecord_idx=str(idx_path),
+        image_shape=image_shape,
+        label_shape=label_shape,
+        is_shuffle=False,
+    )
+    pipe.build()
+    size = int(pipe.epoch_size("Reader"))
+    iterator = DALIGenericIterator(
+        pipe,
+        ["target", "label", "flow"],
+        size=size,
+        last_batch_padded=True,
+        fill_last_batch=False,
+        auto_reset=True,
+    )
+    return iterator, size
+
+
+def _resize_bchw_tensor(batch_tensor: torch.Tensor, target_size: tuple[int, int] | None) -> torch.Tensor:
+    """
+    按 class_1 的 target_size 语义，对 class_2 的 TFRecord 张量做统一 resize。
+
+    原有目录式加载里：
+    - 图像使用 torchvision Resize
+    - flow 使用 FlowResize
+    两者本质都是对空间尺寸做双线性插值，因此这里直接在 batch tensor 上统一处理。
+    """
+    if target_size is None:
+        return batch_tensor
+    return F.interpolate(batch_tensor, size=target_size, mode="bilinear", align_corners=False)
+
+
+def _repeat_gray_to_rgb_bchw(batch_tensor: torch.Tensor) -> torch.Tensor:
+    """
+    把单通道灰度图复制成 3 通道。
+
+    class_1 目录式读取时，2D tif 会在 `_normalize_image_array()` 里被扩成 3 通道；
+    class_2 的 TFRecord `target` 是单通道 prev/next，因此这里显式重复，确保生成器/VGG/GAN
+    分支仍然吃到和 class_1 相同的图像通道数口径。
+    """
+    if batch_tensor.ndim != 4:
+        raise ValueError(f"Expected BCHW tensor, got shape={tuple(batch_tensor.shape)}")
+    if int(batch_tensor.shape[1]) == 3:
+        return batch_tensor
+    if int(batch_tensor.shape[1]) != 1:
+        raise ValueError(f"Expected 1 or 3 channels, got shape={tuple(batch_tensor.shape)}")
+    return batch_tensor.repeat(1, 3, 1, 1)
+
+
+def _augment_flow_uv_to_uvw_bchw(flow_uv_bchw: torch.Tensor) -> torch.Tensor:
+    """
+    把 2 通道 uv 光流补成 3 通道 uvm。
+
+    class_1 的 `.flo` 读取流程会额外补 magnitude，第 3 通道为 `sqrt(u^2 + v^2)`；
+    为了保持训练/evaluate 里所有 flow 指标、日志和可视化代码不需要分支判断，
+    class_2 这里也构造成完全一致的 3 通道格式。
+    """
+    if flow_uv_bchw.ndim != 4 or int(flow_uv_bchw.shape[1]) != 2:
+        raise ValueError(f"Expected Bx2xHxW flow tensor, got shape={tuple(flow_uv_bchw.shape)}")
+    magnitude = torch.linalg.norm(flow_uv_bchw, dim=1, keepdim=True)
+    return torch.cat([flow_uv_bchw, magnitude], dim=1)
+
+
+def _make_lr_from_hr_bchw(hr_tensor: torch.Tensor, factor: int) -> torch.Tensor:
+    """
+    用项目现有的 `downsample_tif()` 逻辑，从 HR 图像动态生成 LR 图像。
+
+    这里明确选择 `expand_to_original=False`：
+    - 训练阶段的 LR 应该保持真正的小分辨率尺寸；
+    - 后续超分模型会自己把 LR 映射回 HR，而不是像可视化那样先扩回原尺寸。
+    """
+    if factor <= 1:
+        return hr_tensor.detach().clone()
+
+    lr_images: list[np.ndarray] = []
+    for sample in hr_tensor.detach().cpu().numpy():
+        lr_hw = downsample_tif(
+            sample[0],
+            factor=factor,
+            expand_to_original=False,
+            method=DOWNSAMPLE_METHOD,
+            interpolation_mode=INTERPOLATION_MODE,
+        )
+        lr_images.append(lr_hw[None, ...])
+
+    lr = np.stack(lr_images, axis=0).astype(np.float32, copy=False)
+    return torch.from_numpy(lr).to(device=hr_tensor.device, dtype=hr_tensor.dtype)
+
+
+def _make_lr_from_flow_uv_bchw(flow_uv_tensor: torch.Tensor, factor: int) -> torch.Tensor:
+    """
+    用项目现有的 `downsample_flo()` 逻辑，从 HR uv 光流动态生成 LR uv 光流。
+
+    注意这里输入/输出都只处理 u/v 两个分量；magnitude 会在下采样之后重新计算，
+    这样能保持第三通道始终与当前分辨率下的 u/v 数值严格对应。
+    """
+    if factor <= 1:
+        return flow_uv_tensor.detach().clone()
+
+    lr_flows: list[np.ndarray] = []
+    for sample in flow_uv_tensor.detach().cpu().numpy():
+        flow_hw2 = np.moveaxis(sample[:2], 0, -1)
+        lr_hw2 = downsample_flo(
+            flow_hw2,
+            factor=factor,
+            expand_to_original=False,
+            method=DOWNSAMPLE_METHOD,
+            interpolation_mode=INTERPOLATION_MODE,
+        )
+        lr_flows.append(np.moveaxis(lr_hw2, -1, 0))
+
+    lr = np.stack(lr_flows, axis=0).astype(np.float32, copy=False)
+    return torch.from_numpy(lr).to(device=flow_uv_tensor.device, dtype=flow_uv_tensor.dtype)
+
+
+def _build_class2_placeholder_samples(
+    *,
+    tfrecord_path: Path,
+    sample_count: int,
+    class_name: str,
+    split_name: str,
+) -> list[dict]:
+    """
+    为 class_2 的 TFRecord 样本生成“虚拟路径元数据”。
+
+    原有 pipeline 会把 `loader.dataset.samples` 序列化到 `datas_splits.json`，并在日志里打印样本路径。
+    class_2 的真实数据存在 TFRecord 内部，没有单独的 tif/flo 文件，因此这里构造稳定、可读、
+    不依赖真实落盘文件存在的虚拟路径，保证所有旧接口仍然能工作。
+    """
+    virtual_root = tfrecord_path.parent / "_virtual_samples" / split_name
+    samples: list[dict] = []
+    for index in range(sample_count):
+        sample_key = f"{split_name}_{index:06d}"
+        samples.append(
+            {
+                "class_name": class_name,
+                "sample_key": sample_key,
+                "image_pair": {
+                    "gr_paths": [
+                        virtual_root / f"{sample_key}_img1.tif",
+                        virtual_root / f"{sample_key}_img2.tif",
+                    ],
+                    "lr_paths": [
+                        virtual_root / f"{sample_key}_img1_lr.tif",
+                        virtual_root / f"{sample_key}_img2_lr.tif",
+                    ],
+                },
+                "flo": {
+                    "gr_paths": [virtual_root / f"{sample_key}_flow.flo"],
+                    "lr_paths": [virtual_root / f"{sample_key}_flow_lr.flo"],
+                },
+            }
+        )
+    return samples
+
+
+class _Class2TFRecordDataset:
+    """
+    轻量级 dataset 壳对象。
+
+    这个类不负责真正的数据读取，只负责提供：
+    - `samples`：兼容 save_loaders_paths / datas_splits.json
+    - `__len__`：兼容训练日志和进度统计
+    """
+
+    def __init__(self, samples: list[dict]) -> None:
+        self.samples = samples
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+
+class _Class2TFRecordLoader:
+    """
+    class_2 的单 GPU TFRecord loader。
+
+    设计目标是“对上层训练/验证代码伪装成原来的 DataLoader”：
+    - `len(loader)` 返回 batch 数
+    - `loader.dataset.samples` 可被旧的 split 序列化逻辑直接使用
+    - `for batch in loader` 产出的 batch 结构，与 `sr_paired_collate_fn` 的结果完全一致
+    """
+
+    def __init__(
+        self,
+        *,
+        tfrecord_path: Path,
+        idx_path: Path,
+        samples: list[dict],
+        class_to_idx: dict[str, int],
+        batch_size: int,
+        num_threads: int,
+        target_size: tuple[int, int] | None,
+        scale_factor: int,
+        device_id: int,
+    ) -> None:
+        self.tfrecord_path = tfrecord_path
+        self.idx_path = idx_path
+        self.dataset = _Class2TFRecordDataset(samples)
+        self.class_to_idx = class_to_idx
+        self.batch_size = batch_size
+        self.num_threads = num_threads
+        self.target_size = target_size
+        self.scale_factor = scale_factor
+        self.device_id = device_id
+
+    def __len__(self) -> int:
+        if self.batch_size <= 0:
+            raise ValueError(f"batch_size must be > 0, got {self.batch_size}")
+        return (len(self.dataset) + self.batch_size - 1) // self.batch_size
+
+    def __iter__(self):
+        iterator, _ = _build_class2_dali_iterator(
+            tfrecord_path=self.tfrecord_path,
+            idx_path=self.idx_path,
+            batch_size=self.batch_size,
+            num_threads=self.num_threads,
+            device_id=self.device_id,
+            image_shape=[2, 256, 256],
+            label_shape=[12],
+        )
+
+        processed = 0
+        total_samples = len(self.dataset.samples)
+        for dali_batch in iterator:
+            local_dict = dali_batch[0]
+            valid_count = min(int(local_dict["target"].shape[0]), total_samples - processed)
+            if valid_count <= 0:
+                break
+
+            # 这里沿用 test_all / RAFT256-PIV_test.py 的原始读取口径：
+            # TFRecord 里存的是浮点颗粒图像，训练时继续除以 256，保持和现有 test 分支一致。
+            images = local_dict["target"].to(
+                device=torch.device("cuda", self.device_id),
+                dtype=torch.float32,
+            )[:valid_count] / 256.0
+            flow_uv = local_dict["flow"].to(
+                device=torch.device("cuda", self.device_id),
+                dtype=torch.float32,
+            )[:valid_count]
+
+            images = _resize_bchw_tensor(images, self.target_size)
+            flow_uv = _resize_bchw_tensor(flow_uv, self.target_size)
+
+            prev_hr = images[:, 0:1, :, :]
+            next_hr = images[:, 1:2, :, :]
+            prev_lr = _make_lr_from_hr_bchw(prev_hr, self.scale_factor)
+            next_lr = _make_lr_from_hr_bchw(next_hr, self.scale_factor)
+
+            flow_hr = _augment_flow_uv_to_uvw_bchw(flow_uv[:, :2, :, :])
+            flow_lr_uv = _make_lr_from_flow_uv_bchw(flow_uv[:, :2, :, :], self.scale_factor)
+            flow_lr = _augment_flow_uv_to_uvw_bchw(flow_lr_uv)
+
+            # class_1 的 tif 读取会自动扩成 3 通道；这里也保持同一输入通道口径。
+            prev_hr_rgb = _repeat_gray_to_rgb_bchw(prev_hr)
+            next_hr_rgb = _repeat_gray_to_rgb_bchw(next_hr)
+            prev_lr_rgb = _repeat_gray_to_rgb_bchw(prev_lr)
+            next_lr_rgb = _repeat_gray_to_rgb_bchw(next_lr)
+
+            batch_samples = self.dataset.samples[processed:processed + valid_count]
+            yield {
+                "image_pair": {
+                    "previous": {
+                        "lr_data": prev_lr_rgb,
+                        "gr_data": prev_hr_rgb,
+                    },
+                    "next": {
+                        "lr_data": next_lr_rgb,
+                        "gr_data": next_hr_rgb,
+                    },
+                },
+                "flo": {
+                    "lr_data": flow_lr,
+                    "gr_data": flow_hr,
+                },
+                "label": torch.tensor(
+                    [self.class_to_idx[sample["class_name"]] for sample in batch_samples],
+                    dtype=torch.long,
+                    device=prev_hr_rgb.device,
+                ),
+                "class_name": [sample["class_name"] for sample in batch_samples],
+                "sample_key": [sample["sample_key"] for sample in batch_samples],
+                "image_pair_lr_paths": [
+                    " | ".join(str(path) for path in sample["image_pair"]["lr_paths"])
+                    for sample in batch_samples
+                ],
+                "image_pair_gr_paths": [
+                    " | ".join(str(path) for path in sample["image_pair"]["gr_paths"])
+                    for sample in batch_samples
+                ],
+                "flo_lr_paths": [
+                    " | ".join(str(path) for path in sample["flo"]["lr_paths"])
+                    for sample in batch_samples
+                ],
+                "flo_gr_paths": [
+                    " | ".join(str(path) for path in sample["flo"]["gr_paths"])
+                    for sample in batch_samples
+                ],
+            }
+            processed += valid_count
+            if processed >= total_samples:
+                break
+
+
+def _load_class2_tfrecord_data(
+    *,
+    gr_data_root_dir: str,
+    selected_classes: str | list[str] | tuple[str, ...] | None,
+    batch_size: int,
+    num_threads: int,
+    target_size: tuple[int, int] | None,
+    scale_factor: int,
+    class2_train_tfrecord: str | Path,
+    class2_train_tfrecord_idx: str | Path,
+    class2_validate_tfrecord: str | Path,
+    class2_validate_tfrecord_idx: str | Path,
+):
+    """
+    加载 class_2 的 train/validate TFRecord，并包装成与原 DataLoader 完全一致的 batch 接口。
+
+    与 class_1 相比，class_2 的不同点是：
+    1. 数据划分由两个 TFRecord 文件天然固定，不再依赖 Train_nums_rate/Test_nums_rate/Validate_nums_rate；
+    2. LR 不再从磁盘目录读取，而是从 HR 动态下采样生成；
+    3. 不返回 test_loader，因为用户明确要求 class_2 不跑 evaluate_all。
+    """
+    gr_root = ensure_valid_root_dir(gr_data_root_dir, "gr_data_root_dir")
+    class_names = normalize_selected_classes([CLASS2_PSEUDO_CLASS_NAME], selected_classes)
+    class_to_idx = {CLASS2_PSEUDO_CLASS_NAME: 0}
+
+    train_tfrecord_path = Path(class2_train_tfrecord).expanduser()
+    train_idx_path = Path(class2_train_tfrecord_idx).expanduser()
+    validate_tfrecord_path = Path(class2_validate_tfrecord).expanduser()
+    validate_idx_path = Path(class2_validate_tfrecord_idx).expanduser()
+
+    train_count = sum(1 for line in train_idx_path.open("r", encoding="utf-8") if line.strip())
+    validate_count = sum(1 for line in validate_idx_path.open("r", encoding="utf-8") if line.strip())
+    if train_count <= 0 or validate_count <= 0:
+        raise ValueError(
+            f"class_2 TFRecord idx has invalid sample count: train={train_count}, validate={validate_count}"
+        )
+
+    total_count = train_count + validate_count
+    logger.info("=" * 80)
+    logger.info("[Start] Begin loading class_2 TFRecord dataset")
+    logger.info(f"[Start] TFRecord root: {gr_root}")
+    logger.info(f"[Start] train_tfrecord={train_tfrecord_path}")
+    logger.info(f"[Start] validate_tfrecord={validate_tfrecord_path}")
+    logger.info(
+        f"[Start] class_2 uses dynamic LR generation, scale_factor={scale_factor}, "
+        f"target_size={target_size}, batch_size={batch_size}"
+    )
+    logger.info(
+        f"[Start] class_2 actual counts: train={train_count}, validate={validate_count}, total={total_count}"
+    )
+
+    train_samples = _build_class2_placeholder_samples(
+        tfrecord_path=train_tfrecord_path,
+        sample_count=train_count,
+        class_name=CLASS2_PSEUDO_CLASS_NAME,
+        split_name="train",
+    )
+    validate_samples = _build_class2_placeholder_samples(
+        tfrecord_path=validate_tfrecord_path,
+        sample_count=validate_count,
+        class_name=CLASS2_PSEUDO_CLASS_NAME,
+        split_name="validate",
+    )
+
+    train_loader = _Class2TFRecordLoader(
+        tfrecord_path=train_tfrecord_path,
+        idx_path=train_idx_path,
+        samples=train_samples,
+        class_to_idx=class_to_idx,
+        batch_size=batch_size,
+        num_threads=max(1, int(num_threads)),
+        target_size=target_size,
+        scale_factor=scale_factor,
+        device_id=torch.cuda.current_device() if torch.cuda.is_available() else 0,
+    )
+    validate_loader = _Class2TFRecordLoader(
+        tfrecord_path=validate_tfrecord_path,
+        idx_path=validate_idx_path,
+        samples=validate_samples,
+        class_to_idx=class_to_idx,
+        batch_size=batch_size,
+        num_threads=max(1, int(num_threads)),
+        target_size=target_size,
+        scale_factor=scale_factor,
+        device_id=torch.cuda.current_device() if torch.cuda.is_available() else 0,
+    )
+
+    split_summary = {
+        CLASS2_PSEUDO_CLASS_NAME: {
+            "total": total_count,
+            "train": train_count,
+            "val": validate_count,
+            "test": 0,
+        }
+    }
+    logger.info(f"[Done] class_2 pseudo class names: {class_names}")
+    logger.info(
+        f"[Done] class_2 split rates: train={train_count / total_count:.8f}, "
+        f"validate={validate_count / total_count:.8f}, test=0.0"
+    )
+    logger.info(
+        f"[Done] class_2 summary: {split_summary[CLASS2_PSEUDO_CLASS_NAME]}"
+    )
+    logger.info("=" * 80)
+    return train_loader, validate_loader, None, class_names, train_samples + validate_samples
 
 
 def normalize_selected_classes(
@@ -1875,6 +2419,12 @@ def load_data(
     fixed_split: bool = False,
     fixed_train_list_path: str | Path | None = None,
     fixed_validate_list_path: str | Path | None = None,
+    dataset_name: str = "class_1",
+    scale_factor: int = 1,
+    class2_train_tfrecord: str | Path | None = None,
+    class2_train_tfrecord_idx: str | Path | None = None,
+    class2_validate_tfrecord: str | Path | None = None,
+    class2_validate_tfrecord_idx: str | Path | None = None,
 ):
     """
     加载超分辨率 GR/LR 成对数据集。
@@ -1917,7 +2467,37 @@ def load_data(
           fixed_validate_list_path 两个列表指定 train/validate 样本。
         - fixed_train_list_path/fixed_validate_list_path: fixed 模式的样本列表路径。列表里的目录
           前缀只用于辅助识别类别，真实 GR/LR/LR-flow 路径仍按本函数原有根目录和文件名收集。
+        - dataset_name: 数据集来源。`class_1` 为原始目录式数据；`class_2` 为 TFRecord 数据。
+        - scale_factor: LR 动态下采样倍率。class_1 仅用于日志；class_2 会真正用于生成 LR。
+        - class2_*: DATA_SET=class_2 时使用的 train/validate TFRecord 与 idx 路径。
     """
+    normalized_dataset_name = str(dataset_name).strip().lower()
+    if normalized_dataset_name == "class_2":
+        if None in {
+            class2_train_tfrecord,
+            class2_train_tfrecord_idx,
+            class2_validate_tfrecord,
+            class2_validate_tfrecord_idx,
+        }:
+            raise ValueError(
+                "DATA_SET=class_2 requires class2_train_tfrecord/class2_train_tfrecord_idx/"
+                "class2_validate_tfrecord/class2_validate_tfrecord_idx."
+            )
+        return _load_class2_tfrecord_data(
+            gr_data_root_dir=gr_data_root_dir,
+            selected_classes=selected_classes,
+            batch_size=batch_size,
+            num_threads=num_workers,
+            target_size=target_size,
+            scale_factor=scale_factor,
+            class2_train_tfrecord=class2_train_tfrecord,
+            class2_train_tfrecord_idx=class2_train_tfrecord_idx,
+            class2_validate_tfrecord=class2_validate_tfrecord,
+            class2_validate_tfrecord_idx=class2_validate_tfrecord_idx,
+        )
+    if normalized_dataset_name != "class_1":
+        raise ValueError(f"Unsupported dataset_name: {dataset_name}")
+
     gr_root = ensure_valid_root_dir(gr_data_root_dir, "gr_data_root_dir")
     resolved_lr_data_root_dir = resolve_lr_data_root_dir(lr_data_root_dir, lr_data_variant)
     lr_root = ensure_valid_root_dir(resolved_lr_data_root_dir, "lr_data_root_dir")
@@ -1953,7 +2533,7 @@ def load_data(
     )
     logger.info("=" * 80)
 
-    all_available_class_names = get_class_names(gr_data_root_dir)
+    all_available_class_names = get_class_names(gr_data_root_dir, dataset_name=dataset_name)
     available_class_names = filter_excluded_class_names(
         all_available_class_names,
         excluded_classes,

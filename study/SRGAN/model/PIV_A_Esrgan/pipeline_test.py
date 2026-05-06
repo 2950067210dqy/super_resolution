@@ -37,6 +37,7 @@ def main():
     """
     加载训练好的 PIV_A_Esrgan 模型，并对 TEST_DATASETS 执行完整 test_all。
     """
+
     return run_pipeline_test(
         global_data=global_data,
         branch_name="PIV_A_Esrgan",

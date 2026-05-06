@@ -51,6 +51,54 @@ except:
             pass
 
 
+def _get_class_names_compat(gr_data_root_dir: str, dataset_name: str):
+    """兼容新旧 `get_class_names()` 签名。"""
+    try:
+        return get_class_names(gr_data_root_dir, dataset_name=dataset_name)
+    except TypeError as exc:
+        if "dataset_name" not in str(exc):
+            raise
+        if str(dataset_name).strip().lower() == "class_2":
+            logger.warning(
+                "Imported get_class_names() does not support dataset_name keyword yet; "
+                "fallback to class_2 pseudo class name. Please make sure data_load.py is also updated."
+            )
+            return [getattr(global_data.esrgan, "CLASS2_PSEUDO_CLASS_NAME", "problem_class2_raft_piv")]
+        return get_class_names(gr_data_root_dir)
+
+
+def _load_data_compat(**kwargs):
+    """兼容新旧 `load_data()` 签名。"""
+    try:
+        return load_data(**kwargs)
+    except TypeError as exc:
+        message = str(exc)
+        compatibility_keys = (
+            "dataset_name",
+            "scale_factor",
+            "class2_train_tfrecord",
+            "class2_train_tfrecord_idx",
+            "class2_validate_tfrecord",
+            "class2_validate_tfrecord_idx",
+        )
+        if not any(key in message for key in compatibility_keys):
+            raise
+        dataset_name = str(kwargs.get("dataset_name", "class_1")).strip().lower()
+        if dataset_name == "class_2":
+            raise RuntimeError(
+                "当前导入的 data_load.load_data 仍是旧签名，缺少 class_2 TFRecord 支持。"
+                "请同步更新 study/SRGAN/data_load.py 后再运行。"
+            ) from exc
+        fallback_kwargs = dict(kwargs)
+        for key in compatibility_keys:
+            fallback_kwargs.pop(key, None)
+        logger.warning(
+            "Imported load_data() does not support the new dataset_name/class_2 kwargs yet; "
+            "fallback to legacy class_1 call signature."
+        )
+        return load_data(**fallback_kwargs)
+
+
 class PIVESRGANRAFTInferenceWrapper(nn.Module):
     """为联合模型 profiling 提供纯 forward 推理接口，只统计模型输出，不包含 loss/backward/优化器。"""
 
@@ -374,21 +422,26 @@ def main():
 
     # 保存超参数
     global_data.esrgan.save_hyper_parameters_txt(f"{global_data.esrgan.OUT_PUT_DIR}/hyper_parameters.txt")
-    # 获取类别名
-    available_class_names = get_class_names(global_data.esrgan.GR_DATA_ROOT_DIR)
+    dataset_name = global_data.esrgan.validate_dataset_name()
+    # 获取类别名；class_1 扫目录，class_2 返回一个伪类别名，表示“整套 TFRecord 就是一个训练任务”。
+    available_class_names = _get_class_names_compat(global_data.esrgan.GR_DATA_ROOT_DIR, dataset_name=dataset_name)
 
     logger.info(f"一共{len(available_class_names)}个类别：{available_class_names}")
 
     # 训练模式: all | single | mixed | fixed
     # 统一通过 global_class 的校验入口读取，避免新增 fixed 后各 pipeline 的字符串判断不一致。
     mode = global_data.esrgan.validate_train_class_mode()
-    if mode == "fixed":
+    if dataset_name == "class_2":
+        # class_2 的 train/validate 已经由两个 TFRecord 固定定义；这里把比例超参数改写成真实样本占比。
+        global_data.esrgan.update_dataset_split_rates()
+        global_data.esrgan.save_hyper_parameters_txt(f"{global_data.esrgan.OUT_PUT_DIR}/hyper_parameters.txt")
+    elif mode == "fixed":
         # fixed 模式下，真实划分由 FlowData_train/test.list 决定。
         # 这里先按 list 行数同步比例超参数，只用于日志、wandb 和 hyper_parameters.txt 展示。
-        global_data.esrgan.update_fixed_split_rates()
+        global_data.esrgan.update_dataset_split_rates()
         # hyper_parameters.txt 在上面已经按默认比例写过一次；fixed 需要覆盖为 list 行数反推后的真实比例。
         global_data.esrgan.save_hyper_parameters_txt(f"{global_data.esrgan.OUT_PUT_DIR}/hyper_parameters.txt")
-    if mode in {"all", "mixed", "fixed"}:
+    if dataset_name == "class_1" and mode in {"all", "mixed", "fixed"}:
         # EXCLUDE_CLASS 只对 all/mixed/fixed 生效：这里先过滤任务列表，
         # 后面 load_data 也会收到同一份排除配置，确保真正的数据收集阶段不读取这些类别。
         available_class_names = filter_excluded_class_names(
@@ -399,7 +452,10 @@ def main():
         logger.info(f"排除类别后剩余{len(available_class_names)}个类别：{available_class_names}")
 
     run_jobs = []
-    if mode == "all":
+    if dataset_name == "class_2":
+        logger.info("DATA_SET=class_2：跳过按类别拆任务，直接使用 TFRecord train/validate 作为单个训练任务。")
+        run_jobs.append({"run_class_name": available_class_names[0], "selected_classes": None})
+    elif mode == "all":
         # 每个类别读取数据并且训练验证和保存模型
         for class_name in available_class_names:
             run_jobs.append({"run_class_name": class_name, "selected_classes": [class_name]})
@@ -422,23 +478,29 @@ def main():
         for SCALE in global_data.esrgan.SCALES:
             # 获取数据 自动根据类别划分数据集并读取，每个类别都安装比例划分训练集和验证集
             # 根据类别和上采样读取数据
-            train_loader, validate_loader, test_loader, class_names, samples = load_data(
+            train_loader, validate_loader, test_loader, class_names, samples = _load_data_compat(
                 gr_data_root_dir=global_data.esrgan.GR_DATA_ROOT_DIR,
                 lr_data_root_dir=f"{global_data.esrgan.LR_DATA_ROOT_DIR}/x{int(SCALE * SCALE)}/data",
                 batch_size=global_data.esrgan.BATCH_SIZE,
                 # fixed 模式必须保留 FlowData_train.list 的顺序，因此无论 SHUFFLE 如何配置都传 False。
-                shuffle=False if mode == "fixed" else global_data.esrgan.SHUFFLE,
+                shuffle=False if (dataset_name == "class_1" and mode == "fixed") else global_data.esrgan.SHUFFLE,
                 target_size=global_data.esrgan.TARGET_SIZE,
                 train_nums_rate=global_data.esrgan.Train_nums_rate,
                 validate_nums_rate=global_data.esrgan.Validate_nums_rate,
                 test_nums_rate=global_data.esrgan.Test_nums_rate,
                 random_seed=global_data.esrgan.RANDOM_SEED,
                 selected_classes=selected_classes,
-                excluded_classes=global_data.esrgan.EXCLUDE_CLASS if mode in {"all", "mixed", "fixed"} else None,
+                excluded_classes=global_data.esrgan.EXCLUDE_CLASS if (dataset_name == "class_1" and mode in {"all", "mixed", "fixed"}) else None,
                 class_sample_ratio=global_data.esrgan.CLASS_SAMPLE_RATIO,
-                fixed_split=mode == "fixed",
+                fixed_split=dataset_name == "class_1" and mode == "fixed",
                 fixed_train_list_path=global_data.esrgan.FIXED_TRAIN_LIST_PATH,
                 fixed_validate_list_path=global_data.esrgan.FIXED_VALIDATE_LIST_PATH,
+                dataset_name=dataset_name,
+                scale_factor=int(SCALE * SCALE),
+                class2_train_tfrecord=global_data.esrgan.CLASS2_TRAIN_TFRECORD,
+                class2_train_tfrecord_idx=global_data.esrgan.CLASS2_TRAIN_TFRECORD_IDX,
+                class2_validate_tfrecord=global_data.esrgan.CLASS2_VALIDATE_TFRECORD,
+                class2_validate_tfrecord_idx=global_data.esrgan.CLASS2_VALIDATE_TFRECORD_IDX,
                 return_test_loader=True
             )
             # 每个类别的图像对和flo文件分别训练验证和保存模型 ！！！！！已经去除
@@ -614,7 +676,16 @@ def main():
             """
             训练 start
             """
-            for epoch in range(global_data.esrgan.START_EPOCH-1,global_data.esrgan.EPOCH_NUMS):
+            training_enabled = bool(getattr(global_data.esrgan, "IS_training", True))
+            if not training_enabled:
+                logger.info("IS_training=False，跳过训练循环，直接进入 evaluate_all/test_all。")
+            # 保持原训练循环主体不变：开关关闭时只把 epoch_range 置空，后续验证/测试流程仍继续执行。
+            epoch_range = (
+                range(global_data.esrgan.START_EPOCH - 1, global_data.esrgan.EPOCH_NUMS)
+                if training_enabled
+                else range(0)
+            )
+            for epoch in epoch_range:
                 # 动态更新 PIV_esrgan_RAFT 实际使用的两类损失权重。
                 # 这些权重在每个 epoch 开始时刷新一次，本 epoch 内所有 batch 保持一致：
                 # 1. LAMBDA_ADVERSARIAL: 生成器对抗损失权重，前半程从 0.0005 增长到 0.02。
@@ -755,7 +826,10 @@ def main():
                     stride=6,
                 )
             else:
-                logger.info("IS_VALIDATE_ALL=False，跳过 evaluate_all 完整验证。")
+                logger.info(
+                    "跳过 evaluate_all："
+                    f" IS_VALIDATE_ALL={global_data.esrgan.IS_VALIDATE_ALL}"
+                )
             """
             验证集全部验证一遍 end
             """

@@ -112,6 +112,82 @@ def _init_raft128_from_raft256_if_enabled(model: nn.Module) -> None:
         logger.info(f"[ESRuRAFT_PIV_Ground] skipped weights truncated: {len(skipped) - 20} more")
 
 
+def _normalize_checkpoint_state_for_target(source_state: dict, target_model: nn.Module) -> dict:
+    """
+    让 RAFT checkpoint 的 key 前缀适配当前 piv_RAFT。
+
+    训练时如果用了 DataParallel/DDP，state_dict 可能带 module. 前缀；如果经过 torch.compile，
+    也可能带 _orig_mod. 前缀。这里选择与当前 RAFT 模型 key 命中最多的版本，不改变任何 tensor。
+    """
+    if not isinstance(source_state, dict):
+        return source_state
+
+    target_keys = set(target_model.state_dict().keys())
+
+    def score(candidate: dict) -> int:
+        return sum(1 for key in candidate.keys() if key in target_keys)
+
+    candidates = [source_state]
+    for prefix in ("module.", "_orig_mod.", "model.", "net.", "network."):
+        if any(str(key).startswith(prefix) for key in source_state.keys()):
+            candidates.append(
+                {
+                    (str(key)[len(prefix):] if str(key).startswith(prefix) else key): value
+                    for key, value in source_state.items()
+                }
+            )
+    return max(candidates, key=score)
+
+
+def _load_raft_checkpoint_for_hr_ground_mode(model: nn.Module) -> None:
+    """
+    TRAIN_MODE="hr_ground_raft_load_models" 专用：把 RAFT_CHECKPOINT 下的权重导入 piv_RAFT。
+
+    这个模式的图像输入仍然是 HR ground truth，与 hr_ground_raft 完全一致；
+    区别只在 RAFT 初始权重来自 checkpoint，而不是当前模型随机初始化或训练目录恢复。
+    默认 strict=True，确保用户实际测试的是完整 checkpoint 权重。
+    """
+    checkpoint_path = _resolve_raft256_pretrain_path(global_data.esrgan.HR_GROUND_RAFT_LOAD_MODELS_CKPT)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"hr_ground_raft_load_models 的 RAFT checkpoint 不存在: {checkpoint_path}")
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    source_state = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else None
+    if not isinstance(source_state, dict):
+        raise ValueError(f"无法从 RAFT checkpoint 中读取 model_state_dict: {checkpoint_path}")
+
+    source_state = _normalize_checkpoint_state_for_target(source_state, model)
+    strict_load = bool(getattr(global_data.esrgan, "HR_GROUND_RAFT_LOAD_MODELS_STRICT", True))
+    if strict_load:
+        model.load_state_dict(source_state, strict=True)
+        logger.info(
+            "[ESRuRAFT_PIV_Ground] hr_ground_raft_load_models loaded RAFT checkpoint strictly | "
+            f"checkpoint={checkpoint_path}, tensors={len(source_state)}"
+        )
+        return
+
+    # 非严格模式只作为调试兜底：shape 不一致的层不导入，保持当前模型初始化。
+    # 默认不会走到这里，避免用户无意中拿“半加载”的 RAFT 做正式对比。
+    target_state = model.state_dict()
+    matched_state = {}
+    skipped = []
+    for name, value in source_state.items():
+        target_value = target_state.get(name)
+        if target_value is not None and hasattr(value, "shape") and target_value.shape == value.shape:
+            matched_state[name] = value
+        else:
+            source_shape = tuple(value.shape) if hasattr(value, "shape") else type(value).__name__
+            target_shape = tuple(target_value.shape) if target_value is not None else None
+            skipped.append((name, source_shape, target_shape))
+
+    target_state.update(matched_state)
+    model.load_state_dict(target_state, strict=True)
+    logger.warning(
+        "[ESRuRAFT_PIV_Ground] hr_ground_raft_load_models loaded RAFT checkpoint non-strictly | "
+        f"checkpoint={checkpoint_path}, loaded={len(matched_state)}, skipped={len(skipped)}"
+    )
+
+
 def _build_piv_raft(batch_size: int) -> nn.Module:
     """
     根据 global_data.esrgan.RAFT_MODEL_TYPE 创建 piv_RAFT。
@@ -166,11 +242,12 @@ class ESRuRAFT_PIV(nn.Module):
     Ground 版本和 ESRuRAFT_PIV 的训练/评估外壳保持一致，但通过 TRAIN_MODE 切换图像来源和 PIV 估计器：
     1. lr_ground_raft: LR 最近邻对齐到 HR 后送入 RAFT。
     2. hr_ground_raft: HR 真值图像直接送入 RAFT。
-    3. bicubic_raft: LR 经 bicubic 上采样后送入 RAFT。
-    4. esrgan_raft: 原始 ESRGAN 超分后送入 RAFT。
-    5. bicubic_widim: LR 经 bicubic 上采样后进入传统 WIDIM/窗口互相关 PIV。
-    6. bicubic_hs: LR 经 bicubic 上采样后进入 Horn-Schunck 光流法。
-    7. srgan_raft: 传统 SRGAN 超分后送入 RAFT。
+    3. hr_ground_raft_load_models: HR 真值图像直接送入“从 RAFT_CHECKPOINT 加载权重后的 RAFT”。
+    4. bicubic_raft: LR 经 bicubic 上采样后送入 RAFT。
+    5. esrgan_raft: 原始 ESRGAN 超分后送入 RAFT。
+    6. bicubic_widim: LR 经 bicubic 上采样后进入传统 WIDIM/窗口互相关 PIV。
+    7. bicubic_hs: LR 经 bicubic 上采样后进入 Horn-Schunck 光流法。
+    8. srgan_raft: 传统 SRGAN 超分后送入 RAFT。
     """
 
     def __init__(self,inner_chanel,batch_size,sr_scale=None):
@@ -206,6 +283,10 @@ class ESRuRAFT_PIV(nn.Module):
             self.piv_esrgan_generator = nn.Identity()
             self.piv_esrgan_discriminator = nn.Identity()
         self.piv_RAFT = _build_piv_raft(batch_size=batch_size)  # 按 RAFT_MODEL_TYPE 选择 RAFT / RAFT128 / RAFT256
+        if self.train_mode == "hr_ground_raft_load_models":
+            # 新模式只改变 RAFT 的初始权重来源，不改变 HR ground 输入逻辑。
+            # strict=True 时要求 checkpoint 与 RAFT_MODEL_TYPE 完全匹配，例如 ckpt_256.tar 对应 RAFT256。
+            _load_raft_checkpoint_for_hr_ground_mode(self.piv_RAFT)
 
 
 
@@ -579,7 +660,8 @@ class ESRuRAFT_PIV(nn.Module):
         """
         计算 ground 模式的图像诊断项。
 
-        lr_ground_raft/hr_ground_raft/bicubic_raft/bicubic_widim/bicubic_hs 没有 Generator，不应该对图像损失反传；但保留这些数值日志有两个好处：
+        lr_ground_raft/hr_ground_raft/hr_ground_raft_load_models/bicubic_raft/bicubic_widim/bicubic_hs
+        没有 Generator，不应该对图像损失反传；但保留这些数值日志有两个好处：
         1. CSV 字段继续和 ESRuRAFT_PIV 对齐；
         2. 可以直观看到最近邻 LR、bicubic LR 或 HR ground 图像与真实 HR 的图像差异。
         """
@@ -652,8 +734,10 @@ class ESRuRAFT_PIV(nn.Module):
                 pred_prev, pred_next, input_gr_prev, input_gr_next
             )
 
-        if self.train_mode == "hr_ground_raft":
+        if self.train_mode in {"hr_ground_raft", "hr_ground_raft_load_models"}:
             # 高分辨率 ground + RAFT：RAFT 直接看真实 HR 图像，相当于给 RAFT 最理想的图像输入。
+            # hr_ground_raft_load_models 在 __init__ 里已经把 RAFT_CHECKPOINT 权重导入 piv_RAFT；
+            # 到这里后与 hr_ground_raft 走完全相同的 HR 输入和 loss 逻辑。
             raft_prev = input_gr_prev
             raft_next = input_gr_next
             pred_prev = input_gr_prev
@@ -993,7 +1077,7 @@ class ESRuRAFT_PIV(nn.Module):
             }
 
         if not self._uses_super_resolution():
-            # lr_ground_raft / hr_ground_raft / bicubic_raft 只训练 RAFT：
+            # lr_ground_raft / hr_ground_raft / hr_ground_raft_load_models / bicubic_raft 只训练 RAFT：
             # - 不调用 Generator backward；
             # - 不更新 Discriminator；
             # - 仍然计算图像诊断项，保持 CSV 字段和 ESRuRAFT_PIV 对齐。

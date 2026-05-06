@@ -149,9 +149,53 @@ def _extract_model_state_dict(checkpoint_obj):
         1. 直接 torch.save(model.state_dict(), path)
         2. torch.save({'model_state_dict': ...}, path)
     """
-    if isinstance(checkpoint_obj, dict) and "model_state_dict" in checkpoint_obj:
-        return checkpoint_obj["model_state_dict"]
+    if hasattr(checkpoint_obj, "state_dict") and not isinstance(checkpoint_obj, dict):
+        # 少数旧实验会直接保存整个 nn.Module。pipeline_test 只需要权重字典，
+        # 这里先转成 state_dict，避免后面把 Module 当 dict 处理。
+        return checkpoint_obj.state_dict()
+
+    if not isinstance(checkpoint_obj, dict):
+        return checkpoint_obj
+
+    # 优先识别训练脚本和常见框架会使用的包装字段；这样 checkpoint 里即使带 epoch、
+    # optimizer_state_dict、scheduler_state_dict，也不会误把整个 checkpoint 当模型权重加载。
+    for key in ("model_state_dict", "state_dict", "model", "net", "network", "module"):
+        candidate = checkpoint_obj.get(key)
+        if _looks_like_model_state_dict(candidate):
+            return candidate
+        if hasattr(candidate, "state_dict"):
+            return candidate.state_dict()
+
+    if _looks_like_model_state_dict(checkpoint_obj):
+        return checkpoint_obj
+
+    # 有些 checkpoint 只包了一层自定义 key；如果唯一的 dict 值看起来像 state_dict，也兼容它。
+    nested_candidates = [
+        value for value in checkpoint_obj.values()
+        if _looks_like_model_state_dict(value)
+    ]
+    if len(nested_candidates) == 1:
+        return nested_candidates[0]
+
     return checkpoint_obj
+
+
+def _looks_like_model_state_dict(obj):
+    """
+    粗略判断一个对象是不是 PyTorch 模型 state_dict。
+
+    optimizer/scheduler 的 state_dict 也是 dict，但顶层通常不是大量 Tensor；
+    这里要求 key 是字符串且至少有一个 Tensor 值，避免 pipeline_test 误加载优化器文件。
+    """
+    if not isinstance(obj, dict) or not obj:
+        return False
+    tensor_count = 0
+    for key, value in obj.items():
+        if not isinstance(key, str):
+            return False
+        if torch.is_tensor(value):
+            tensor_count += 1
+    return tensor_count > 0
 
 
 def _normalize_state_dict_keys_for_model(state_dict, model):
@@ -164,15 +208,89 @@ def _normalize_state_dict_keys_for_model(state_dict, model):
     if not isinstance(state_dict, dict):
         return state_dict
 
-    model_keys = list(model.state_dict().keys())
-    has_model_module_prefix = any(key.startswith("module.") for key in model_keys)
-    has_state_module_prefix = any(str(key).startswith("module.") for key in state_dict.keys())
-    if has_state_module_prefix and not has_model_module_prefix:
-        return {
-            (key[7:] if str(key).startswith("module.") else key): value
-            for key, value in state_dict.items()
-        }
-    return state_dict
+    model_keys = set(model.state_dict().keys())
+
+    def score(candidate):
+        return sum(1 for key in candidate.keys() if key in model_keys)
+
+    candidates = [state_dict]
+    for prefix in ("module.", "_orig_mod.", "model.", "net.", "network."):
+        if any(str(key).startswith(prefix) for key in state_dict.keys()):
+            candidates.append(
+                {
+                    (str(key)[len(prefix):] if str(key).startswith(prefix) else key): value
+                    for key, value in state_dict.items()
+                }
+            )
+
+    # 选择与当前模型 key 命中最多的版本。这样可以同时兼容 DataParallel 的 module.
+    # 前缀、torch.compile 的 _orig_mod. 前缀，以及部分自定义保存代码加上的 model./net. 前缀。
+    return max(candidates, key=score)
+
+
+def _summarize_state_dict_mismatch(model, state_dict, max_items=20):
+    """
+    生成 checkpoint 与当前模型结构不匹配的简短诊断信息。
+
+    pipeline_test 最常见的导入错误来自当前 global_class 和训练时不一致，例如：
+    TRAIN_MODE、RAFT_MODEL_TYPE、SCALE 或 inner_chanel 改了。直接抛 PyTorch 原始长错误
+    不太好定位，所以这里把 missing/unexpected/shape mismatch 分开列出来。
+    """
+    target_state = model.state_dict()
+    source_keys = set(state_dict.keys()) if isinstance(state_dict, dict) else set()
+    target_keys = set(target_state.keys())
+    missing = sorted(target_keys - source_keys)
+    unexpected = sorted(source_keys - target_keys)
+    shape_mismatch = []
+    if isinstance(state_dict, dict):
+        for key in sorted(source_keys & target_keys):
+            source_value = state_dict[key]
+            target_value = target_state[key]
+            if hasattr(source_value, "shape") and hasattr(target_value, "shape"):
+                if tuple(source_value.shape) != tuple(target_value.shape):
+                    shape_mismatch.append((key, tuple(source_value.shape), tuple(target_value.shape)))
+
+    def first_items(values):
+        return values[:max_items], max(0, len(values) - max_items)
+
+    missing_head, missing_more = first_items(missing)
+    unexpected_head, unexpected_more = first_items(unexpected)
+    shape_head, shape_more = first_items(shape_mismatch)
+    return {
+        "missing": missing_head,
+        "missing_more": missing_more,
+        "unexpected": unexpected_head,
+        "unexpected_more": unexpected_more,
+        "shape_mismatch": shape_head,
+        "shape_mismatch_more": shape_more,
+    }
+
+
+def _load_state_dict_checked(model, state_dict, checkpoint_path):
+    """
+    严格加载 pipeline_test 的模型权重，并在失败时给出可操作诊断。
+
+    这里默认仍然是 strict=True：测试入口应该加载“训练好的完整模型”，不应该悄悄跳过层。
+    但错误信息会明确告诉你哪些 key 缺失、哪些 key 多出来、哪些层尺寸不一致。
+    """
+    if not _looks_like_model_state_dict(state_dict):
+        raise ValueError(
+            f"[pipeline_test] checkpoint 中没有识别到模型 state_dict: {checkpoint_path}"
+        )
+
+    try:
+        model.load_state_dict(state_dict, strict=True)
+        return
+    except RuntimeError as exc:
+        summary = _summarize_state_dict_mismatch(model, state_dict)
+        raise RuntimeError(
+            "[pipeline_test] 模型权重导入失败。请确认当前 global_class 与训练 checkpoint 完全一致，"
+            "尤其是 TRAIN_MODE、RAFT_MODEL_TYPE、SCALE/SCALES、inner_chanel、网络版本。\n"
+            f"checkpoint={checkpoint_path}\n"
+            f"missing_keys(first)={summary['missing']} | more={summary['missing_more']}\n"
+            f"unexpected_keys(first)={summary['unexpected']} | more={summary['unexpected_more']}\n"
+            f"shape_mismatch(first)={summary['shape_mismatch']} | more={summary['shape_mismatch_more']}"
+        ) from exc
 
 
 def run_pipeline_test(global_data, branch_name, model_factory, data_type_resolver, test_all_fn):
@@ -200,12 +318,24 @@ def run_pipeline_test(global_data, branch_name, model_factory, data_type_resolve
             data_type = str(data_type_resolver()).strip()
 
             for scale in getattr(global_data.esrgan, "SCALES", [1]):
+                # 初始化日志
+                logger.add(
+                    f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(scale * scale)}/{global_data.esrgan.LOG_DIR}/test.log",
+                    rotation="100 MB",
+                    retention="30 days",
+                    level="DEBUG",
+                    format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {process.name} | {thread.name} | {name}:{module}:{line} | {message}",
+                    enqueue=True,
+                    backtrace=True,
+                    diagnose=True,
+
+                )
                 model = model_factory(scale).to(device, non_blocking=(getattr(device, "type", "cpu") == "cuda"))
                 checkpoint_path = _find_checkpoint_path(global_data, class_name, data_type, scale)
                 checkpoint_obj = torch.load(checkpoint_path, map_location=device)
                 state_dict = _extract_model_state_dict(checkpoint_obj)
                 state_dict = _normalize_state_dict_keys_for_model(state_dict, model)
-                model.load_state_dict(state_dict)
+                _load_state_dict_checked(model, state_dict, checkpoint_path)
 
                 logger.info(
                     "[pipeline_test] branch={} | class_name={} | data_type={} | scale={} | checkpoint={}",

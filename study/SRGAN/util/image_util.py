@@ -41,10 +41,37 @@ def add_horizontal_separator(width, channels=3, sep_height=8, value=1.0, device=
     return torch.full((1, channels, sep_height, width), value, device=device, dtype=dtype)
 
 
+def _pad_tensor_to_canvas(tensor: torch.Tensor, height: int, width: int, value: float = 1.0) -> torch.Tensor:
+    """
+    把较小的图像放到固定大小画布中，不做插值放大。
+
+    这主要用于 LR | Fake | HR 对比图：LR 图必须保持真实低分辨率尺寸，
+    但三张图仍需要处在同一行的三个固定位置上，因此用 padding 画布补齐尺寸。
+    """
+    b, c, h, w = tensor.shape
+    if h > height or w > width:
+        raise ValueError(f"tensor shape {(h, w)} exceeds target canvas {(height, width)}")
+    canvas = torch.full((b, c, height, width), value, device=tensor.device, dtype=tensor.dtype)
+    top = (height - h) // 2
+    left = (width - w) // 2
+    canvas[:, :, top:top + h, left:left + w] = tensor
+    return canvas
+
+
 def build_triplet_row(lr, fake, hr, sep_width=6):
-    """拼接一行对比图：LR | Fake | HR。"""
-    sep = add_vertical_separator(lr, sep_width=sep_width, value=1.0)
-    return torch.cat([lr, sep, fake, sep, hr], dim=3)
+    """
+    拼接一行对比图：LR | Fake | HR。
+
+    LR 通常比 Fake/HR 小。这里不会把 LR 插值放大，而是把三张图分别放到同一个
+    max(H,W) 画布里再拼接，保证 LR 仍在第一列位置，同时保留真实低分辨率外观。
+    """
+    canvas_h = max(int(lr.shape[-2]), int(fake.shape[-2]), int(hr.shape[-2]))
+    canvas_w = max(int(lr.shape[-1]), int(fake.shape[-1]), int(hr.shape[-1]))
+    lr_canvas = _pad_tensor_to_canvas(lr, canvas_h, canvas_w, value=1.0)
+    fake_canvas = _pad_tensor_to_canvas(fake, canvas_h, canvas_w, value=1.0)
+    hr_canvas = _pad_tensor_to_canvas(hr, canvas_h, canvas_w, value=1.0)
+    sep = add_vertical_separator(lr_canvas, sep_width=sep_width, value=1.0)
+    return torch.cat([lr_canvas, sep, fake_canvas, sep, hr_canvas], dim=3)
 
 
 def build_pair_row(left, right, sep_width=6):

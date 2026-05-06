@@ -8,6 +8,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
 import numpy as np
 import torch
 import torch.nn as nn
@@ -54,32 +55,95 @@ def _match_common_channels(pred_chw, gt_chw):
     return pred[:cnum], gt[:cnum]
 
 
+def _finite_pair_mask(pred, gt):
+    """
+    返回预测/真值同时为有限值的位置掩码。
+
+    TBL/TWCF 的 full-frame 数据里会包含边界外、无效区或历史 fold 边界留下的 NaN/Inf。
+    这些点不能参与指标计算，否则任意一个 NaN 都会把整张图的 mean/max/fft/EPE 变成 NaN。
+    """
+    return np.isfinite(pred) & np.isfinite(gt)
+
+
+def _finite_pair_values(pred, gt):
+    """
+    拉平成一维并只保留预测和真值都有效的位置。
+
+    MSE、R2、NRMSE 这类逐像素统计应该严格忽略无效像素，而不是先把 NaN 填 0；
+    否则会把无效区域误当作真实误差，尤其会影响 TBL/TWCF 这类大幅面数据。
+    """
+    valid = _finite_pair_mask(pred, gt)
+    if not np.any(valid):
+        empty = np.asarray([], dtype=np.float32)
+        return empty, empty
+    return pred[valid].astype(np.float32, copy=False), gt[valid].astype(np.float32, copy=False)
+
+
+def _dense_metric_pair(pred_2d, gt_2d, fill_value=0.0):
+    """
+    为 SSIM/FFT 这类需要完整二维矩阵的指标准备无 NaN 输入。
+
+    逐像素误差可以直接用掩码过滤；但 SSIM 和频谱需要完整的 2D 场。这里先找出
+    pred/gt 同时有效的位置，如果存在有效数据，就用各自有效区域均值填补无效点。
+    这样无效区域不会制造极端 0 值，也不会让 FFT/SSIM 因 NaN 直接失效。
+    """
+    pred = np.asarray(pred_2d, dtype=np.float32).copy()
+    gt = np.asarray(gt_2d, dtype=np.float32).copy()
+    valid = _finite_pair_mask(pred, gt)
+    if not np.any(valid):
+        return None, None
+
+    pred_fill = float(np.mean(pred[valid], dtype=np.float64)) if np.any(np.isfinite(pred[valid])) else float(fill_value)
+    gt_fill = float(np.mean(gt[valid], dtype=np.float64)) if np.any(np.isfinite(gt[valid])) else float(fill_value)
+    pred[~valid] = pred_fill
+    gt[~valid] = gt_fill
+    pred[~np.isfinite(pred)] = pred_fill
+    gt[~np.isfinite(gt)] = gt_fill
+    return pred, gt
+
+
+def _nanmean_or_nan(values):
+    """只对有限值求均值；没有有效值时返回 NaN。"""
+    arr = np.asarray(values, dtype=np.float32).reshape(-1)
+    arr = arr[np.isfinite(arr)]
+    return float(np.mean(arr, dtype=np.float64)) if arr.size > 0 else float("nan")
+
+
 def _mse(pred_chw, gt_chw):
-    """计算均方误差 MSE。"""
+    """计算均方误差 MSE，只统计 pred/gt 都有限的像素。"""
     pred, gt = _match_common_channels(pred_chw, gt_chw)
-    return float(np.mean((pred - gt) ** 2))
+    pred_valid, gt_valid = _finite_pair_values(pred, gt)
+    if pred_valid.size == 0:
+        return float("nan")
+    return float(np.mean((pred_valid - gt_valid) ** 2, dtype=np.float64))
 
 
 def _psnr_from_mse(mse):
     """由 MSE 计算 PSNR，假设图像范围已经在 [0,1]。"""
+    if not np.isfinite(mse):
+        return float("nan")
     return float("inf") if mse == 0 else 20.0 * math.log10(1.0 / math.sqrt(mse))
 
 
 def _r2_score(pred_chw, gt_chw, eps=1e-12):
-    """计算决定系数 R^2。"""
+    """计算决定系数 R^2，只使用有效像素，避免无效边界把结果变成 NaN。"""
     pred, gt = _match_common_channels(pred_chw, gt_chw)
-    y_true = gt.reshape(-1)
-    y_pred = pred.reshape(-1)
+    y_pred, y_true = _finite_pair_values(pred, gt)
+    if y_true.size == 0:
+        return float("nan")
     ss_res = float(np.sum((y_true - y_pred) ** 2))
     ss_tot = float(np.sum((y_true - np.mean(y_true)) ** 2))
     return 1.0 - ss_res / (ss_tot + eps)
 
 
 def _nrmse(pred_chw, gt_chw, eps=1e-12):
-    """按真值范围归一化的 RMSE。"""
+    """按真值范围归一化的 RMSE，只统计有效像素。"""
     pred, gt = _match_common_channels(pred_chw, gt_chw)
-    rmse = math.sqrt(float(np.mean((pred - gt) ** 2)))
-    den = float(np.max(gt) - np.min(gt))
+    pred_valid, gt_valid = _finite_pair_values(pred, gt)
+    if pred_valid.size == 0:
+        return float("nan")
+    rmse = math.sqrt(float(np.mean((pred_valid - gt_valid) ** 2, dtype=np.float64)))
+    den = float(np.max(gt_valid) - np.min(gt_valid))
     return rmse / (den + eps)
 
 
@@ -96,25 +160,31 @@ def _ssim_score(pred_chw, gt_chw):
 
         vals = []
         for c in range(pred.shape[0]):
-            p = pred[c]
-            g = gt[c]
+            # skimage 的 SSIM 不能直接处理 NaN/Inf；先按有效区域均值补齐无效点，
+            # 补齐仅用于 dense image metric，不会改变 results.npy 或可视化输出。
+            pair = _dense_metric_pair(pred[c], gt[c])
+            if pair[0] is None:
+                continue
+            p, g = pair
             dr = float(np.max(g) - np.min(g))
             dr = dr if dr > 1e-12 else 1.0
             vals.append(float(sk_ssim(g, p, data_range=dr)))
-        return float(np.mean(vals))
+        return float(np.mean(vals)) if vals else float("nan")
     except Exception:
         vals = []
         C1, C2 = 0.01**2, 0.03**2
         for c in range(pred.shape[0]):
-            x = pred[c]
-            y = gt[c]
+            pair = _dense_metric_pair(pred[c], gt[c])
+            if pair[0] is None:
+                continue
+            x, y = pair
             mx, my = float(np.mean(x)), float(np.mean(y))
             vx, vy = float(np.var(x)), float(np.var(y))
             cov = float(np.mean((x - mx) * (y - my)))
             num = (2 * mx * my + C1) * (2 * cov + C2)
             den = (mx * mx + my * my + C1) * (vx + vy + C2)
             vals.append(num / den if den != 0 else 0.0)
-        return float(np.mean(vals))
+        return float(np.mean(vals)) if vals else float("nan")
 
 
 def _tke_reconstruction_accuracy(pred_chw, gt_chw, eps=1e-12):
@@ -129,6 +199,10 @@ def _tke_reconstruction_accuracy(pred_chw, gt_chw, eps=1e-12):
         return float("nan")
     up, vp = pred[0], pred[1]
     ug, vg = gt[0], gt[1]
+    valid = np.isfinite(up) & np.isfinite(vp) & np.isfinite(ug) & np.isfinite(vg)
+    if not np.any(valid):
+        return float("nan")
+    up, vp, ug, vg = up[valid], vp[valid], ug[valid], vg[valid]
     up_p = up - np.mean(up)
     vp_p = vp - np.mean(vp)
     ug_p = ug - np.mean(ug)
@@ -152,26 +226,64 @@ def _radial_spectrum(ch2d):
 
 
 def _energy_spectrum_curves(pred_chw, gt_chw):
-    """计算公共通道上的平均径向能量谱曲线。"""
+    """计算公共通道上的平均径向能量谱曲线，FFT 前会补齐无效像素。"""
     pred, gt = _match_common_channels(pred_chw, gt_chw)
     pred_specs = []
     gt_specs = []
     min_len = None
     for c in range(pred.shape[0]):
-        sp = _radial_spectrum(pred[c])
-        sg = _radial_spectrum(gt[c])
+        pair = _dense_metric_pair(pred[c], gt[c])
+        if pair[0] is None:
+            continue
+        pred_2d, gt_2d = pair
+        sp = _radial_spectrum(pred_2d)
+        sg = _radial_spectrum(gt_2d)
         n = min(len(sp), len(sg))
         min_len = n if min_len is None else min(min_len, n)
         pred_specs.append(sp[:n])
         gt_specs.append(sg[:n])
+    if not pred_specs or min_len is None:
+        empty = np.asarray([np.nan], dtype=np.float32)
+        return empty, empty
     pred_curve = np.mean(np.stack([x[:min_len] for x in pred_specs], axis=0), axis=0)
     gt_curve = np.mean(np.stack([x[:min_len] for x in gt_specs], axis=0), axis=0)
     return pred_curve, gt_curve
 
 
 def _energy_spectrum_mse_from_curves(pred_curve, gt_curve):
-    """对已算好的谱曲线计算 log1p 频谱差 MSE。"""
-    return float(np.mean((np.log1p(pred_curve) - np.log1p(gt_curve)) ** 2))
+    """对已算好的谱曲线计算 log1p 频谱差 MSE，只统计有限频点。"""
+    pred_log = np.log1p(pred_curve)
+    gt_log = np.log1p(gt_curve)
+    valid = _finite_pair_mask(pred_log, gt_log)
+    if not np.any(valid):
+        return float("nan")
+    return float(np.mean((pred_log[valid] - gt_log[valid]) ** 2, dtype=np.float64))
+
+
+def _compute_epe_values_from_chw(pred_chw, gt_chw):
+    """
+    计算单样本 CHW 流场的有效像素 EPE 序列。
+
+    TBL/TWCF 的 GT 或预测可能在无效区域包含 NaN/Inf。这里要求 U/V 两个通道的
+    pred 和 gt 都是有限值才参与 EPE，保证 AEE、NORM_AEE_PER100PIXEL 和 C-AEE
+    不再被单个无效像素拖成 NaN。
+    """
+    pred, gt = _match_common_channels(pred_chw, gt_chw)
+    if pred.shape[0] < 2 or gt.shape[0] < 2:
+        return np.asarray([], dtype=np.float32)
+    valid = (
+        np.isfinite(pred[0])
+        & np.isfinite(pred[1])
+        & np.isfinite(gt[0])
+        & np.isfinite(gt[1])
+    )
+    if not np.any(valid):
+        return np.asarray([], dtype=np.float32)
+    du = pred[0] - gt[0]
+    dv = pred[1] - gt[1]
+    epe = np.sqrt(du * du + dv * dv)
+    epe = epe[valid]
+    return epe[np.isfinite(epe)].astype(np.float32, copy=False)
 
 
 def _compute_aee_from_chw(pred_chw, gt_chw):
@@ -180,13 +292,10 @@ def _compute_aee_from_chw(pred_chw, gt_chw):
 
     这里和 evaluate_all 保持同口径：AEE 等价于像素级 EPE 的平均值。
     """
-    pred, gt = _match_common_channels(pred_chw, gt_chw)
-    if pred.shape[0] < 2 or gt.shape[0] < 2:
+    epe = _compute_epe_values_from_chw(pred_chw, gt_chw)
+    if epe.size == 0:
         return float("nan")
-    du = pred[0] - gt[0]
-    dv = pred[1] - gt[1]
-    epe = np.sqrt(du * du + dv * dv)
-    return float(np.mean(epe))
+    return float(np.mean(epe, dtype=np.float64))
 
 
 def _mean_sum_per_100_pixels(values_1d, group_size=100):
@@ -197,6 +306,8 @@ def _mean_sum_per_100_pixels(values_1d, group_size=100):
     最后一组不足 100 个像素时直接丢弃，不参与统计。
     """
     values = np.asarray(values_1d, dtype=np.float32).reshape(-1)
+    # 无效像素已经不属于真实评估区域，先过滤再按每 100 个有效像素分组。
+    values = values[np.isfinite(values)]
     if values.size < group_size:
         return float("nan")
     usable_count = (values.size // group_size) * group_size
@@ -211,13 +322,47 @@ def _compute_norm_aee_per100_from_chw(pred_chw, gt_chw):
     """
     用单样本 CHW 流场计算“每 100 个像素 EPE 累加值的平均”。
     """
-    pred, gt = _match_common_channels(pred_chw, gt_chw)
-    if pred.shape[0] < 2 or gt.shape[0] < 2:
+    epe = _compute_epe_values_from_chw(pred_chw, gt_chw)
+    if epe.size == 0:
         return float("nan")
-    du = pred[0] - gt[0]
-    dv = pred[1] - gt[1]
-    epe = np.sqrt(du * du + dv * dv)
     return _mean_sum_per_100_pixels(epe, group_size=100)
+
+
+def _torch_finite_epe_per_sample(predicted_flows, flows):
+    """
+    在 GPU tensor 上计算每个样本的有限像素平均 EPE。
+
+    旧逻辑直接对整张图 `.mean()`，TBL/TWCF 只要某个无效区域含 NaN/Inf，
+    整个 sample 甚至整批 batch 的 EPE 就会变成 NaN。这里和 CSV 明细指标保持一致：
+    只有 pred(U/V) 与 gt(U/V) 全部为有限值的像素才参与平均。
+    """
+    if predicted_flows.size(1) < 2 or flows.size(1) < 2:
+        return torch.full(
+            (int(predicted_flows.size(0)),),
+            float("nan"),
+            device=predicted_flows.device,
+            dtype=predicted_flows.dtype,
+        )
+
+    pred_uv = predicted_flows[:, :2, :, :]
+    gt_uv = flows[:, :2, :, :]
+    valid = (
+        torch.isfinite(pred_uv[:, 0])
+        & torch.isfinite(pred_uv[:, 1])
+        & torch.isfinite(gt_uv[:, 0])
+        & torch.isfinite(gt_uv[:, 1])
+    )
+
+    diff = pred_uv - gt_uv
+    epe = torch.sqrt(torch.sum(diff * diff, dim=1))
+    epe = torch.where(valid & torch.isfinite(epe), epe, torch.zeros_like(epe))
+
+    valid_flat = valid.flatten(1)
+    epe_flat = epe.flatten(1)
+    counts = valid_flat.sum(dim=1)
+    sums = epe_flat.sum(dim=1)
+    means = sums / counts.clamp_min(1).to(dtype=sums.dtype)
+    return torch.where(counts > 0, means, torch.full_like(means, float("nan")))
 
 
 def _compute_image_metric_row(dataset_name, sample_index, pair_type, pred_chw, gt_chw):
@@ -694,7 +839,13 @@ def _fold_weighted_patches(patch_tensor, B, C, H, W, num_y, num_x, offset, shift
     flow 使用 C=2，SR 图像使用 C=1；抽成公共函数后，tbl/twcf 的 flow 和生成图
     都能使用同一套重叠区域融合逻辑，避免图片输出和 flow 输出的拼接方式不一致。
     """
-    weighted_patches = patch_tensor * window
+    # squared spline window 的外边界可能正好为 0。full-frame 最外圈像素只被一个 patch 覆盖时，
+    # 如果继续使用 0 权重，会在 folded / folding_mask 处产生 0/0，后续绘图再把 NaN 填 0，
+    # 就会出现用户看到的 TWCF 顶部紫色/0 displacement 细带。这里仅把 0 权重点抬到极小值，
+    # 重叠区域的融合权重不变，外边界则保留该 patch 的真实预测值。
+    blend_window = torch.clamp(window, min=1.0e-6)
+
+    weighted_patches = patch_tensor * blend_window
     weighted_patches = weighted_patches.reshape((B, num_y, num_x, C, offset, offset)).permute(0, 3, 1, 2, 4, 5)
     weighted_patches = weighted_patches.contiguous().view(B, C, -1, offset * offset)
     weighted_patches = weighted_patches.permute(0, 1, 3, 2)
@@ -704,13 +855,47 @@ def _fold_weighted_patches(patch_tensor, B, C, H, W, num_y, num_x, offset, shift
     mask_source = torch.ones((B, C, H, W), device=patch_tensor.device, dtype=patch_tensor.dtype)
     mask_patches = mask_source.unfold(3, offset, shift).unfold(2, offset, shift)
     mask_patches = mask_patches.contiguous().view(B, C, -1, offset, offset)
-    mask_patches = mask_patches * window
+    mask_patches = mask_patches * blend_window
     mask_patches = mask_patches.view(B, C, -1, offset * offset)
     mask_patches = mask_patches.permute(0, 1, 3, 2)
     mask_patches = mask_patches.contiguous().view(B, C * offset * offset, -1)
     folding_mask = F.fold(mask_patches, output_size=(H, W), kernel_size=offset, stride=shift)
 
-    return folded / folding_mask
+    # 正常情况下，_predict_full_frame_with_folding 会先 pad 到每个像素都被窗口覆盖；
+    # 这里仍保留 clamp 作为最后保护，避免极端尺寸或外部调用产生 0/0。
+    return folded / torch.clamp(folding_mask, min=1.0e-6)
+
+
+def _sliding_full_coverage_size(length, offset, shift):
+    """
+    计算滑窗能够完整覆盖原始长度所需的 padded 长度。
+
+    PyTorch unfold 只会取完整窗口；例如 TWCF 高度 2160，offset=256，shift=64 时，
+    不 padding 会只覆盖到 2112 行，顶部剩余区域没有预测。这里把长度补到 2176，
+    让最后一个窗口覆盖原图末端，fold 后再裁回 2160。
+    """
+    length = int(length)
+    offset = int(offset)
+    shift = int(shift)
+    if length <= offset:
+        return offset
+    num_windows = int(math.ceil((length - offset) / shift)) + 1
+    return (num_windows - 1) * shift + offset
+
+
+def _pad_full_frame_for_sliding(tensor, padded_h, padded_w):
+    """
+    将 full-frame tensor 右侧/末端 padding 到滑窗可完整覆盖的尺寸。
+
+    使用 replicate padding 而不是 0 padding，是为了让最边缘 patch 的上下文连续；
+    这些 padding 区域只参与边缘 patch 的推理，最终输出会裁回原始 H/W，不会保存到结果里。
+    """
+    _, _, h, w = tensor.shape
+    pad_h = int(padded_h) - int(h)
+    pad_w = int(padded_w) - int(w)
+    if pad_h <= 0 and pad_w <= 0:
+        return tensor
+    return F.pad(tensor, (0, max(pad_w, 0), 0, max(pad_h, 0)), mode="replicate")
 
 
 def _predict_full_frame_with_folding(model, images, flows, factor, device, test_args):
@@ -724,9 +909,18 @@ def _predict_full_frame_with_folding(model, images, flows, factor, device, test_
     shift = int(test_args["shift"])
     split_size = int(test_args["split_size"])
 
-    B, C, H, W = images.size()
-    num_y = int(H / shift - (offset / shift - 1))
-    num_x = int(W / shift - (offset / shift - 1))
+    B, C, original_h, original_w = images.size()
+    padded_h = _sliding_full_coverage_size(original_h, offset, shift)
+    padded_w = _sliding_full_coverage_size(original_w, offset, shift)
+
+    # 保存原始 full-frame，后续 LR/HR 图像指标和最终输出都必须回到原图尺寸。
+    original_images = images
+    images = _pad_full_frame_for_sliding(images, padded_h, padded_w)
+    flows = _pad_full_frame_for_sliding(flows, padded_h, padded_w)
+
+    _, _, H, W = images.size()
+    num_y = (H - offset) // shift + 1
+    num_x = (W - offset) // shift + 1
 
     predicted_flows = torch.zeros_like(flows, device=device)
 
@@ -761,13 +955,18 @@ def _predict_full_frame_with_folding(model, images, flows, factor, device, test_
         torch.cat(patch_pred_next_outputs, dim=0), B, 1, H, W, num_y, num_x, offset, shift, window
     )
 
+    # padding 只用于让滑窗覆盖到原图末端；返回前必须裁回原始 H/W。
+    predicted_flows = predicted_flows[:, :, :original_h, :original_w]
+    pred_prev = pred_prev[:, :, :original_h, :original_w]
+    pred_next = pred_next[:, :, :original_h, :original_w]
+
     return {
         "flow": predicted_flows,
         # tbl/twcf 的 LR 图保存整张 full-frame 下采样结果；SR/generated 图则来自 patch SR 融合。
-        "prev_lr": _make_lr_from_hr_tensor(images[:, 0:1, :, :], factor, device),
-        "next_lr": _make_lr_from_hr_tensor(images[:, 1:2, :, :], factor, device),
-        "prev_hr": images[:, 0:1, :, :],
-        "next_hr": images[:, 1:2, :, :],
+        "prev_lr": _make_lr_from_hr_tensor(original_images[:, 0:1, :, :], factor, device),
+        "next_lr": _make_lr_from_hr_tensor(original_images[:, 1:2, :, :], factor, device),
+        "prev_hr": original_images[:, 0:1, :, :],
+        "next_hr": original_images[:, 1:2, :, :],
         "pred_prev": pred_prev,
         "pred_next": pred_next,
     }
@@ -784,6 +983,107 @@ def _mask_field_for_plot(field_2d, mask_2d=None):
     if mask.shape != field.shape:
         return field
     return np.ma.masked_where(mask <= 0, field)
+
+
+def _fill_invalid_field_for_plot(field_2d, mask_2d=None, fill_value=0.0):
+    """
+    按 mask 把无效区域填成固定 displacement 值后再绘图。
+
+    TWCF 原始 PascalPIV 图在波浪边界下方不是留白，而是用 0 displacement 对应的颜色填充。
+    Current 预测图也需要保持同样视觉口径，否则白色空洞会被误读成没有输出。
+    """
+    field = np.asarray(field_2d, dtype=np.float32).copy()
+    field[~np.isfinite(field)] = float(fill_value)
+    if mask_2d is None:
+        return field
+    mask = np.asarray(mask_2d)
+    if mask.shape != field.shape:
+        return field
+    field[mask <= 0] = float(fill_value)
+    return field
+
+
+def _repair_nonfinite_by_vertical_nearest(field_2d, fallback=0.0):
+    """
+    将绘图字段中的 NaN/Inf 用同一列最近的有效值补齐。
+
+    TWCF 的 Current 图来自 patch fold，历史输出或极端边界仍可能留下少量非有限值。
+    这些点不应该被直接填成 0，因为 0 在 U 色条里会显示成明显的低位移颜色；
+    用同列最近有效值补齐可以保持边界连续，只影响 png 可视化，不改模型预测文件。
+    """
+    field = np.asarray(field_2d, dtype=np.float32).copy()
+    if field.ndim != 2:
+        field[~np.isfinite(field)] = float(fallback)
+        return field
+
+    finite_mask = np.isfinite(field)
+    if finite_mask.all():
+        return field
+
+    y_positions = np.arange(field.shape[0], dtype=np.float32)
+    for col_idx in range(field.shape[1]):
+        column = field[:, col_idx]
+        valid = np.isfinite(column)
+        if valid.all():
+            continue
+        if valid.any():
+            # np.interp 在两端会使用最近端点值外推，正好用于修复 top/bottom 边界 NaN。
+            field[:, col_idx] = np.interp(
+                y_positions,
+                y_positions[valid],
+                column[valid],
+            ).astype(np.float32)
+        else:
+            # 极少数整列都无效时才退回固定值，避免 matplotlib 处理非有限数组失败。
+            field[:, col_idx] = float(fallback)
+    return field
+
+
+def _bottom_connected_invalid_mask(mask_2d, field_shape):
+    """
+    从 TWCF mask 中只提取“从底部连通上来”的无效区域。
+
+    TWCF 的论文式 PascalPIV 图只把底部波浪边界以下填成 0 displacement。
+    如果 mask 在顶部、孤立噪点或其它区域也标成无效，不能一并填 0，
+    否则 Current U/V 顶部会出现本不该存在的 0 displacement 色带。
+    """
+    if mask_2d is None:
+        return None
+
+    mask = np.asarray(mask_2d)
+    if mask.shape != tuple(field_shape):
+        return None
+
+    invalid = mask <= 0
+    bottom_invalid = np.zeros_like(invalid, dtype=bool)
+    height, width = invalid.shape
+
+    for col_idx in range(width):
+        column_invalid = invalid[:, col_idx]
+        # imshow(origin="lower") 下 row=0 是图像底部；只有底部起始就是无效时，
+        # 才把连续无效段认定为波浪边界下方的填 0 区域。
+        if not column_invalid[0]:
+            continue
+        first_valid = np.flatnonzero(~column_invalid)
+        if first_valid.size == 0:
+            bottom_invalid[:, col_idx] = True
+        else:
+            bottom_invalid[: int(first_valid[0]), col_idx] = True
+    return bottom_invalid
+
+
+def _fill_twcf_bottom_invalid_field_for_plot(field_2d, mask_2d=None, fill_value=0.0):
+    """
+    TWCF 专用绘图填充：修复 fold 边界，再只填底部波浪无效区。
+
+    这保留了 PascalPIV/TWCF 图中“底部无效区域为 0 displacement”的显示习惯，
+    同时避免把顶部有效流场或 fold 产生的边界 NaN 误染成 0。
+    """
+    field = _repair_nonfinite_by_vertical_nearest(field_2d, fallback=fill_value)
+    bottom_invalid = _bottom_connected_invalid_mask(mask_2d, field.shape)
+    if bottom_invalid is not None:
+        field[bottom_invalid] = float(fill_value)
+    return field
 
 
 def _plot_field_with_colorbar(ax, field_2d, title, cmap_name, vmin, vmax, label):
@@ -803,6 +1103,9 @@ def _plot_twcf(out_path, u_pred, v_pred, piv_results, mask_twcf, sample_index, c
     修改点：
         旧版色条使用 Greys，视觉上是黑白图；这里改成与用户给定示例一致的 viridis 风格色条，
         让位移高低在紫-蓝-绿-黄之间连续过渡，更适合看边界层速度梯度。
+
+        TWCF 的波浪边界下方按照原始 PascalPIV 图的口径填 0 displacement，而不是 mask 成白色。
+        填 0 只作用于底部连通的波浪无效区，顶部或孤立无效点不会被误染成 0。
     """
     ref_index = min(int(sample_index), int(piv_results.shape[0]) - 1)
     u_pascal = np.asarray(piv_results[ref_index, 0, :, :], dtype=np.float32)
@@ -811,19 +1114,19 @@ def _plot_twcf(out_path, u_pred, v_pred, piv_results, mask_twcf, sample_index, c
 
     fig, axes = plt.subplots(2, 2, figsize=(24, 16), dpi=120, facecolor="w", edgecolor="k")
     _plot_field_with_colorbar(
-        axes[0, 0], _mask_field_for_plot(u_pascal, mask_2d), "PascalPIV U",
+        axes[0, 0], _fill_twcf_bottom_invalid_field_for_plot(u_pascal, mask_2d, fill_value=0.0), "PascalPIV U",
         cmap_name, vmin=-2, vmax=12, label="displacement [px]"
     )
     _plot_field_with_colorbar(
-        axes[0, 1], _mask_field_for_plot(v_pascal, mask_2d), "PascalPIV V",
+        axes[0, 1], _fill_twcf_bottom_invalid_field_for_plot(v_pascal, mask_2d, fill_value=0.0), "PascalPIV V",
         cmap_name, vmin=-1, vmax=1, label="displacement [px]"
     )
     _plot_field_with_colorbar(
-        axes[1, 0], _mask_field_for_plot(u_pred, mask_2d), "Current U",
+        axes[1, 0], _fill_twcf_bottom_invalid_field_for_plot(u_pred, mask_2d, fill_value=0.0), "Current U",
         cmap_name, vmin=-2, vmax=12, label="displacement [px]"
     )
     _plot_field_with_colorbar(
-        axes[1, 1], _mask_field_for_plot(v_pred, mask_2d), "Current V",
+        axes[1, 1], _fill_twcf_bottom_invalid_field_for_plot(v_pred, mask_2d, fill_value=0.0), "Current V",
         cmap_name, vmin=-1, vmax=1, label="displacement [px]"
     )
     fig.tight_layout()
@@ -831,36 +1134,227 @@ def _plot_twcf(out_path, u_pred, v_pred, piv_results, mask_twcf, sample_index, c
     plt.close(fig)
 
 
-def _plot_tbl(out_path, u_pred, v_pred, u_gt, v_gt, cmap_name="viridis"):
+def _crop_tbl_valid_y(field_2d, y_limit=None):
+    """
+    裁剪 TBL 可视化使用的有效 y 区域。
+
+    TBL TFRecord 的 full-frame 高度通常是 256，但顶部一段在数据里本来就是 0/无效填充。
+    这些 0 会在 U 图里显示成最低色，在 V 图里显示成 0 对应的中间色，容易被误读为模型结果。
+    因此 TBL 的图片展示默认只取 y=0..TBL_PROFILE_Y_LIMIT 的有效边界层区域；
+    这个裁剪只影响 png 可视化，不改变 results.npy 和所有指标计算。
+    """
+    field = np.squeeze(np.asarray(field_2d, dtype=np.float32))
+    if y_limit is None:
+        return field
+    crop_h = int(np.clip(int(y_limit), 1, int(field.shape[0])))
+    return field[:crop_h, :]
+
+
+def _annotate_profile_columns(ax, columns, field_height, region_names=None, show_labels=False):
+    """
+    在 TBL sample 图上标出 Laminar/Transition/Turbulent 的剖面采样位置。
+
+    这些列坐标和 profile_analysis 里抽剖面的列完全一致，因此用户看 sample 对比图时，
+    可以直接把红色虚线对应到下面的三张 displacement-vs-y-position 剖面曲线。
+    """
+    if columns is None:
+        return
+
+    labels = tuple(region_names or ())
+    label_y = max(float(field_height) - 8.0, 0.0)
+    for idx, col in enumerate(columns):
+        ax.axvline(int(col), color="red", linestyle="--", linewidth=2.0)
+        if not show_labels:
+            continue
+        label = labels[idx] if idx < len(labels) else f"Region {idx + 1}"
+        ax.text(
+            int(col),
+            label_y,
+            label,
+            color="red",
+            fontsize=13,
+            ha="center",
+            va="top",
+            bbox={"facecolor": "white", "edgecolor": "none", "pad": 2.0},
+        )
+
+
+def _plot_tbl(
+    out_path,
+    u_pred,
+    v_pred,
+    u_gt,
+    v_gt,
+    cmap_name="viridis",
+    y_limit=None,
+    profile_columns=None,
+    profile_region_names=None,
+    label_profile_columns=False,
+):
     """
     保存 TBL 全图测试的预测/真值对比图。
 
     这里同样把原来的黑白色条改成 viridis，便于直接和论文式位移场热图保持一致。
+    TBL 顶部 0 填充区域不是有效流场，因此按 TBL_PROFILE_Y_LIMIT 裁掉，只影响可视化。
+
+    可选的 profile_columns/profile_region_names 用于在 profile_analysis 文件夹里额外保存
+    带 Laminar/Transition/Turbulent 采样虚线的 sample 对比图；普通 sample 图不传入时仍保持原样。
     """
+    u_pred_plot = _crop_tbl_valid_y(u_pred, y_limit)
+    v_pred_plot = _crop_tbl_valid_y(v_pred, y_limit)
+    u_gt_plot = _crop_tbl_valid_y(u_gt, y_limit)
+    v_gt_plot = _crop_tbl_valid_y(v_gt, y_limit)
+
     fig, axes = plt.subplots(2, 2, figsize=(24, 16), dpi=120, facecolor="w", edgecolor="k")
     _plot_field_with_colorbar(
-        axes[0, 0], np.squeeze(u_pred), "Pred U",
+        axes[0, 0], u_pred_plot, "Pred U",
         cmap_name, vmin=2, vmax=8, label="displacement [px]"
     )
     _plot_field_with_colorbar(
-        axes[0, 1], np.squeeze(v_pred), "Pred V",
+        axes[0, 1], v_pred_plot, "Pred V",
         cmap_name, vmin=-0.5, vmax=0.5, label="displacement [px]"
     )
     _plot_field_with_colorbar(
-        axes[1, 0], np.squeeze(u_gt), "GT U",
+        axes[1, 0], u_gt_plot, "GT U",
         cmap_name, vmin=2, vmax=8, label="displacement [px]"
     )
     _plot_field_with_colorbar(
-        axes[1, 1], np.squeeze(v_gt), "GT V",
+        axes[1, 1], v_gt_plot, "GT V",
         cmap_name, vmin=-0.5, vmax=0.5, label="displacement [px]"
     )
+    if profile_columns is not None:
+        # 四个子图都画同一组 x 方向采样虚线；标签只放在左上角 Pred U 图，
+        # 避免 2x2 sample 对比图被重复文字遮挡。
+        for idx, ax in enumerate(axes.reshape(-1)):
+            _annotate_profile_columns(
+                ax,
+                profile_columns,
+                u_gt_plot.shape[0],
+                region_names=profile_region_names,
+                show_labels=label_profile_columns and idx == 0,
+            )
     fig.tight_layout()
     fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
 
 
-def _resolve_twcf_profile_columns(width, column_ratios):
-    """把 TWCF 论文风格图的三个剖面位置从比例转换成像素列坐标。"""
+def _resolve_tbl_profile_crop_segments(width, columns, crop_width=256):
+    """
+    计算 TBL 三个剖面位置各自的局部裁剪窗口。
+
+    TBL full-frame 宽度为 3296，但这里不再假设它可以按固定数量均分成 sample。
+    profile_analysis 里的 Laminar/Transition/Turbulent 位置是 full-frame 全局列号；
+    每个位置都以该列为中心截取一段固定宽度的局部窗口：
+        - x_start/x_end: 局部窗口在 full-frame 中的左右边界；
+        - local_col: 剖面线在局部窗口内的列号。
+
+    这样保存出来的对比图不是整张 3296 宽图，也不依赖错误的“均分 sample”假设。
+    """
+    width = int(width)
+    crop_width = int(np.clip(int(crop_width), 1, width))
+    half_width = crop_width // 2
+
+    segment_rows = []
+    for region_idx, global_col in enumerate(columns):
+        global_col = int(np.clip(int(global_col), 0, width - 1))
+        x_start = global_col - half_width
+        x_end = x_start + crop_width
+        if x_start < 0:
+            x_start = 0
+            x_end = crop_width
+        if x_end > width:
+            x_end = width
+            x_start = max(0, width - crop_width)
+        local_col = int(np.clip(global_col - x_start, 0, x_end - x_start - 1))
+        segment_rows.append([region_idx, x_start, x_end, global_col, local_col, crop_width])
+
+    return np.asarray(segment_rows, dtype=np.int32)
+
+
+def _safe_filename_token(text):
+    """把区域名转换成文件名安全的短 token。"""
+    token = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in str(text))
+    token = token.strip("_")
+    return token or "region"
+
+
+def _save_tbl_profile_sample_comparisons(
+    analysis_dir,
+    u_pred,
+    u_gt,
+    v_pred,
+    v_gt,
+    columns,
+    region_names,
+    profile_height,
+    cmap_name,
+    crop_width=256,
+):
+    """
+    把 Laminar/Transition/Turbulent 三个位置附近的局部对比图保存到 profile_analysis。
+
+    注意这里不假设 TBL 的 sample 是均分得到的；每个区域都以自己的剖面全局 x 位置为中心，
+    截取一段局部窗口。每张图都会在 Pred/GT 的 U/V 四个子图中画出对应位置的红色虚线。
+    """
+    segment_rows = _resolve_tbl_profile_crop_segments(
+        width=np.asarray(u_gt).shape[1],
+        columns=columns,
+        crop_width=crop_width,
+    )
+    np.save(analysis_dir / "profile_crop_segments.npy", segment_rows)
+
+    for row in segment_rows:
+        region_idx, x_start, x_end, global_col, local_col, _ = [int(v) for v in row]
+        region_name = region_names[region_idx] if region_idx < len(region_names) else f"Region {region_idx + 1}"
+        region_token = _safe_filename_token(region_name)
+        out_path = analysis_dir / f"tbl_profile_crop_{region_idx:02d}_{region_token}_x{global_col}_compare.png"
+        _plot_tbl(
+            out_path,
+            u_pred[:, x_start:x_end],
+            v_pred[:, x_start:x_end],
+            u_gt[:, x_start:x_end],
+            v_gt[:, x_start:x_end],
+            cmap_name=cmap_name,
+            y_limit=profile_height,
+            profile_columns=[local_col],
+            profile_region_names=[region_name],
+            label_profile_columns=True,
+        )
+
+
+def _save_tbl_full_frame_profile_comparison(
+    analysis_dir,
+    u_pred,
+    u_gt,
+    v_pred,
+    v_gt,
+    columns,
+    region_names,
+    profile_height,
+    cmap_name,
+):
+    """
+    保存整张 TBL full-frame 的 2x2 对比图，并标出三条剖面位置。
+
+    局部裁剪图便于看 Laminar/Transition/Turbulent 位置附近的细节；这张 3296 宽 full-frame
+    合图则保留全局空间关系，方便确认三条红色虚线在整幅 TBL 场中的相对位置。
+    """
+    _plot_tbl(
+        analysis_dir / "tbl_full_frame_compare_with_profile_positions.png",
+        u_pred,
+        v_pred,
+        u_gt,
+        v_gt,
+        cmap_name=cmap_name,
+        y_limit=profile_height,
+        profile_columns=columns,
+        profile_region_names=region_names,
+        label_profile_columns=True,
+    )
+
+
+def _resolve_profile_columns(width, column_ratios):
+    """把论文风格图的三个剖面位置从比例转换成像素列坐标。"""
     cols = []
     for ratio in column_ratios:
         ratio = float(ratio)
@@ -869,72 +1363,134 @@ def _resolve_twcf_profile_columns(width, column_ratios):
     return cols
 
 
-def _save_twcf_profile_artifacts(
+def _save_tbl_profile_artifacts(
     dataset_dir,
     sample_index,
     u_pred,
     u_gt,
-    mask_twcf,
+    v_pred,
+    v_gt,
     method_label,
     cmap_name="viridis",
-    column_ratios=(0.15, 0.24, 0.83),
+    column_ratios=(0.15, 0.40, 0.83),
     region_names=("Laminar", "Transition", "Turbulent"),
+    y_limit=200,
+    sample_crop_width=256,
 ):
     """
-    保存 TWCF 的论文风格剖面对比图，并把关键数据落成 .npy 便于和其他方法后处理比较。
+    保存 TBL 的论文风格剖面对比图，并把关键数据落成 .npy 便于和其他方法后处理比较。
 
     图像结构：
         1. 上半部分：GT 水平位移场 + 三条红色虚线采样位置；
-        2. 下半部分：三个位置的 y-方向位移剖面，只画 GT 与当前方法。
+        2. 下半部分：三个位置的 horizontal/U displacement 剖面，只画 GT 与当前方法。
+
+    注意：
+        profile_analysis 是 TBL 专属分析，不给 TWCF 生成。
+        上半部分显示 horizontal/U 位移场，用来标注 Laminar、Transition、Turbulent 三个 x 位置；
+        下半部分的 x 轴是对应列上的 U displacement，y 轴是光流场的空间 y-position。
+
+        TBL 的论文图只展示靠近壁面的有效 y 区域，默认取 0..200px。
+        这个裁剪只用于 profile_analysis 的画图和剖面保存，不影响 test_all 的流场指标、
+        results.npy，也不影响普通 tbl_sample_xxxx.png 的 2x2 全图对比。
+
+        额外保存的局部对比图不是整张 3296 宽 full-frame，也不按 sample 均分。
+        它会以 Laminar/Transition/Turbulent 的全局 x 位置为中心各截取一段窗口。
     """
-    analysis_dir = dataset_dir / "twcf_profile_analysis" / f"sample_{sample_index:04d}"
+    analysis_dir = dataset_dir / "profile_analysis" / f"sample_{sample_index:04d}"
     analysis_dir.mkdir(parents=True, exist_ok=True)
 
     u_pred = np.asarray(u_pred, dtype=np.float32)
     u_gt = np.asarray(u_gt, dtype=np.float32)
-    mask_2d = None if mask_twcf is None else np.asarray(mask_twcf, dtype=np.float32)
-    columns = _resolve_twcf_profile_columns(u_gt.shape[1], column_ratios)
-    y_positions = np.arange(u_gt.shape[0], dtype=np.float32)
+    v_pred = np.asarray(v_pred, dtype=np.float32)
+    v_gt = np.asarray(v_gt, dtype=np.float32)
 
-    profile_gt = np.full((len(columns), u_gt.shape[0]), np.nan, dtype=np.float32)
-    profile_pred = np.full((len(columns), u_gt.shape[0]), np.nan, dtype=np.float32)
+    # TBL 论文风格图只看 y=0 开始的有效边界层区域。
+    # 之前把完整 256px 高度都画进去时，顶部额外区域会把 Transition 标注和参考图视觉位置拉偏；
+    # 这里默认裁到 200px，和参考图的 y-position 范围一致。
+    if y_limit is None:
+        profile_height = int(u_gt.shape[0])
+    else:
+        profile_height = int(np.clip(int(y_limit), 1, int(u_gt.shape[0])))
+    u_gt_profile = u_gt[:profile_height, :]
+    u_pred_profile = u_pred[:profile_height, :]
+    v_gt_profile = v_gt[:profile_height, :]
+    v_pred_profile = v_pred[:profile_height, :]
+
+    columns = _resolve_profile_columns(u_gt_profile.shape[1], column_ratios)
+    y_positions = np.arange(profile_height, dtype=np.float32)
+
+    profile_gt = np.full((len(columns), profile_height), np.nan, dtype=np.float32)
+    profile_pred = np.full((len(columns), profile_height), np.nan, dtype=np.float32)
     for idx, col in enumerate(columns):
-        if mask_2d is not None and mask_2d.shape == u_gt.shape:
-            valid = mask_2d[:, col] > 0
-        else:
-            valid = np.ones((u_gt.shape[0],), dtype=bool)
-        profile_gt[idx, valid] = u_gt[valid, col]
-        profile_pred[idx, valid] = u_pred[valid, col]
+        valid = np.isfinite(u_gt_profile[:, col]) & np.isfinite(u_pred_profile[:, col])
+        # TBL 剖面使用 horizontal/U displacement；profile_columns 记录 x 采样位置，
+        # 后续其他方法只要按同样列号抽 U 分量即可直接叠加比较。
+        profile_gt[idx, valid] = u_gt_profile[valid, col]
+        profile_pred[idx, valid] = u_pred_profile[valid, col]
 
     # 保存原始场和已经抽好的剖面，后续其他方法只要在同样列位置上取 profile 就能直接对比。
     np.save(analysis_dir / "u_gt.npy", u_gt.astype(np.float32))
     np.save(analysis_dir / "u_pred.npy", u_pred.astype(np.float32))
-    if mask_2d is not None:
-        np.save(analysis_dir / "mask.npy", mask_2d.astype(np.float32))
+    np.save(analysis_dir / "v_gt.npy", v_gt.astype(np.float32))
+    np.save(analysis_dir / "v_pred.npy", v_pred.astype(np.float32))
+    np.save(analysis_dir / "u_gt_profile_view.npy", u_gt_profile.astype(np.float32))
+    np.save(analysis_dir / "u_pred_profile_view.npy", u_pred_profile.astype(np.float32))
     np.save(analysis_dir / "profile_columns.npy", np.asarray(columns, dtype=np.int32))
     np.save(analysis_dir / "profile_y_positions.npy", y_positions)
+    np.save(analysis_dir / "profile_y_limit.npy", np.asarray(profile_height, dtype=np.int32))
     np.save(analysis_dir / "profile_gt.npy", profile_gt)
     np.save(analysis_dir / "profile_pred.npy", profile_pred)
+    np.save(analysis_dir / "profile_component.npy", np.asarray("u"))
 
-    masked_gt = _mask_field_for_plot(u_gt, mask_2d)
-    if np.ma.isMaskedArray(masked_gt):
-        valid_values = masked_gt.compressed()
-    else:
-        valid_values = np.asarray(masked_gt).reshape(-1)
-        valid_values = valid_values[np.isfinite(valid_values)]
+    # 除了三处局部裁剪图，也额外保存一张 3296 宽 full-frame 2x2 合图。
+    # 这张图同样标注 Laminar/Transition/Turbulent 三条虚线，用于从全局上确认剖面位置。
+    _save_tbl_full_frame_profile_comparison(
+        analysis_dir,
+        u_pred,
+        u_gt,
+        v_pred,
+        v_gt,
+        columns,
+        region_names,
+        profile_height,
+        cmap_name=cmap_name,
+    )
+
+    # 把 Laminar/Transition/Turbulent 三个位置附近的局部窗口也放进 profile_analysis。
+    # 这里不再假设 TBL sample 是均分的，而是围绕每个剖面 x 位置截取固定宽度的局部区域，
+    # 避免把整张 3296 宽图混在一起看不清剖面位置。
+    _save_tbl_profile_sample_comparisons(
+        analysis_dir,
+        u_pred,
+        u_gt,
+        v_pred,
+        v_gt,
+        columns,
+        region_names,
+        profile_height,
+        cmap_name=cmap_name,
+        crop_width=sample_crop_width,
+    )
+
+    valid_values = np.asarray(u_gt_profile).reshape(-1)
+    valid_values = valid_values[np.isfinite(valid_values)]
     if valid_values.size > 0:
         vmin = float(np.nanpercentile(valid_values, 1))
         vmax = float(np.nanpercentile(valid_values, 99))
     else:
-        vmin, vmax = float(np.min(u_gt)), float(np.max(u_gt))
+        vmin, vmax = float(np.min(u_gt_profile)), float(np.max(u_gt_profile))
     if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
         vmin, vmax = 0.0, 1.0
 
-    fig = plt.figure(figsize=(14, 14), dpi=160, facecolor="w", edgecolor="k")
+    # 横向稍微放宽，避免 Laminar/Transition 两个相邻标签贴在一起，
+    # 但三条红色虚线的位置仍严格由 TBL_PROFILE_COLUMN_RATIOS 控制。
+    fig = plt.figure(figsize=(16, 14), dpi=160, facecolor="w", edgecolor="k")
     grid = fig.add_gridspec(2, 3, height_ratios=[1.0, 1.8], hspace=0.35, wspace=0.25)
 
     ax_top = fig.add_subplot(grid[0, :])
-    im = ax_top.imshow(masked_gt, origin="lower", cmap=cmap_name, vmin=vmin, vmax=vmax, aspect="auto")
+    # TBL 顶部不做无效区填 0。TWCF 的波浪边界填 0 只用于 _plot_twcf，
+    # 这里直接显示裁剪后的 GT horizontal/U 位移场。
+    im = ax_top.imshow(u_gt_profile, origin="lower", cmap=cmap_name, vmin=vmin, vmax=vmax, aspect="auto")
     ax_top.set_title("Ground truth of horizontal direction", fontsize=18)
     ax_top.set_xticks([])
     ax_top.set_yticks([])
@@ -943,7 +1499,7 @@ def _save_twcf_profile_artifacts(
         label = region_names[idx] if idx < len(region_names) else f"Region {idx + 1}"
         ax_top.text(
             col,
-            u_gt.shape[0] - 8,
+            profile_height - 8,
             label,
             color="red",
             fontsize=16,
@@ -966,6 +1522,7 @@ def _save_twcf_profile_artifacts(
     if not np.isfinite(x_min) or not np.isfinite(x_max) or x_min == x_max:
         x_min, x_max = 0.0, 1.0
     x_pad = 0.05 * max(x_max - x_min, 1.0)
+    x_right = max(x_max + x_pad, 1.0)
 
     for idx, col in enumerate(columns):
         ax = fig.add_subplot(grid[1, idx])
@@ -991,48 +1548,68 @@ def _save_twcf_profile_artifacts(
             )
         title = region_names[idx] if idx < len(region_names) else f"Region {idx + 1}"
         ax.set_title(title, fontsize=15, fontweight="bold")
-        ax.set_xlabel("Displacement[px]", fontsize=12)
+        ax.set_xlabel("displacement[px]", fontsize=12)
         if idx == 0:
             ax.set_ylabel("y-position[px]", fontsize=12)
             ax.legend(loc="upper left", fontsize=11, frameon=True)
-        ax.set_xlim(x_min - x_pad, x_max + x_pad)
-        ax.set_ylim(0, u_gt.shape[0] - 1)
+        # 横轴从 0 开始，确保曲线的 0 点与左下角原点对齐，而不是被 padding 推到图内。
+        ax.set_xlim(0.0, x_right)
+        # y_limit=200 表示论文图展示 0..200 px 的坐标范围；profile 数组本身有 200 行，
+        # 行索引最大是 199。这里把坐标轴上限显式设为 200，并强制加入 200 刻度，
+        # 避免 Matplotlib 自动刻度停在 175，看起来像没有画满 0..200。
+        y_ticks = list(np.arange(0, profile_height + 1, 25, dtype=np.int32))
+        if y_ticks[-1] != profile_height:
+            y_ticks.append(profile_height)
+        ax.set_ylim(0, profile_height)
+        ax.set_yticks(y_ticks)
         ax.grid(alpha=0.15)
 
-    fig.savefig(analysis_dir / "twcf_profile_compare.png", bbox_inches="tight")
+    fig.savefig(analysis_dir / "tbl_profile_compare.png", bbox_inches="tight")
     plt.close(fig)
 
 
-def _plot_regular(out_path, u_pred, v_pred, u_gt, v_gt):
-    """保存 256x256 数据集的 u/v 预测、真值和误差图。"""
+def _plot_regular(out_path, u_pred, v_pred, u_gt, v_gt, cmap_name="jet"):
+    """
+    保存 256x256 数据集的 u/v 预测、真值和误差图。
+
+    evaluate_all 的光流图使用 jet 风格的彩色位移图，而旧版 test_all 这里仍是 Greys。
+    这会让 cylinder/dns_turb/jhtdb/sqg/backstep 的测试图和 evaluate_all 视觉口径不一致；
+    因此主位移图统一改成 jet，误差图继续使用 bwr 以保留正负误差方向。
+    """
     min_val_u, max_val_u = -4, 4
     min_val_v, max_val_v = -4, 4
 
     plt.figure(num=None, figsize=(24, 16), dpi=120, facecolor="w", edgecolor="k")
     plt.subplot(3, 2, 1)
-    plt.pcolor(u_pred, cmap="Greys", vmin=min_val_u, vmax=max_val_u)
+    plt.pcolor(u_pred, cmap=cmap_name, vmin=min_val_u, vmax=max_val_u)
+    plt.title("Current method - U", fontsize=16)
     plt.axis("off")
     plt.colorbar().ax.set_ylabel("displacement [px]", fontsize=14)
     plt.subplot(3, 2, 3)
-    plt.pcolor(u_gt, cmap="Greys", vmin=min_val_u, vmax=max_val_u)
+    plt.pcolor(u_gt, cmap=cmap_name, vmin=min_val_u, vmax=max_val_u)
+    plt.title("GT - U", fontsize=16)
     plt.axis("off")
     plt.colorbar().ax.set_ylabel("displacement [px]", fontsize=14)
     plt.subplot(3, 2, 5)
     plt.pcolor(u_pred - u_gt, cmap="bwr", vmin=-0.25, vmax=0.25)
+    plt.title("Error - U (Current - GT)", fontsize=16)
     plt.axis("off")
-    plt.colorbar().ax.set_ylabel("abs. error [px]", fontsize=14)
+    plt.colorbar().ax.set_ylabel("error [px]", fontsize=14)
     plt.subplot(3, 2, 2)
-    plt.pcolor(v_pred, cmap="Greys", vmin=min_val_v, vmax=max_val_v)
+    plt.pcolor(v_pred, cmap=cmap_name, vmin=min_val_v, vmax=max_val_v)
+    plt.title("Current method - V", fontsize=16)
     plt.axis("off")
     plt.colorbar().ax.set_ylabel("displacement [px]", fontsize=14)
     plt.subplot(3, 2, 4)
-    plt.pcolor(v_gt, cmap="Greys", vmin=min_val_v, vmax=max_val_v)
+    plt.pcolor(v_gt, cmap=cmap_name, vmin=min_val_v, vmax=max_val_v)
+    plt.title("GT - V", fontsize=16)
     plt.axis("off")
     plt.colorbar().ax.set_ylabel("displacement [px]", fontsize=14)
     plt.subplot(3, 2, 6)
     plt.pcolor(v_pred - v_gt, cmap="bwr", vmin=-0.25, vmax=0.25)
+    plt.title("Error - V (Current - GT)", fontsize=16)
     plt.axis("off")
-    plt.colorbar().ax.set_ylabel("abs. error [px]", fontsize=14)
+    plt.colorbar().ax.set_ylabel("error [px]", fontsize=14)
     plt.savefig(out_path)
     plt.close()
 
@@ -1049,19 +1626,25 @@ def _clip_image_for_display(arr):
     return np.clip(arr, 0.0, 1.0)
 
 
-def _resize_image_for_display(arr, out_hw):
+def _place_image_on_display_canvas(arr, out_hw, fill_value=1.0):
     """
-    将 LR 图临时插值到 HR 尺寸，仅用于合并对比图的视觉对齐。
+    将 LR 图放到 HR 尺寸画布中，仅用于合并对比图的视觉对齐。
 
-    单独保存的 *_lr.png 仍然保留真实低分辨率尺寸；这里放大只是为了让 LR/HR/SR
-    能在同一张 comparison 图里并排比较。
+    单独保存的 *_lr.png 保留真实低分辨率尺寸；comparison.png 里也不再插值放大 LR。
+    这里仅用白色画布补齐到 HR 大小，让 LR 仍位于同一行第一列，与 HR/SR 并排比较。
     """
     arr = np.squeeze(arr).astype(np.float32, copy=False)
     if tuple(arr.shape[-2:]) == tuple(out_hw):
         return arr
-    tensor = torch.from_numpy(arr)[None, None, :, :].float()
-    resized = F.interpolate(tensor, size=out_hw, mode="bicubic", align_corners=False)
-    return resized.squeeze(0).squeeze(0).numpy()
+    out_h, out_w = int(out_hw[0]), int(out_hw[1])
+    h, w = int(arr.shape[-2]), int(arr.shape[-1])
+    canvas = np.full((out_h, out_w), float(fill_value), dtype=np.float32)
+    paste_h = min(h, out_h)
+    paste_w = min(w, out_w)
+    top = max((out_h - paste_h) // 2, 0)
+    left = max((out_w - paste_w) // 2, 0)
+    canvas[top:top + paste_h, left:left + paste_w] = arr[:paste_h, :paste_w]
+    return canvas
 
 
 def _save_gray_image(path, arr):
@@ -1084,7 +1667,7 @@ def _plot_image_comparison(out_path, sample_images):
     fig, axes = plt.subplots(2, 3, figsize=(12, 8), dpi=140, facecolor="w")
     for row_idx, (frame_name, lr_img, hr_img, sr_img) in enumerate(frames):
         hr_hw = np.squeeze(hr_img).shape[-2:]
-        lr_for_compare = _resize_image_for_display(lr_img, hr_hw)
+        lr_for_compare = _place_image_on_display_canvas(lr_img, hr_hw)
         panels = [
             ("LR", lr_for_compare),
             ("Original HR", hr_img),
@@ -1102,7 +1685,162 @@ def _plot_image_comparison(out_path, sample_images):
     plt.close(fig)
 
 
-def _save_image_outputs(dataset_dir, image_payload, start_index):
+def _resolve_tbl_comparison_crop_bounds(image_hw, crop_size=256, center_ratio=0.40):
+    """
+    计算 TBL 长图 comparison 使用的局部裁剪窗口。
+
+    设计说明：
+    1. TBL 的 full-frame 颗粒图宽度远大于高度，直接把整张长图塞进 LR/HR/SR 三联图里，细节会非常小。
+    2. 这里在 full-frame 原图上先标一个红框，再把红框内的局部区域单独拿出来对比。
+    3. 默认横向中心使用 `center_ratio=0.40`，与当前 Transition 位置保持一致；这样用户在看
+       comparison.png 和 profile_analysis 时，更容易把两者对应起来。
+    4. 高度方向优先截取 256；对当前 TBL 数据而言原图高就是 256，所以实际会覆盖完整高度。
+    """
+    image_h = int(image_hw[0])
+    image_w = int(image_hw[1])
+    crop_h = int(np.clip(int(crop_size), 1, image_h))
+    crop_w = int(np.clip(int(crop_size), 1, image_w))
+
+    x_center = int(round((image_w - 1) * float(center_ratio)))
+    half_w = crop_w // 2
+    x_start = x_center - half_w
+    x_end = x_start + crop_w
+    if x_start < 0:
+        x_start = 0
+        x_end = crop_w
+    if x_end > image_w:
+        x_end = image_w
+        x_start = max(0, image_w - crop_w)
+
+    # 当前 TBL 高度通常就是 256，因此这里会自然得到 [0, 256)。
+    y_start = max((image_h - crop_h) // 2, 0)
+    y_end = y_start + crop_h
+    if y_end > image_h:
+        y_end = image_h
+        y_start = max(0, image_h - crop_h)
+
+    return int(y_start), int(y_end), int(x_start), int(x_end)
+
+
+def _scale_crop_bounds_to_target(bounds, ref_hw, target_hw):
+    """
+    把 HR full-frame 上的裁剪框映射到目标图像尺寸。
+
+    用途：
+    - HR / SR 通常与 full-frame 同尺寸，可直接复用原框；
+    - LR 由于是动态下采样得到的，空间尺寸更小，这里按比例把同一物理区域映射过去，
+      再裁成 LR 的局部图。这样 comparison 图里三列仍对应同一空间位置。
+    """
+    y_start, y_end, x_start, x_end = [int(v) for v in bounds]
+    ref_h, ref_w = int(ref_hw[0]), int(ref_hw[1])
+    target_h, target_w = int(target_hw[0]), int(target_hw[1])
+
+    if ref_h <= 0 or ref_w <= 0 or target_h <= 0 or target_w <= 0:
+        raise ValueError(
+            f"Invalid shape for crop scaling: ref_hw={ref_hw}, target_hw={target_hw}"
+        )
+
+    scaled_y_start = int(np.floor(y_start / ref_h * target_h))
+    scaled_y_end = int(np.ceil(y_end / ref_h * target_h))
+    scaled_x_start = int(np.floor(x_start / ref_w * target_w))
+    scaled_x_end = int(np.ceil(x_end / ref_w * target_w))
+
+    scaled_y_start = int(np.clip(scaled_y_start, 0, target_h - 1))
+    scaled_x_start = int(np.clip(scaled_x_start, 0, target_w - 1))
+    scaled_y_end = int(np.clip(max(scaled_y_start + 1, scaled_y_end), 1, target_h))
+    scaled_x_end = int(np.clip(max(scaled_x_start + 1, scaled_x_end), 1, target_w))
+    return scaled_y_start, scaled_y_end, scaled_x_start, scaled_x_end
+
+
+def _crop_2d_by_bounds(arr, bounds):
+    """按 `(y_start, y_end, x_start, x_end)` 从单通道 2D 图像裁出局部区域。"""
+    arr = np.squeeze(arr).astype(np.float32, copy=False)
+    y_start, y_end, x_start, x_end = [int(v) for v in bounds]
+    return arr[y_start:y_end, x_start:x_end]
+
+
+def _plot_tbl_image_comparison(
+    out_path,
+    sample_images,
+    crop_size=256,
+    center_ratio=0.40,
+):
+    """
+    保存 TBL 专用的颗粒图 comparison 图。
+
+    图像布局：
+    - 第 1 行：prev 原始 full-frame 长图，并用红框标出局部比较区域；
+    - 第 2 行：prev 的 LR / HR / Generated SR 局部对比；
+    - 第 3 行：next 原始 full-frame 长图，并用红框标出局部比较区域；
+    - 第 4 行：next 的 LR / HR / Generated SR 局部对比。
+
+    这样既保留了用户想要的“在原来很长的图里画红框”的全局上下文，
+    又能把 256x256 局部放大到足够清楚的尺寸来对比超分细节。
+    """
+    frames = [
+        ("prev", sample_images["prev_lr"], sample_images["prev_hr"], sample_images["pred_prev"]),
+        ("next", sample_images["next_lr"], sample_images["next_hr"], sample_images["pred_next"]),
+    ]
+
+    fig = plt.figure(figsize=(14, 12), dpi=140, facecolor="w")
+    grid = fig.add_gridspec(4, 3, height_ratios=[0.7, 1.0, 0.7, 1.0])
+
+    for frame_idx, (frame_name, lr_img, hr_img, sr_img) in enumerate(frames):
+        hr_2d = np.squeeze(hr_img).astype(np.float32, copy=False)
+        crop_bounds_hr = _resolve_tbl_comparison_crop_bounds(
+            hr_2d.shape[-2:],
+            crop_size=crop_size,
+            center_ratio=center_ratio,
+        )
+        hr_crop = _crop_2d_by_bounds(hr_img, crop_bounds_hr)
+        sr_crop = _crop_2d_by_bounds(
+            sr_img,
+            _scale_crop_bounds_to_target(crop_bounds_hr, hr_2d.shape[-2:], np.squeeze(sr_img).shape[-2:]),
+        )
+        lr_crop = _crop_2d_by_bounds(
+            lr_img,
+            _scale_crop_bounds_to_target(crop_bounds_hr, hr_2d.shape[-2:], np.squeeze(lr_img).shape[-2:]),
+        )
+        # 不插值放大 LR，只把它放到和 HR crop 同尺寸的白色画布中，继续保持项目里现有的展示规则。
+        lr_crop_for_compare = _place_image_on_display_canvas(lr_crop, hr_crop.shape[-2:])
+
+        overview_ax = fig.add_subplot(grid[frame_idx * 2, :])
+        overview_ax.imshow(_clip_image_for_display(hr_img), cmap="gray", vmin=0.0, vmax=1.0, aspect="auto")
+        y_start, y_end, x_start, x_end = crop_bounds_hr
+        overview_ax.add_patch(
+            Rectangle(
+                (x_start - 0.5, y_start - 0.5),
+                x_end - x_start,
+                y_end - y_start,
+                fill=False,
+                edgecolor="red",
+                linewidth=2.5,
+            )
+        )
+        overview_ax.set_title(
+            f"{frame_name} Original HR full-frame with 256x256 crop box",
+            fontsize=11,
+        )
+        overview_ax.axis("off")
+
+        panels = [
+            ("LR crop", lr_crop_for_compare),
+            ("Original HR crop", hr_crop),
+            ("Generated SR crop", sr_crop),
+        ]
+        for col_idx, (title, arr) in enumerate(panels):
+            ax = fig.add_subplot(grid[frame_idx * 2 + 1, col_idx])
+            ax.imshow(_clip_image_for_display(arr), cmap="gray", vmin=0.0, vmax=1.0)
+            ax.set_title(f"{frame_name} {title}", fontsize=10)
+            ax.axis("off")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
+def _save_image_outputs(dataset_name, dataset_dir, image_payload, start_index, plot_args=None):
     """
     保存每个 sample 的 LR、原始 HR、生成 SR 图，以及一张合并对比图。
 
@@ -1112,6 +1850,7 @@ def _save_image_outputs(dataset_dir, image_payload, start_index):
         next_lr.png / next_hr.png / next_sr.png
         comparison.png
     """
+    plot_args = plot_args or {}
     payload_np = {
         "prev_lr": _as_numpy_batch(image_payload["prev_lr"]),
         "next_lr": _as_numpy_batch(image_payload["next_lr"]),
@@ -1140,7 +1879,24 @@ def _save_image_outputs(dataset_dir, image_payload, start_index):
         _save_gray_image(sample_dir / "next_lr.png", sample_images["next_lr"])
         _save_gray_image(sample_dir / "next_hr.png", sample_images["next_hr"])
         _save_gray_image(sample_dir / "next_sr.png", sample_images["pred_next"])
-        _plot_image_comparison(sample_dir / "comparison.png", sample_images)
+        if dataset_name == "tbl":
+            # TBL 的颗粒图是 full-frame 长图；普通三联图里直接显示整张长图时，细节太小不利于比较。
+            # 因此这里改成：先在原始长图上画红框，再把框内 256x256 局部拿出来对比。
+            tbl_profile_column_ratios = tuple(
+                plot_args.get("tbl_profile_column_ratios", (0.15, 0.40, 0.83))
+            )
+            tbl_crop_center_ratio = (
+                float(tbl_profile_column_ratios[1]) if len(tbl_profile_column_ratios) >= 2 else 0.40
+            )
+            tbl_crop_size = int(plot_args.get("tbl_profile_sample_crop_width", 256))
+            _plot_tbl_image_comparison(
+                sample_dir / "comparison.png",
+                sample_images,
+                crop_size=tbl_crop_size,
+                center_ratio=tbl_crop_center_ratio,
+            )
+        else:
+            _plot_image_comparison(sample_dir / "comparison.png", sample_images)
 
 
 def _save_sample_plots(
@@ -1159,16 +1915,21 @@ def _save_sample_plots(
     plot_args 用于把 test_all 的一些可视化超参数往下传，例如：
         - displacement_cmap
         - method_label
-        - twcf_profile_column_ratios
-        - twcf_profile_region_names
+        - tbl_profile_column_ratios
+        - tbl_profile_region_names
+        - tbl_profile_y_limit
+        - tbl_profile_sample_crop_width
     """
     plot_args = plot_args or {}
     displacement_cmap = str(plot_args.get("displacement_cmap", "viridis"))
+    regular_flow_cmap = str(plot_args.get("regular_flow_cmap", "jet"))
     method_label = str(plot_args.get("method_label", "Current method"))
-    twcf_profile_column_ratios = tuple(plot_args.get("twcf_profile_column_ratios", (0.15, 0.24, 0.83)))
-    twcf_profile_region_names = tuple(plot_args.get("twcf_profile_region_names", ("Laminar", "Transition", "Turbulent")))
+    tbl_profile_column_ratios = tuple(plot_args.get("tbl_profile_column_ratios", (0.15, 0.40, 0.83)))
+    tbl_profile_region_names = tuple(plot_args.get("tbl_profile_region_names", ("Laminar", "Transition", "Turbulent")))
+    tbl_profile_y_limit = plot_args.get("tbl_profile_y_limit", 200)
+    tbl_profile_sample_crop_width = int(plot_args.get("tbl_profile_sample_crop_width", 256))
     if image_payload is not None:
-        _save_image_outputs(dataset_dir, image_payload, start_index)
+        _save_image_outputs(dataset_name, dataset_dir, image_payload, start_index, plot_args=plot_args)
 
     for local_idx in range(predicted_np.shape[0]):
         sample_index = start_index + local_idx
@@ -1188,22 +1949,35 @@ def _save_sample_plots(
                 sample_index,
                 cmap_name=displacement_cmap,
             )
-            # 额外生成用户要求的论文风格 TWCF 剖面对比图，并把关键场/剖面存成 .npy。
-            _save_twcf_profile_artifacts(
+        elif dataset_name == "tbl":
+            _plot_tbl(
+                out_path,
+                u_pred,
+                v_pred,
+                u_gt,
+                v_gt,
+                cmap_name=displacement_cmap,
+                y_limit=tbl_profile_y_limit,
+            )
+            # profile_analysis 是 TBL 专属的论文风格剖面对比图：
+            # 上方显示 GT 的 horizontal/U 位移场，下面三列画 Laminar/Transition/Turbulent
+            # 三个 x 位置上的 U displacement-vs-y-position 剖面。
+            _save_tbl_profile_artifacts(
                 dataset_dir=dataset_dir,
                 sample_index=sample_index,
                 u_pred=u_pred,
                 u_gt=u_gt,
-                mask_twcf=twcf_payload["mask"],
+                v_pred=v_pred,
+                v_gt=v_gt,
                 method_label=method_label,
                 cmap_name=displacement_cmap,
-                column_ratios=twcf_profile_column_ratios,
-                region_names=twcf_profile_region_names,
+                column_ratios=tbl_profile_column_ratios,
+                region_names=tbl_profile_region_names,
+                y_limit=tbl_profile_y_limit,
+                sample_crop_width=tbl_profile_sample_crop_width,
             )
-        elif dataset_name == "tbl":
-            _plot_tbl(out_path, u_pred, v_pred, u_gt, v_gt, cmap_name=displacement_cmap)
         else:
-            _plot_regular(out_path, u_pred, v_pred, u_gt, v_gt)
+            _plot_regular(out_path, u_pred, v_pred, u_gt, v_gt, cmap_name=regular_flow_cmap)
 
 
 def _write_csv(path, rows):
@@ -1268,13 +2042,25 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
         # viridis 与用户提供的彩色位移色条最接近；这里用 getattr 预留后续配置入口，
         # 这样不改 global_class 也能工作，未来如果用户想换别的 cmap，可以直接在全局变量补同名字段。
         "displacement_cmap": getattr(global_data.esrgan, "TEST_DISPLACEMENT_CMAP", "viridis"),
+        # cylinder/dns_turb/jhtdb/sqg/backstep 五类常规 256x256 数据集按 evaluate_all 的光流图口径显示。
+        # evaluate_all 中 U/V 位移图使用 jet，误差图使用 bwr；这里保持同样的主色条。
+        "regular_flow_cmap": getattr(global_data.esrgan, "TEST_REGULAR_FLOW_CMAP", "jet"),
         "method_label": getattr(global_data.esrgan, "name", "Current method"),
-        "twcf_profile_column_ratios": getattr(global_data.esrgan, "TWCF_PROFILE_COLUMN_RATIOS", (0.15, 0.24, 0.83)),
-        "twcf_profile_region_names": getattr(
+        # TBL 的 Laminar/Transition/Turbulent 剖面位置；优先读新的 TBL_* 全局变量。
+        # 为了兼容前一次临时命名，如果用户还没改 global_class，也会回退读取 TWCF_*。
+        "tbl_profile_column_ratios": getattr(
             global_data.esrgan,
-            "TWCF_PROFILE_REGION_NAMES",
-            ("Laminar", "Transition", "Turbulent"),
+            "TBL_PROFILE_COLUMN_RATIOS",
+            getattr(global_data.esrgan, "TWCF_PROFILE_COLUMN_RATIOS", (0.15, 0.40, 0.83)),
         ),
+        "tbl_profile_region_names": getattr(
+            global_data.esrgan,
+            "TBL_PROFILE_REGION_NAMES",
+            getattr(global_data.esrgan, "TWCF_PROFILE_REGION_NAMES", ("Laminar", "Transition", "Turbulent")),
+        ),
+        "tbl_profile_y_limit": getattr(global_data.esrgan, "TBL_PROFILE_Y_LIMIT", 200),
+        # TBL 不再按 sample 均分；profile_analysis 围绕每个剖面位置截取固定宽度窗口。
+        "tbl_profile_sample_crop_width": getattr(global_data.esrgan, "TBL_PROFILE_SAMPLE_CROP_WIDTH", 256),
     }
 
     twcf_payload = None
@@ -1303,21 +2089,25 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
 
                 height = int(dataset_cfg["image_height"])
                 width = int(dataset_cfg["image_width"])
-                results = np.empty((dataset_size, 4, height, width), dtype=np.float32)
-                epe_array = np.empty((dataset_size,), dtype=np.float32)
-                norm_aee_per100_array = np.empty((dataset_size,), dtype=np.float32)
+                # full-frame 数据集的最后一批或异常样本可能无法写满全部位置；
+                # 用 NaN 初始化能防止未写入位置残留 np.empty 的随机内存值，后续均值会自动跳过这些无效项。
+                results = np.full((dataset_size, 4, height, width), np.nan, dtype=np.float32)
+                epe_array = np.full((dataset_size,), np.nan, dtype=np.float32)
+                norm_aee_per100_array = np.full((dataset_size,), np.nan, dtype=np.float32)
                 dataset_image_rows = []
                 dataset_raft_rows = []
 
                 total_samples = 0
                 sum_epe = 0.0
+                total_epe_samples = 0
                 start_time = time.time()
 
                 for i_batch, sample_batched in progress:
                     t0 = time.time()
                     local_dict = sample_batched[0]
 
-                    # 与 RAFT256-PIV_test.py 保持一致：target / 256，且 target[0]=prev、target[1]=next。
+                    # target[0]=prev，target[1]=next；按 RAFT256-PIV_test.py 的输入口径除以 256，
+                    # 将 TFRecord 中的图像强度缩放到模型测试使用的浮点范围。
                     images = local_dict["target"].type(torch.FloatTensor).cuda(device_id) / 256
                     flows = local_dict["flow"].type(torch.FloatTensor).cuda(device_id)
 
@@ -1339,10 +2129,13 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
                             prediction = _predict_patch(model, images, flows, factor, device)
                         predicted_flows = prediction["flow"]
 
-                    epe_per_sample = torch.sum((predicted_flows - flows) ** 2, dim=1).sqrt().flatten(1).mean(dim=1)
-                    batch_epe = float(epe_per_sample.mean().item())
+                    epe_per_sample = _torch_finite_epe_per_sample(predicted_flows, flows)
+                    finite_epe_per_sample = epe_per_sample[torch.isfinite(epe_per_sample)]
                     total_samples += valid_size
-                    sum_epe += batch_epe * valid_size
+                    if int(finite_epe_per_sample.numel()) > 0:
+                        # running mean 只统计有效样本，避免某个无有效像素的 sample 把整个日志均值拖成 NaN。
+                        sum_epe += float(finite_epe_per_sample.sum().item())
+                        total_epe_samples += int(finite_epe_per_sample.numel())
 
                     predicted_np = predicted_flows.detach().cpu().numpy().astype(np.float32, copy=False)
                     flow_np = flows.detach().cpu().numpy().astype(np.float32, copy=False)
@@ -1401,11 +2194,13 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
 
                     logger.info(
                         f"[test_all] dataset={dataset_name}, batch={i_batch}, "
-                        f"samples={total_samples}/{dataset_size}, mean_epe={sum_epe / total_samples:.6f}, "
+                        f"samples={total_samples}/{dataset_size}, "
+                        f"mean_epe={(sum_epe / total_epe_samples) if total_epe_samples else float('nan'):.6f}, "
                         f"time={time.time() - t0:.2f}s"
                     )
 
-                mean_epe = float(np.mean(epe_array[:total_samples])) if total_samples else float("nan")
+                # dataset 级 mean_epe 和 CSV 均值同口径：只对有限 EPE 求平均。
+                mean_epe = _nanmean_or_nan(epe_array[:total_samples]) if total_samples else float("nan")
                 elapsed = time.time() - start_time
                 results_path = dataset_dir / "results.npy"
                 epe_path = dataset_dir / "epe_array.npy"

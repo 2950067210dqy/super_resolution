@@ -234,7 +234,11 @@ class global_data:
         # =========================
         # 数据集划分比例
         # =========================
-        # 训练数据集和验证集合比例 测试集  比例
+        # 训练数据集和验证集合比例 测试集比例。
+        # 说明：
+        # 1. TRAIN_CLASS_MODE="fixed" 时，这三个比例不会参与真实划分，而是会由两个 list 的行数反推。
+        # 2. DATA_SET="class_2" 时，这三个比例同样不会参与真实划分，而是会由 train/validate TFRecord
+        #    的实际样本数反推；class_2 没有单独 test split，因此 Test_nums_rate 会被自动改写为 0。
         Train_nums_rate = 0.8
         Test_nums_rate = 0.1
         Validate_nums_rate = round(1 - Train_nums_rate - Test_nums_rate,2)
@@ -242,13 +246,28 @@ class global_data:
         # =========================
         # 数据路径与输出路径
         # =========================
-        # 真实数据根路径
-        GR_DATA_ROOT_DIR = rf"{AUTODL_DATA_PATH}/study_datas/sr_dataset/class_1/data"
-        # 低分辨率数据根地址
-        LR_DATA_ROOT_DIR = rf"{AUTODL_DATA_PATH}/study_datas/sr_dataset/class_1_lr"
+        # 当前训练/验证数据集来源。
+        # - class_1: 继续沿用原来的“目录扫描 + 预生成 LR 文件”流程。
+        # - class_2: 改为读取 RAFT-PIV TFRecord，LR 不再从 LR_DATA_ROOT_DIR 读取，而是在 data_load.py
+        #   中按 test_all 同款下采样逻辑动态生成。
+        DATA_SETS = ("class_1", "class_2")
+        DATA_SET = "class_1"
+        CLASS2_PSEUDO_CLASS_NAME = "problem_class2_raft_piv"
 
-        # 如果路径不存在则创建路径
-        OUT_PUT_DIR = f"{AUTODL_DATA_PATH}/train_datas/{name}"  # 实验输出总目录
+        CLASS1_GR_DATA_ROOT_DIR = rf"{AUTODL_DATA_PATH}/study_datas/sr_dataset/class_1/data"
+        CLASS1_LR_DATA_ROOT_DIR = rf"{AUTODL_DATA_PATH}/study_datas/sr_dataset/class_1_lr"
+        CLASS2_GR_DATA_ROOT_DIR = rf"{AUTODL_DATA_PATH}/study_datas/sr_dataset/class_2/Data_ProblemClass2_RAFT-PIV"
+
+        GR_DATA_ROOT_DIR = CLASS2_GR_DATA_ROOT_DIR if DATA_SET == "class_2" else CLASS1_GR_DATA_ROOT_DIR
+        # class_2 分支不会使用 LR_DATA_ROOT_DIR；这里保留变量只为兼容旧代码中的属性引用。
+        LR_DATA_ROOT_DIR = CLASS1_LR_DATA_ROOT_DIR
+
+        CLASS2_TRAIN_TFRECORD = rf"{CLASS2_GR_DATA_ROOT_DIR}/Training_Dataset_ProblemClass2_RAFT256-PIV.tfrecord-00000-of-00001"
+        CLASS2_TRAIN_TFRECORD_IDX = rf"{CLASS2_GR_DATA_ROOT_DIR}/Training_Dataset_ProblemClass2_RAFT256-PIV.tfrecord-00000-of-00001.idx"
+        CLASS2_VALIDATE_TFRECORD = rf"{CLASS2_GR_DATA_ROOT_DIR}/Validation_Dataset_ProblemClass2_RAFT256-PIV.tfrecord-00000-of-00001"
+        CLASS2_VALIDATE_TFRECORD_IDX = rf"{CLASS2_GR_DATA_ROOT_DIR}/Validation_Dataset_ProblemClass2_RAFT256-PIV.tfrecord-00000-of-00001.idx"
+
+        OUT_PUT_DIR = f"{AUTODL_DATA_PATH}/train_datas/{name}/{DATA_SET}"  # 实验输出总目录
         TRAINING_DIR = "/training_data"#正在训练输出目录
         LOSS_DIR = "/train_loss"  # 损失曲线目录
         MODEL_DIR = "/train_model"  # 模型权重目录
@@ -257,7 +276,10 @@ class global_data:
         # =========================
         # RAFT256-PIV 风格 TFRecord 测试配置
         # =========================
-        IS_VALIDATE_ALL = True  # 是否执行 evaluate_all 完整验证；默认 True，保持原有验证流程不变。
+        IS_training = True  # 是否执行训练循环；False 时跳过训练，模型构建和后续 evaluate_all/test_all 仍按原流程执行。
+        # 是否执行 evaluate_all 完整验证。
+        # 这里恢复为纯手动总开关：无论 DATA_SET 是 class_1 还是 class_2，都由该超参数决定是否执行。
+        IS_VALIDATE_ALL = True
         IS_TEST = False  # 是否在 evaluate_all 之后启用 test_all；默认 False，避免改变原训练/验证流程。
         is_TEST_CLASS3 = False  # 是否额外测试 tbl/twcf 大图数据集；默认 False，节省显存和测试时间。
         TEST_DIR = "/test_all"  # test_all 统一输出目录，会在该目录下再按 dataset 名称分文件夹。
@@ -268,6 +290,12 @@ class global_data:
         TEST_SHIFT = 64  # tbl/twcf 全图滑窗步长，沿用 RAFT256-PIV_test.py。
         TEST_AMP = False  # 测试阶段是否启用 AMP；默认 False，和参考脚本一致。
         TEST_PLOT_RESULTS = True  # 是否保存每个 sample 的 png 可视化图。
+        TEST_DISPLACEMENT_CMAP = "viridis"  # tbl/twcf 位移场使用和论文图相近的紫-蓝-绿-黄色条。
+        TEST_REGULAR_FLOW_CMAP = "jet"  # backstep/cylinder/dns_turb/jhtdb/sqg 常规光流图沿用 evaluate_all 的 jet 色条。
+        TBL_PROFILE_COLUMN_RATIOS = (0.15, 0.40, 0.83)  # TBL 剖面分析的 Laminar/Transition/Turbulent 三个 x 位置比例；Transition 位置设为 0.40。
+        TBL_PROFILE_REGION_NAMES = ("Laminar", "Transition", "Turbulent")  # TBL 剖面图中三个区域标签。
+        TBL_PROFILE_Y_LIMIT = 200  # TBL 论文风格剖面只显示 y=0..200px 的有效边界层区域。
+        TBL_PROFILE_SAMPLE_CROP_WIDTH = 256  # TBL 剖面位置局部对比图的截取宽度；不再假设 sample 均分。
         TEST_TFRECORD2IDX_SCRIPT = "tfrecord2idx"  # idx 文件缺失时用于生成 idx 的外部工具。
         PIV_RESULTS_TWCF_PATH = rf"{AUTODL_DATA_PATH}/study_datas/sr_dataset/class_3/TWCF/PIV_results_TWCF.npy"  # twcf PascalPIV 对比结果路径。
         MASK_TWCF_PATH = rf"{AUTODL_DATA_PATH}/study_datas/sr_dataset/class_3/TWCF/mask_TWCF.npy"  # twcf 可视化 mask 路径。
@@ -517,6 +545,104 @@ class global_data:
                 "validate_count": validate_count,
                 "train_rate": cls.Train_nums_rate,
                 "validate_rate": cls.Validate_nums_rate,
+            }
+
+        @classmethod
+        def normalized_dataset_name(cls) -> str:
+            """
+            返回规范化后的数据集名称。
+
+            统一在配置层做 strip/lower，避免 pipeline、data_load 和 test 里分别手写
+            `"class_1"` / `"CLASS_1"` / `"Class_2"` 这种大小写分支。
+            """
+            return str(cls.DATA_SET).strip().lower()
+
+        @classmethod
+        def validate_dataset_name(cls) -> str:
+            """
+            校验 DATA_SET 是否属于当前支持的数据集。
+
+            目前只支持：
+            - class_1: 目录式 GR/LR 数据
+            - class_2: RAFT-PIV TFRecord 数据
+            """
+            dataset_name = cls.normalized_dataset_name()
+            if dataset_name not in cls.DATA_SETS:
+                raise ValueError(f"DATA_SET 仅支持 {cls.DATA_SETS}，当前为: {cls.DATA_SET}")
+            return dataset_name
+
+        @classmethod
+        def _count_tfrecord_idx_rows(cls, idx_path: str | Path, split_name: str) -> int:
+            """
+            统计 TFRecord idx 文件中的有效样本数。
+
+            DALI/TFRecord 的 `.idx` 文件通常一行对应一个样本偏移；这里不解析内容，
+            只统计非空行数，用于把 class_2 的 Train_nums_rate / Validate_nums_rate
+            反推成真实比例，保证日志和超参数记录与实际数据规模一致。
+            """
+            path = Path(idx_path).expanduser()
+            if not path.exists():
+                raise FileNotFoundError(f"{split_name} class_2 tfrecord idx does not exist: {path}")
+
+            count = 0
+            with path.open("r", encoding="utf-8") as file_obj:
+                for line in file_obj:
+                    if line.strip():
+                        count += 1
+            if count <= 0:
+                raise ValueError(f"{split_name} class_2 tfrecord idx has no valid sample rows: {path}")
+            return count
+
+        @classmethod
+        def update_class2_split_rates(cls) -> dict:
+            """
+            根据 class_2 的 train/validate TFRecord 样本数同步比例超参数。
+
+            class_2 不再使用 Train_nums_rate / Validate_nums_rate / Test_nums_rate 作为划分输入；
+            真正的数据边界已经由两个 TFRecord 文件决定。这里更新比例只是为了：
+            1. 日志展示真实数据规模；
+            2. hyper_parameters.txt / wandb 记录真实比例；
+            3. 让后续 pipeline 不再误以为 class_2 还有 test split。
+            """
+            train_count = cls._count_tfrecord_idx_rows(cls.CLASS2_TRAIN_TFRECORD_IDX, "train")
+            validate_count = cls._count_tfrecord_idx_rows(cls.CLASS2_VALIDATE_TFRECORD_IDX, "validate")
+            total_count = train_count + validate_count
+            cls.Train_nums_rate = train_count / total_count
+            cls.Validate_nums_rate = validate_count / total_count
+            cls.Test_nums_rate = 0.0
+            logger.info(
+                "[Class2Split] Update split rates from tfrecord idx rows: "
+                f"train_count={train_count}, validate_count={validate_count}, "
+                f"Train_nums_rate={cls.Train_nums_rate:.8f}, "
+                f"Validate_nums_rate={cls.Validate_nums_rate:.8f}, Test_nums_rate=0.0"
+            )
+            return {
+                "train_count": train_count,
+                "validate_count": validate_count,
+                "train_rate": cls.Train_nums_rate,
+                "validate_rate": cls.Validate_nums_rate,
+            }
+
+        @classmethod
+        def update_dataset_split_rates(cls) -> dict:
+            """
+            按当前 DATA_SET / TRAIN_CLASS_MODE 选择正确的“真实比例同步”策略。
+
+            - class_2: 永远按 TFRecord 的真实样本数反推比例；
+            - class_1 + fixed: 按固定 list 的真实行数反推比例；
+            - 其它 class_1 模式：保留当前配置比例，不做改写。
+            """
+            dataset_name = cls.validate_dataset_name()
+            if dataset_name == "class_2":
+                return cls.update_class2_split_rates()
+
+            if cls.normalized_train_class_mode() == "fixed":
+                return cls.update_fixed_split_rates()
+
+            return {
+                "train_rate": cls.Train_nums_rate,
+                "validate_rate": cls.Validate_nums_rate,
+                "test_rate": cls.Test_nums_rate,
             }
 
         @classmethod
