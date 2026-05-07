@@ -411,6 +411,428 @@ def _compute_flow_metric_row(dataset_name, sample_index, pred_chw, gt_chw):
     }
 
 
+def _flow_uv_to_uvw_np(flow_chw):
+    """
+    将 test_all 的 2 通道 [u, v] 光流扩展成 [u, v, magnitude]。
+
+    evaluate_all 的 flow 汇总里包含 Δw，其中 w 表示位移幅值；test_all 的 TFRecord
+    真值和 RAFT 输出通常只有 uv 两个通道，所以这里在统计直方图/能量谱前补出第三通道，
+    保证 test_all 的类别级和总体级 npy/图像输出与 evaluate_all 口径一致。
+    """
+    flow = np.asarray(flow_chw, dtype=np.float32)
+    if flow.shape[0] >= 3:
+        return flow[:3]
+    if flow.shape[0] < 2:
+        raise ValueError(f"Expected flow with at least 2 channels, got shape={flow.shape}")
+    u = flow[0:1]
+    v = flow[1:2]
+    mag = np.sqrt(u * u + v * v + 1e-12).astype(np.float32, copy=False)
+    return np.concatenate([u, v, mag], axis=0)
+
+
+def _compute_flow_error_maps_np(pred_chw, gt_chw):
+    """
+    计算 evaluate_all 同款的 Δu / Δv / Δw / EPE 误差图。
+
+    返回的数组保留 NaN/Inf，后续直方图函数会只统计有限值；这样不会把无效区域误当作 0 误差。
+    """
+    pred = _flow_uv_to_uvw_np(pred_chw)
+    gt = _flow_uv_to_uvw_np(gt_chw)
+    delta_u = pred[0] - gt[0]
+    delta_v = pred[1] - gt[1]
+    delta_w = pred[2] - gt[2]
+    epe = np.sqrt(delta_u * delta_u + delta_v * delta_v)
+    return delta_u.astype(np.float32), delta_v.astype(np.float32), delta_w.astype(np.float32), epe.astype(np.float32)
+
+
+def _finite_display_field(field_2d, fill_value=0.0):
+    """
+    将单通道场转换成可绘图数组。
+
+    NPY 文件会保存原始 NaN/Inf，便于后处理继续识别无效区域；但 matplotlib 的 colorbar、
+    quiver 和 tight_layout 对 NaN/Inf 很敏感，因此只在绘图副本中用有限区域均值做填补。
+    """
+    field = np.asarray(field_2d, dtype=np.float32).copy()
+    finite = np.isfinite(field)
+    if np.any(finite):
+        fill = float(np.mean(field[finite], dtype=np.float64))
+    else:
+        fill = float(fill_value)
+    field[~finite] = fill
+    return field
+
+
+def _finite_color_limits_from_arrays(arrays, symmetric=False, fallback=(-1.0, 1.0)):
+    """
+    从一组数组的有限值中求色条范围。
+
+    symmetric=True 用于误差图或涡度差图，使色条以 0 为中心，正负误差更容易比较。
+    """
+    chunks = []
+    for arr in arrays:
+        values = np.asarray(arr, dtype=np.float32).reshape(-1)
+        values = values[np.isfinite(values)]
+        if values.size > 0:
+            chunks.append(values)
+    if not chunks:
+        return float(fallback[0]), float(fallback[1])
+    values = np.concatenate(chunks, axis=0)
+    if symmetric:
+        max_abs = float(np.max(np.abs(values)))
+        max_abs = max(max_abs, 1e-6)
+        return -max_abs, max_abs
+    vmin = float(np.min(values))
+    vmax = float(np.max(values))
+    if not np.isfinite(vmin) or not np.isfinite(vmax):
+        return float(fallback[0]), float(fallback[1])
+    if abs(vmax - vmin) < 1e-6:
+        pad = max(abs(vmax), 1.0) * 0.05
+        return vmin - pad, vmax + pad
+    return vmin, vmax
+
+
+def _omega_star_from_uv_np(u_2d, v_2d, eps=1e-8):
+    """
+    由 U/V 位移场计算 evaluate_all 同款 omega* 涡度场。
+
+    与各分支 visual_plot_init.py 中的 _omega_star_from_uv 保持一致：先算
+    omega=dv/dx-du/dy，再 min-max 到 [-2, 2]。这里额外保留无效区域为 NaN，
+    避免 TBL/TWCF 的无效边界被误当作真实涡度。
+    """
+    u = np.asarray(u_2d, dtype=np.float32)
+    v = np.asarray(v_2d, dtype=np.float32)
+    valid = np.isfinite(u) & np.isfinite(v)
+    if not np.any(valid):
+        return np.full(u.shape, np.nan, dtype=np.float32)
+
+    u_fill = _finite_display_field(u)
+    v_fill = _finite_display_field(v)
+    dv_dy, dv_dx = np.gradient(v_fill)
+    du_dy, du_dx = np.gradient(u_fill)
+    omega = (dv_dx - du_dy).astype(np.float32, copy=False)
+    omega[~valid] = np.nan
+
+    finite = np.isfinite(omega)
+    if not np.any(finite):
+        return omega.astype(np.float32, copy=False)
+    omin = float(np.min(omega[finite]))
+    omax = float(np.max(omega[finite]))
+    omega_star = (omega - omin) / (omax - omin + float(eps))
+    omega_star = omega_star * 4.0 - 2.0
+    omega_star[~finite] = np.nan
+    return omega_star.astype(np.float32, copy=False)
+
+
+def _save_uvw_compare_artifacts(sample_dir, pred_chw, gt_chw, cmap_name="jet"):
+    """
+    保存 test_all 的 U/V/S compare 图以及对应 NPY。
+
+    evaluate_all 的样本目录会保存 fake_flo.npy / hr_flo.npy 和 uvs_compare.png；
+    test_all 这里补齐同款文件，同时额外保存 pred/gt/delta 的 CHW 版本，方便后续脚本
+    直接读取 U、V、S 三个分量做分析。
+    """
+    sample_dir = Path(sample_dir)
+    sample_dir.mkdir(parents=True, exist_ok=True)
+
+    pred_uvw = _flow_uv_to_uvw_np(pred_chw).astype(np.float32, copy=False)
+    gt_uvw = _flow_uv_to_uvw_np(gt_chw).astype(np.float32, copy=False)
+    delta_uvw = (pred_uvw - gt_uvw).astype(np.float32, copy=False)
+
+    # evaluate_all 兼容命名：HWC 保存，便于直接当成 flo 结果读入。
+    np.save(sample_dir / "fake_flo.npy", pred_uvw.transpose(1, 2, 0).astype(np.float32))
+    np.save(sample_dir / "hr_flo.npy", gt_uvw.transpose(1, 2, 0).astype(np.float32))
+    # test_all 显式命名：CHW 保存，和模型输出通道顺序一致。
+    np.save(sample_dir / "pred_uvw.npy", pred_uvw.astype(np.float32))
+    np.save(sample_dir / "gt_uvw.npy", gt_uvw.astype(np.float32))
+    np.save(sample_dir / "delta_uvw.npy", delta_uvw.astype(np.float32))
+
+    component_names = ("u", "v", "s")
+    for idx, name in enumerate(component_names):
+        np.save(sample_dir / f"pred_{name}.npy", pred_uvw[idx].astype(np.float32))
+        np.save(sample_dir / f"gt_{name}.npy", gt_uvw[idx].astype(np.float32))
+        np.save(sample_dir / f"delta_{name}.npy", delta_uvw[idx].astype(np.float32))
+
+    fig, axes = plt.subplots(3, 3, figsize=(15, 11), dpi=140, facecolor="w")
+    for row_idx, label in enumerate(("U", "V", "S")):
+        # Pred/GT 的色条范围用 GT 和 Pred 的有限值共同决定，避免预测越界时被截断。
+        vmin, vmax = _finite_color_limits_from_arrays(
+            [gt_uvw[row_idx], pred_uvw[row_idx]],
+            symmetric=False,
+            fallback=(-1.0, 1.0),
+        )
+        err_min, err_max = _finite_color_limits_from_arrays(
+            [delta_uvw[row_idx]],
+            symmetric=True,
+            fallback=(-0.25, 0.25),
+        )
+        _plot_field_with_colorbar(
+            axes[row_idx, 0],
+            _finite_display_field(pred_uvw[row_idx]),
+            f"Pred {label}",
+            cmap_name,
+            vmin,
+            vmax,
+            f"{label} displacement [px]",
+        )
+        _plot_field_with_colorbar(
+            axes[row_idx, 1],
+            _finite_display_field(gt_uvw[row_idx]),
+            f"GT {label}",
+            cmap_name,
+            vmin,
+            vmax,
+            f"{label} displacement [px]",
+        )
+        _plot_field_with_colorbar(
+            axes[row_idx, 2],
+            _finite_display_field(delta_uvw[row_idx], fill_value=0.0),
+            f"Error {label} (Pred-GT)",
+            "bwr",
+            err_min,
+            err_max,
+            f"{label} error [px]",
+        )
+
+    fig.tight_layout()
+    fig.savefig(sample_dir / "uvs_compare.png", bbox_inches="tight")
+    plt.close(fig)
+    return pred_uvw, gt_uvw, delta_uvw
+
+
+def _save_vorticity_velocity_artifacts(sample_dir, pred_uvw, gt_uvw, stride=None):
+    """
+    保存涡度-速度对比图及对应 NPY。
+
+    图中三列分别是：
+        1. Pred omega* + 预测速度矢量
+        2. GT omega* + 真值速度矢量
+        3. Delta omega* + 速度差矢量
+
+    这样既保留 evaluate_all 的 vorticity_quiver.png 命名，又补上用户要求的
+    “涡流速度差对比”信息。
+    """
+    sample_dir = Path(sample_dir)
+    sample_dir.mkdir(parents=True, exist_ok=True)
+
+    pred_omega = _omega_star_from_uv_np(pred_uvw[0], pred_uvw[1])
+    gt_omega = _omega_star_from_uv_np(gt_uvw[0], gt_uvw[1])
+    delta_omega = (pred_omega - gt_omega).astype(np.float32, copy=False)
+    delta_uv = (pred_uvw[:2] - gt_uvw[:2]).astype(np.float32, copy=False)
+
+    np.save(sample_dir / "pred_vorticity.npy", pred_omega.astype(np.float32))
+    np.save(sample_dir / "gt_vorticity.npy", gt_omega.astype(np.float32))
+    np.save(sample_dir / "delta_vorticity.npy", delta_omega.astype(np.float32))
+    np.save(sample_dir / "delta_velocity_uv.npy", delta_uv.transpose(1, 2, 0).astype(np.float32))
+
+    h, w = int(pred_uvw.shape[-2]), int(pred_uvw.shape[-1])
+    if stride is None:
+        # 大图自动稀疏采样，避免 TBL/TWCF 的 quiver 过密导致图片巨大或保存过慢。
+        stride = max(1, min(h, w) // 32)
+    stride = max(1, int(stride))
+
+    yy, xx = np.mgrid[0:h, 0:w]
+    panels = [
+        ("Pred omega* + velocity", pred_omega, pred_uvw[0], pred_uvw[1], False),
+        ("GT omega* + velocity", gt_omega, gt_uvw[0], gt_uvw[1], False),
+        ("Delta omega* + velocity error", delta_omega, delta_uv[0], delta_uv[1], True),
+    ]
+    omega_min, omega_max = _finite_color_limits_from_arrays(
+        [pred_omega, gt_omega],
+        symmetric=True,
+        fallback=(-2.0, 2.0),
+    )
+    delta_min, delta_max = _finite_color_limits_from_arrays(
+        [delta_omega],
+        symmetric=True,
+        fallback=(-1.0, 1.0),
+    )
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5.2), dpi=140, facecolor="w")
+    for ax, (title, omega, u_field, v_field, is_delta) in zip(axes, panels):
+        vmin, vmax = (delta_min, delta_max) if is_delta else (omega_min, omega_max)
+        im = ax.imshow(
+            _finite_display_field(omega, fill_value=0.0),
+            origin="lower",
+            cmap="RdBu_r",
+            vmin=vmin,
+            vmax=vmax,
+            aspect="auto",
+        )
+        u_show = _finite_display_field(u_field, fill_value=0.0)
+        v_show = _finite_display_field(v_field, fill_value=0.0)
+        ax.quiver(
+            xx[::stride, ::stride],
+            yy[::stride, ::stride],
+            u_show[::stride, ::stride],
+            v_show[::stride, ::stride],
+            color="k",
+            pivot="mid",
+            angles="xy",
+            scale_units="xy",
+            scale=0.25,
+            width=0.003,
+        )
+        ax.set_title(title, fontsize=11)
+        ax.set_xlim(0, w - 1)
+        ax.set_ylim(0, h - 1)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cb.ax.set_ylabel("omega*", fontsize=10)
+
+    fig.tight_layout()
+    # evaluate_all 兼容命名。
+    fig.savefig(sample_dir / "vorticity_quiver.png", bbox_inches="tight")
+    # 显式命名，强调第三列是涡度/速度差。
+    fig.savefig(sample_dir / "vorticity_velocity_delta_compare.png", bbox_inches="tight")
+    plt.close(fig)
+
+
+def _save_flow_visual_artifacts(sample_dir, pred_chw, gt_chw, cmap_name="jet", quiver_stride=None):
+    """
+    汇总保存 test_all 的光流样本级图和 NPY。
+
+    该函数只负责新增的 evaluate_all 同款样本文件，不改动原有
+    `{dataset_name}_sample_XXXX.png` 总览图，避免影响现有脚本读取路径。
+    """
+    pred_uvw, gt_uvw, _ = _save_uvw_compare_artifacts(sample_dir, pred_chw, gt_chw, cmap_name=cmap_name)
+    _save_vorticity_velocity_artifacts(sample_dir, pred_uvw, gt_uvw, stride=quiver_stride)
+
+
+def _histogram_matrix(values, bins):
+    """
+    保存成 `[bin_center, count]` 两列矩阵，和 evaluate_all 的直方图 npy 结构保持一致。
+    """
+    finite_values = np.asarray(values, dtype=np.float32).reshape(-1)
+    finite_values = finite_values[np.isfinite(finite_values)]
+    if finite_values.size == 0:
+        counts = np.zeros(len(bins) - 1, dtype=np.float32)
+        edges = bins
+    else:
+        counts, edges = np.histogram(finite_values, bins=bins)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    return np.stack([centers.astype(np.float32), counts.astype(np.float32)], axis=1)
+
+
+def _symmetric_histogram_matrix(values, bins=201):
+    """
+    以 0 为中心统计有符号误差分布，用于 Δu/Δv/Δw。
+    """
+    finite_values = np.asarray(values, dtype=np.float32).reshape(-1)
+    finite_values = finite_values[np.isfinite(finite_values)]
+    max_abs = float(np.max(np.abs(finite_values))) + 1e-12 if finite_values.size > 0 else 1e-12
+    edges = np.linspace(-max_abs, max_abs, bins + 1, dtype=np.float32)
+    return _histogram_matrix(finite_values, edges)
+
+
+def _epe_histogram_matrix(values, bins=201):
+    """统计非负 EPE 分布，输出格式与 evaluate_all 的 epe_hist_all.npy 一致。"""
+    finite_values = np.asarray(values, dtype=np.float32).reshape(-1)
+    finite_values = finite_values[np.isfinite(finite_values)]
+    max_val = float(np.max(finite_values)) + 1e-12 if finite_values.size > 0 else 1e-12
+    edges = np.linspace(0.0, max_val, bins + 1, dtype=np.float32)
+    return _histogram_matrix(finite_values, edges)
+
+
+def _save_histogram_plot(hist_matrix, out_png, title, xlabel, color="#4C9F70"):
+    """
+    将两列直方图矩阵额外画成 png。
+
+    evaluate_all 原本至少保存 npy；test_all 这里在保存同款 npy 的基础上也补一张图，
+    方便不用写后处理脚本就能快速检查类别级/总体级误差分布。
+    """
+    out_png = Path(out_png)
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    hist = np.asarray(hist_matrix, dtype=np.float32)
+    if hist.ndim != 2 or hist.shape[1] != 2 or hist.shape[0] == 0:
+        return
+    centers = hist[:, 0]
+    counts = hist[:, 1]
+    if centers.size > 1:
+        width = float(np.median(np.diff(centers)))
+        width = width if np.isfinite(width) and width > 0 else 1.0
+    else:
+        width = 1.0
+    fig, ax = plt.subplots(1, 1, figsize=(5.2, 3.8), dpi=150)
+    ax.bar(centers, counts, width=width, color=color, alpha=0.72, edgecolor="none")
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Count")
+    fig.tight_layout()
+    fig.savefig(out_png, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _save_flow_histogram_bundle(out_dir, delta_u_values, delta_v_values, delta_w_values, epe_values):
+    """
+    保存 evaluate_all 同款的 Δu/Δv/Δw/EPE 汇总直方图 npy，并额外输出 png 快速预览。
+
+    out_dir 可以是单个 dataset 目录，也可以是 test_all 根目录，因此同一函数同时服务
+    “分类别”和“总体”两级输出。
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    specs = [
+        ("delta_u", delta_u_values, _symmetric_histogram_matrix, "Delta U Error Distribution", "delta u displacement [px]", "#F4A142"),
+        ("delta_v", delta_v_values, _symmetric_histogram_matrix, "Delta V Error Distribution", "delta v displacement [px]", "#4C9F70"),
+        ("delta_w", delta_w_values, _symmetric_histogram_matrix, "Delta W Error Distribution", "delta w displacement [px]", "#8E6BBE"),
+        ("epe", epe_values, _epe_histogram_matrix, "EPE Distribution", "EPE [px]", "#4477AA"),
+    ]
+    for prefix, values, builder, title, xlabel, color in specs:
+        if not values:
+            continue
+        merged = np.concatenate([np.asarray(v, dtype=np.float32).reshape(-1) for v in values], axis=0)
+        hist = builder(merged)
+        np.save(out_dir / f"{prefix}_hist_all.npy", hist.astype(np.float32))
+        _save_histogram_plot(hist, out_dir / f"{prefix}_hist_all.png", title=title, xlabel=xlabel, color=color)
+
+
+def _save_energy_spectrum_plot(pred_curve, gt_curve, out_png, title):
+    """保存 mean energy spectrum 对比图，文件名和 evaluate_all 的均值频谱图保持同一套口径。"""
+    out_png = Path(out_png)
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    k = np.arange(1, len(pred_curve) + 1)
+    fig, ax = plt.subplots(1, 1, figsize=(6, 4), dpi=160)
+    ax.loglog(k, np.maximum(gt_curve, 1e-12), label="GT", linewidth=2)
+    ax.loglog(k, np.maximum(pred_curve, 1e-12), label="Pred", linewidth=2, linestyle="--")
+    ax.set_xlabel("Wavenumber k")
+    ax.set_ylabel("E(k)")
+    ax.set_title(title)
+    ax.grid(True, which="both", alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_png, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _save_mean_spectrum(pred_curves, gt_curves, out_dir, title, file_prefix, also_save_legacy_names=False):
+    """
+    保存 evaluate_all 同款的平均能量谱 npy/png。
+
+    test_all 的 sample 图已经有自己的布局，因此这里只补“类别级/总体级”的频谱汇总；
+    文件名沿用 evaluate_all：`{prefix}_energy_spectrum_*_mean.npy/png`。
+    """
+    if not pred_curves or not gt_curves:
+        return
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    min_len = min(min(len(x) for x in pred_curves), min(len(x) for x in gt_curves))
+    pred_mean = np.mean(np.stack([np.asarray(x[:min_len], dtype=np.float32) for x in pred_curves], axis=0), axis=0)
+    gt_mean = np.mean(np.stack([np.asarray(x[:min_len], dtype=np.float32) for x in gt_curves], axis=0), axis=0)
+    np.save(out_dir / f"{file_prefix}_energy_spectrum_pred_mean.npy", pred_mean.astype(np.float32))
+    np.save(out_dir / f"{file_prefix}_energy_spectrum_gt_mean.npy", gt_mean.astype(np.float32))
+    _save_energy_spectrum_plot(
+        pred_mean,
+        gt_mean,
+        out_dir / f"{file_prefix}_energy_spectrum_mean_compare.png",
+        title=title,
+    )
+    if also_save_legacy_names:
+        np.save(out_dir / "energy_spectrum_pred_mean.npy", pred_mean.astype(np.float32))
+        np.save(out_dir / "energy_spectrum_gt_mean.npy", gt_mean.astype(np.float32))
+        _save_energy_spectrum_plot(pred_mean, gt_mean, out_dir / "energy_spectrum_mean_compare.png", title=title)
+
+
 def _build_mean_row(rows, fixed_fields, metric_keys):
     """根据给定指标列生成一行均值记录。"""
     mean_row = dict(fixed_fields)
@@ -1363,6 +1785,155 @@ def _resolve_profile_columns(width, column_ratios):
     return cols
 
 
+def _extract_tbl_component_profiles(gt_profile, pred_profile, columns):
+    """
+    在 Laminar/Transition/Turbulent 三个 x 位置抽取单个流场分量的剖面。
+
+    gt_profile / pred_profile 是已经按 y_limit 裁剪后的二维场，columns 是 full-frame
+    对应的全局列坐标。这里同时要求 GT 和当前方法都为有限值，避免无效像素把剖面曲线
+    或后续 npy 对比数据污染成 NaN。
+    """
+    profile_height = int(gt_profile.shape[0])
+    profile_gt = np.full((len(columns), profile_height), np.nan, dtype=np.float32)
+    profile_pred = np.full((len(columns), profile_height), np.nan, dtype=np.float32)
+    for idx, col in enumerate(columns):
+        valid = np.isfinite(gt_profile[:, col]) & np.isfinite(pred_profile[:, col])
+        profile_gt[idx, valid] = gt_profile[valid, col]
+        profile_pred[idx, valid] = pred_profile[valid, col]
+    return profile_gt, profile_pred
+
+
+def _save_tbl_component_profile_figure(
+    analysis_dir,
+    output_names,
+    top_field,
+    profile_gt,
+    profile_pred,
+    columns,
+    y_positions,
+    profile_height,
+    region_names,
+    method_label,
+    cmap_name,
+    top_title,
+    x_zero_left=False,
+):
+    """
+    保存 TBL 单个分量的论文风格剖面对比图。
+
+    U/V 两个分量的图形结构完全一致：
+        1. 上方显示对应 GT 分量场，并标注 Laminar/Transition/Turbulent 三个 x 位置；
+        2. 下方分别画三处位置的 GT 与当前方法 displacement-vs-y-position 剖面。
+
+    x_zero_left=True 只给 U 分量使用，保持此前“0 点对齐左下角原点”的视觉习惯；
+    V 分量可能有正负位移，因此默认自动包含 0，避免把负值曲线裁掉。
+    """
+    output_names = [output_names] if isinstance(output_names, str) else list(output_names)
+    top_field = np.asarray(top_field, dtype=np.float32)
+    valid_values = top_field.reshape(-1)
+    valid_values = valid_values[np.isfinite(valid_values)]
+    if valid_values.size > 0:
+        vmin = float(np.nanpercentile(valid_values, 1))
+        vmax = float(np.nanpercentile(valid_values, 99))
+    else:
+        vmin, vmax = 0.0, 1.0
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
+        vmin, vmax = 0.0, 1.0
+
+    # 横向稍微放宽，避免 Laminar/Transition 两个相邻标签贴在一起，
+    # 但三条红色虚线的位置仍严格由 TBL_PROFILE_COLUMN_RATIOS 控制。
+    fig = plt.figure(figsize=(16, 14), dpi=160, facecolor="w", edgecolor="k")
+    grid = fig.add_gridspec(2, 3, height_ratios=[1.0, 1.8], hspace=0.35, wspace=0.25)
+
+    ax_top = fig.add_subplot(grid[0, :])
+    # 顶部图显示当前分析分量的 GT 位移场；TBL 不做无效区填 0，
+    # TWCF 的波浪边界填 0 只用于 _plot_twcf。
+    im = ax_top.imshow(top_field, origin="lower", cmap=cmap_name, vmin=vmin, vmax=vmax, aspect="auto")
+    ax_top.set_title(top_title, fontsize=18)
+    ax_top.set_xticks([])
+    ax_top.set_yticks([])
+    for idx, col in enumerate(columns):
+        ax_top.axvline(col, color="red", linestyle="--", linewidth=2.0)
+        label = region_names[idx] if idx < len(region_names) else f"Region {idx + 1}"
+        ax_top.text(
+            col,
+            profile_height - 8,
+            label,
+            color="red",
+            fontsize=16,
+            ha="center",
+            va="top",
+            bbox={"facecolor": "white", "edgecolor": "none", "pad": 2.5},
+        )
+    cbar = fig.colorbar(im, ax=ax_top, orientation="horizontal", fraction=0.08, pad=0.18)
+    cbar.set_label("Displacement[px]", fontsize=15)
+
+    x_values = np.concatenate(
+        [
+            profile_gt[np.isfinite(profile_gt)],
+            profile_pred[np.isfinite(profile_pred)],
+        ],
+        axis=0,
+    ) if np.isfinite(profile_gt).any() or np.isfinite(profile_pred).any() else np.asarray([0.0, 1.0], dtype=np.float32)
+    x_min = float(np.nanmin(x_values))
+    x_max = float(np.nanmax(x_values))
+    if not np.isfinite(x_min) or not np.isfinite(x_max) or x_min == x_max:
+        x_min, x_max = 0.0, 1.0
+    x_pad = 0.05 * max(x_max - x_min, 1.0)
+    if x_zero_left:
+        x_left = 0.0
+        x_right = max(x_max + x_pad, 1.0)
+    else:
+        # V 分量通常会跨过 0；这里显式包含 0，便于观察正负位移偏差。
+        x_left = min(x_min - x_pad, 0.0)
+        x_right = max(x_max + x_pad, 0.0)
+        if x_left == x_right:
+            x_left, x_right = x_left - 0.5, x_right + 0.5
+
+    for idx, col in enumerate(columns):
+        ax = fig.add_subplot(grid[1, idx])
+        valid_gt = np.isfinite(profile_gt[idx])
+        valid_pred = np.isfinite(profile_pred[idx])
+        if np.any(valid_gt):
+            ax.plot(
+                profile_gt[idx][valid_gt],
+                y_positions[valid_gt],
+                color="black",
+                linewidth=2.0,
+                linestyle=(0, (6, 3)),
+                label="GT",
+            )
+        if np.any(valid_pred):
+            ax.plot(
+                profile_pred[idx][valid_pred],
+                y_positions[valid_pred],
+                color="red",
+                linewidth=2.2,
+                linestyle="-",
+                label=method_label,
+            )
+        title = region_names[idx] if idx < len(region_names) else f"Region {idx + 1}"
+        ax.set_title(title, fontsize=15, fontweight="bold")
+        ax.set_xlabel("displacement[px]", fontsize=12)
+        if idx == 0:
+            ax.set_ylabel("y-position[px]", fontsize=12)
+            ax.legend(loc="upper left", fontsize=11, frameon=True)
+        ax.set_xlim(x_left, x_right)
+        # y_limit=200 表示论文图展示 0..200 px 的坐标范围；profile 数组本身有 200 行，
+        # 行索引最大是 199。这里把坐标轴上限显式设为 200，并强制加入 200 刻度，
+        # 避免 Matplotlib 自动刻度停在 175，看起来像没有画满 0..200。
+        y_ticks = list(np.arange(0, profile_height + 1, 25, dtype=np.int32))
+        if y_ticks[-1] != profile_height:
+            y_ticks.append(profile_height)
+        ax.set_ylim(0, profile_height)
+        ax.set_yticks(y_ticks)
+        ax.grid(alpha=0.15)
+
+    for output_name in output_names:
+        fig.savefig(analysis_dir / output_name, bbox_inches="tight")
+    plt.close(fig)
+
+
 def _save_tbl_profile_artifacts(
     dataset_dir,
     sample_index,
@@ -1419,14 +1990,10 @@ def _save_tbl_profile_artifacts(
     columns = _resolve_profile_columns(u_gt_profile.shape[1], column_ratios)
     y_positions = np.arange(profile_height, dtype=np.float32)
 
-    profile_gt = np.full((len(columns), profile_height), np.nan, dtype=np.float32)
-    profile_pred = np.full((len(columns), profile_height), np.nan, dtype=np.float32)
-    for idx, col in enumerate(columns):
-        valid = np.isfinite(u_gt_profile[:, col]) & np.isfinite(u_pred_profile[:, col])
-        # TBL 剖面使用 horizontal/U displacement；profile_columns 记录 x 采样位置，
-        # 后续其他方法只要按同样列号抽 U 分量即可直接叠加比较。
-        profile_gt[idx, valid] = u_gt_profile[valid, col]
-        profile_pred[idx, valid] = u_pred_profile[valid, col]
+    # 旧版本只抽 horizontal/U displacement。这里保留 U 的旧文件名，
+    # 同时新增 V displacement 的同结构剖面，方便后续按同样列号做多方法对比。
+    profile_gt, profile_pred = _extract_tbl_component_profiles(u_gt_profile, u_pred_profile, columns)
+    v_profile_gt, v_profile_pred = _extract_tbl_component_profiles(v_gt_profile, v_pred_profile, columns)
 
     # 保存原始场和已经抽好的剖面，后续其他方法只要在同样列位置上取 profile 就能直接对比。
     np.save(analysis_dir / "u_gt.npy", u_gt.astype(np.float32))
@@ -1435,12 +2002,21 @@ def _save_tbl_profile_artifacts(
     np.save(analysis_dir / "v_pred.npy", v_pred.astype(np.float32))
     np.save(analysis_dir / "u_gt_profile_view.npy", u_gt_profile.astype(np.float32))
     np.save(analysis_dir / "u_pred_profile_view.npy", u_pred_profile.astype(np.float32))
+    np.save(analysis_dir / "v_gt_profile_view.npy", v_gt_profile.astype(np.float32))
+    np.save(analysis_dir / "v_pred_profile_view.npy", v_pred_profile.astype(np.float32))
     np.save(analysis_dir / "profile_columns.npy", np.asarray(columns, dtype=np.int32))
     np.save(analysis_dir / "profile_y_positions.npy", y_positions)
     np.save(analysis_dir / "profile_y_limit.npy", np.asarray(profile_height, dtype=np.int32))
+    # 兼容旧后处理：profile_gt/profile_pred/profile_component 仍表示 U 分量。
     np.save(analysis_dir / "profile_gt.npy", profile_gt)
     np.save(analysis_dir / "profile_pred.npy", profile_pred)
     np.save(analysis_dir / "profile_component.npy", np.asarray("u"))
+    # 新增显式分量文件：U/V 都用 component 前缀保存，后续多方法叠图时不用猜旧文件语义。
+    np.save(analysis_dir / "u_profile_gt.npy", profile_gt)
+    np.save(analysis_dir / "u_profile_pred.npy", profile_pred)
+    np.save(analysis_dir / "v_profile_gt.npy", v_profile_gt)
+    np.save(analysis_dir / "v_profile_pred.npy", v_profile_pred)
+    np.save(analysis_dir / "profile_components.npy", np.asarray(["u", "v"]))
 
     # 除了三处局部裁剪图，也额外保存一张 3296 宽 full-frame 2x2 合图。
     # 这张图同样标注 Laminar/Transition/Turbulent 三条虚线，用于从全局上确认剖面位置。
@@ -1472,100 +2048,40 @@ def _save_tbl_profile_artifacts(
         crop_width=sample_crop_width,
     )
 
-    valid_values = np.asarray(u_gt_profile).reshape(-1)
-    valid_values = valid_values[np.isfinite(valid_values)]
-    if valid_values.size > 0:
-        vmin = float(np.nanpercentile(valid_values, 1))
-        vmax = float(np.nanpercentile(valid_values, 99))
-    else:
-        vmin, vmax = float(np.min(u_gt_profile)), float(np.max(u_gt_profile))
-    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
-        vmin, vmax = 0.0, 1.0
-
-    # 横向稍微放宽，避免 Laminar/Transition 两个相邻标签贴在一起，
-    # 但三条红色虚线的位置仍严格由 TBL_PROFILE_COLUMN_RATIOS 控制。
-    fig = plt.figure(figsize=(16, 14), dpi=160, facecolor="w", edgecolor="k")
-    grid = fig.add_gridspec(2, 3, height_ratios=[1.0, 1.8], hspace=0.35, wspace=0.25)
-
-    ax_top = fig.add_subplot(grid[0, :])
-    # TBL 顶部不做无效区填 0。TWCF 的波浪边界填 0 只用于 _plot_twcf，
-    # 这里直接显示裁剪后的 GT horizontal/U 位移场。
-    im = ax_top.imshow(u_gt_profile, origin="lower", cmap=cmap_name, vmin=vmin, vmax=vmax, aspect="auto")
-    ax_top.set_title("Ground truth of horizontal direction", fontsize=18)
-    ax_top.set_xticks([])
-    ax_top.set_yticks([])
-    for idx, col in enumerate(columns):
-        ax_top.axvline(col, color="red", linestyle="--", linewidth=2.0)
-        label = region_names[idx] if idx < len(region_names) else f"Region {idx + 1}"
-        ax_top.text(
-            col,
-            profile_height - 8,
-            label,
-            color="red",
-            fontsize=16,
-            ha="center",
-            va="top",
-            bbox={"facecolor": "white", "edgecolor": "none", "pad": 2.5},
-        )
-    cbar = fig.colorbar(im, ax=ax_top, orientation="horizontal", fraction=0.08, pad=0.18)
-    cbar.set_label("Displacement[px]", fontsize=15)
-
-    x_values = np.concatenate(
-        [
-            profile_gt[np.isfinite(profile_gt)],
-            profile_pred[np.isfinite(profile_pred)],
-        ],
-        axis=0,
-    ) if np.isfinite(profile_gt).any() or np.isfinite(profile_pred).any() else np.asarray([0.0, 1.0], dtype=np.float32)
-    x_min = float(np.nanmin(x_values))
-    x_max = float(np.nanmax(x_values))
-    if not np.isfinite(x_min) or not np.isfinite(x_max) or x_min == x_max:
-        x_min, x_max = 0.0, 1.0
-    x_pad = 0.05 * max(x_max - x_min, 1.0)
-    x_right = max(x_max + x_pad, 1.0)
-
-    for idx, col in enumerate(columns):
-        ax = fig.add_subplot(grid[1, idx])
-        valid_gt = np.isfinite(profile_gt[idx])
-        valid_pred = np.isfinite(profile_pred[idx])
-        if np.any(valid_gt):
-            ax.plot(
-                profile_gt[idx][valid_gt],
-                y_positions[valid_gt],
-                color="black",
-                linewidth=2.0,
-                linestyle=(0, (6, 3)),
-                label="GT",
-            )
-        if np.any(valid_pred):
-            ax.plot(
-                profile_pred[idx][valid_pred],
-                y_positions[valid_pred],
-                color="red",
-                linewidth=2.2,
-                linestyle="-",
-                label=method_label,
-            )
-        title = region_names[idx] if idx < len(region_names) else f"Region {idx + 1}"
-        ax.set_title(title, fontsize=15, fontweight="bold")
-        ax.set_xlabel("displacement[px]", fontsize=12)
-        if idx == 0:
-            ax.set_ylabel("y-position[px]", fontsize=12)
-            ax.legend(loc="upper left", fontsize=11, frameon=True)
-        # 横轴从 0 开始，确保曲线的 0 点与左下角原点对齐，而不是被 padding 推到图内。
-        ax.set_xlim(0.0, x_right)
-        # y_limit=200 表示论文图展示 0..200 px 的坐标范围；profile 数组本身有 200 行，
-        # 行索引最大是 199。这里把坐标轴上限显式设为 200，并强制加入 200 刻度，
-        # 避免 Matplotlib 自动刻度停在 175，看起来像没有画满 0..200。
-        y_ticks = list(np.arange(0, profile_height + 1, 25, dtype=np.int32))
-        if y_ticks[-1] != profile_height:
-            y_ticks.append(profile_height)
-        ax.set_ylim(0, profile_height)
-        ax.set_yticks(y_ticks)
-        ax.grid(alpha=0.15)
-
-    fig.savefig(analysis_dir / "tbl_profile_compare.png", bbox_inches="tight")
-    plt.close(fig)
+    # 保存 U 分量剖面图：tbl_profile_compare.png 是旧文件名，继续保留；
+    # tbl_u_profile_compare.png 是新增的显式命名，和 V 分量文件形成一组。
+    _save_tbl_component_profile_figure(
+        analysis_dir=analysis_dir,
+        output_names=["tbl_profile_compare.png", "tbl_u_profile_compare.png"],
+        top_field=u_gt_profile,
+        profile_gt=profile_gt,
+        profile_pred=profile_pred,
+        columns=columns,
+        y_positions=y_positions,
+        profile_height=profile_height,
+        region_names=region_names,
+        method_label=method_label,
+        cmap_name=cmap_name,
+        top_title="Ground truth of horizontal direction",
+        x_zero_left=True,
+    )
+    # 新增 V 分量剖面图：使用同一组 Laminar/Transition/Turbulent 列坐标，
+    # 但顶部显示 GT vertical/V 位移场，下方曲线对应 V displacement。
+    _save_tbl_component_profile_figure(
+        analysis_dir=analysis_dir,
+        output_names="tbl_v_profile_compare.png",
+        top_field=v_gt_profile,
+        profile_gt=v_profile_gt,
+        profile_pred=v_profile_pred,
+        columns=columns,
+        y_positions=y_positions,
+        profile_height=profile_height,
+        region_names=region_names,
+        method_label=method_label,
+        cmap_name=cmap_name,
+        top_title="Ground truth of vertical direction",
+        x_zero_left=False,
+    )
 
 
 def _plot_regular(out_path, u_pred, v_pred, u_gt, v_gt, cmap_name="jet"):
@@ -1626,6 +2142,52 @@ def _clip_image_for_display(arr):
     return np.clip(arr, 0.0, 1.0)
 
 
+def _compute_particle_image_error(sr_img, hr_img):
+    """
+    计算颗粒图像的有符号误差图：Generated SR - Original HR。
+
+    说明：
+        1. 与 PIV 的 Error-U/Error-V 图保持一致，误差保留正负号；
+        2. NPY 中保留 NaN，用来表示 SR/HR 任一侧无效的位置；
+        3. 如果个别分支输出尺寸和 HR 不一致，只在误差计算前把 SR 放到 HR 尺寸画布上，
+           不改变原来的 LR/HR/SR 单图保存逻辑，也不影响指标计算。
+    """
+    hr_2d = np.squeeze(hr_img).astype(np.float32, copy=False)
+    sr_2d = np.squeeze(sr_img).astype(np.float32, copy=False)
+    if sr_2d.shape[-2:] != hr_2d.shape[-2:]:
+        sr_2d = _place_image_on_display_canvas(sr_2d, hr_2d.shape[-2:], fill_value=np.nan)
+
+    valid = np.isfinite(sr_2d) & np.isfinite(hr_2d)
+    error = np.full(hr_2d.shape[-2:], np.nan, dtype=np.float32)
+    error[valid] = sr_2d[valid] - hr_2d[valid]
+    return error
+
+
+def _error_image_for_display(error_map, limit=0.25):
+    """
+    将误差图转换成 matplotlib 可显示数组。
+
+    NPY 保存原始 NaN；显示时参考 PIV error-U 的做法用固定红蓝色条，
+    因此这里只把非有限值临时填 0，避免 imshow/colorbar 被 NaN 干扰。
+    """
+    arr = np.squeeze(error_map).astype(np.float32, copy=False)
+    return np.nan_to_num(arr, nan=0.0, posinf=float(limit), neginf=-float(limit))
+
+
+def _plot_particle_error_panel(ax, error_map, title, limit=0.25):
+    """
+    在 comparison 图里绘制颗粒图像误差图。
+
+    色条风格仿照 PIV 的 Error-U/Error-V：bwr 表示正负误差，固定范围便于跨样本比较。
+    """
+    im = ax.imshow(_error_image_for_display(error_map, limit=limit), cmap="bwr", vmin=-limit, vmax=limit)
+    ax.set_title(title, fontsize=10)
+    ax.axis("off")
+    cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.ax.set_ylabel("error", fontsize=9)
+    return im
+
+
 def _place_image_on_display_canvas(arr, out_hw, fill_value=1.0):
     """
     将 LR 图放到 HR 尺寸画布中，仅用于合并对比图的视觉对齐。
@@ -1655,17 +2217,18 @@ def _save_gray_image(path, arr):
 
 def _plot_image_comparison(out_path, sample_images):
     """
-    保存 prev/next 的 LR、原图 HR、生成 SR 合并对比图。
+    保存 prev/next 的 LR、原图 HR、生成 SR、SR-HR 误差合并对比图。
 
-    画布为 2 行 3 列：第一行 previous，第二行 next；列依次为 LR、HR、Generated。
+    画布为 2 行 4 列：第一行 previous，第二行 next；
+    列依次为 LR、HR、Generated、Error。Error 使用和 PIV error-U 一样的 bwr 色条。
     """
     frames = [
-        ("prev", sample_images["prev_lr"], sample_images["prev_hr"], sample_images["pred_prev"]),
-        ("next", sample_images["next_lr"], sample_images["next_hr"], sample_images["pred_next"]),
+        ("prev", sample_images["prev_lr"], sample_images["prev_hr"], sample_images["pred_prev"], sample_images["prev_error"]),
+        ("next", sample_images["next_lr"], sample_images["next_hr"], sample_images["pred_next"], sample_images["next_error"]),
     ]
 
-    fig, axes = plt.subplots(2, 3, figsize=(12, 8), dpi=140, facecolor="w")
-    for row_idx, (frame_name, lr_img, hr_img, sr_img) in enumerate(frames):
+    fig, axes = plt.subplots(2, 4, figsize=(16, 8), dpi=140, facecolor="w")
+    for row_idx, (frame_name, lr_img, hr_img, sr_img, error_map) in enumerate(frames):
         hr_hw = np.squeeze(hr_img).shape[-2:]
         lr_for_compare = _place_image_on_display_canvas(lr_img, hr_hw)
         panels = [
@@ -1678,6 +2241,11 @@ def _plot_image_comparison(out_path, sample_images):
             ax.imshow(_clip_image_for_display(arr), cmap="gray", vmin=0.0, vmax=1.0)
             ax.set_title(f"{frame_name} {title}", fontsize=10)
             ax.axis("off")
+        _plot_particle_error_panel(
+            axes[row_idx, 3],
+            error_map,
+            f"{frame_name} Error (SR-HR)",
+        )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
@@ -1770,22 +2338,22 @@ def _plot_tbl_image_comparison(
 
     图像布局：
     - 第 1 行：prev 原始 full-frame 长图，并用红框标出局部比较区域；
-    - 第 2 行：prev 的 LR / HR / Generated SR 局部对比；
+    - 第 2 行：prev 的 LR / HR / Generated SR / Error 局部对比；
     - 第 3 行：next 原始 full-frame 长图，并用红框标出局部比较区域；
-    - 第 4 行：next 的 LR / HR / Generated SR 局部对比。
+    - 第 4 行：next 的 LR / HR / Generated SR / Error 局部对比。
 
     这样既保留了用户想要的“在原来很长的图里画红框”的全局上下文，
-    又能把 256x256 局部放大到足够清楚的尺寸来对比超分细节。
+    又能把 256x256 局部放大到足够清楚的尺寸来对比超分细节和 SR-HR 误差。
     """
     frames = [
-        ("prev", sample_images["prev_lr"], sample_images["prev_hr"], sample_images["pred_prev"]),
-        ("next", sample_images["next_lr"], sample_images["next_hr"], sample_images["pred_next"]),
+        ("prev", sample_images["prev_lr"], sample_images["prev_hr"], sample_images["pred_prev"], sample_images["prev_error"]),
+        ("next", sample_images["next_lr"], sample_images["next_hr"], sample_images["pred_next"], sample_images["next_error"]),
     ]
 
-    fig = plt.figure(figsize=(14, 12), dpi=140, facecolor="w")
-    grid = fig.add_gridspec(4, 3, height_ratios=[0.7, 1.0, 0.7, 1.0])
+    fig = plt.figure(figsize=(17, 12), dpi=140, facecolor="w")
+    grid = fig.add_gridspec(4, 4, height_ratios=[0.7, 1.0, 0.7, 1.0])
 
-    for frame_idx, (frame_name, lr_img, hr_img, sr_img) in enumerate(frames):
+    for frame_idx, (frame_name, lr_img, hr_img, sr_img, error_map) in enumerate(frames):
         hr_2d = np.squeeze(hr_img).astype(np.float32, copy=False)
         crop_bounds_hr = _resolve_tbl_comparison_crop_bounds(
             hr_2d.shape[-2:],
@@ -1801,6 +2369,8 @@ def _plot_tbl_image_comparison(
             lr_img,
             _scale_crop_bounds_to_target(crop_bounds_hr, hr_2d.shape[-2:], np.squeeze(lr_img).shape[-2:]),
         )
+        # Error 图使用完整 full-frame SR-HR 误差图按同一 HR crop 裁剪，保证和 HR/SR crop 是同一物理区域。
+        error_crop = _crop_2d_by_bounds(error_map, crop_bounds_hr)
         # 不插值放大 LR，只把它放到和 HR crop 同尺寸的白色画布中，继续保持项目里现有的展示规则。
         lr_crop_for_compare = _place_image_on_display_canvas(lr_crop, hr_crop.shape[-2:])
 
@@ -1833,6 +2403,11 @@ def _plot_tbl_image_comparison(
             ax.imshow(_clip_image_for_display(arr), cmap="gray", vmin=0.0, vmax=1.0)
             ax.set_title(f"{frame_name} {title}", fontsize=10)
             ax.axis("off")
+        _plot_particle_error_panel(
+            fig.add_subplot(grid[frame_idx * 2 + 1, 3]),
+            error_crop,
+            f"{frame_name} Error crop (SR-HR)",
+        )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
@@ -1848,6 +2423,7 @@ def _save_image_outputs(dataset_name, dataset_dir, image_payload, start_index, p
     dataset_dir/images/sample_0000/
         prev_lr.png / prev_hr.png / prev_sr.png
         next_lr.png / next_hr.png / next_sr.png
+        prev_sr_error.npy / next_sr_error.npy
         comparison.png
     """
     plot_args = plot_args or {}
@@ -1872,7 +2448,21 @@ def _save_image_outputs(dataset_name, dataset_dir, image_payload, start_index, p
             "pred_prev": payload_np["pred_prev"][local_idx, 0],
             "pred_next": payload_np["pred_next"][local_idx, 0],
         }
+        # 颗粒图像误差图：Generated SR - Original HR。
+        # 这里先落完整 full-frame NPY，再把同一份误差图传给 comparison 画图；
+        # 这样可视化和后处理数据完全一致。
+        sample_images["prev_error"] = _compute_particle_image_error(
+            sample_images["pred_prev"],
+            sample_images["prev_hr"],
+        )
+        sample_images["next_error"] = _compute_particle_image_error(
+            sample_images["pred_next"],
+            sample_images["next_hr"],
+        )
 
+        sample_dir.mkdir(parents=True, exist_ok=True)
+        np.save(sample_dir / "prev_sr_error.npy", sample_images["prev_error"].astype(np.float32))
+        np.save(sample_dir / "next_sr_error.npy", sample_images["next_error"].astype(np.float32))
         _save_gray_image(sample_dir / "prev_lr.png", sample_images["prev_lr"])
         _save_gray_image(sample_dir / "prev_hr.png", sample_images["prev_hr"])
         _save_gray_image(sample_dir / "prev_sr.png", sample_images["pred_prev"])
@@ -1889,6 +2479,26 @@ def _save_image_outputs(dataset_name, dataset_dir, image_payload, start_index, p
                 float(tbl_profile_column_ratios[1]) if len(tbl_profile_column_ratios) >= 2 else 0.40
             )
             tbl_crop_size = int(plot_args.get("tbl_profile_sample_crop_width", 256))
+            # TBL 的 comparison 显示的是红框里的局部误差图，因此额外保存 crop 版 NPY，
+            # 方便直接和 comparison.png 里的 Error crop 面板一一对应。
+            prev_crop_bounds_hr = _resolve_tbl_comparison_crop_bounds(
+                np.squeeze(sample_images["prev_hr"]).shape[-2:],
+                crop_size=tbl_crop_size,
+                center_ratio=tbl_crop_center_ratio,
+            )
+            next_crop_bounds_hr = _resolve_tbl_comparison_crop_bounds(
+                np.squeeze(sample_images["next_hr"]).shape[-2:],
+                crop_size=tbl_crop_size,
+                center_ratio=tbl_crop_center_ratio,
+            )
+            np.save(
+                sample_dir / "prev_sr_error_crop.npy",
+                _crop_2d_by_bounds(sample_images["prev_error"], prev_crop_bounds_hr).astype(np.float32),
+            )
+            np.save(
+                sample_dir / "next_sr_error_crop.npy",
+                _crop_2d_by_bounds(sample_images["next_error"], next_crop_bounds_hr).astype(np.float32),
+            )
             _plot_tbl_image_comparison(
                 sample_dir / "comparison.png",
                 sample_images,
@@ -1924,6 +2534,7 @@ def _save_sample_plots(
     displacement_cmap = str(plot_args.get("displacement_cmap", "viridis"))
     regular_flow_cmap = str(plot_args.get("regular_flow_cmap", "jet"))
     method_label = str(plot_args.get("method_label", "Current method"))
+    quiver_stride = plot_args.get("vorticity_quiver_stride", None)
     tbl_profile_column_ratios = tuple(plot_args.get("tbl_profile_column_ratios", (0.15, 0.40, 0.83)))
     tbl_profile_region_names = tuple(plot_args.get("tbl_profile_region_names", ("Laminar", "Transition", "Turbulent")))
     tbl_profile_y_limit = plot_args.get("tbl_profile_y_limit", 200)
@@ -1938,6 +2549,18 @@ def _save_sample_plots(
         v_pred = predicted_np[local_idx, 1, :, :]
         u_gt = flow_np[local_idx, 0, :, :]
         v_gt = flow_np[local_idx, 1, :, :]
+        # 新增 evaluate_all 同款的样本级光流细节输出：
+        # - flow/sample_xxxx/uvs_compare.png 以及 U/V/S 对应 npy；
+        # - flow/sample_xxxx/vorticity_quiver.png 以及涡度、速度差 npy。
+        # 原有 dataset_name_sample_xxxx.png 继续保留，保证旧脚本路径不受影响。
+        flow_sample_dir = dataset_dir / "flow" / f"sample_{sample_index:04d}"
+        _save_flow_visual_artifacts(
+            flow_sample_dir,
+            predicted_np[local_idx],
+            flow_np[local_idx],
+            cmap_name=displacement_cmap if dataset_name in {"tbl", "twcf"} else regular_flow_cmap,
+            quiver_stride=quiver_stride,
+        )
 
         if dataset_name == "twcf":
             _plot_twcf(
@@ -1960,8 +2583,8 @@ def _save_sample_plots(
                 y_limit=tbl_profile_y_limit,
             )
             # profile_analysis 是 TBL 专属的论文风格剖面对比图：
-            # 上方显示 GT 的 horizontal/U 位移场，下面三列画 Laminar/Transition/Turbulent
-            # 三个 x 位置上的 U displacement-vs-y-position 剖面。
+            # 现在同时保存 U/V 两个分量。U 图保留旧文件名 tbl_profile_compare.png，
+            # V 图新增 tbl_v_profile_compare.png；二者使用同一组 Laminar/Transition/Turbulent 列坐标。
             _save_tbl_profile_artifacts(
                 dataset_dir=dataset_dir,
                 sample_index=sample_index,
@@ -2061,6 +2684,8 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
         "tbl_profile_y_limit": getattr(global_data.esrgan, "TBL_PROFILE_Y_LIMIT", 200),
         # TBL 不再按 sample 均分；profile_analysis 围绕每个剖面位置截取固定宽度窗口。
         "tbl_profile_sample_crop_width": getattr(global_data.esrgan, "TBL_PROFILE_SAMPLE_CROP_WIDTH", 256),
+        # test_all 新增的涡度-速度差 quiver 图可选步长；None 时按图像尺寸自动稀疏采样。
+        "vorticity_quiver_stride": getattr(global_data.esrgan, "TEST_VORTICITY_QUIVER_STRIDE", None),
     }
 
     twcf_payload = None
@@ -2075,6 +2700,17 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
     was_training = model.training
     model.eval()
     summary_rows = []
+    # test_all 根目录总体汇总：跨 TEST_DATASETS 全部类别累计，用于生成总体 mean spectrum 和误差直方图。
+    all_image_pred_curves = []
+    all_image_gt_curves = []
+    all_flow_pred_curves = []
+    all_flow_gt_curves = []
+    all_delta_u_values = []
+    all_delta_v_values = []
+    all_delta_w_values = []
+    all_epe_values = []
+    all_class_image_pair_mean_rows = []
+    all_class_flow_mean_rows = []
 
     try:
         with torch.no_grad():
@@ -2096,6 +2732,15 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
                 norm_aee_per100_array = np.full((dataset_size,), np.nan, dtype=np.float32)
                 dataset_image_rows = []
                 dataset_raft_rows = []
+                # dataset 级汇总缓存：每个 TEST_DATASETS 条目相当于 evaluate_all 的一个类别。
+                dataset_image_pred_curves = []
+                dataset_image_gt_curves = []
+                dataset_flow_pred_curves = []
+                dataset_flow_gt_curves = []
+                dataset_delta_u_values = []
+                dataset_delta_v_values = []
+                dataset_delta_w_values = []
+                dataset_epe_values = []
 
                 total_samples = 0
                 sum_epe = 0.0
@@ -2153,6 +2798,20 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
                     # 逐样本补充 test_all 的 SR 图像指标和流场额外指标。
                     for local_idx in range(valid_size):
                         sample_index = sample_start + local_idx
+                        # 频谱曲线既用于 image_pair 的 ESE 指标，也用于后面的 dataset/root 均值频谱图。
+                        # 这里按 previous/next 两张颗粒图分别登记，和 evaluate_all 的 image_pair 口径一致。
+                        prev_pred_curve, prev_gt_curve = _energy_spectrum_curves(
+                            pred_prev_np[local_idx],
+                            prev_hr_np[local_idx],
+                        )
+                        next_pred_curve, next_gt_curve = _energy_spectrum_curves(
+                            pred_next_np[local_idx],
+                            next_hr_np[local_idx],
+                        )
+                        dataset_image_pred_curves.extend([prev_pred_curve, next_pred_curve])
+                        dataset_image_gt_curves.extend([prev_gt_curve, next_gt_curve])
+                        all_image_pred_curves.extend([prev_pred_curve, next_pred_curve])
+                        all_image_gt_curves.extend([prev_gt_curve, next_gt_curve])
                         dataset_image_rows.append(
                             _compute_image_metric_row(
                                 dataset_name,
@@ -2179,6 +2838,25 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
                         )
                         dataset_raft_rows.append(flow_row)
                         norm_aee_per100_array[sample_index] = float(flow_row["NORM_AEE_PER100PIXEL"])
+                        flow_pred_uvw = _flow_uv_to_uvw_np(predicted_np[local_idx])
+                        flow_gt_uvw = _flow_uv_to_uvw_np(flow_np[local_idx])
+                        flow_pred_curve, flow_gt_curve = _energy_spectrum_curves(flow_pred_uvw, flow_gt_uvw)
+                        dataset_flow_pred_curves.append(flow_pred_curve)
+                        dataset_flow_gt_curves.append(flow_gt_curve)
+                        all_flow_pred_curves.append(flow_pred_curve)
+                        all_flow_gt_curves.append(flow_gt_curve)
+                        delta_u_map, delta_v_map, delta_w_map, epe_map = _compute_flow_error_maps_np(
+                            predicted_np[local_idx],
+                            flow_np[local_idx],
+                        )
+                        dataset_delta_u_values.append(delta_u_map.reshape(-1))
+                        dataset_delta_v_values.append(delta_v_map.reshape(-1))
+                        dataset_delta_w_values.append(delta_w_map.reshape(-1))
+                        dataset_epe_values.append(epe_map.reshape(-1))
+                        all_delta_u_values.append(delta_u_map.reshape(-1))
+                        all_delta_v_values.append(delta_v_map.reshape(-1))
+                        all_delta_w_values.append(delta_w_map.reshape(-1))
+                        all_epe_values.append(epe_map.reshape(-1))
 
                     if bool(test_args["plot_results"]):
                         _save_sample_plots(
@@ -2208,6 +2886,28 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
                 np.save(results_path, results)
                 np.save(epe_path, epe_array)
                 np.save(norm_aee_per100_path, norm_aee_per100_array)
+                # dataset 级图/npy：补齐 evaluate_all 在类别目录下会保存的均值频谱和误差直方图。
+                _save_mean_spectrum(
+                    dataset_image_pred_curves,
+                    dataset_image_gt_curves,
+                    dataset_dir,
+                    title=f"{dataset_name}-{data_type}-x{int(SCALE*SCALE)} Image Pair Mean Energy Spectrum",
+                    file_prefix="image_pair",
+                )
+                _save_mean_spectrum(
+                    dataset_flow_pred_curves,
+                    dataset_flow_gt_curves,
+                    dataset_dir,
+                    title=f"{dataset_name}-{data_type}-x{int(SCALE*SCALE)} Flow Mean Energy Spectrum",
+                    file_prefix="flow",
+                )
+                _save_flow_histogram_bundle(
+                    dataset_dir,
+                    dataset_delta_u_values,
+                    dataset_delta_v_values,
+                    dataset_delta_w_values,
+                    dataset_epe_values,
+                )
 
                 # C-AEE 需要把 same sample 的 previous/next 图像 ESE 与该 sample 的 RAFT AEE 配对，
                 # 并在当前 dataset 内做 min-max 归一化后再组合，因此必须放到整个 dataset 收集完成后统一回填。
@@ -2255,6 +2955,17 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
                         metric_keys=raft_metric_keys,
                     )
 
+                if image_mean_row is not None:
+                    image_class_row = dict(image_mean_row)
+                    image_class_row["sample_index"] = "CLASS_MEAN"
+                    image_class_row["pair_type"] = "image_pair"
+                    all_class_image_pair_mean_rows.append(image_class_row)
+                if raft_mean_row is not None:
+                    flow_class_row = dict(raft_mean_row)
+                    flow_class_row["sample_index"] = "CLASS_MEAN"
+                    flow_class_row["pair_type"] = "flow"
+                    all_class_flow_mean_rows.append(flow_class_row)
+
                 summary_rows.append(
                     {
                         "dataset": dataset_name,
@@ -2289,6 +3000,30 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
                     f"elapsed={elapsed:.2f}s"
                 )
 
+        # test_all 根目录总体图/npy：跨所有 dataset 汇总，和 evaluate_all 的 output_root 总体文件对应。
+        _save_mean_spectrum(
+            all_image_pred_curves,
+            all_image_gt_curves,
+            test_base_dir,
+            title=f"{class_name}-{data_type}-x{int(SCALE*SCALE)} Image Pair Mean Energy Spectrum",
+            file_prefix="image_pair",
+        )
+        _save_mean_spectrum(
+            all_flow_pred_curves,
+            all_flow_gt_curves,
+            test_base_dir,
+            title=f"{class_name}-{data_type}-x{int(SCALE*SCALE)} Flow Mean Energy Spectrum",
+            file_prefix="flow",
+        )
+        _save_flow_histogram_bundle(
+            test_base_dir,
+            all_delta_u_values,
+            all_delta_v_values,
+            all_delta_w_values,
+            all_epe_values,
+        )
+        _write_csv(test_base_dir / "ALL_CLASS_IMAGE_PAIR.CSV", all_class_image_pair_mean_rows)
+        _write_csv(test_base_dir / "ALL_CLASS_flow.CSV", all_class_flow_mean_rows)
         _write_csv(test_base_dir / "metrics_all.csv", summary_rows)
         return summary_rows
     finally:

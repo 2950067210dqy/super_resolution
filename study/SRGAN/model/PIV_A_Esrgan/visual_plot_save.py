@@ -146,6 +146,7 @@ def save_vorticity_quiver_single(fake_bchw: torch.Tensor, save_path: str, stride
     fake_bchw: [B,3,H,W], channel0=u, channel1=v, channel2=s
     """
     # 训练预览只用于诊断；这里先把 NaN/Inf 清掉，避免 matplotlib 保存图时中断训练。
+    stride = max(1, int(stride))
     u = _sanitize_plot_array(_to_np_2d(fake_bchw[0, 0]), name="u")
     v = _sanitize_plot_array(_to_np_2d(fake_bchw[0, 1]), name="v")
     omega_star = _sanitize_plot_array(_omega_star_from_uv(u, v), name="omega_star")
@@ -199,6 +200,7 @@ def save_vorticity_quiver_compare(
     """
     B = min(pred_bchw.shape[0], hr_bchw.shape[0])
     titles = ["Pred", "HR"]
+    stride = max(1, int(stride))
 
     def _resize_np_nearest(arr, out_h, out_w):
         # arr: [h,w]
@@ -232,11 +234,11 @@ def save_vorticity_quiver_compare(
             row_items.append((u, v, omega_star))
 
         # 同一行共用色标范围，只使用有限值计算，避免 NaN 传播到 colorbar tick。
-        row_finite_values = np.concatenate([w[np.isfinite(w)].reshape(-1) for _, _, w in row_items if np.isfinite(w).any()])
-        if row_finite_values.size == 0:
-            row_vmin, row_vmax = -1.0, 1.0
+        row_finite_chunks = [w[np.isfinite(w)].reshape(-1) for _, _, w in row_items if np.isfinite(w).any()]
+        if row_finite_chunks:
+            row_vmin, row_vmax = _finite_color_limits(np.concatenate(row_finite_chunks))
         else:
-            row_vmin, row_vmax = _finite_color_limits(row_finite_values)
+            row_vmin, row_vmax = -1.0, 1.0
 
         for j, (title, (u, v, omega_star)) in enumerate(zip(titles, row_items)):
             ax = axes[i, j]

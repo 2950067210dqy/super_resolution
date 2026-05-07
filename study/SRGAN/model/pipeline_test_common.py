@@ -6,6 +6,20 @@ from loguru import logger
 from study.SRGAN.data_load import filter_excluded_class_names, get_class_names
 
 
+def _validate_dataset_name(global_data):
+    """
+    统一读取 DATA_SET。
+
+    训练 pipeline 已经支持 DATA_SET=class_1/class_2；pipeline_test 也必须使用同一套入口。
+    这里优先复用 global_class 中的 validate_dataset_name()，如果旧分支还没有这个方法，
+    就回退到 DATA_SET 字符串本身，保持 class_1 老实验的测试入口不受影响。
+    """
+    validator = getattr(global_data.esrgan, "validate_dataset_name", None)
+    if callable(validator):
+        return validator()
+    return str(getattr(global_data.esrgan, "DATA_SET", "class_1")).strip().lower()
+
+
 def _validate_train_class_mode(global_data):
     """
     统一读取 TRAIN_CLASS_MODE。
@@ -17,6 +31,34 @@ def _validate_train_class_mode(global_data):
     if callable(validator):
         return validator()
     return str(getattr(global_data.esrgan, "TRAIN_CLASS_MODE", "mixed")).strip().lower()
+
+
+def _get_class_names_for_dataset(global_data, dataset_name):
+    """
+    按 DATA_SET 获取 pipeline_test 的任务类别名。
+
+    class_1:
+        仍然扫描原有目录类别，完全保持旧行为。
+
+    class_2:
+        数据根目录是 TFRecord 文件夹，没有 class_name/class_name 的目录结构；
+        因此不能再调用旧的目录扫描逻辑，否则会报：
+        `No class folders found under GR root: ...Data_ProblemClass2_RAFT-PIV`。
+        这里直接返回训练 pipeline 同款伪类别名，让 pipeline_test 去匹配
+        `{OUT_PUT_DIR}/{CLASS2_PSEUDO_CLASS_NAME}/{data_type}/scale_xxx/...` 下的模型。
+    """
+    dataset_name = str(dataset_name).strip().lower()
+    if dataset_name == "class_2":
+        return [getattr(global_data.esrgan, "CLASS2_PSEUDO_CLASS_NAME", "problem_class2_raft_piv")]
+
+    try:
+        # 新版 data_load 支持 dataset_name 关键字；class_1 下也传入，便于签名保持一致。
+        return get_class_names(global_data.esrgan.GR_DATA_ROOT_DIR, dataset_name=dataset_name)
+    except TypeError as exc:
+        if "dataset_name" not in str(exc):
+            raise
+        # 兼容旧版 data_load.py：旧函数只支持 class_1 目录扫描，不认识 dataset_name 参数。
+        return get_class_names(global_data.esrgan.GR_DATA_ROOT_DIR)
 
 
 def _select_single_class(available_class_names, preset_name=None):
@@ -65,15 +107,35 @@ def _build_run_jobs(global_data):
         - single: 只测一个类别；
         - mixed: 用 mixed_all_classes 这个聚合任务目录；
         - fixed: 用 fixed_train_validate 这个固定划分任务目录。
+
+    DATA_SET=class_2 时例外：
+        class_2 只有 train/validate TFRecord，不存在 class_1 那种类别目录。
+        训练 pipeline 已经把它作为一个伪类别任务保存，因此 pipeline_test 也只构造这一个任务。
     """
-    available_class_names = get_class_names(global_data.esrgan.GR_DATA_ROOT_DIR)
+    dataset_name = _validate_dataset_name(global_data)
+    available_class_names = _get_class_names_for_dataset(global_data, dataset_name)
     logger.info(f"[pipeline_test] 一共{len(available_class_names)}个类别：{available_class_names}")
 
     mode = _validate_train_class_mode(global_data)
+    if dataset_name == "class_2":
+        # class_2 的真实样本数由 train/validate TFRecord 的 idx 决定；这里同步一次，
+        # 只用于日志和超参数记录，不参与 pipeline_test 的任务拆分。
+        updater = getattr(global_data.esrgan, "update_dataset_split_rates", None)
+        if callable(updater):
+            updater()
+        run_jobs = [{"run_class_name": available_class_names[0], "selected_classes": None}]
+        logger.info(
+            "[pipeline_test] DATA_SET=class_2：使用 TFRecord 伪类别任务进行 test_all，"
+            f"run_jobs={run_jobs}"
+        )
+        return mode, run_jobs
+
     if mode == "fixed":
         # fixed 模式的比例超参数是由 list 文件反推出来的；这里同步一次，
         # 主要是为了让 pipeline_test 的日志/超参数文本与训练阶段口径一致。
-        updater = getattr(global_data.esrgan, "update_fixed_split_rates", None)
+        updater = getattr(global_data.esrgan, "update_dataset_split_rates", None)
+        if not callable(updater):
+            updater = getattr(global_data.esrgan, "update_fixed_split_rates", None)
         if callable(updater):
             updater()
 

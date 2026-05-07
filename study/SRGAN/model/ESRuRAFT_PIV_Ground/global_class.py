@@ -70,7 +70,7 @@ class global_data:
         # 训练任务标识
         # =========================
         name = "ESRuRAFT_PIV_Ground"  # 当前实验名（用于输出目录/模型名/wandb run名）
-        DESCRIPTION = "v_test_esrgan_raft"  # 实验补充描述（可写损失配置、数据版本等）
+        DESCRIPTION = "v_esrgan_raft"  # 实验补充描述（可写损失配置、数据版本等）
         name +=DESCRIPTION
 
         #整体项目注释
@@ -134,7 +134,7 @@ class global_data:
         # single 模式保持原语义，不主动应用 EXCLUDE_CLASS，避免用户点名单类训练时被隐式过滤。
         EXCLUDE_CLASS = ["JHTDB_channel_hd", "JHTDB_isotropic1024_hd", "JHTDB_mhd1024_hd", "uniform"]
         #每个类别加载多少的数据 50%
-        CLASS_SAMPLE_RATIO =0.01
+        CLASS_SAMPLE_RATIO =1
         # =========================
         # 设备与模型加载
         # =========================
@@ -148,7 +148,7 @@ class global_data:
         # =========================
         # 训练主超参数
         # =========================
-        EPOCH_NUMS = 1 # 训练轮数 50
+        EPOCH_NUMS = 50 # 训练轮数 50
         START_EPOCH  = 1#从哪个epoch开始 从1开始
         BATCH_SIZE = 4 # batch 大小
         PRE_TRIAN_G_EPOCH = 1 #预训练G完成的轮次 从1开始 就是从第几轮开始弃用对抗损失
@@ -345,6 +345,7 @@ class global_data:
         # 是否执行 evaluate_all 完整验证。
         # 这里恢复为纯手动总开关：无论 DATA_SET 是 class_1 还是 class_2，都由该超参数决定是否执行。
         IS_VALIDATE_ALL = True
+        IS_SAVE_VALIDATE_IMAGES = False  # evaluate_all 是否保存验证/测试样本图和 npy；False 时只保留指标 CSV，减少磁盘 IO。
         IS_TEST = True  # 是否在 evaluate_all 之后启用 test_all；默认 False，避免改变原训练/验证流程。
         is_TEST_CLASS3 = True  # 是否额外测试 tbl/twcf 大图数据集；默认 False，节省显存和测试时间。
         TEST_DIR = "/test_all"  # test_all 统一输出目录，会在该目录下再按 dataset 名称分文件夹。

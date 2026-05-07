@@ -13,6 +13,42 @@ from study.SRGAN.model.PIV_esrgan_RAFT.visual_plot_init import _omega_star_from_
 from study.SRGAN.util.image_util import build_triplet_row, build_pair_row
 from study.SRGAN.util.tensor_util import _to_np_2d
 
+
+def _sanitize_plot_array(arr: np.ndarray, name: str = "array") -> np.ndarray:
+    """
+    将用于 matplotlib 可视化的数组清洗成有限值。
+
+    训练预览图只用于观察中间结果，不参与反向传播；如果某一次 RAFT 预测、
+    涡量计算或数值缩放临时产生 NaN/Inf，不能让保存图片打断训练。
+    因此这里只在“画图前”把非有限值替换为 0，模型张量和 loss 计算不受影响。
+    """
+    arr = np.asarray(arr, dtype=np.float32)
+    if np.isfinite(arr).all():
+        return arr
+    return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _finite_color_limits(arr: np.ndarray) -> tuple[float, float]:
+    """
+    为 imshow/colorbar 计算稳定的有限色标范围。
+
+    matplotlib 会根据 vmin/vmax 生成 colorbar tick；一旦范围里含 NaN/Inf，
+    tight_layout 内部就可能在 log10/整数转换时报
+    ValueError: cannot convert float NaN to integer。
+    """
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return -1.0, 1.0
+    vmin = float(finite.min())
+    vmax = float(finite.max())
+    if not np.isfinite(vmin) or not np.isfinite(vmax):
+        return -1.0, 1.0
+    if vmin == vmax:
+        pad = max(abs(vmin) * 0.01, 1e-6)
+        return vmin - pad, vmax + pad
+    return vmin, vmax
+
+
 def _tensor_to_rgb_pil(tensor: torch.Tensor) -> Image.Image:
     """将 [1,C,H,W] 或 [C,H,W] 张量转成 RGB PIL 图像。"""
     if tensor.dim() == 4:
@@ -110,16 +146,17 @@ def save_vorticity_quiver_single(fake_bchw: torch.Tensor, save_path: str, stride
     batch_train: 只看生成图效果（fake）
     fake_bchw: [B,3,H,W], channel0=u, channel1=v, channel2=s
     """
-    u = _to_np_2d(fake_bchw[0, 0])
-    v = _to_np_2d(fake_bchw[0, 1])
-    omega_star = _omega_star_from_uv(u, v)
+    # 训练预览只用于诊断；这里先把 NaN/Inf 清掉，避免 matplotlib 保存图时中断训练。
+    stride = max(1, int(stride))
+    u = _sanitize_plot_array(_to_np_2d(fake_bchw[0, 0]), name="u")
+    v = _sanitize_plot_array(_to_np_2d(fake_bchw[0, 1]), name="v")
+    omega_star = _sanitize_plot_array(_omega_star_from_uv(u, v), name="omega_star")
 
     H, W = u.shape
     yy, xx = np.mgrid[0:H, 0:W]
 
     fig, ax = plt.subplots(1, 1, figsize=(4.2, 3.4), dpi=160)
-    vmin = float(omega_star.min())
-    vmax = float(omega_star.max())
+    vmin, vmax = _finite_color_limits(omega_star)
 
     im = ax.imshow(omega_star, origin="lower", cmap="RdBu_r", vmin=vmin, vmax=vmax)
     ax.quiver(
@@ -139,9 +176,15 @@ def save_vorticity_quiver_single(fake_bchw: torch.Tensor, save_path: str, stride
     cb = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     cb.set_ticks(np.linspace(vmin, vmax, 5))
 
-    plt.tight_layout()
-    plt.savefig(save_path, bbox_inches="tight")
-    plt.close(fig)
+    try:
+        plt.tight_layout()
+        plt.savefig(save_path, bbox_inches="tight")
+    except ValueError:
+        # 极端情况下某些 Matplotlib 版本仍可能在布局阶段被异常 tick 卡住；
+        # 此时退化为不 tight_layout 保存，保证训练不会因为预览图失败而停止。
+        plt.savefig(save_path)
+    finally:
+        plt.close(fig)
 
 def save_vorticity_quiver_compare(
     pred_bchw: torch.Tensor,
@@ -158,6 +201,7 @@ def save_vorticity_quiver_compare(
     """
     B = min(pred_bchw.shape[0], hr_bchw.shape[0])
     titles = ["Pred", "HR"]
+    stride = max(1, int(stride))
 
     def _resize_np_nearest(arr, out_h, out_w):
         # arr: [h,w]
@@ -184,14 +228,18 @@ def save_vorticity_quiver_compare(
 
         row_items = []
         for t in triplet:
-            u = _to_np_2d(t[0, 0])  # [h,w]
-            v = _to_np_2d(t[0, 1])  # [h,w]
-            omega_star = _omega_star_from_uv(u, v)  # 原分辨率算涡量
+            # Pred/HR 对比图同样要清洗非有限值，避免 colorbar/tight_layout 崩溃。
+            u = _sanitize_plot_array(_to_np_2d(t[0, 0]), name="u")  # [h,w]
+            v = _sanitize_plot_array(_to_np_2d(t[0, 1]), name="v")  # [h,w]
+            omega_star = _sanitize_plot_array(_omega_star_from_uv(u, v), name="omega_star")  # 原分辨率算涡量
             row_items.append((u, v, omega_star))
 
-        # 同一行共用色标范围
-        row_vmin = min(float(w.min()) for _, _, w in row_items)
-        row_vmax = max(float(w.max()) for _, _, w in row_items)
+        # 同一行共用色标范围，只使用有限值计算，避免 NaN 传播到 colorbar tick。
+        row_finite_chunks = [w[np.isfinite(w)].reshape(-1) for _, _, w in row_items if np.isfinite(w).any()]
+        if row_finite_chunks:
+            row_vmin, row_vmax = _finite_color_limits(np.concatenate(row_finite_chunks))
+        else:
+            row_vmin, row_vmax = -1.0, 1.0
 
         for j, (title, (u, v, omega_star)) in enumerate(zip(titles, row_items)):
             ax = axes[i, j]
@@ -245,9 +293,14 @@ def save_vorticity_quiver_compare(
         fig.colorbar(im, cax=cax)
         cax.yaxis.set_ticks_position("right")
 
-    fig.tight_layout()
-    plt.savefig(save_path, bbox_inches="tight")
-    plt.close(fig)
+    try:
+        fig.tight_layout()
+        plt.savefig(save_path, bbox_inches="tight")
+    except ValueError:
+        # 保存训练可视化失败不应该终止训练；退化为普通保存。
+        plt.savefig(save_path)
+    finally:
+        plt.close(fig)
 #瞬时涡流速度场 end
 """
 可视化保存 end

@@ -277,6 +277,40 @@ def _build_raft_eval_args():
     )
 
 
+def _finite_flatten_np(values: np.ndarray) -> np.ndarray:
+    """
+    将 numpy 数组展平成一维，并只保留有限值。
+
+    TBL/TWCF 或异常预测中可能出现 NaN/Inf；这些值通常代表无效区域或数值异常，
+    评价与直方图统计时应该跳过，避免一个无效像素把整张图的指标都污染成 NaN。
+    """
+    flat = np.asarray(values, dtype=np.float32).reshape(-1)
+    return flat[np.isfinite(flat)]
+
+
+def _safe_mean_np(values: np.ndarray) -> float:
+    """对有限值求均值；如果没有任何有限值，则返回 NaN 保留诊断信号。"""
+    finite = _finite_flatten_np(values)
+    return float(np.mean(finite, dtype=np.float32)) if finite.size > 0 else float("nan")
+
+
+def _safe_symmetric_abs_limit(values: np.ndarray, fallback: float = 0.05, quantile: float | None = None) -> float:
+    """
+    为误差图/直方图计算稳定的对称范围。
+
+    quantile 不为 None 时使用分位数，避免少数极端值把色条和直方图范围拉得过宽；
+    全部为 NaN/Inf 时使用 fallback，保证 matplotlib 的 range 始终是有限值。
+    """
+    finite = _finite_flatten_np(values)
+    if finite.size == 0:
+        return float(fallback)
+    abs_values = np.abs(finite)
+    limit = float(np.quantile(abs_values, quantile)) if quantile is not None else float(np.max(abs_values))
+    if not np.isfinite(limit):
+        return float(fallback)
+    return max(limit, float(fallback))
+
+
 def _compute_aee_from_flow_tensors(pred_bchw: torch.Tensor, gt_bchw: torch.Tensor) -> float:
     """
     计算 batch 流场的 Average Endpoint Error（AEE）。
@@ -285,7 +319,8 @@ def _compute_aee_from_flow_tensors(pred_bchw: torch.Tensor, gt_bchw: torch.Tenso
     if pred_bchw.shape[1] < 2 or gt_bchw.shape[1] < 2:
         return float("nan")
     epe_map = torch.sqrt(torch.sum((pred_bchw[:, :2] - gt_bchw[:, :2]) ** 2, dim=1))
-    return float(epe_map.mean().item())
+    finite_epe = epe_map[torch.isfinite(epe_map)]
+    return float(finite_epe.mean().item()) if finite_epe.numel() > 0 else float("nan")
 
 
 def _compute_samplewise_aee_from_flow_tensors(pred_bchw: torch.Tensor, gt_bchw: torch.Tensor) -> np.ndarray:
@@ -302,7 +337,11 @@ def _compute_samplewise_aee_from_flow_tensors(pred_bchw: torch.Tensor, gt_bchw: 
     if pred_bchw.shape[1] < 2 or gt_bchw.shape[1] < 2:
         return np.full((pred_bchw.shape[0],), np.nan, dtype=np.float32)
     epe_map = torch.sqrt(torch.sum((pred_bchw[:, :2] - gt_bchw[:, :2]) ** 2, dim=1))
-    return epe_map.reshape(epe_map.shape[0], -1).mean(dim=1).detach().cpu().numpy().astype(np.float32, copy=False)
+    sample_values = []
+    for sample_epe in epe_map.reshape(epe_map.shape[0], -1):
+        finite_epe = sample_epe[torch.isfinite(sample_epe)]
+        sample_values.append(float(finite_epe.mean().item()) if finite_epe.numel() > 0 else float("nan"))
+    return np.asarray(sample_values, dtype=np.float32)
 
 
 def _flow_uv_to_uvw(flow_bchw: torch.Tensor) -> torch.Tensor:
@@ -334,7 +373,7 @@ def _compute_aee_from_chw(pred_chw: np.ndarray, gt_chw: np.ndarray) -> float:
     du = pred_chw[0] - gt_chw[0]
     dv = pred_chw[1] - gt_chw[1]
     epe = np.sqrt(du * du + dv * dv)
-    return float(np.mean(epe))
+    return _safe_mean_np(epe)
 
 
 def _mean_sum_per_100_pixels(values_1d: np.ndarray, group_size: int = 100) -> float:
@@ -342,7 +381,7 @@ def _mean_sum_per_100_pixels(values_1d: np.ndarray, group_size: int = 100) -> fl
     将一维误差序列按每 100 个像素分组求和，再对所有满 100 像素分组和取平均。
     最后一组不足 100 个像素时直接丢弃，不参与统计。
     """
-    values = values_1d.reshape(-1).astype(np.float32)
+    values = _finite_flatten_np(values_1d)
     if values.size < group_size:
         return float("nan")
     usable_count = (values.size // group_size) * group_size
@@ -421,7 +460,11 @@ def _compute_flow_ref_max_rad(flow_gt_bchw: torch.Tensor) -> float:
     gt_u = flow_gt_bchw[:, 0]
     gt_v = flow_gt_bchw[:, 1]
     gt_mag_uv = torch.sqrt(gt_u * gt_u + gt_v * gt_v)
-    return max(torch.quantile(gt_mag_uv.flatten(), 0.99).item(), 1e-6)
+    finite_mag = gt_mag_uv[torch.isfinite(gt_mag_uv)]
+    if finite_mag.numel() == 0:
+        return 1e-6
+    ref_max = float(torch.quantile(finite_mag.flatten(), 0.99).item())
+    return max(ref_max, 1e-6) if np.isfinite(ref_max) else 1e-6
 
 
 def _compute_flow_ref_max_rad_batch(flow_gt_bchw: torch.Tensor) -> list[float]:
@@ -436,8 +479,16 @@ def _compute_flow_ref_max_rad_batch(flow_gt_bchw: torch.Tensor) -> list[float]:
     gt_u = flow_gt_bchw[:, 0]
     gt_v = flow_gt_bchw[:, 1]
     gt_mag_uv = torch.sqrt(gt_u * gt_u + gt_v * gt_v)
-    ref_max = torch.quantile(gt_mag_uv.flatten(1), 0.99, dim=1).clamp_min(1e-6)
-    return [float(v) for v in ref_max.detach().cpu().tolist()]
+    ref_values = []
+    for sample_mag in gt_mag_uv.flatten(1):
+        # 每个样本单独过滤非有限值，避免一个 NaN 把整批 ref_max 都变成 NaN。
+        finite_mag = sample_mag[torch.isfinite(sample_mag)]
+        if finite_mag.numel() == 0:
+            ref_values.append(1e-6)
+            continue
+        ref_max = float(torch.quantile(finite_mag, 0.99).item())
+        ref_values.append(max(ref_max, 1e-6) if np.isfinite(ref_max) else 1e-6)
+    return ref_values
 
 
 def _flow_to_color_preview(flow_uv_bchw: torch.Tensor, ref_max_rad: float) -> torch.Tensor:
@@ -693,14 +744,25 @@ def _save_heatmap(arr_2d: np.ndarray, out_png: Path, title: str, cmap: str = "vi
     保存二维热力图。
     symmetric=True 时，颜色范围关于 0 对称，更适合误差正负分布图。
     """
+    arr_show = np.asarray(arr_2d, dtype=np.float32)
+    finite = _finite_flatten_np(arr_show)
+    if finite.size == 0:
+        arr_show = np.zeros_like(arr_show, dtype=np.float32)
+        finite = np.array([0.0], dtype=np.float32)
+    else:
+        # 只影响可视化显示：NaN/Inf 用 0 填充，避免 imshow/colorbar 布局失败。
+        arr_show = np.nan_to_num(arr_show, nan=0.0, posinf=float(np.max(finite)), neginf=float(np.min(finite)))
+
     plt.figure(figsize=(4.8, 4.0), dpi=160)
     if symmetric:
-        vmax = float(np.max(np.abs(arr_2d))) + 1e-12
+        vmax = _safe_symmetric_abs_limit(finite, fallback=1e-12)
         vmin = -vmax
     else:
-        vmin = float(np.min(arr_2d))
-        vmax = float(np.max(arr_2d))
-    plt.imshow(arr_2d, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
+        vmin = float(np.min(finite))
+        vmax = float(np.max(finite))
+        if vmin == vmax:
+            vmax = vmin + 1e-12
+    plt.imshow(arr_show, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
     plt.colorbar(fraction=0.046, pad=0.04)
     plt.title(title)
     plt.xticks([])
@@ -750,8 +812,10 @@ def _save_signed_error_map(
     保存带固定对称色标的误差图。
     这里固定到 [-0.5, 0.5]，并采用蓝-白-红渐变，以对齐参考图风格。
     """
+    # 这里只清洗显示数组，不改返回给指标计算的原始误差图。
+    arr_show = np.nan_to_num(np.asarray(arr_2d, dtype=np.float32), nan=0.0, posinf=vmax, neginf=vmin)
     fig, ax = plt.subplots(1, 1, figsize=(4.8, 3.9), dpi=160)
-    im = ax.imshow(arr_2d, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
+    im = ax.imshow(arr_show, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
     ax.set_xticks([])
     ax.set_yticks([])
     if stat_text:
@@ -783,9 +847,11 @@ def _save_error_histogram(
     """
     保存单组误差直方图，风格对齐参考图的中心对称分布展示。
     """
-    values = values_1d.reshape(-1).astype(np.float32)
-    max_abs = float(np.quantile(np.abs(values), 0.995))
-    max_abs = max(max_abs, 0.05)
+    # 直方图只统计有限值；无效区域/异常值不参与分布范围计算。
+    values = _finite_flatten_np(values_1d)
+    if values.size == 0:
+        values = np.array([0.0], dtype=np.float32)
+    max_abs = _safe_symmetric_abs_limit(values, fallback=0.05, quantile=0.995)
     fig, ax = plt.subplots(1, 1, figsize=(4.8, 3.9), dpi=160)
     ax.hist(values, bins=bins, range=(-max_abs, max_abs), color=color, alpha=0.65, edgecolor="none")
     ax.set_xlim(-max_abs, max_abs)
@@ -826,7 +892,7 @@ def _save_flow_error_visuals(
         gt_np = gt_np_chw
 
     du, dv, dw, epe = _compute_flow_error_maps(pred_bchw, gt_bchw, pred_np, gt_np)
-    aee = float(np.mean(epe))
+    aee = _safe_mean_np(epe)
 
     if ref_max_rad is None:
         ref_max_rad = _compute_flow_ref_max_rad(gt_flow)
@@ -902,7 +968,12 @@ def _histogram_matrix(values: np.ndarray, bins: np.ndarray) -> np.ndarray:
     将直方图统计整理成两列矩阵：[bin_center, count]。
     这样保存成 .npy 后，后处理读起来更直接。
     """
-    counts, edges = np.histogram(values.reshape(-1), bins=bins)
+    finite_values = _finite_flatten_np(values)
+    if finite_values.size == 0:
+        counts = np.zeros(len(bins) - 1, dtype=np.float32)
+        edges = bins
+    else:
+        counts, edges = np.histogram(finite_values, bins=bins)
     centers = 0.5 * (edges[:-1] + edges[1:])
     return np.stack([centers.astype(np.float32), counts.astype(np.float32)], axis=1)
 
@@ -912,7 +983,7 @@ def _delta_u_histogram_matrix(delta_u_2d: np.ndarray, bins: int = 201) -> np.nda
     统计 Δu 的像素计数分布。
     分布区间以 0 为中心，用来观察误差是否高度集中在零附近。
     """
-    max_abs = float(np.max(np.abs(delta_u_2d))) + 1e-12
+    max_abs = _safe_symmetric_abs_limit(delta_u_2d, fallback=1e-12)
     edges = np.linspace(-max_abs, max_abs, bins + 1, dtype=np.float32)
     return _histogram_matrix(delta_u_2d, edges)
 
@@ -922,7 +993,7 @@ def _delta_v_histogram_matrix(delta_v_2d: np.ndarray, bins: int = 201) -> np.nda
     统计 Δv 的像素计数分布。
     分布区间同样以 0 为中心，便于和 Δu 采用一致的误差分析口径。
     """
-    max_abs = float(np.max(np.abs(delta_v_2d))) + 1e-12
+    max_abs = _safe_symmetric_abs_limit(delta_v_2d, fallback=1e-12)
     edges = np.linspace(-max_abs, max_abs, bins + 1, dtype=np.float32)
     return _histogram_matrix(delta_v_2d, edges)
 
@@ -932,7 +1003,7 @@ def _delta_w_histogram_matrix(delta_w_2d: np.ndarray, bins: int = 201) -> np.nda
     统计 Δw 的像素计数分布。
     分布区间同样以 0 为中心，便于和 Δu / Δv 采用一致的误差分析口径。
     """
-    max_abs = float(np.max(np.abs(delta_w_2d))) + 1e-12
+    max_abs = _safe_symmetric_abs_limit(delta_w_2d, fallback=1e-12)
     edges = np.linspace(-max_abs, max_abs, bins + 1, dtype=np.float32)
     return _histogram_matrix(delta_w_2d, edges)
 
@@ -941,7 +1012,8 @@ def _epe_histogram_matrix(epe_2d: np.ndarray, bins: int = 201) -> np.ndarray:
     """
     统计端点误差 EPE 的像素计数分布。
     """
-    max_val = float(np.max(epe_2d)) + 1e-12
+    finite_epe = _finite_flatten_np(epe_2d)
+    max_val = float(np.max(finite_epe)) + 1e-12 if finite_epe.size > 0 else 1e-12
     edges = np.linspace(0.0, max_val, bins + 1, dtype=np.float32)
     return _histogram_matrix(epe_2d, edges)
 
@@ -1307,6 +1379,8 @@ def evaluate_all(
     use_adversarial = True
 
     logger.info(f"[evaluate_all] SAVE_AS_GRAY={global_data.esrgan.SAVE_AS_GRAY}")
+    save_validate_images = bool(getattr(global_data.esrgan, "IS_SAVE_VALIDATE_IMAGES", False))
+    logger.info(f"[evaluate_all] IS_SAVE_VALIDATE_IMAGES={save_validate_images}")
 
     output_root = Path(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -1384,6 +1458,8 @@ def evaluate_all(
         file_prefix: str,
         also_save_legacy_names: bool = False,
     ) -> None:
+        if not save_validate_images:
+            return
         if not pred_curves or not gt_curves:
             return
         # 不同样本曲线长度可能略有不同，所以先截到共同最短长度再平均。
@@ -1555,11 +1631,12 @@ def evaluate_all(
                     fk_save = pair_cache["fake"][i:i + 1]
                     hr_save = pair_cache["hr"][i:i + 1]
 
-                    save_image(lr_save, str(pair_dir / "lr.png"), normalize=False)
-                    save_image(fk_save, str(pair_dir / "fake.png"), normalize=False)
-                    save_image(hr_save, str(pair_dir / "hr.png"), normalize=False)
+                    if save_validate_images:
+                        save_image(lr_save, str(pair_dir / "lr.png"), normalize=False)
+                        save_image(fk_save, str(pair_dir / "fake.png"), normalize=False)
+                        save_image(hr_save, str(pair_dir / "hr.png"), normalize=False)
 
-                    _save_triplet(lr_save, fk_save, hr_save, pair_dir / "image_triplet.png")
+                        _save_triplet(lr_save, fk_save, hr_save, pair_dir / "image_triplet.png")
 
                     # 指标直接使用 batch 级 numpy 缓存，避免每张 previous/next 图再次触发 CPU 拷贝。
                     p_img = pair_cache["fake_np"][i]
@@ -1572,9 +1649,10 @@ def evaluate_all(
                     nrmse_img = _nrmse(p_img, g_img)
                     pred_curve, gt_curve = _energy_spectrum_curves(p_img, g_img)
                     es_mse_img = _energy_spectrum_mse_from_curves(pred_curve, gt_curve)
-                    np.save(pair_dir / "energy_spectrum_pred.npy", pred_curve.astype(np.float32))
-                    np.save(pair_dir / "energy_spectrum_gt.npy", gt_curve.astype(np.float32))
-                    _save_energy_spectrum_plot(pred_curve, gt_curve, pair_dir / "energy_spectrum_compare.png", title=f"{sid}-{pair_type} Energy Spectrum")
+                    if save_validate_images:
+                        np.save(pair_dir / "energy_spectrum_pred.npy", pred_curve.astype(np.float32))
+                        np.save(pair_dir / "energy_spectrum_gt.npy", gt_curve.astype(np.float32))
+                        _save_energy_spectrum_plot(pred_curve, gt_curve, pair_dir / "energy_spectrum_compare.png", title=f"{sid}-{pair_type} Energy Spectrum")
                     register_curve(sample_bucket, pred_curve, gt_curve, curve_group="image_pair")
 
                     append_row({
@@ -1611,97 +1689,102 @@ def evaluate_all(
 
                 # np.save(one_dir / "lr_flo.npy", _to_np_chw(lr1[0]).transpose(1, 2, 0))
                 # 保存三通道预测流场 [u, v, magnitude]，便于和三通道真值直接对比。
-                np.save(one_dir / "fake_flo.npy", p.transpose(1, 2, 0))
-                np.save(one_dir / "hr_flo.npy", g.transpose(1, 2, 0))
+                if save_validate_images:
+                    np.save(one_dir / "fake_flo.npy", p.transpose(1, 2, 0))
+                    np.save(one_dir / "hr_flo.npy", g.transpose(1, 2, 0))
 
-                ref_max_rad = flow_ref_max_rads[i]
+                    ref_max_rad = flow_ref_max_rads[i]
 
-                # lr_color, _ = flow_to_color_tensor(lr_up1[:, :2], ref_max_rad=ref_max_rad)
-                fk_color = _flow_to_color_preview(fk1[:, :2], ref_max_rad=ref_max_rad)
-                hr_color = _flow_to_color_preview(hr1[:, :2], ref_max_rad=ref_max_rad)
-                flow_pair_panel = build_pair_row(fk_color, hr_color, sep_width=6)
-                flow_pair_panel = _add_headers_to_panel(
-                    flow_pair_panel,
-                    headers=["Pred", "HR"],
-                    column_widths=[fk_color.shape[-1], hr_color.shape[-1]],
-                    separator_widths=[6],
-                )
-                flow_pair_panel = _append_colorbar_sections_to_panel(
-                    flow_pair_panel,
-                    [{"vmin": 0.0, "vmax": ref_max_rad, "cmap": "jet", "label": "|V|"}],
-                    top_margin=22,
-                    section_heights=[fk_color.shape[-2]],
-                )
-                # 流场样本级拼图不再包含 flo 的 LR 图像，只保留 Pred/HR 两列。
-                save_image(flow_pair_panel.clamp(0, 1), str(one_dir / "flow_triplet.png"), normalize=False)
-                # 单独的预测流场彩图已经在 _save_flow_error_visuals 中按统一命名保存为 pred_flow.png，
-                # 这里不再重复落盘，避免同目录下出现语义重复的文件。
+                    # lr_color, _ = flow_to_color_tensor(lr_up1[:, :2], ref_max_rad=ref_max_rad)
+                    fk_color = _flow_to_color_preview(fk1[:, :2], ref_max_rad=ref_max_rad)
+                    hr_color = _flow_to_color_preview(hr1[:, :2], ref_max_rad=ref_max_rad)
+                    flow_pair_panel = build_pair_row(fk_color, hr_color, sep_width=6)
+                    flow_pair_panel = _add_headers_to_panel(
+                        flow_pair_panel,
+                        headers=["Pred", "HR"],
+                        column_widths=[fk_color.shape[-1], hr_color.shape[-1]],
+                        separator_widths=[6],
+                    )
+                    flow_pair_panel = _append_colorbar_sections_to_panel(
+                        flow_pair_panel,
+                        [{"vmin": 0.0, "vmax": ref_max_rad, "cmap": "jet", "label": "|V|"}],
+                        top_margin=22,
+                        section_heights=[fk_color.shape[-2]],
+                    )
+                    # 流场样本级拼图不再包含 flo 的 LR 图像，只保留 Pred/HR 两列。
+                    save_image(flow_pair_panel.clamp(0, 1), str(one_dir / "flow_triplet.png"), normalize=False)
+                    # 单独的预测流场彩图已经在 _save_flow_error_visuals 中按统一命名保存为 pred_flow.png，
+                    # 这里不再重复落盘，避免同目录下出现语义重复的文件。
 
-                # U/V/S 面板改为 Pred/HR 双列对比，并补左侧行标题、顶部列标题，最右侧追加色条。
-                uvs_panel = build_flo_uvw_pred_gt_panel(fk1_uvw, hr1)
-                uvs_panel = _add_row_and_column_headers_to_panel(
-                    uvs_panel,
-                    row_labels=["U", "V", "W"],
-                    row_heights=[fk1_uvw.shape[-2], fk1_uvw.shape[-2], fk1_uvw.shape[-2]],
-                    row_separator_heights=[8, 8],
-                    column_headers=["Pred", "HR"],
-                    column_widths=[fk1_uvw.shape[-1], hr1.shape[-1]],
-                    column_separator_widths=[6],
-                )
-                hr_min = g[:3].min(axis=(1, 2))
-                hr_max = g[:3].max(axis=(1, 2))
-                uvs_panel = _append_colorbar_sections_to_panel(
-                    uvs_panel,
-                    [
-                        {"vmin": float(hr_min[0]), "vmax": float(hr_max[0]), "cmap": "jet", "label": "U"},
-                        {"vmin": float(hr_min[1]), "vmax": float(hr_max[1]), "cmap": "jet", "label": "V"},
-                        {"vmin": float(hr_min[2]), "vmax": float(hr_max[2]), "cmap": "jet", "label": "W"},
-                    ],
-                    top_margin=22,
-                    section_heights=[fk1_uvw.shape[-2], fk1_uvw.shape[-2], fk1_uvw.shape[-2]],
-                    section_gaps=[8, 8],
-                )
-                save_image(uvs_panel.clamp(0, 1), str(one_dir / "uvs_compare.png"), normalize=False)
-                # 涡度图内部实际只依赖前两个通道 uv，这里传三通道预测和真值保持接口一致。
-                save_vorticity_quiver_compare(fk1_uvw, hr1, str(one_dir / "vorticity_quiver.png"), stride=stride)
-                # 额外保存 AEE 误差图、涡度误差图，并返回像素级误差用于统计分布。
-                delta_u_map, delta_v_map, delta_w_map, epe_map = _save_flow_error_visuals(
-                    fk1,
-                    hr1,
-                    one_dir,
-                    pred_np_chw=p,
-                    gt_np_chw=g,
-                    ref_max_rad=ref_max_rad,
-                )
+                    # U/V/S 面板改为 Pred/HR 双列对比，并补左侧行标题、顶部列标题，最右侧追加色条。
+                    uvs_panel = build_flo_uvw_pred_gt_panel(fk1_uvw, hr1)
+                    uvs_panel = _add_row_and_column_headers_to_panel(
+                        uvs_panel,
+                        row_labels=["U", "V", "W"],
+                        row_heights=[fk1_uvw.shape[-2], fk1_uvw.shape[-2], fk1_uvw.shape[-2]],
+                        row_separator_heights=[8, 8],
+                        column_headers=["Pred", "HR"],
+                        column_widths=[fk1_uvw.shape[-1], hr1.shape[-1]],
+                        column_separator_widths=[6],
+                    )
+                    hr_min = g[:3].min(axis=(1, 2))
+                    hr_max = g[:3].max(axis=(1, 2))
+                    uvs_panel = _append_colorbar_sections_to_panel(
+                        uvs_panel,
+                        [
+                            {"vmin": float(hr_min[0]), "vmax": float(hr_max[0]), "cmap": "jet", "label": "U"},
+                            {"vmin": float(hr_min[1]), "vmax": float(hr_max[1]), "cmap": "jet", "label": "V"},
+                            {"vmin": float(hr_min[2]), "vmax": float(hr_max[2]), "cmap": "jet", "label": "W"},
+                        ],
+                        top_margin=22,
+                        section_heights=[fk1_uvw.shape[-2], fk1_uvw.shape[-2], fk1_uvw.shape[-2]],
+                        section_gaps=[8, 8],
+                    )
+                    save_image(uvs_panel.clamp(0, 1), str(one_dir / "uvs_compare.png"), normalize=False)
+                    # 涡度图内部实际只依赖前两个通道 uv，这里传三通道预测和真值保持接口一致。
+                    save_vorticity_quiver_compare(fk1_uvw, hr1, str(one_dir / "vorticity_quiver.png"), stride=stride)
+                    # 额外保存 AEE 误差图、涡度误差图，并返回像素级误差用于统计分布。
+                    delta_u_map, delta_v_map, delta_w_map, epe_map = _save_flow_error_visuals(
+                        fk1,
+                        hr1,
+                        one_dir,
+                        pred_np_chw=p,
+                        gt_np_chw=g,
+                        ref_max_rad=ref_max_rad,
+                    )
+                else:
+                    # 关闭图像保存时仍然计算误差图，用于 AEE、NORM_AEE 和 CSV 指标。
+                    delta_u_map, delta_v_map, delta_w_map, epe_map = _compute_flow_error_maps(fk1, hr1, p, g)
 
-                # 逐样本保存 Δu / Δv / EPE 分布。
-                # Δu、Δv 直方图都以 0 为中心，便于横向比较水平/垂直位移误差。
-                sample_delta_u_hist = _delta_u_histogram_matrix(delta_u_map)
-                sample_delta_v_hist = _delta_v_histogram_matrix(delta_v_map)
-                sample_delta_w_hist = _delta_w_histogram_matrix(delta_w_map)
-                sample_epe_hist = _epe_histogram_matrix(epe_map)
-                np.save(one_dir / "delta_u_hist.npy", sample_delta_u_hist)
-                np.save(one_dir / "delta_v_hist.npy", sample_delta_v_hist)
-                np.save(one_dir / "delta_w_hist.npy", sample_delta_w_hist)
-                np.save(one_dir / "epe_hist.npy", sample_epe_hist)
+                if save_validate_images:
+                    # 逐样本保存 Δu / Δv / Δw / EPE 分布；关闭保存时不构造这些大数组，
+                    # 让 evaluate_all 只保留指标计算，避免额外内存和磁盘 IO。
+                    sample_delta_u_hist = _delta_u_histogram_matrix(delta_u_map)
+                    sample_delta_v_hist = _delta_v_histogram_matrix(delta_v_map)
+                    sample_delta_w_hist = _delta_w_histogram_matrix(delta_w_map)
+                    sample_epe_hist = _epe_histogram_matrix(epe_map)
+                    np.save(one_dir / "delta_u_hist.npy", sample_delta_u_hist)
+                    np.save(one_dir / "delta_v_hist.npy", sample_delta_v_hist)
+                    np.save(one_dir / "delta_w_hist.npy", sample_delta_w_hist)
+                    np.save(one_dir / "epe_hist.npy", sample_epe_hist)
 
-                # 同时把每个 sample 的误差统计登记到所属类别，便于类别级汇总。
-                # 这里要先确保类别桶已经创建，再去 append；
-                # 否则像 DNS_turbulence 这类首次出现的类别会在 append 时直接 KeyError。
-                delta_u_hist_by_class.setdefault(sample_bucket, [])
-                delta_v_hist_by_class.setdefault(sample_bucket, [])
-                delta_w_hist_by_class.setdefault(sample_bucket, [])
-                epe_hist_by_class.setdefault(sample_bucket, [])
-                delta_u_hist_by_class[sample_bucket].append(delta_u_map.reshape(-1))
-                delta_v_hist_by_class[sample_bucket].append(delta_v_map.reshape(-1))
-                delta_w_hist_by_class[sample_bucket].append(delta_w_map.reshape(-1))
-                epe_hist_by_class[sample_bucket].append(epe_map.reshape(-1))
+                    # 同时把每个 sample 的误差统计登记到所属类别，便于类别级汇总。
+                    # 这里要先确保类别桶已经创建，再去 append；
+                    # 否则像 DNS_turbulence 这类首次出现的类别会在 append 时直接 KeyError。
+                    delta_u_hist_by_class.setdefault(sample_bucket, [])
+                    delta_v_hist_by_class.setdefault(sample_bucket, [])
+                    delta_w_hist_by_class.setdefault(sample_bucket, [])
+                    epe_hist_by_class.setdefault(sample_bucket, [])
+                    delta_u_hist_by_class[sample_bucket].append(delta_u_map.reshape(-1))
+                    delta_v_hist_by_class[sample_bucket].append(delta_v_map.reshape(-1))
+                    delta_w_hist_by_class[sample_bucket].append(delta_w_map.reshape(-1))
+                    epe_hist_by_class[sample_bucket].append(epe_map.reshape(-1))
 
                 # 数值指标对比统一使用三通道 [u, v, magnitude]。
                 # p/g 已经来自 batch 级 numpy 缓存；AEE 和每 100 像素 EPE 直接复用上面生成的 epe_map。
                 mse = _mse(p, g)
                 psnr = _psnr_from_mse(mse)
-                aee = float(np.mean(epe_map))
+                aee = _safe_mean_np(epe_map)
                 norm_aee_per100 = _mean_sum_per_100_pixels(epe_map, group_size=100)
                 r2 = _r2_score(p, g)
                 ssim = _ssim_score(p, g)
@@ -1710,12 +1793,13 @@ def evaluate_all(
 
                 pred_curve, gt_curve = _energy_spectrum_curves(p, g)
                 es_mse = _energy_spectrum_mse_from_curves(pred_curve, gt_curve)
-                np.save(one_dir / "energy_spectrum_pred.npy", pred_curve.astype(np.float32))
-                np.save(one_dir / "energy_spectrum_gt.npy", gt_curve.astype(np.float32))
-                np.save(one_dir / "flow_energy_spectrum_pred.npy", pred_curve.astype(np.float32))
-                np.save(one_dir / "flow_energy_spectrum_gt.npy", gt_curve.astype(np.float32))
-                _save_energy_spectrum_plot(pred_curve, gt_curve, one_dir / "energy_spectrum_compare.png", title=f"{sid} Energy Spectrum")
-                _save_energy_spectrum_plot(pred_curve, gt_curve, one_dir / "flow_energy_spectrum_compare.png", title=f"{sid} Flow Energy Spectrum")
+                if save_validate_images:
+                    np.save(one_dir / "energy_spectrum_pred.npy", pred_curve.astype(np.float32))
+                    np.save(one_dir / "energy_spectrum_gt.npy", gt_curve.astype(np.float32))
+                    np.save(one_dir / "flow_energy_spectrum_pred.npy", pred_curve.astype(np.float32))
+                    np.save(one_dir / "flow_energy_spectrum_gt.npy", gt_curve.astype(np.float32))
+                    _save_energy_spectrum_plot(pred_curve, gt_curve, one_dir / "energy_spectrum_compare.png", title=f"{sid} Energy Spectrum")
+                    _save_energy_spectrum_plot(pred_curve, gt_curve, one_dir / "flow_energy_spectrum_compare.png", title=f"{sid} Flow Energy Spectrum")
                 register_curve(sample_bucket, pred_curve, gt_curve, curve_group="flow")
 
                 append_row({
@@ -1764,18 +1848,20 @@ def evaluate_all(
     )
 
     # 根目录额外保存整套验证集的 Δu / EPE 统计结果，便于做全局误差分布分析。
-    all_delta_u_values = [v for values in delta_u_hist_by_class.values() for v in values]
-    all_delta_v_values = [v for values in delta_v_hist_by_class.values() for v in values]
-    all_delta_w_values = [v for values in delta_w_hist_by_class.values() for v in values]
-    all_epe_values = [v for values in epe_hist_by_class.values() for v in values]
-    if all_delta_u_values:
-        np.save(output_root / "delta_u_hist_all.npy", _delta_u_histogram_matrix(np.concatenate(all_delta_u_values, axis=0)))
-    if all_delta_v_values:
-        np.save(output_root / "delta_v_hist_all.npy", _delta_v_histogram_matrix(np.concatenate(all_delta_v_values, axis=0)))
-    if all_delta_w_values:
-        np.save(output_root / "delta_w_hist_all.npy", _delta_w_histogram_matrix(np.concatenate(all_delta_w_values, axis=0)))
-    if all_epe_values:
-        np.save(output_root / "epe_hist_all.npy", _epe_histogram_matrix(np.concatenate(all_epe_values, axis=0)))
+    # 默认关闭图/npy 保存时不再拼接这些像素级大数组，但 CSV 指标已经在上方正常计算完成。
+    if save_validate_images:
+        all_delta_u_values = [v for values in delta_u_hist_by_class.values() for v in values]
+        all_delta_v_values = [v for values in delta_v_hist_by_class.values() for v in values]
+        all_delta_w_values = [v for values in delta_w_hist_by_class.values() for v in values]
+        all_epe_values = [v for values in epe_hist_by_class.values() for v in values]
+        if all_delta_u_values:
+            np.save(output_root / "delta_u_hist_all.npy", _delta_u_histogram_matrix(np.concatenate(all_delta_u_values, axis=0)))
+        if all_delta_v_values:
+            np.save(output_root / "delta_v_hist_all.npy", _delta_v_histogram_matrix(np.concatenate(all_delta_v_values, axis=0)))
+        if all_delta_w_values:
+            np.save(output_root / "delta_w_hist_all.npy", _delta_w_histogram_matrix(np.concatenate(all_delta_w_values, axis=0)))
+        if all_epe_values:
+            np.save(output_root / "epe_hist_all.npy", _epe_histogram_matrix(np.concatenate(all_epe_values, axis=0)))
 
     metrics_csv_path = Path(metrics_csv_path)
     metrics_image_pair_csv_path = metrics_csv_path.with_name(f"{metrics_csv_path.stem}_image_pair{metrics_csv_path.suffix}")
@@ -1827,16 +1913,16 @@ def evaluate_all(
         )
 
         # 类别级 Δu / EPE 统计：把该类别所有 sample 的像素误差拼起来，再统一做直方图。
-        if delta_u_hist_by_class.get(bucket_name):
+        if save_validate_images and delta_u_hist_by_class.get(bucket_name):
             class_delta_u_values = np.concatenate(delta_u_hist_by_class[bucket_name], axis=0)
             np.save(class_root / "delta_u_hist_all.npy", _delta_u_histogram_matrix(class_delta_u_values))
-        if delta_v_hist_by_class.get(bucket_name):
+        if save_validate_images and delta_v_hist_by_class.get(bucket_name):
             class_delta_v_values = np.concatenate(delta_v_hist_by_class[bucket_name], axis=0)
             np.save(class_root / "delta_v_hist_all.npy", _delta_v_histogram_matrix(class_delta_v_values))
-        if delta_w_hist_by_class.get(bucket_name):
+        if save_validate_images and delta_w_hist_by_class.get(bucket_name):
             class_delta_w_values = np.concatenate(delta_w_hist_by_class[bucket_name], axis=0)
             np.save(class_root / "delta_w_hist_all.npy", _delta_w_histogram_matrix(class_delta_w_values))
-        if epe_hist_by_class.get(bucket_name):
+        if save_validate_images and epe_hist_by_class.get(bucket_name):
             class_epe_values = np.concatenate(epe_hist_by_class[bucket_name], axis=0)
             np.save(class_root / "epe_hist_all.npy", _epe_histogram_matrix(class_epe_values))
 
