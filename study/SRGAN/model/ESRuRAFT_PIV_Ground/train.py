@@ -7,6 +7,7 @@ from study.SRGAN.model.ESRuRAFT_PIV_Ground.Module.PIV_ESRGAN_RAFT_Model import E
 from study.SRGAN.model.ESRuRAFT_PIV_Ground.global_class import global_data
 from study.SRGAN.model.ESRuRAFT_PIV_Ground.visual_plot_init import build_flo_uvw_fake_panel
 from study.SRGAN.model.ESRuRAFT_PIV_Ground.visual_plot_save import save_vorticity_quiver_single
+from study.SRGAN.model.training_safety_common import raise_if_nonfinite_losses
 from study.SRGAN.util.image_util import flow_to_color_tensor
 
 
@@ -132,6 +133,17 @@ def esrgan_union_RAFT_train(
         raft_optimizer=RAFT_optimizer,
         scaler=scaler,
         is_adversarial=use_adversarial,
+    )
+    # 训练过程中一旦任意损失变成 NaN/Inf，立即抛出早停异常。
+    # pipeline 捕获后会加载上一个 epoch 保存的模型，再进入 evaluate_all/test_all。
+    raise_if_nonfinite_losses(
+        loss_dict,
+        epoch=epoch,
+        batch_index=i,
+        class_name=class_name,
+        data_type=data_type,
+        scale=SCALE,
+        global_data=global_data,
     )
     metric.add(
         # 注意这里的记录顺序必须和 global_class.loss_label 完全一致，否则 csv/plot 会错位。

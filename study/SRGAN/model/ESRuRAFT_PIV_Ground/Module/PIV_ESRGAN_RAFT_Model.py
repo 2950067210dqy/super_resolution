@@ -414,6 +414,23 @@ class ESRuRAFT_PIV(nn.Module):
         return (frame - mean) / std
 
     @staticmethod
+    def _standardize_pair_for_horn_schunck(prev: torch.Tensor, next_frame: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        给 Horn-Schunck 光流使用的成对亮度标准化。
+
+        Horn-Schunck 1981 的核心约束是亮度恒定：
+            Ix * u + Iy * v + It = 0
+        因此前后两帧必须处在同一个亮度坐标系里。之前如果分别对 prev / next_frame
+        单独减均值、除方差，会把两帧各自重新拉伸，导致 It 不再只表示真实时间亮度变化。
+        这里改为“同一个 sample、同一个 channel、两帧共同”的均值和方差，只做共享线性缩放；
+        共享缩放不会改变亮度恒定方程的零点，同时能让梯度法在不同强度范围的数据上更稳定。
+        """
+        pair = torch.stack([prev, next_frame], dim=0)  # [2, B, C, H, W]，显式保留前后帧维度。
+        mean = pair.mean(dim=(0, 3, 4), keepdim=True).squeeze(0)
+        std = pair.std(dim=(0, 3, 4), keepdim=True, unbiased=False).clamp_min(1e-6).squeeze(0)
+        return (prev - mean) / std, (next_frame - mean) / std
+
+    @staticmethod
     def _sample_with_integer_displacement(image: torch.Tensor, dx: int, dy: int) -> torch.Tensor:
         """
         按整数位移采样后一帧图像，用于窗口互相关搜索。
@@ -486,40 +503,51 @@ class ESRuRAFT_PIV(nn.Module):
         该方法假设亮度守恒并通过全局平滑项约束 flow，适合作为“非学习光流法”的参考。
         输出通道同 RAFT 保持一致：[u, v]。
         """
-        prev = self._standardize_frame_for_traditional_piv(prev.detach())
-        next_frame = self._standardize_frame_for_traditional_piv(next_frame.detach())
-        avg_frame = 0.5 * (prev + next_frame)
+        prev, next_frame = self._standardize_pair_for_horn_schunck(prev.detach(), next_frame.detach())
 
-        sobel_x = avg_frame.new_tensor(
-            [[[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]]
-        ).view(1, 1, 3, 3) / 8.0
-        sobel_y = avg_frame.new_tensor(
-            [[[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]]
-        ).view(1, 1, 3, 3) / 8.0
-        smooth_kernel = avg_frame.new_tensor(
+        # Horn & Schunck 原文使用相邻两帧共同参与的 2x2 有限差分估计 Ix / Iy / It。
+        # 这样空间梯度和时间梯度来自同一个局部时空小块，比“平均帧 Sobel + next-prev”
+        # 更贴近论文中的亮度恒定线性化口径。
+        grad_x = prev.new_tensor(
+            [[[-1.0, 1.0], [-1.0, 1.0]]]
+        ).view(1, 1, 2, 2) * 0.25
+        grad_y = prev.new_tensor(
+            [[[-1.0, -1.0], [1.0, 1.0]]]
+        ).view(1, 1, 2, 2) * 0.25
+        grad_t = prev.new_ones((1, 1, 2, 2)) * 0.25
+        smooth_kernel = prev.new_tensor(
             [[[1.0 / 12.0, 1.0 / 6.0, 1.0 / 12.0],
               [1.0 / 6.0, 0.0, 1.0 / 6.0],
               [1.0 / 12.0, 1.0 / 6.0, 1.0 / 12.0]]]
         ).view(1, 1, 3, 3)
 
-        ix = F.conv2d(avg_frame, sobel_x, padding=1)
-        iy = F.conv2d(avg_frame, sobel_y, padding=1)
-        it = next_frame - prev
+        # 2x2 差分核会少一行/列，这里只在右侧和下侧复制边界，保持输出仍为原图 HxW。
+        # 使用 replicate padding 避免 zero padding 在边界制造假的黑色亮度跳变。
+        prev_pad = F.pad(prev, (0, 1, 0, 1), mode="replicate")
+        next_pad = F.pad(next_frame, (0, 1, 0, 1), mode="replicate")
+        ix = F.conv2d(prev_pad, grad_x) + F.conv2d(next_pad, grad_x)
+        iy = F.conv2d(prev_pad, grad_y) + F.conv2d(next_pad, grad_y)
+        it = F.conv2d(next_pad, grad_t) - F.conv2d(prev_pad, grad_t)
 
         alpha = float(global_data.esrgan.HS_ALPHA)
-        iterations = int(global_data.esrgan.HS_ITERS)
+        iterations = max(int(global_data.esrgan.HS_ITERS), 0)
+        eps = float(getattr(global_data.esrgan, "HS_EPS", 1e-6))
         u = torch.zeros_like(prev)
         v = torch.zeros_like(prev)
-        denom = alpha * alpha + ix * ix + iy * iy + 1e-6
+        denom = (alpha * alpha + ix * ix + iy * iy).clamp_min(eps)
 
         for _ in range(iterations):
-            u_avg = F.conv2d(u, smooth_kernel, padding=1)
-            v_avg = F.conv2d(v, smooth_kernel, padding=1)
+            # Horn-Schunck 的全局平滑项通过邻域平均的迭代形式求解：
+            # u_bar / v_bar 是当前 flow 的 8 邻域加权平均；
+            # 再沿亮度约束 Ix*u + Iy*v + It = 0 的残差方向修正。
+            u_avg = F.conv2d(F.pad(u, (1, 1, 1, 1), mode="replicate"), smooth_kernel)
+            v_avg = F.conv2d(F.pad(v, (1, 1, 1, 1), mode="replicate"), smooth_kernel)
             residual = ix * u_avg + iy * v_avg + it
             u = u_avg - ix * residual / denom
             v = v_avg - iy * residual / denom
 
-        return torch.cat([u, v], dim=1)
+        # 传统光流没有网络内部的 NaN 防线；这里在返回前兜底，避免极端输入污染后续 EPE/可视化。
+        return torch.nan_to_num(torch.cat([u, v], dim=1), nan=0.0, posinf=0.0, neginf=0.0)
 
     @staticmethod
     def _flow_metrics_from_prediction(pred_flow_uv: torch.Tensor, target_flow_uv: torch.Tensor) -> dict:

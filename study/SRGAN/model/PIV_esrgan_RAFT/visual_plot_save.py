@@ -193,14 +193,14 @@ def save_vorticity_quiver_compare(
     stride: int = 8
 ):
     """
-    保存 batch 级对比图：每行一个样本，两列 Pred/HR 的涡量+矢量。
+    保存 batch 级对比图：每行一个样本，三列 Pred/HR/Error 的涡量+矢量。
     把一个 batch 画成一张图：
-    每个样本一行，两列 Pred | HR
+    每个样本一行，三列 Pred | HR | Error
     输入: [B,3,H,W]
     自动处理两者分辨率不一致
     """
     B = min(pred_bchw.shape[0], hr_bchw.shape[0])
-    titles = ["Pred", "HR"]
+    titles = ["Pred", "HR", "Error (Pred-HR)"]
     stride = max(1, int(stride))
 
     def _resize_np_nearest(arr, out_h, out_w):
@@ -209,13 +209,26 @@ def save_vorticity_quiver_compare(
         t = F.interpolate(t, size=(out_h, out_w), mode="nearest")
         return t[0, 0].numpy()
 
-    # 额外给每一行预留一个独立的 colorbar 轴，确保色条始终贴在整张图最右侧。
+    def _symmetric_color_limits(arr: np.ndarray, fallback: float = 1.0) -> tuple[float, float]:
+        """为误差图计算以 0 为中心的色条范围，保证正负误差视觉对称。"""
+        finite = np.asarray(arr, dtype=np.float32)
+        finite = finite[np.isfinite(finite)]
+        if finite.size == 0:
+            return -float(fallback), float(fallback)
+        limit = float(np.max(np.abs(finite)))
+        if not np.isfinite(limit) or limit <= 0:
+            limit = float(fallback)
+        return -limit, limit
+
+    # 每行预留两个独立 colorbar：
+    # 1. Pred/HR 共用 jet 色条，和 U/V/S 流场图保持同一色条风格；
+    # 2. Error 使用蓝白红误差色条，避免和原始 omega* 范围混在一起。
     fig, axes = plt.subplots(
-        B, 3,
-        figsize=(8.3, 3.2 * B),
+        B, 5,
+        figsize=(12.2, 3.2 * B),
         dpi=160,
         squeeze=False,
-        gridspec_kw={"width_ratios": [1.0, 1.0, 0.055]},
+        gridspec_kw={"width_ratios": [1.0, 1.0, 1.0, 0.055, 0.055]},
     )
 
     for i in range(B):
@@ -234,40 +247,66 @@ def save_vorticity_quiver_compare(
             omega_star = _sanitize_plot_array(_omega_star_from_uv(u, v), name="omega_star")  # 原分辨率算涡量
             row_items.append((u, v, omega_star))
 
-        # 同一行共用色标范围，只使用有限值计算，避免 NaN 传播到 colorbar tick。
-        row_finite_chunks = [w[np.isfinite(w)].reshape(-1) for _, _, w in row_items if np.isfinite(w).any()]
+        show_items = []
+        for u, v, omega_star in row_items:
+            if u.shape != (Ht, Wt):
+                show_items.append(
+                    (
+                        _resize_np_nearest(u, Ht, Wt),
+                        _resize_np_nearest(v, Ht, Wt),
+                        _resize_np_nearest(omega_star, Ht, Wt),
+                    )
+                )
+            else:
+                show_items.append((u, v, omega_star))
+
+        pred_u, pred_v, pred_omega = show_items[0]
+        gt_u, gt_v, gt_omega = show_items[1]
+        delta_u = (pred_u - gt_u).astype(np.float32, copy=False)
+        delta_v = (pred_v - gt_v).astype(np.float32, copy=False)
+        delta_omega = (pred_omega - gt_omega).astype(np.float32, copy=False)
+
+        # Pred/HR 共用色标范围，只使用有限值计算，避免 NaN 传播到 colorbar tick。
+        row_finite_chunks = [
+            w[np.isfinite(w)].reshape(-1)
+            for w in (pred_omega, gt_omega)
+            if np.isfinite(w).any()
+        ]
         if row_finite_chunks:
             row_vmin, row_vmax = _finite_color_limits(np.concatenate(row_finite_chunks))
         else:
             row_vmin, row_vmax = -1.0, 1.0
+        delta_vmin, delta_vmax = _symmetric_color_limits(delta_omega)
 
-        for j, (title, (u, v, omega_star)) in enumerate(zip(titles, row_items)):
+        im = None
+        im_delta = None
+        for j, (title, (u, v, omega_star, cmap_name, vmin, vmax)) in enumerate(
+            [
+                (titles[0], (pred_u, pred_v, pred_omega, "jet", row_vmin, row_vmax)),
+                (titles[1], (gt_u, gt_v, gt_omega, "jet", row_vmin, row_vmax)),
+                (titles[2], (delta_u, delta_v, delta_omega, "bwr", delta_vmin, delta_vmax)),
+            ]
+        ):
             ax = axes[i, j]
-            h, w = u.shape
-
-            # 背景统一到目标尺寸，便于三列视觉一致
-            if (h, w) != (Ht, Wt):
-                omega_show = _resize_np_nearest(omega_star, Ht, Wt)
-            else:
-                omega_show = omega_star
-
-            im = ax.imshow(
-                omega_show,
+            h, w = int(u.shape[0]), int(u.shape[1])
+            image = ax.imshow(
+                omega_star,
                 origin="lower",
-                cmap="RdBu_r",
-                vmin=row_vmin,
-                vmax=row_vmax
+                cmap=cmap_name,
+                vmin=vmin,
+                vmax=vmax,
             )
+            if j < 2:
+                im = image
+            else:
+                im_delta = image
 
-            # 矢量坐标从原网格映射到目标画布（保持“原始稀疏度”）
+            # 矢量坐标在统一画布上采样；Error 列使用速度误差矢量 delta_u/delta_v。
             yy, xx = np.mgrid[0:h, 0:w]
-            sx = Wt / float(w)
-            sy = Ht / float(h)
-
             cur_stride = stride
             ax.quiver(
-                (xx * sx)[::cur_stride, ::cur_stride],
-                (yy * sy)[::cur_stride, ::cur_stride],
+                xx[::cur_stride, ::cur_stride],
+                yy[::cur_stride, ::cur_stride],
                 u[::cur_stride, ::cur_stride],
                 v[::cur_stride, ::cur_stride],
                 color="k",
@@ -286,12 +325,12 @@ def save_vorticity_quiver_compare(
             ax.set_yticks([])
 
         # colorbar 专用轴不参与图像绘制，只保留右侧色标。
-        axes[i, 2].set_frame_on(True)
-
-        # 当前已经改成两列 Pred / HR，因此把色条固定画到这一行最右边的专用轴上。
-        cax = axes[i, 2]
-        fig.colorbar(im, cax=cax)
-        cax.yaxis.set_ticks_position("right")
+        cax_main = axes[i, 3]
+        cax_error = axes[i, 4]
+        fig.colorbar(im, cax=cax_main).ax.set_ylabel(r"$\omega^\ast$")
+        fig.colorbar(im_delta, cax=cax_error).ax.set_ylabel(r"$\Delta\omega^\ast$")
+        cax_main.yaxis.set_ticks_position("right")
+        cax_error.yaxis.set_ticks_position("right")
 
     try:
         fig.tight_layout()

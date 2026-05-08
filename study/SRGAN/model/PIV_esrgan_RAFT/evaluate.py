@@ -24,9 +24,26 @@ from study.SRGAN.model.PIV_esrgan_RAFT.judge_delicators import _to_np_chw, _mse,
 from study.SRGAN.model.PIV_esrgan_RAFT.visual_plot_init import build_flo_uvw_pred_gt_panel, _omega_star_from_uv
 from study.SRGAN.model.PIV_esrgan_RAFT.visual_plot_save import save_vorticity_quiver_compare, _save_triplet, _save_pair, \
     _save_energy_spectrum_plot
-from study.SRGAN.model.c_aee_metric_common import attach_c_aee_to_raft_rows, compute_c_aee_array
+from study.SRGAN.model.c_aee_metric_common import attach_c_aee_to_raft_rows, compute_c_aee_value
+from study.SRGAN.model.evaluate_image_compare_common import (
+    compute_particle_image_error,
+    save_image_triplet_with_error,
+    save_particle_error_histogram,
+    save_particle_error_histogram_bundle,
+)
 from study.SRGAN.util.image_util import flow_to_color_tensor, build_triplet_row, add_vertical_separator, \
     add_horizontal_separator, build_pair_row, _select_metric_or_save_channels
+
+
+def _save_evaluate_npy(path, array, save_npy: bool, *, force: bool = False) -> None:
+    """
+    evaluate_all 的 NPY 统一保存入口。
+
+    IS_SAVE_NPY=False 时跳过普通中间结果，降低全量验证的磁盘占用；
+    force=True 用于用户要求必须保留的 hist 直方图 NPY 和误差 NPY。
+    """
+    if force or bool(save_npy):
+        np.save(path, array)
 
 """
 验证函数 start
@@ -309,12 +326,9 @@ def _compute_samplewise_aee_from_flow_tensors(pred_bchw: torch.Tensor, gt_bchw: 
     """
     计算 batch 内每个样本自己的 AEE。
 
-    evaluate() 新增的 C-AEE 不是直接对“整批均值”做归一化，而是：
-        1. 先拿到每个样本自己的 ESE 和 AEE；
-        2. 在当前验证集合内部做 min-max 归一化；
-        3. 再按样本组合成 C-AEE，最后求整体验证均值。
-
-    因此这里需要一个 sample-wise AEE，而不只是 batch 平均 AEE。
+    C-AEE 使用固定参考尺度的绝对归一化。
+    这里仍然保留 sample-wise AEE，是为了让 evaluate_all / test_all 可以把同一个样本的
+    SR 图像 ESMSE、SSIM 和 RAFT EPE 精确配对；训练中 evaluate 的最终 C-AEE 会先求平均再归一化。
     """
     if pred_bchw.shape[1] < 2 or gt_bchw.shape[1] < 2:
         return np.full((pred_bchw.shape[0],), np.nan, dtype=np.float32)
@@ -846,6 +860,7 @@ def _save_flow_error_visuals(
     pred_np_chw: np.ndarray | None = None,
     gt_np_chw: np.ndarray | None = None,
     ref_max_rad: float | None = None,
+    save_npy: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     保存预测光流彩色图、u/v/w 三张 AEE 风格误差图、Δu/Δv/Δw 误差分布图。
@@ -895,8 +910,21 @@ def _save_flow_error_visuals(
 
     pred_omega = _omega_star_from_uv(pred_np[0], pred_np[1])
     gt_omega = _omega_star_from_uv(gt_np[0], gt_np[1])
-    np.save(out_dir / "pred_vorticity.npy", pred_omega.astype(np.float32))
-    np.save(out_dir / "gt_vorticity.npy", gt_omega.astype(np.float32))
+    delta_omega = (pred_omega - gt_omega).astype(np.float32, copy=False)
+    # pred/gt 涡度是普通中间结果，由 IS_SAVE_NPY 控制；delta_vorticity/hist 是误差诊断结果，强制保存。
+    _save_evaluate_npy(out_dir / "pred_vorticity.npy", pred_omega.astype(np.float32), save_npy)
+    _save_evaluate_npy(out_dir / "gt_vorticity.npy", gt_omega.astype(np.float32), save_npy)
+    _save_evaluate_npy(out_dir / "delta_vorticity.npy", delta_omega.astype(np.float32), save_npy, force=True)
+    save_particle_error_histogram(
+        out_dir,
+        delta_omega,
+        file_prefix="delta_vorticity",
+        title="Delta Vorticity Error Distribution",
+        xlabel="delta omega*",
+        color="#4477AA",
+        save_npy_fn=_save_evaluate_npy,
+        save_npy=save_npy,
+    )
 
     return du.astype(np.float32), dv.astype(np.float32), dw.astype(np.float32), epe.astype(np.float32)
 
@@ -1108,16 +1136,21 @@ def validate_raft(model, dataloader, device, epoch, result_dir=None, data_type="
     if len(sample_energy_spectrum_mse_values) != len(sample_aee_values):
         common_len = min(len(sample_energy_spectrum_mse_values), len(sample_aee_values))
         logger.warning(
-            "[validate_raft] sample-wise ESE/AEE length mismatch: ese_count={}, aee_count={}, truncated_to={}",
+            "[validate_raft] sample-wise ESMSE/EPE length mismatch: esmse_count={}, epe_count={}, truncated_to={}",
             len(sample_energy_spectrum_mse_values),
             len(sample_aee_values),
             common_len,
         )
         sample_energy_spectrum_mse_values = sample_energy_spectrum_mse_values[:common_len]
         sample_aee_values = sample_aee_values[:common_len]
-    sample_c_aee_values = compute_c_aee_array(sample_energy_spectrum_mse_values, sample_aee_values)
-    finite_c_aee = sample_c_aee_values[np.isfinite(sample_c_aee_values)]
-    avg_c_aee = float(np.mean(finite_c_aee)) if finite_c_aee.size > 0 else float("nan")
+    # C-AEE 是整体验证指标：先得到平均 ESMSE / 平均 EPE / 平均 SSIM loss，
+    # 再用固定参考尺度放缩到同一无量纲尺度，避免不同量纲直接相加。
+    # avg_val_ssim_loss 来自 SSIMLoss，本身就是 1-SSIM，因此用 ssim_error_value 显式传入。
+    avg_c_aee = compute_c_aee_value(
+        avg_energy_spectrum_mse,
+        avg_aee,
+        ssim_error_value=avg_val_ssim_loss,
+    )
     return avg_val_ssim_loss, avg_val_mse_loss, avg_psnr, avg_energy_spectrum_mse, avg_aee, avg_norm_aee_per100, avg_c_aee
 
 """
@@ -1280,6 +1313,10 @@ def evaluate_all(
     logger.info(f"[evaluate_all] SAVE_AS_GRAY={global_data.esrgan.SAVE_AS_GRAY}")
     save_validate_images = bool(getattr(global_data.esrgan, "IS_SAVE_VALIDATE_IMAGES", False))
     logger.info(f"[evaluate_all] IS_SAVE_VALIDATE_IMAGES={save_validate_images}")
+    save_npy = bool(getattr(global_data.esrgan, "IS_SAVE_NPY", False))
+    logger.info(
+        f"[evaluate_all] IS_SAVE_NPY={save_npy}；普通 NPY 由该开关控制，hist/误差 NPY 仍按需保存。"
+    )
 
     output_root = Path(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -1312,11 +1349,13 @@ def evaluate_all(
     rows = []
     rows_by_class: dict[str, list[dict]] = {}
     image_pair_curves_by_class: dict[str, dict[str, list[np.ndarray]]] = {}
+    image_error_hist_by_class: dict[str, list[np.ndarray]] = {}
     flow_curves_by_class: dict[str, dict[str, list[np.ndarray]]] = {}
     delta_u_hist_by_class: dict[str, list[np.ndarray]] = {}
     delta_v_hist_by_class: dict[str, list[np.ndarray]] = {}
     delta_w_hist_by_class: dict[str, list[np.ndarray]] = {}
     epe_hist_by_class: dict[str, list[np.ndarray]] = {}
+    delta_vorticity_hist_by_class: dict[str, list[np.ndarray]] = {}
     all_image_pair_pred_curves = []
     all_image_pair_gt_curves = []
     all_flow_pred_curves = []
@@ -1365,8 +1404,9 @@ def evaluate_all(
         min_len = min(min(len(x) for x in pred_curves), min(len(x) for x in gt_curves))
         pred_mean = np.mean(np.stack([x[:min_len] for x in pred_curves], axis=0), axis=0)
         gt_mean = np.mean(np.stack([x[:min_len] for x in gt_curves], axis=0), axis=0)
-        np.save(out_dir / f"{file_prefix}_energy_spectrum_pred_mean.npy", pred_mean.astype(np.float32))
-        np.save(out_dir / f"{file_prefix}_energy_spectrum_gt_mean.npy", gt_mean.astype(np.float32))
+        # 均值频谱 NPY 属于普通中间结果，由 IS_SAVE_NPY 控制；PNG 仍按原逻辑保存。
+        _save_evaluate_npy(out_dir / f"{file_prefix}_energy_spectrum_pred_mean.npy", pred_mean.astype(np.float32), save_npy)
+        _save_evaluate_npy(out_dir / f"{file_prefix}_energy_spectrum_gt_mean.npy", gt_mean.astype(np.float32), save_npy)
         _save_energy_spectrum_plot(
             pred_mean,
             gt_mean,
@@ -1374,8 +1414,8 @@ def evaluate_all(
             title=title,
         )
         if also_save_legacy_names:
-            np.save(out_dir / "energy_spectrum_pred_mean.npy", pred_mean.astype(np.float32))
-            np.save(out_dir / "energy_spectrum_gt_mean.npy", gt_mean.astype(np.float32))
+            _save_evaluate_npy(out_dir / "energy_spectrum_pred_mean.npy", pred_mean.astype(np.float32), save_npy)
+            _save_evaluate_npy(out_dir / "energy_spectrum_gt_mean.npy", gt_mean.astype(np.float32), save_npy)
             _save_energy_spectrum_plot(pred_mean, gt_mean, out_dir / "energy_spectrum_mean_compare.png", title=title)
 
     def build_mean_row(target_rows: list[dict], bucket_name: str) -> dict:
@@ -1512,17 +1552,31 @@ def evaluate_all(
                     lr_save = pair_cache["lr"][i:i + 1]
                     fk_save = pair_cache["fake"][i:i + 1]
                     hr_save = pair_cache["hr"][i:i + 1]
+                    # 指标和 Error 面板都使用 batch 级 numpy 缓存，避免每张 previous/next 图再次触发 CPU 拷贝。
+                    p_img = pair_cache["fake_np"][i]
+                    g_img = pair_cache["hr_np"][i]
 
                     if save_validate_images:
                         save_image(lr_save, str(pair_dir / "lr.png"), normalize=False)
                         save_image(fk_save, str(pair_dir / "fake.png"), normalize=False)
                         save_image(hr_save, str(pair_dir / "hr.png"), normalize=False)
 
-                        _save_triplet(lr_save, fk_save, hr_save, pair_dir / "image_triplet.png")
-
-                    # 指标直接使用 batch 级 numpy 缓存，避免每张 previous/next 图再次触发 CPU 拷贝。
-                    p_img = pair_cache["fake_np"][i]
-                    g_img = pair_cache["hr_np"][i]
+                        # evaluate_all 的颗粒图像对比图同步补 Error 面板：
+                        # Error = Generated SR - Original HR，色图与 test_all 的 PIV error-U 风格一致。
+                        save_image_triplet_with_error(lr_save, fk_save, hr_save, p_img, g_img, pair_dir / "image_triplet.png")
+                        # 颗粒图像误差 hist：和光流 Δu/Δv hist 一样保存单 sample 误差分布。
+                        # sr_error.npy/hist 属于诊断结果，force=True 时不受 IS_SAVE_NPY 关闭影响。
+                        image_error_map = compute_particle_image_error(p_img, g_img)
+                        _save_evaluate_npy(pair_dir / "sr_error.npy", image_error_map.astype(np.float32), save_npy, force=True)
+                        save_particle_error_histogram(
+                            pair_dir,
+                            image_error_map,
+                            file_prefix="sr_error",
+                            title=f"{sid}-{pair_type} Particle Image Error Distribution",
+                            save_npy_fn=_save_evaluate_npy,
+                            save_npy=save_npy,
+                        )
+                        image_error_hist_by_class.setdefault(sample_bucket, []).append(image_error_map.reshape(-1))
                     mse_img = _mse(p_img, g_img)
                     psnr_img = _psnr_from_mse(mse_img)
                     r2_img = _r2_score(p_img, g_img)
@@ -1532,8 +1586,8 @@ def evaluate_all(
                     pred_curve, gt_curve = _energy_spectrum_curves(p_img, g_img)
                     es_mse_img = _energy_spectrum_mse_from_curves(pred_curve, gt_curve)
                     if save_validate_images:
-                        np.save(pair_dir / "energy_spectrum_pred.npy", pred_curve.astype(np.float32))
-                        np.save(pair_dir / "energy_spectrum_gt.npy", gt_curve.astype(np.float32))
+                        _save_evaluate_npy(pair_dir / "energy_spectrum_pred.npy", pred_curve.astype(np.float32), save_npy)
+                        _save_evaluate_npy(pair_dir / "energy_spectrum_gt.npy", gt_curve.astype(np.float32), save_npy)
                         _save_energy_spectrum_plot(pred_curve, gt_curve, pair_dir / "energy_spectrum_compare.png", title=f"{sid}-{pair_type} Energy Spectrum")
                     register_curve(sample_bucket, pred_curve, gt_curve, curve_group="image_pair")
 
@@ -1567,8 +1621,8 @@ def evaluate_all(
                 # np.save(one_dir / "lr_flo.npy", _to_np_chw(lr1[0]).transpose(1, 2, 0))
                 # 保存三通道预测流场 [u, v, magnitude]，便于和三通道真值直接对比。
                 if save_validate_images:
-                    np.save(one_dir / "fake_flo.npy", p.transpose(1, 2, 0))
-                    np.save(one_dir / "hr_flo.npy", g.transpose(1, 2, 0))
+                    _save_evaluate_npy(one_dir / "fake_flo.npy", p.transpose(1, 2, 0), save_npy)
+                    _save_evaluate_npy(one_dir / "hr_flo.npy", g.transpose(1, 2, 0), save_npy)
 
                     ref_max_rad = flow_ref_max_rads[i]
 
@@ -1628,6 +1682,7 @@ def evaluate_all(
                         pred_np_chw=p,
                         gt_np_chw=g,
                         ref_max_rad=ref_max_rad,
+                        save_npy=save_npy,
                     )
                 else:
                     # 关闭图像保存时仍然计算误差图，用于 AEE、NORM_AEE 和 CSV 指标。
@@ -1640,10 +1695,10 @@ def evaluate_all(
                     sample_delta_v_hist = _delta_v_histogram_matrix(delta_v_map)
                     sample_delta_w_hist = _delta_w_histogram_matrix(delta_w_map)
                     sample_epe_hist = _epe_histogram_matrix(epe_map)
-                    np.save(one_dir / "delta_u_hist.npy", sample_delta_u_hist)
-                    np.save(one_dir / "delta_v_hist.npy", sample_delta_v_hist)
-                    np.save(one_dir / "delta_w_hist.npy", sample_delta_w_hist)
-                    np.save(one_dir / "epe_hist.npy", sample_epe_hist)
+                    _save_evaluate_npy(one_dir / "delta_u_hist.npy", sample_delta_u_hist, save_npy, force=True)
+                    _save_evaluate_npy(one_dir / "delta_v_hist.npy", sample_delta_v_hist, save_npy, force=True)
+                    _save_evaluate_npy(one_dir / "delta_w_hist.npy", sample_delta_w_hist, save_npy, force=True)
+                    _save_evaluate_npy(one_dir / "epe_hist.npy", sample_epe_hist, save_npy, force=True)
 
                     # 同时把每个 sample 的误差统计登记到所属类别，便于类别级汇总。
                     # 这里要先确保类别桶已经创建，再去 append；
@@ -1656,6 +1711,12 @@ def evaluate_all(
                     delta_v_hist_by_class[sample_bucket].append(delta_v_map.reshape(-1))
                     delta_w_hist_by_class[sample_bucket].append(delta_w_map.reshape(-1))
                     epe_hist_by_class[sample_bucket].append(epe_map.reshape(-1))
+                    # vorticity_quiver.png 第三列是 omega* 误差，这里同步登记像素级 delta omega*，
+                    # 后面按类别和总体输出 delta_vorticity_hist_all.npy/png。
+                    delta_vorticity_map = (
+                        _omega_star_from_uv(p[0], p[1]) - _omega_star_from_uv(g[0], g[1])
+                    ).astype(np.float32, copy=False)
+                    delta_vorticity_hist_by_class.setdefault(sample_bucket, []).append(delta_vorticity_map.reshape(-1))
 
                 # 数值指标对比统一使用三通道 [u, v, magnitude]。
                 # p/g 已经来自 batch 级 numpy 缓存；AEE 和每 100 像素 EPE 直接复用上面生成的 epe_map。
@@ -1671,10 +1732,10 @@ def evaluate_all(
                 pred_curve, gt_curve = _energy_spectrum_curves(p, g)
                 es_mse = _energy_spectrum_mse_from_curves(pred_curve, gt_curve)
                 if save_validate_images:
-                    np.save(one_dir / "energy_spectrum_pred.npy", pred_curve.astype(np.float32))
-                    np.save(one_dir / "energy_spectrum_gt.npy", gt_curve.astype(np.float32))
-                    np.save(one_dir / "flow_energy_spectrum_pred.npy", pred_curve.astype(np.float32))
-                    np.save(one_dir / "flow_energy_spectrum_gt.npy", gt_curve.astype(np.float32))
+                    _save_evaluate_npy(one_dir / "energy_spectrum_pred.npy", pred_curve.astype(np.float32), save_npy)
+                    _save_evaluate_npy(one_dir / "energy_spectrum_gt.npy", gt_curve.astype(np.float32), save_npy)
+                    _save_evaluate_npy(one_dir / "flow_energy_spectrum_pred.npy", pred_curve.astype(np.float32), save_npy)
+                    _save_evaluate_npy(one_dir / "flow_energy_spectrum_gt.npy", gt_curve.astype(np.float32), save_npy)
                     _save_energy_spectrum_plot(pred_curve, gt_curve, one_dir / "energy_spectrum_compare.png", title=f"{sid} Energy Spectrum")
                     _save_energy_spectrum_plot(pred_curve, gt_curve, one_dir / "flow_energy_spectrum_compare.png", title=f"{sid} Flow Energy Spectrum")
                 register_curve(sample_bucket, pred_curve, gt_curve, curve_group="flow")
@@ -1705,6 +1766,7 @@ def evaluate_all(
         sample_key_fields=("class_name", "sample_id"),
         ese_key="energy_spectrum_mse",
         aee_key="VAL_AEE",
+        ssim_key="ssim",
         output_key="VAL_C_AEE",
     )
 
@@ -1727,18 +1789,40 @@ def evaluate_all(
     # 根目录额外保存整套验证集的 Δu / EPE 统计结果，便于做全局误差分布分析。
     # 默认关闭图/npy 保存时不再拼接这些像素级大数组，但 CSV 指标已经在上方正常计算完成。
     if save_validate_images:
+        all_image_error_values = [v for values in image_error_hist_by_class.values() for v in values]
         all_delta_u_values = [v for values in delta_u_hist_by_class.values() for v in values]
         all_delta_v_values = [v for values in delta_v_hist_by_class.values() for v in values]
         all_delta_w_values = [v for values in delta_w_hist_by_class.values() for v in values]
         all_epe_values = [v for values in epe_hist_by_class.values() for v in values]
+        all_delta_vorticity_values = [v for values in delta_vorticity_hist_by_class.values() for v in values]
+        if all_image_error_values:
+            save_particle_error_histogram_bundle(
+                output_root,
+                all_image_error_values,
+                file_prefix="sr_error",
+                title=f"{class_name}-{data_type}-x{int(SCALE*SCALE)} Particle Image Error Distribution",
+                save_npy_fn=_save_evaluate_npy,
+                save_npy=save_npy,
+            )
+        if all_delta_vorticity_values:
+            save_particle_error_histogram_bundle(
+                output_root,
+                all_delta_vorticity_values,
+                file_prefix="delta_vorticity",
+                title=f"{class_name}-{data_type}-x{int(SCALE*SCALE)} Delta Vorticity Error Distribution",
+                xlabel="delta omega*",
+                color="#4477AA",
+                save_npy_fn=_save_evaluate_npy,
+                save_npy=save_npy,
+            )
         if all_delta_u_values:
-            np.save(output_root / "delta_u_hist_all.npy", _delta_u_histogram_matrix(np.concatenate(all_delta_u_values, axis=0)))
+            _save_evaluate_npy(output_root / "delta_u_hist_all.npy", _delta_u_histogram_matrix(np.concatenate(all_delta_u_values, axis=0)), save_npy, force=True)
         if all_delta_v_values:
-            np.save(output_root / "delta_v_hist_all.npy", _delta_v_histogram_matrix(np.concatenate(all_delta_v_values, axis=0)))
+            _save_evaluate_npy(output_root / "delta_v_hist_all.npy", _delta_v_histogram_matrix(np.concatenate(all_delta_v_values, axis=0)), save_npy, force=True)
         if all_delta_w_values:
-            np.save(output_root / "delta_w_hist_all.npy", _delta_w_histogram_matrix(np.concatenate(all_delta_w_values, axis=0)))
+            _save_evaluate_npy(output_root / "delta_w_hist_all.npy", _delta_w_histogram_matrix(np.concatenate(all_delta_w_values, axis=0)), save_npy, force=True)
         if all_epe_values:
-            np.save(output_root / "epe_hist_all.npy", _epe_histogram_matrix(np.concatenate(all_epe_values, axis=0)))
+            _save_evaluate_npy(output_root / "epe_hist_all.npy", _epe_histogram_matrix(np.concatenate(all_epe_values, axis=0)), save_npy, force=True)
 
     metrics_csv_path = Path(metrics_csv_path)
     metrics_image_pair_csv_path = metrics_csv_path.with_name(f"{metrics_csv_path.stem}_image_pair{metrics_csv_path.suffix}")
@@ -1789,19 +1873,44 @@ def evaluate_all(
             file_prefix="flow",
         )
 
+        # 类别级颗粒图像 SR-HR 误差直方图：对应每个 sample 的 sr_error_hist.npy，
+        # 用于快速观察该类别所有 previous/next 颗粒图的整体重建偏差。
+        if save_validate_images and image_error_hist_by_class.get(bucket_name):
+            save_particle_error_histogram_bundle(
+                class_root,
+                image_error_hist_by_class[bucket_name],
+                file_prefix="sr_error",
+                title=f"{bucket_name}-{data_type}-x{int(SCALE*SCALE)} Particle Image Error Distribution",
+                save_npy_fn=_save_evaluate_npy,
+                save_npy=save_npy,
+            )
+
+        # 类别级涡度误差直方图：对应 vorticity_quiver.png 的 Delta omega* 面板。
+        if save_validate_images and delta_vorticity_hist_by_class.get(bucket_name):
+            save_particle_error_histogram_bundle(
+                class_root,
+                delta_vorticity_hist_by_class[bucket_name],
+                file_prefix="delta_vorticity",
+                title=f"{bucket_name}-{data_type}-x{int(SCALE*SCALE)} Delta Vorticity Error Distribution",
+                xlabel="delta omega*",
+                color="#4477AA",
+                save_npy_fn=_save_evaluate_npy,
+                save_npy=save_npy,
+            )
+
         # 类别级 Δu / EPE 统计：把该类别所有 sample 的像素误差拼起来，再统一做直方图。
         if save_validate_images and delta_u_hist_by_class.get(bucket_name):
             class_delta_u_values = np.concatenate(delta_u_hist_by_class[bucket_name], axis=0)
-            np.save(class_root / "delta_u_hist_all.npy", _delta_u_histogram_matrix(class_delta_u_values))
+            _save_evaluate_npy(class_root / "delta_u_hist_all.npy", _delta_u_histogram_matrix(class_delta_u_values), save_npy, force=True)
         if save_validate_images and delta_v_hist_by_class.get(bucket_name):
             class_delta_v_values = np.concatenate(delta_v_hist_by_class[bucket_name], axis=0)
-            np.save(class_root / "delta_v_hist_all.npy", _delta_v_histogram_matrix(class_delta_v_values))
+            _save_evaluate_npy(class_root / "delta_v_hist_all.npy", _delta_v_histogram_matrix(class_delta_v_values), save_npy, force=True)
         if save_validate_images and delta_w_hist_by_class.get(bucket_name):
             class_delta_w_values = np.concatenate(delta_w_hist_by_class[bucket_name], axis=0)
-            np.save(class_root / "delta_w_hist_all.npy", _delta_w_histogram_matrix(class_delta_w_values))
+            _save_evaluate_npy(class_root / "delta_w_hist_all.npy", _delta_w_histogram_matrix(class_delta_w_values), save_npy, force=True)
         if save_validate_images and epe_hist_by_class.get(bucket_name):
             class_epe_values = np.concatenate(epe_hist_by_class[bucket_name], axis=0)
-            np.save(class_root / "epe_hist_all.npy", _epe_histogram_matrix(class_epe_values))
+            _save_evaluate_npy(class_root / "epe_hist_all.npy", _epe_histogram_matrix(class_epe_values), save_npy, force=True)
 
     write_all_class_mean_csv(all_class_image_pair_csv_path, all_class_image_pair_mean_rows)
     write_all_class_mean_csv(all_class_flow_csv_path, all_class_flow_mean_rows)

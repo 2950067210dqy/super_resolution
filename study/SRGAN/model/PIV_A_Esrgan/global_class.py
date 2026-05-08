@@ -99,7 +99,7 @@ class global_data:
         # 设备与模型加载
         # =========================
         device = torch.device("cuda")  # 训练设备
-        IS_LOAD_EXISTS_MODEL = False  # 是否从已保存模型断点继续训练
+        IS_LOAD_EXISTS_MODEL = True  # 是否从已保存模型断点继续训练
         AMP =False #是否开启混合精度训练
         # =========================
         # 训练模式开关
@@ -303,7 +303,7 @@ class global_data:
         # - class_2: 改为读取 RAFT-PIV TFRecord，LR 不再从 LR_DATA_ROOT_DIR 读取，而是在 data_load.py
         #   中按 test_all 同款下采样逻辑动态生成。
         DATA_SETS = ("class_1", "class_2")
-        DATA_SET = "class_2"
+        DATA_SET = "class_1"
         CLASS2_PSEUDO_CLASS_NAME = "problem_class2_raft_piv"
 
         # class_1 保留原有目录结构；class_2 使用单独的 TFRecord 根目录。
@@ -334,11 +334,14 @@ class global_data:
         # =========================
         # RAFT256-PIV 风格 TFRecord 测试配置
         # =========================
-        IS_training = True  # 是否执行训练循环；False 时跳过训练，模型构建和后续 evaluate_all/test_all 仍按原流程执行。
+        IS_training = False  # 是否执行训练循环；False 时跳过训练，模型构建和后续 evaluate_all/test_all 仍按原流程执行。
         # 是否执行 evaluate_all 完整验证。
         # 这里恢复为纯手动总开关：无论 DATA_SET 是 class_1 还是 class_2，都由该超参数决定是否执行。
         IS_VALIDATE_ALL = True
-        IS_SAVE_VALIDATE_IMAGES = False  # evaluate_all 是否保存验证/测试样本图和 npy；False 时只保留指标 CSV，减少磁盘 IO。
+        IS_SAVE_VALIDATE_IMAGES = True  # evaluate_all 是否保存验证/测试样本图；False 时只保留指标 CSV，减少磁盘 IO。
+        # 是否保存普通 NPY 数据文件。默认 False 用于减少 evaluate_all/test_all 的磁盘占用；
+        # TBL 三位置 profile NPY、hist 直方图 NPY 以及误差 NPY 属于后处理必需文件，会在保存图像时绕过该开关继续保存。
+        IS_SAVE_NPY = False
         IS_TEST = True  # 是否在 evaluate_all 之后启用 test_all；默认 False，避免改变原训练/验证流程。
         is_TEST_CLASS3 = True  # 是否额外测试 tbl/twcf 大图数据集；默认 False，节省显存和测试时间。
         TEST_DIR = "/test_all"  # test_all 统一输出目录，会在该目录下再按 dataset 名称分文件夹。
@@ -437,7 +440,8 @@ class global_data:
 
         BASE_VALIDATE_LABEL = ['VAL_MSE_LOSS', 'VAL_SSIM_Loss', 'Avg_PSNR', "VAL_energy_spectrum_mse"]
         # 新增 VAL_C_AEE：
-        # C-AEE = 0.5 * ESE_norm + 0.5 * AEE_norm
+        # C-AEE = 0.3 * ESMSE_norm + 0.3 * EPE_norm + 0.2 * (1-SSIM)_norm。
+        # 三项先按固定参考尺度放缩为无量纲量，再加权求和，避免不同量纲直接相加。
         # 这里只负责定义训练曲线 / CSV 的列名，真正的数值计算在 evaluate.py 中完成。
         RAFT_VALIDATE_LABEL = ["VAL_AEE", "VAL_NORM_AEE_PER100PIXEL", "VAL_C_AEE"]
         validate_label = BASE_VALIDATE_LABEL + (RAFT_VALIDATE_LABEL if USE_RAFT else [])

@@ -30,6 +30,11 @@ from study.SRGAN.model.PIV_A_Esrgan.test import test_all
 from study.SRGAN.util.famo_weight_logger import save_famo_weight_snapshot
 from study.SRGAN.model.PIV_A_Esrgan.global_class import global_data
 from study.SRGAN.model.PIV_A_Esrgan.train import esrgan_union_RAFT_train
+from study.SRGAN.model.training_safety_common import (
+    NonFiniteLossError,
+    restore_model_from_checkpoint,
+    save_early_stop_report,
+)
 from study.SRGAN.util.CSV_operator import CsvTable
 from study.SRGAN.util.accumulator import Accumulator
 from study.SRGAN.util.animator import Animator
@@ -938,6 +943,14 @@ def main():
             )
             famo_weight_csv_path = scale_output_dir / global_data.esrgan.LOSS_DIR.strip("/") / "famo_weights.csv"
             famo_weight_plot_path = scale_output_dir / global_data.esrgan.LOSS_DIR.strip("/") / "famo_weights.png"
+            # NaN/Inf 早停报告目录。出现异常时会保存 txt/json，并从 last_good_model_save_path
+            # 恢复上一个 epoch 的模型权重后进入 evaluate_all/test_all。
+            early_stop_report = None
+            early_stop_report_dir = scale_output_dir / global_data.esrgan.LOSS_DIR.strip("/") / "early_stop"
+            last_good_model_save_path = (
+                scale_output_dir / global_data.esrgan.MODEL_DIR.strip("/") /
+                f"ESRuRAFT_PIV_model_{global_data.esrgan.name}.pth"
+            )
             # 轮数
             """
             训练 start
@@ -982,20 +995,34 @@ def main():
 
                 for i, batch in enumerate(train_progress_bar):
                     """按 USE_RAFT 自动选择“SR+RAFT 联合训练”或“只做 SR 训练”。"""
-                    loss_dict = esrgan_union_RAFT_train(
-                        epoch=epoch,
-                        batch=batch, i=i,
-                        g_optimizer=ESRuRAFT_PIV_model_g_optimizer,
-                        d_optimizer=ESRuRAFT_PIV_model_d_optimizer,
-                        RAFT_optimizer = ESRuRAFT_PIV_model_RAFT_optimizeroptimizer,
-                        scaler = ESRuRAFT_PIV_model_scaler,
+                    try:
+                        loss_dict = esrgan_union_RAFT_train(
+                            epoch=epoch,
+                            batch=batch, i=i,
+                            g_optimizer=ESRuRAFT_PIV_model_g_optimizer,
+                            d_optimizer=ESRuRAFT_PIV_model_d_optimizer,
+                            RAFT_optimizer = ESRuRAFT_PIV_model_RAFT_optimizeroptimizer,
+                            scaler = ESRuRAFT_PIV_model_scaler,
 
-                        model = ESRuRAFT_PIV_model,
-                        train_progress_bar=train_progress_bar,
-                        metric=metric, data_type=data_type, device=global_data.esrgan.device, class_name=class_name,
-                        SCALE=SCALE
+                            model = ESRuRAFT_PIV_model,
+                            train_progress_bar=train_progress_bar,
+                            metric=metric, data_type=data_type, device=global_data.esrgan.device, class_name=class_name,
+                            SCALE=SCALE
 
-                    )
+                        )
+                    except NonFiniteLossError as early_stop_error:
+                        # 当前 batch 的损失已经出现 NaN/Inf，立即终止本次训练。
+                        # 先把完整损失和权重写入报告，再恢复上一个 epoch 已保存的模型权重。
+                        early_stop_report = dict(early_stop_error.report)
+                        early_stop_report["last_checkpoint_path"] = str(last_good_model_save_path)
+                        early_stop_report["restored_last_checkpoint"] = restore_model_from_checkpoint(
+                            ESRuRAFT_PIV_model,
+                            last_good_model_save_path,
+                            device=global_data.esrgan.device,
+                            logger=logger,
+                        )
+                        save_early_stop_report(early_stop_report, early_stop_report_dir, logger=logger)
+                        break
                     # 每个 batch 记录一次 FAMO 权重。
                     # FAMO 的权重是按训练 step 更新的，逐 batch 保存才能看到真实变化曲线。
                     append_famo_weight_row(
@@ -1005,6 +1032,12 @@ def main():
                         global_step=epoch * len(train_loader) + i,
                         loss_dict=loss_dict,
                     )
+                if early_stop_report is not None:
+                    logger.error(
+                        f"[EarlyStop] Epoch {early_stop_report.get('epoch')} 出现 NaN/Inf 损失，"
+                        "已跳出训练循环并进入 evaluate_all/test_all。"
+                    )
+                    break
                 # 每轮结束后评价一次 验证集只取一轮batch
                 avg_val_mse_loss,avg_val_ssim_loss,avg_psnr,avg_val_energy_spectrum_mse,avg_val_aee,avg_val_norm_aee_per100=evaluate(epoch=epoch, class_name=class_name, data_type=data_type, device=global_data.esrgan.device,
                          model = ESRuRAFT_PIV_model, animator=animator, validate_loader=validate_loader,
@@ -1066,7 +1099,7 @@ def main():
                     logger.info(
                         f"{class_name} {data_type} |RAFT_optimizer saved: v -> {ESRuRAFT_PIV_RAFT_optimizer_save_path}")
                 # 保存模型
-                model_save_path = f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.MODEL_DIR}/ESRuRAFT_PIV_model_{global_data.esrgan.name}.pth"
+                model_save_path = str(last_good_model_save_path)
                 if _model_parameters_are_finite(ESRuRAFT_PIV_model, "ESRuRAFT_PIV_model"):
                     torch.save(ESRuRAFT_PIV_model.state_dict(), model_save_path)
                     logger.info(
@@ -1152,8 +1185,9 @@ if __name__ =="__main__":
     except Exception as e:
         logger.error(f"{e}\n{traceback.format_exc()}")
     finally:
-        if global_data.esrgan.IS_AUTO_DL:
-            os.system("/usr/bin/shutdown")
+        pass
+        # if global_data.esrgan.IS_AUTO_DL:
+        #     os.system("/usr/bin/shutdown")
 
 
 
