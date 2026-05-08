@@ -68,6 +68,20 @@ FLOW_SUFFIX_PATTERN = re.compile(r"([_-]flow)+$")
 CLASS2_PSEUDO_CLASS_NAME = "problem_class2_raft_piv"
 CLASS2_TRAIN_TFRECORD_NAME = "Training_Dataset_ProblemClass2_RAFT256-PIV.tfrecord-00000-of-00001"
 CLASS2_VALIDATE_TFRECORD_NAME = "Validation_Dataset_ProblemClass2_RAFT256-PIV.tfrecord-00000-of-00001"
+# class_2 的 Validation TFRecord 没有目录式类别名，只能按用户给定的固定顺序切分。
+# 这里把 1000 条验证样本映射成 7 个评估桶，evaluate_all 会直接读取 batch["class_name"]，
+# 因而后续 CSV、图片目录、类别均值都会按这些名字输出。
+CLASS2_VALIDATE_CLASS_COUNTS = (
+    ("Backstep", 224),
+    ("JHTDB", 300),
+    ("DNS", 92),
+    ("Cylinder", 128),
+    ("SQG", 99),
+    ("Uniform", 57),
+    ("Other", 100),
+)
+CLASS2_VALIDATE_SAMPLE_COUNT = sum(count for _, count in CLASS2_VALIDATE_CLASS_COUNTS)
+CLASS2_EVALUATE_CLASS_NAMES = [class_name for class_name, _ in CLASS2_VALIDATE_CLASS_COUNTS]
 
 
 def resolve_lr_data_root_dir(lr_data_root_dir: str, lr_data_variant: str = "default") -> str:
@@ -670,6 +684,7 @@ def _build_class2_placeholder_samples(
     sample_count: int,
     class_name: str,
     split_name: str,
+    ordered_class_names: list[str] | None = None,
 ) -> list[dict]:
     """
     为 class_2 的 TFRecord 样本生成“虚拟路径元数据”。
@@ -680,11 +695,21 @@ def _build_class2_placeholder_samples(
     """
     virtual_root = tfrecord_path.parent / "_virtual_samples" / split_name
     samples: list[dict] = []
+    if ordered_class_names is not None and len(ordered_class_names) != sample_count:
+        raise ValueError(
+            "ordered_class_names must have the same length as sample_count: "
+            f"{len(ordered_class_names)} != {sample_count}"
+        )
+
     for index in range(sample_count):
         sample_key = f"{split_name}_{index:06d}"
+        # class_2 的真实样本来自 TFRecord，没有目录名。Validation 分支会传入
+        # ordered_class_names，把第 0..999 条样本按固定数量映射到 Backstep/JHTDB/...；
+        # train 分支仍使用统一 class_name，避免训练逻辑依赖并不存在的类别目录。
+        sample_class_name = ordered_class_names[index] if ordered_class_names is not None else class_name
         samples.append(
             {
-                "class_name": class_name,
+                "class_name": sample_class_name,
                 "sample_key": sample_key,
                 "image_pair": {
                     "gr_paths": [
@@ -703,6 +728,19 @@ def _build_class2_placeholder_samples(
             }
         )
     return samples
+
+
+def _build_class2_validate_class_sequence() -> list[str]:
+    """
+    生成 class_2 validation 的 1000 条类别序列。
+
+    TFRecord 本身只保证样本顺序，不提供目录式类别信息；用户给定的顺序/数量就是唯一可靠来源。
+    这里单独封装，后续如果论文数据数量调整，只需要改 CLASS2_VALIDATE_CLASS_COUNTS。
+    """
+    class_sequence: list[str] = []
+    for class_name, sample_count in CLASS2_VALIDATE_CLASS_COUNTS:
+        class_sequence.extend([class_name] * int(sample_count))
+    return class_sequence
 
 
 class _Class2TFRecordDataset:
@@ -871,11 +909,18 @@ def _load_class2_tfrecord_data(
     与 class_1 相比，class_2 的不同点是：
     1. 数据划分由两个 TFRecord 文件天然固定，不再依赖 Train_nums_rate/Test_nums_rate/Validate_nums_rate；
     2. LR 不再从磁盘目录读取，而是从 HR 动态下采样生成；
-    3. 不返回 test_loader，因为用户明确要求 class_2 不跑 evaluate_all。
+    3. 不返回 test_loader；validate_loader 会按 CLASS2_VALIDATE_CLASS_COUNTS 标注类别供 evaluate_all 分组。
     """
     gr_root = ensure_valid_root_dir(gr_data_root_dir, "gr_data_root_dir")
-    class_names = normalize_selected_classes([CLASS2_PSEUDO_CLASS_NAME], selected_classes)
-    class_to_idx = {CLASS2_PSEUDO_CLASS_NAME: 0}
+    # class_2 训练仍是一个整体任务，但验证阶段需要按 Backstep/JHTDB/... 分桶输出。
+    # 因此 class_to_idx 直接覆盖全部评估类别；这些 label 当前只为兼容旧 batch 结构保留。
+    class_names = list(CLASS2_EVALUATE_CLASS_NAMES)
+    class_to_idx = {class_name: idx for idx, class_name in enumerate(class_names)}
+    if selected_classes is not None:
+        logger.warning(
+            "DATA_SET=class_2 ignores selected_classes because the TFRecord validation "
+            "categories are fixed by CLASS2_VALIDATE_CLASS_COUNTS."
+        )
 
     train_tfrecord_path = Path(class2_train_tfrecord).expanduser()
     train_idx_path = Path(class2_train_tfrecord_idx).expanduser()
@@ -883,7 +928,13 @@ def _load_class2_tfrecord_data(
     validate_idx_path = Path(class2_validate_tfrecord_idx).expanduser()
 
     train_count = sum(1 for line in train_idx_path.open("r", encoding="utf-8") if line.strip())
-    validate_count = sum(1 for line in validate_idx_path.open("r", encoding="utf-8") if line.strip())
+    validate_idx_count = sum(1 for line in validate_idx_path.open("r", encoding="utf-8") if line.strip())
+    if validate_idx_count < CLASS2_VALIDATE_SAMPLE_COUNT:
+        raise ValueError(
+            "class_2 validate idx has fewer samples than the fixed evaluation layout requires: "
+            f"{validate_idx_count} < {CLASS2_VALIDATE_SAMPLE_COUNT}"
+        )
+    validate_count = CLASS2_VALIDATE_SAMPLE_COUNT
     if train_count <= 0 or validate_count <= 0:
         raise ValueError(
             f"class_2 TFRecord idx has invalid sample count: train={train_count}, validate={validate_count}"
@@ -900,20 +951,25 @@ def _load_class2_tfrecord_data(
         f"target_size={target_size}, batch_size={batch_size}"
     )
     logger.info(
-        f"[Start] class_2 actual counts: train={train_count}, validate={validate_count}, total={total_count}"
+        f"[Start] class_2 actual counts: train={train_count}, "
+        f"validate_used={validate_count}, validate_idx={validate_idx_count}, total={total_count}"
     )
+    logger.info(f"[Start] class_2 validate class counts: {dict(CLASS2_VALIDATE_CLASS_COUNTS)}")
 
     train_samples = _build_class2_placeholder_samples(
         tfrecord_path=train_tfrecord_path,
         sample_count=train_count,
-        class_name=CLASS2_PSEUDO_CLASS_NAME,
+        # class_2 的 train TFRecord 不参与 evaluate_all 分类，统一标到 Other 保持 label 可用。
+        class_name="Other",
         split_name="train",
     )
+    validate_class_sequence = _build_class2_validate_class_sequence()
     validate_samples = _build_class2_placeholder_samples(
         tfrecord_path=validate_tfrecord_path,
         sample_count=validate_count,
-        class_name=CLASS2_PSEUDO_CLASS_NAME,
+        class_name="Other",
         split_name="validate",
+        ordered_class_names=validate_class_sequence,
     )
 
     train_loader = _Class2TFRecordLoader(
@@ -939,21 +995,28 @@ def _load_class2_tfrecord_data(
         device_id=torch.cuda.current_device() if torch.cuda.is_available() else 0,
     )
 
+    train_counter = Counter(sample["class_name"] for sample in train_samples)
+    validate_counter = Counter(sample["class_name"] for sample in validate_samples)
     split_summary = {
-        CLASS2_PSEUDO_CLASS_NAME: {
-            "total": total_count,
-            "train": train_count,
-            "val": validate_count,
+        class_name: {
+            "total": train_counter.get(class_name, 0) + validate_counter.get(class_name, 0),
+            "train": train_counter.get(class_name, 0),
+            "val": validate_counter.get(class_name, 0),
             "test": 0,
         }
+        for class_name in class_names
     }
-    logger.info(f"[Done] class_2 pseudo class names: {class_names}")
+    # 让 evaluate_all 可以从 validate_loader.dataset.known_class_names 读取类别顺序；
+    # 同时 grouped_samples_by_class 也会按 Backstep/JHTDB/... 统计，日志更直观。
+    attach_grouped_class_metadata(train_loader.dataset, class_names, other_name="Other")
+    attach_grouped_class_metadata(validate_loader.dataset, class_names, other_name="Other")
+    logger.info(f"[Done] class_2 evaluate class names: {class_names}")
     logger.info(
         f"[Done] class_2 split rates: train={train_count / total_count:.8f}, "
         f"validate={validate_count / total_count:.8f}, test=0.0"
     )
     logger.info(
-        f"[Done] class_2 summary: {split_summary[CLASS2_PSEUDO_CLASS_NAME]}"
+        f"[Done] class_2 summary: {split_summary}"
     )
     logger.info("=" * 80)
     return train_loader, validate_loader, None, class_names, train_samples + validate_samples

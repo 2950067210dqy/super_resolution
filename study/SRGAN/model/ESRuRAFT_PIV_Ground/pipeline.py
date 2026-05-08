@@ -1151,5 +1151,5 @@ if __name__ =="__main__":
         logger.error(f"{e}\n{traceback.format_exc()}")
     finally:
         if global_data.esrgan.IS_AUTO_DL:
-            os.system("/usr/bin/shutdown")
+            # os.system("/usr/bin/shutdown")
             pass

@@ -92,9 +92,11 @@ class global_data:
         # - None 或 []：不排除，读取所有类别；
         # - ["JHTDB_channel_hd", ...]：在 TRAIN_CLASS_MODE 为 all/mixed/fixed 时不加载这些类别。
         # single 模式保持原语义，不主动应用 EXCLUDE_CLASS，避免用户点名单类训练时被隐式过滤。
-        EXCLUDE_CLASS = ["JHTDB_channel_hd", "JHTDB_isotropic1024_hd", "JHTDB_mhd1024_hd", "uniform"]
+        # DATA_SET="class_1" 默认不再排除 JHTDB*/uniform；这些类别会正常参与训练，
+        # evaluate_all 阶段再把 JHTDB* 归到 JHTDB_channel，并跳过 uniform 的全量验证输出。
+        EXCLUDE_CLASS = []
         #每个类别加载多少的数据 50% TRAIN_CLASS_MODE=fixed时无效
-        CLASS_SAMPLE_RATIO =0.01
+        CLASS_SAMPLE_RATIO =1
         # =========================
         # 设备与模型加载
         # =========================
@@ -354,7 +356,7 @@ class global_data:
         TEST_PLOT_RESULTS = True  # 是否保存每个 sample 的 png 可视化图。
         TEST_DISPLACEMENT_CMAP = "viridis"  # tbl/twcf 位移场使用和论文图相近的紫-蓝-绿-黄色条。
         TEST_REGULAR_FLOW_CMAP = "jet"  # backstep/cylinder/dns_turb/jhtdb/sqg 常规光流图沿用 evaluate_all 的 jet 色条。
-        TBL_PROFILE_COLUMN_RATIOS = (0.15, 0.40, 0.83)  # TBL 剖面分析的 Laminar/Transition/Turbulent 三个 x 位置比例；Transition 位置设为 0.40。
+        TBL_PROFILE_COLUMN_RATIOS = (0.15, 0.33, 0.83)  # TBL 剖面分析的 Laminar/Transition/Turbulent 三个 x 位置比例；Transition 位置设为 0.33。
         TBL_PROFILE_REGION_NAMES = ("Laminar", "Transition", "Turbulent")  # TBL 剖面图中三个区域标签。
         TBL_PROFILE_Y_LIMIT = 200  # TBL 论文风格剖面只显示 y=0..200px 的有效边界层区域。
         TBL_PROFILE_SAMPLE_CROP_WIDTH = 256  # TBL 剖面位置局部对比图的截取宽度；不再假设 sample 均分。

@@ -1381,8 +1381,19 @@ def evaluate_all(
     dataset = getattr(data_loader, "dataset", None)
     known_class_names = list(getattr(dataset, "known_class_names", []))
     other_name = getattr(dataset, "other_class_name", "other")
+    dataset_name = str(getattr(global_data.esrgan, "DATA_SET", "class_1")).strip().lower()
 
-    def bucket_class_name(sample_class_name: str | None) -> str:
+    def bucket_class_name(sample_class_name: str | None) -> str | None:
+        raw_name = "" if sample_class_name is None else str(sample_class_name).strip()
+        raw_lower = raw_name.lower()
+        if dataset_name == "class_1":
+            # class_1 默认不再排除 JHTDB*/uniform：
+            # - JHTDB 开头的多个来源在 evaluate_all 中统一归到 JHTDB_channel；
+            # - uniform 只参与训练/普通验证，不生成 evaluate_all 的图片与 CSV 行。
+            if raw_lower == "uniform":
+                return None
+            if raw_lower.startswith("jhtdb"):
+                return "JHTDB_channel"
         # 优先用已知类别；没有命中就归到 other，避免评估阶段因脏类别名直接丢样本。
         if sample_class_name in known_class_names:
             return str(sample_class_name)
@@ -1581,6 +1592,10 @@ def evaluate_all(
             B = hr.shape[0]
             for i in range(B):
                 sample_bucket = bucket_class_name(batch_class_names[i] if i < len(batch_class_names) else None)
+                if sample_bucket is None:
+                    # uniform 已按用户要求从 evaluate_all 输出中跳过；不创建目录、不写指标，
+                    # 避免 uniform 混入类别均值，但不影响它在训练集中的读取。
+                    continue
                 class_root = output_root / sample_bucket
                 class_root.mkdir(parents=True, exist_ok=True)
 
