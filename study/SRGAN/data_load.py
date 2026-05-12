@@ -5,6 +5,7 @@
 from __future__ import annotations
 from loguru import logger
 
+import csv
 import hashlib
 import json
 import pickle
@@ -68,9 +69,12 @@ FLOW_SUFFIX_PATTERN = re.compile(r"([_-]flow)+$")
 CLASS2_PSEUDO_CLASS_NAME = "problem_class2_raft_piv"
 CLASS2_TRAIN_TFRECORD_NAME = "Training_Dataset_ProblemClass2_RAFT256-PIV.tfrecord-00000-of-00001"
 CLASS2_VALIDATE_TFRECORD_NAME = "Validation_Dataset_ProblemClass2_RAFT256-PIV.tfrecord-00000-of-00001"
-# class_2 的 Validation TFRecord 没有目录式类别名，只能按用户给定的固定顺序切分。
-# 这里把 1000 条验证样本映射成 7 个评估桶，evaluate_all 会直接读取 batch["class_name"]，
-# 因而后续 CSV、图片目录、类别均值都会按这些名字输出。
+# class_2 的 Validation TFRecord 没有目录式类别名，类别需要由外部索引映射表补齐。
+# 下面这个 CSV 文件记录了 validation_index_0based -> category 的对应关系；
+# 读取时会按 index 从小到大恢复 1000 条验证样本的真实类别顺序。
+CLASS2_VALIDATE_CATEGORY_CSV_NAME = "class2_validation_index_category_matches.csv"
+# 这里的数量不再用于“连续切段”，只作为 CSV 完整性校验和固定类别顺序的依据。
+# evaluate_all 会直接读取 batch["class_name"]，后续 CSV、图片目录、类别均值都会按这些名字输出。
 CLASS2_VALIDATE_CLASS_COUNTS = (
     ("Backstep", 224),
     ("JHTDB", 300),
@@ -704,7 +708,7 @@ def _build_class2_placeholder_samples(
     for index in range(sample_count):
         sample_key = f"{split_name}_{index:06d}"
         # class_2 的真实样本来自 TFRecord，没有目录名。Validation 分支会传入
-        # ordered_class_names，把第 0..999 条样本按固定数量映射到 Backstep/JHTDB/...；
+        # ordered_class_names，把第 0..999 条样本按 CSV 中的 validation index 映射到 Backstep/JHTDB/...；
         # train 分支仍使用统一 class_name，避免训练逻辑依赖并不存在的类别目录。
         sample_class_name = ordered_class_names[index] if ordered_class_names is not None else class_name
         samples.append(
@@ -730,17 +734,112 @@ def _build_class2_placeholder_samples(
     return samples
 
 
-def _build_class2_validate_class_sequence() -> list[str]:
+def _resolve_class2_validate_category_csv_path(category_csv_path: str | Path | None = None) -> Path:
     """
-    生成 class_2 validation 的 1000 条类别序列。
+    解析 class_2 validation 类别映射 CSV 的路径。
 
-    TFRecord 本身只保证样本顺序，不提供目录式类别信息；用户给定的顺序/数量就是唯一可靠来源。
-    这里单独封装，后续如果论文数据数量调整，只需要改 CLASS2_VALIDATE_CLASS_COUNTS。
+    说明：
+    - 未显式传入时，默认读取 SRGAN 项目根目录下的 class2_validation_index_category_matches.csv；
+    - 传入相对路径时，同时兼容“当前运行目录”和“data_load.py 所在目录”，避免在服务器上
+      从不同 cwd 启动 pipeline 时找不到文件；
+    - 这个函数只负责定位路径，是否存在和内容是否合法由下游读取函数统一报错。
     """
-    class_sequence: list[str] = []
-    for class_name, sample_count in CLASS2_VALIDATE_CLASS_COUNTS:
-        class_sequence.extend([class_name] * int(sample_count))
-    return class_sequence
+    raw_path = CLASS2_VALIDATE_CATEGORY_CSV_NAME if category_csv_path is None else str(category_csv_path).strip()
+    if not raw_path:
+        raw_path = CLASS2_VALIDATE_CATEGORY_CSV_NAME
+
+    path = Path(raw_path).expanduser()
+    if path.is_absolute():
+        return path
+
+    srgan_root = Path(__file__).resolve().parent
+    candidates = [
+        Path.cwd() / path,
+        srgan_root / path,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[-1]
+
+
+def _build_class2_validate_class_sequence(
+    category_csv_path: str | Path | None = None,
+    expected_count: int = CLASS2_VALIDATE_SAMPLE_COUNT,
+) -> tuple[list[str], Counter[str], Path]:
+    """
+    按 CSV 生成 class_2 validation 的类别序列。
+
+    TFRecord 本身只保证样本顺序，不提供目录式类别信息；现在以
+    class2_validation_index_category_matches.csv 中的 validation_index_0based 为唯一索引来源。
+    返回的 class_sequence[i] 就是第 i 条 validation 样本的类别，evaluate_all 会据此按类别分组。
+
+    校验规则：
+    1. CSV 必须包含 validation_index_0based 和 category 两列；
+    2. index 必须完整覆盖 0..expected_count-1，不能重复、不能越界；
+    3. category 必须属于 Backstep/JHTDB/DNS/Cylinder/SQG/Uniform/Other。
+    """
+    csv_path = _resolve_class2_validate_category_csv_path(category_csv_path)
+    if not csv_path.exists():
+        raise FileNotFoundError(
+            "Cannot find class_2 validation category CSV. "
+            f"Expected at: {csv_path}. You can override it with CLASS2_VALIDATE_CATEGORY_CSV."
+        )
+
+    allowed_by_lower = {name.lower(): name for name in CLASS2_EVALUATE_CLASS_NAMES}
+    index_to_category: dict[int, str] = {}
+    required_columns = {"validation_index_0based", "category"}
+
+    with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = set(reader.fieldnames or [])
+        missing_columns = sorted(required_columns - fieldnames)
+        if missing_columns:
+            raise ValueError(
+                f"class_2 validation category CSV missing columns {missing_columns}: {csv_path}"
+            )
+
+        for line_no, row in enumerate(reader, start=2):
+            raw_index = (row.get("validation_index_0based") or "").strip()
+            raw_category = (row.get("category") or "").strip()
+            try:
+                sample_index = int(raw_index)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid validation_index_0based at {csv_path}:{line_no}: {raw_index!r}"
+                ) from exc
+
+            if sample_index < 0 or sample_index >= expected_count:
+                raise ValueError(
+                    f"validation_index_0based out of expected 0..{expected_count - 1} "
+                    f"at {csv_path}:{line_no}: {sample_index}"
+                )
+            if sample_index in index_to_category:
+                raise ValueError(
+                    f"Duplicate validation_index_0based at {csv_path}:{line_no}: {sample_index}"
+                )
+
+            # 允许 CSV 里大小写略有差异，但进入 batch["class_name"] 时统一成固定显示名。
+            category = allowed_by_lower.get(raw_category.lower())
+            if category is None:
+                raise ValueError(
+                    f"Unknown class_2 validation category at {csv_path}:{line_no}: {raw_category!r}. "
+                    f"Allowed categories: {CLASS2_EVALUATE_CLASS_NAMES}"
+                )
+            index_to_category[sample_index] = category
+
+    missing_indices = [index for index in range(expected_count) if index not in index_to_category]
+    if missing_indices:
+        preview = missing_indices[:20]
+        suffix = "..." if len(missing_indices) > len(preview) else ""
+        raise ValueError(
+            f"class_2 validation category CSV does not cover all {expected_count} samples; "
+            f"missing indices: {preview}{suffix}"
+        )
+
+    class_sequence = [index_to_category[index] for index in range(expected_count)]
+    class_counter: Counter[str] = Counter(class_sequence)
+    return class_sequence, class_counter, csv_path
 
 
 class _Class2TFRecordDataset:
@@ -902,6 +1001,7 @@ def _load_class2_tfrecord_data(
     class2_train_tfrecord_idx: str | Path,
     class2_validate_tfrecord: str | Path,
     class2_validate_tfrecord_idx: str | Path,
+    class2_validate_category_csv: str | Path | None = None,
 ):
     """
     加载 class_2 的 train/validate TFRecord，并包装成与原 DataLoader 完全一致的 batch 接口。
@@ -909,7 +1009,8 @@ def _load_class2_tfrecord_data(
     与 class_1 相比，class_2 的不同点是：
     1. 数据划分由两个 TFRecord 文件天然固定，不再依赖 Train_nums_rate/Test_nums_rate/Validate_nums_rate；
     2. LR 不再从磁盘目录读取，而是从 HR 动态下采样生成；
-    3. 不返回 test_loader；validate_loader 会按 CLASS2_VALIDATE_CLASS_COUNTS 标注类别供 evaluate_all 分组。
+    3. 不返回 test_loader；validate_loader 会按 CSV 中的 validation index/category 标注类别，
+       供 evaluate_all 按 Backstep/JHTDB/DNS/Cylinder/SQG/Uniform/Other 分组。
     """
     gr_root = ensure_valid_root_dir(gr_data_root_dir, "gr_data_root_dir")
     # class_2 训练仍是一个整体任务，但验证阶段需要按 Backstep/JHTDB/... 分桶输出。
@@ -919,7 +1020,7 @@ def _load_class2_tfrecord_data(
     if selected_classes is not None:
         logger.warning(
             "DATA_SET=class_2 ignores selected_classes because the TFRecord validation "
-            "categories are fixed by CLASS2_VALIDATE_CLASS_COUNTS."
+            "categories are fixed by CLASS2_VALIDATE_CATEGORY_CSV."
         )
 
     train_tfrecord_path = Path(class2_train_tfrecord).expanduser()
@@ -927,14 +1028,20 @@ def _load_class2_tfrecord_data(
     validate_tfrecord_path = Path(class2_validate_tfrecord).expanduser()
     validate_idx_path = Path(class2_validate_tfrecord_idx).expanduser()
 
+    # 先读取 CSV 映射，再决定 validate_count。这样类别顺序完全由 CSV 的 validation_index_0based 控制，
+    # 不再假设 Backstep/JHTDB/... 在 TFRecord 中是连续排列。
+    validate_class_sequence, validate_class_counter, validate_category_csv_path = _build_class2_validate_class_sequence(
+        class2_validate_category_csv,
+        expected_count=CLASS2_VALIDATE_SAMPLE_COUNT,
+    )
+    validate_count = len(validate_class_sequence)
     train_count = sum(1 for line in train_idx_path.open("r", encoding="utf-8") if line.strip())
     validate_idx_count = sum(1 for line in validate_idx_path.open("r", encoding="utf-8") if line.strip())
-    if validate_idx_count < CLASS2_VALIDATE_SAMPLE_COUNT:
+    if validate_idx_count < validate_count:
         raise ValueError(
-            "class_2 validate idx has fewer samples than the fixed evaluation layout requires: "
-            f"{validate_idx_count} < {CLASS2_VALIDATE_SAMPLE_COUNT}"
+            "class_2 validate idx has fewer samples than the CSV category mapping requires: "
+            f"{validate_idx_count} < {validate_count}"
         )
-    validate_count = CLASS2_VALIDATE_SAMPLE_COUNT
     if train_count <= 0 or validate_count <= 0:
         raise ValueError(
             f"class_2 TFRecord idx has invalid sample count: train={train_count}, validate={validate_count}"
@@ -946,6 +1053,7 @@ def _load_class2_tfrecord_data(
     logger.info(f"[Start] TFRecord root: {gr_root}")
     logger.info(f"[Start] train_tfrecord={train_tfrecord_path}")
     logger.info(f"[Start] validate_tfrecord={validate_tfrecord_path}")
+    logger.info(f"[Start] validate_category_csv={validate_category_csv_path}")
     logger.info(
         f"[Start] class_2 uses dynamic LR generation, scale_factor={scale_factor}, "
         f"target_size={target_size}, batch_size={batch_size}"
@@ -954,7 +1062,7 @@ def _load_class2_tfrecord_data(
         f"[Start] class_2 actual counts: train={train_count}, "
         f"validate_used={validate_count}, validate_idx={validate_idx_count}, total={total_count}"
     )
-    logger.info(f"[Start] class_2 validate class counts: {dict(CLASS2_VALIDATE_CLASS_COUNTS)}")
+    logger.info(f"[Start] class_2 validate class counts from csv: {dict(validate_class_counter)}")
 
     train_samples = _build_class2_placeholder_samples(
         tfrecord_path=train_tfrecord_path,
@@ -963,7 +1071,6 @@ def _load_class2_tfrecord_data(
         class_name="Other",
         split_name="train",
     )
-    validate_class_sequence = _build_class2_validate_class_sequence()
     validate_samples = _build_class2_placeholder_samples(
         tfrecord_path=validate_tfrecord_path,
         sample_count=validate_count,
@@ -2488,6 +2595,7 @@ def load_data(
     class2_train_tfrecord_idx: str | Path | None = None,
     class2_validate_tfrecord: str | Path | None = None,
     class2_validate_tfrecord_idx: str | Path | None = None,
+    class2_validate_category_csv: str | Path | None = None,
 ):
     """
     加载超分辨率 GR/LR 成对数据集。
@@ -2532,7 +2640,8 @@ def load_data(
           前缀只用于辅助识别类别，真实 GR/LR/LR-flow 路径仍按本函数原有根目录和文件名收集。
         - dataset_name: 数据集来源。`class_1` 为原始目录式数据；`class_2` 为 TFRecord 数据。
         - scale_factor: LR 动态下采样倍率。class_1 仅用于日志；class_2 会真正用于生成 LR。
-        - class2_*: DATA_SET=class_2 时使用的 train/validate TFRecord 与 idx 路径。
+        - class2_*: DATA_SET=class_2 时使用的 train/validate TFRecord、idx，以及
+          validation_index_0based -> category 的 CSV 映射表路径。
     """
     normalized_dataset_name = str(dataset_name).strip().lower()
     if normalized_dataset_name == "class_2":
@@ -2557,6 +2666,7 @@ def load_data(
             class2_train_tfrecord_idx=class2_train_tfrecord_idx,
             class2_validate_tfrecord=class2_validate_tfrecord,
             class2_validate_tfrecord_idx=class2_validate_tfrecord_idx,
+            class2_validate_category_csv=class2_validate_category_csv,
         )
     if normalized_dataset_name != "class_1":
         raise ValueError(f"Unsupported dataset_name: {dataset_name}")

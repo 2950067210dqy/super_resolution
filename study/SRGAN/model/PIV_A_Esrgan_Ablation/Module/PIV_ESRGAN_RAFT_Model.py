@@ -1,0 +1,920 @@
+import torch  # 导入 PyTorch 主库
+from torch import nn  # 导入神经网络模块基类和常用层接口
+import torch.nn.functional as F  # 导入函数式接口，便于直接调用 loss / 激活等函数
+from pathlib import Path  # 用于解析 RAFT256 checkpoint 的相对路径
+
+from loguru import logger
+from study.SRGAN.model.PIV_A_Esrgan_Ablation.Module.RAFT_Model import RAFT, RAFT128, RAFT256  # 导入 RAFT 光流估计主网络
+from study.SRGAN.model.PIV_A_Esrgan_Ablation.Module.loss import (
+    descriminator_loss,  # 判别器损失，负责训练 D 区分真/假图像
+    flow_warp_consistency_loss,  # GT flow 引导的 SR 前后帧 warp 一致性损失
+    perceptual_loss,  # 感知损失，内部可选带对抗项
+
+    pixel_loss,  # 像素域复合损失，包含 L1/MSE/SSIM/FFT 等项
+)
+from study.SRGAN.model.PIV_A_Esrgan_Ablation.Module.piv_esrgan_model import (  # 导入消融分支的 SR 网络组件
+    Discriminator,  # PIV_A 风格 Attention U-Net 判别器
+    Generator,  # PIV_A 风格双帧感知生成器
+    OriginalESRGANDiscriminator,  # 最基础 ESRGAN 判别器，供消融模式 1/4/5 使用
+    OriginalESRGANGenerator,  # 最基础 ESRGAN 生成器，供消融模式 5 使用
+)
+from study.SRGAN.model.PIV_A_Esrgan_Ablation.global_class import global_data
+from study.SRGAN.util.MTL_METHOD import FAMO
+
+try:
+    # 自动混合精度上下文管理器
+    # 使用后可以在前向推理中自动选择 float16 / float32，
+    # 从而减少显存占用并提升训练速度
+    autocast = torch.cuda.amp.autocast
+except:
+    # 如果 PyTorch 版本过低，不支持 AMP，则定义一个“空壳” autocast
+    # 这样后面 with autocast(...): 仍然可以正常运行，只是不会启用混合精度
+    class autocast:
+        def __init__(self, enabled):
+            pass
+
+        def __enter__(self):
+            pass
+
+        def __exit__(self, *args):
+            pass
+
+
+def _resolve_raft256_pretrain_path(path_text: str | Path) -> Path:
+    """
+    解析 RAFT256 预训练 checkpoint 路径。
+
+    配置中默认写成 "RAFT_CHECKPOINT/ckpt_256.tar"，这是相对 SRGAN 根目录的路径；
+    如果用户传入绝对路径，则直接使用绝对路径。这样从 PyCharm、命令行或 notebook
+    不同工作目录启动时，都不会因为 cwd 不同而找错 checkpoint。
+    """
+    path = Path(path_text)
+    if path.is_absolute():
+        return path
+    srgan_root = Path(__file__).resolve().parents[3]
+    return srgan_root / path
+
+
+def _init_raft128_from_raft256_if_enabled(model: nn.Module) -> None:
+    """
+    可选：用 RAFT256 checkpoint 中 shape 一致的权重初始化 RAFT128。
+
+    这是一个“预训练初始化”而不是无损结构迁移：
+    - RAFT256 的 update_block.mask.2 输出通道是 8*8*9=576；
+    - RAFT128 的 update_block.mask.2 输出通道是 4*4*9=144；
+    - 这类 shape 不一致的层必须跳过，保留 RAFT128 自身初始化。
+
+    因此该功能只在：
+    1. global_data.esrgan.RAFT128_INIT_FROM_RAFT256=True；
+    2. global_data.esrgan.RAFT_MODEL_TYPE="RAFT128"；
+    时生效。迁移后建议继续训练/微调，让 RAFT128 适应 1/4 分辨率的内部特征网格。
+    """
+    if not bool(global_data.esrgan.RAFT128_INIT_FROM_RAFT256):
+        return
+
+    checkpoint_path = _resolve_raft256_pretrain_path(global_data.esrgan.RAFT128_INIT_FROM_RAFT256_CKPT)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"RAFT256 预训练 checkpoint 不存在: {checkpoint_path}")
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    source_state = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else None
+    if not isinstance(source_state, dict):
+        raise ValueError(f"无法从 checkpoint 中读取 RAFT256 state_dict: {checkpoint_path}")
+
+    target_state = model.state_dict()
+    matched_state = {}
+    skipped = []
+    for name, value in source_state.items():
+        target_value = target_state.get(name)
+        if target_value is not None and hasattr(value, "shape") and target_value.shape == value.shape:
+            matched_state[name] = value
+        else:
+            source_shape = tuple(value.shape) if hasattr(value, "shape") else type(value).__name__
+            target_shape = tuple(target_value.shape) if target_value is not None else None
+            skipped.append((name, source_shape, target_shape))
+
+    # target_state 本身已经包含 RAFT128 的完整随机初始化权重。
+    # 这里只覆盖 shape 完全相同的层；被跳过的层保持 RAFT128 初始化，相当于“重建”不兼容层。
+    target_state.update(matched_state)
+    model.load_state_dict(target_state)
+
+    logger.info(
+        "[PIV_A_Esrgan_Ablation] RAFT128 initialized from RAFT256 checkpoint | "
+        f"checkpoint={checkpoint_path}, loaded={len(matched_state)}, skipped={len(skipped)}"
+    )
+    for name, source_shape, target_shape in skipped[:20]:
+        logger.info(
+            "[PIV_A_Esrgan_Ablation] skipped RAFT256->RAFT128 weight | "
+            f"name={name}, source_shape={source_shape}, target_shape={target_shape}"
+        )
+    if len(skipped) > 20:
+        logger.info(f"[PIV_A_Esrgan_Ablation] skipped weights truncated: {len(skipped) - 20} more")
+
+
+def _build_piv_raft(batch_size: int) -> nn.Module:
+    """
+    根据全局配置创建 piv_RAFT。
+
+    这个函数只替代原来硬编码的 RAFT128 实例化，不改变后续 forward / train_step 接口。
+    默认 RAFT_MODEL_TYPE="RAFT128"，因此用户不改配置时，行为与原来完全一致。
+    """
+    raft_model_type = global_data.esrgan.validate_raft_model_type()
+    if raft_model_type == "raft":
+        model = RAFT()
+    elif raft_model_type == "raft128":
+        model = RAFT128(upsample=global_data.esrgan.RAFT_UPSAMPLE, batch_size=batch_size)
+        _init_raft128_from_raft256_if_enabled(model)
+    elif raft_model_type == "raft256":
+        model = RAFT256(upsample=global_data.esrgan.RAFT_UPSAMPLE, batch_size=batch_size)
+    else:
+        # validate_raft_model_type 已经拦截非法值；这里保留防御式分支，便于未来扩展时定位问题。
+        raise ValueError(f"Unsupported RAFT_MODEL_TYPE: {global_data.esrgan.RAFT_MODEL_TYPE}")
+
+    logger.info(
+        "[PIV_A_Esrgan_Ablation] piv_RAFT created | "
+        f"type={raft_model_type}, upsample={global_data.esrgan.RAFT_UPSAMPLE}"
+    )
+    return model
+
+
+def _build_sr_generator(inner_chanel: int) -> nn.Module:
+    """
+    根据 ABLATION_MODE 创建 SR 生成器。
+
+    - 默认 / 模式 1~4：使用 PIV_A_Esrgan 的双帧感知生成器，保留 previous/next 特征交互；
+    - 模式 5：使用最基础 ESRGAN 单帧生成器，去掉双帧融合，配合关闭图像一致性损失做干净消融。
+    """
+    if global_data.esrgan.use_basic_esrgan_generator():
+        logger.info(
+            "[PIV_A_Esrgan_Ablation] SR generator created | "
+            f"type=basic_esrgan, rrdb={global_data.esrgan.ORIGINAL_ESRGAN_NUM_RRDB}"
+        )
+        return OriginalESRGANGenerator(
+            inner_chanel=inner_chanel,
+            num_residual_blocks=global_data.esrgan.ORIGINAL_ESRGAN_NUM_RRDB,
+        )
+
+    logger.info("[PIV_A_Esrgan_Ablation] SR generator created | type=piv_a_esrgan")
+    return Generator(inner_chanel=inner_chanel)
+
+
+def _build_sr_discriminator(inner_chanel: int) -> nn.Module:
+    """
+    根据 ABLATION_MODE 创建 SR 判别器。
+
+    两种判别器接收的输入都保持为 [prev_gray, next_gray, abs(next-prev)]：
+    这样消融只改变 D 的结构，不改变 D 看到的数据语义。
+    """
+    if global_data.esrgan.use_basic_esrgan_discriminator():
+        logger.info("[PIV_A_Esrgan_Ablation] SR discriminator created | type=basic_esrgan")
+        return OriginalESRGANDiscriminator(inner_chanel=inner_chanel)
+
+    logger.info(
+        "[PIV_A_Esrgan_Ablation] SR discriminator created | "
+        f"type=piv_a_attention_unet, base_channels={global_data.esrgan.DISCRIMINATOR_BASE_CHANNELS}, "
+        f"multiscale={global_data.esrgan.DISCRIMINATOR_USE_MULTISCALE}, "
+        f"spectral_norm={global_data.esrgan.DISCRIMINATOR_SPECTRAL_NORM}"
+    )
+    return Discriminator(
+        inner_chanel=inner_chanel,
+        base_channels=global_data.esrgan.DISCRIMINATOR_BASE_CHANNELS,
+        use_multiscale=global_data.esrgan.DISCRIMINATOR_USE_MULTISCALE,
+        spectral_norm=global_data.esrgan.DISCRIMINATOR_SPECTRAL_NORM,
+    )
+
+
+class ESRuRAFT_PIV(nn.Module):
+    """
+    ESRuRAFT_PIV 主网络。
+
+    基本流程:
+    1.用改进的esrgan 对低分辨率图像对进行超分辨
+    2.然后用基本的RAFT进行piv估计
+    """
+
+    def __init__(self,inner_chanel,batch_size):
+        super(ESRuRAFT_PIV, self).__init__()  # 调用父类初始化
+
+        # USE_RAFT 是本分支新增的总开关：
+        # - True: 维持原来的 ESRGAN + RAFT 联合训练；
+        # - False: 只做 PIV 图像对超分辨率，完全跳过 RAFT 网络、RAFT loss 和 RAFT 评价指标。
+        self.use_raft = bool(global_data.esrgan.USE_RAFT)
+        # 生成器 / 判别器不再硬编码。消融模式在 global_class.apply_ablation_config()
+        # 中被翻译为 SR_GENERATOR_TYPE / SR_DISCRIMINATOR_TYPE，这里只按最终配置实例化。
+        self.piv_esrgan_generator = _build_sr_generator(inner_chanel=inner_chanel)
+        self.piv_esrgan_discriminator = _build_sr_discriminator(inner_chanel=3)
+        self.piv_RAFT = (
+            _build_piv_raft(batch_size=batch_size)
+            if self.use_raft
+            else None
+        )  # USE_RAFT=False 时不实例化 RAFT，避免无意义显存占用
+
+        # Generator 侧 FAMO 只在 USE_FAMO=True 时启用。
+        # 默认保持 None，训练就会完全走手动权重组合，不改变当前实验行为。
+        self.generator_famo_task_names = list(global_data.esrgan.FAMO_GENERATOR_TASK_NAMES)
+        self.generator_famo = None
+        if bool(global_data.esrgan.USE_FAMO):
+            self.generator_famo = FAMO(
+                n_tasks=len(self.generator_famo_task_names),
+                device=global_data.esrgan.device,
+                gamma=global_data.esrgan.FAMO_GAMMA,
+                w_lr=global_data.esrgan.FAMO_W_LR,
+                task_weights=global_data.esrgan.FAMO_GENERATOR_INIT_WEIGHTS,
+                max_norm=global_data.esrgan.FAMO_MAX_NORM,
+            )
+
+
+
+    @staticmethod
+    def _set_requires_grad(module: nn.Module, requires_grad: bool) -> None:
+        """
+        统一控制某个子模块的参数是否参与梯度计算。
+
+        参数:
+            module: 需要切换梯度状态的子模块
+            requires_grad: 是否计算梯度
+        """
+        if module is None:
+            return
+        for param in module.parameters():  # 遍历该子模块的全部可学习参数
+            param.requires_grad = requires_grad  # 统一开启或关闭梯度，常用于交替训练 G 和 D
+
+    def _to_raft_frame(self, image: torch.Tensor) -> torch.Tensor:
+        """
+        将 ESRGAN 输出转换成 RAFT 当前实现所需的单通道帧。
+
+        参数:
+            image: [B, C, H, W]
+
+        返回:
+            frame: [B, 1, H, W]
+        """
+        if image.dim() != 4:  # 检查输入是否是标准 4 维图像张量
+            raise ValueError(f"Expected image to be 4D [B, C, H, W], got shape={tuple(image.shape)}")  # 如果不是 [B,C,H,W]，直接报错提醒
+
+        if image.size(1) == 1:  # 如果本来就是单通道
+            return image  # 则无需转换，直接返回
+
+        # 当前 RAFT 分支按单通道实现；若生成器输出是 3 通道，
+        # 这里先在通道维求均值压成单通道，保证接口兼容。
+        return image.mean(dim=1, keepdim=True)  # 否则在通道维求均值，将多通道图压成单通道图
+
+
+    @staticmethod
+    def _to_discriminator_gray_frame(image: torch.Tensor) -> torch.Tensor:
+        """
+        将送入判别器的图像压成单通道灰度。
+
+        你的颗粒图像本质是灰度图复制成 3 通道，因此判别器不需要同时看 RGB 三个重复通道；
+        这里固定只取第 0 个通道，后面再拼成方案 C 的 3 通道时序输入。
+        """
+        if image.dim() != 4:
+            raise ValueError(f"Expected image to be 4D [B, C, H, W], got shape={tuple(image.shape)}")
+        return image if image.size(1) == 1 else image[:, 0:1, :, :]
+
+    def _build_temporal_discriminator_input(self, prev: torch.Tensor, next_frame: torch.Tensor) -> torch.Tensor:
+        """
+        构造方案 C 判别器输入: [prev, next, abs(next - prev)]。
+
+        prev 和 next 都先取单通道灰度，所以最终输入仍是 3 通道：
+        第 0 通道看前一帧亮度，第 1 通道看后一帧亮度，第 2 通道看帧间亮度变化。
+        """
+        prev_gray = self._to_discriminator_gray_frame(prev)
+        next_gray = self._to_discriminator_gray_frame(next_frame)
+        diff_gray = torch.abs(next_gray - prev_gray)
+        return torch.cat([prev_gray, next_gray, diff_gray], dim=1)
+
+    def _to_raft_flow_gt(self, flow: torch.Tensor) -> torch.Tensor:
+        """
+        将数据集中的流场真值转换成 RAFT 监督所需的 2 通道 uv 形式。
+
+        说明：
+            数据集里的 flo 常常是三通道 [u, v, magnitude]，
+            但 RAFT 的监督和 EPE 计算只使用前两个通道 [u, v]。
+        """
+        if flow.dim() != 4:  # 检查输入是否是标准 4 维流场张量
+            raise ValueError(f"Expected flow to be 4D [B, C, H, W], got shape={tuple(flow.shape)}")
+        if flow.size(1) < 2:  # 至少要有 u、v 两个通道
+            raise ValueError(f"Expected flow to have at least 2 channels, got shape={tuple(flow.shape)}")
+        # 这里显式只保留前两个通道 u / v，避免把 magnitude 一起传给 RAFT loss。
+        return flow[:, :2, :, :]
+
+
+    def _compute_generator_frame_terms(self, pred: torch.Tensor, target: torch.Tensor) -> dict:
+        """
+        计算单帧生成器的基础图像损失项。
+
+        注意：这里不再调用判别器，也不再把对抗项混入感知损失。
+        - perceptual_loss: 只等于 VGG feature L1。
+        - pixel_*: 保留 L1 / MSE / SSIM / FFT 四个原始子项，后面按全局权重手动组合。
+        """
+        vgg_loss = perceptual_loss(pred, target)
+        pixel_total, pixel_l1, pixel_mse, pixel_ssim, pixel_fft = pixel_loss(pred, target)
+
+        return {
+            "perceptual_loss": vgg_loss,
+            "vgg_loss": vgg_loss,
+            "pixel_total": pixel_total,
+            "pixel_l1": pixel_l1,
+            "pixel_mse": pixel_mse,
+            "pixel_ssim": pixel_ssim,
+            "pixel_fft": pixel_fft,
+        }
+
+    @staticmethod
+    def _mean_loss_term(prev_terms: dict, next_terms: dict, key: str) -> torch.Tensor:
+        """
+        对前后两帧的同名标量损失做平均。
+        """
+        return 0.5 * (prev_terms[key] + next_terms[key])  # 对前后两帧的同名损失做平均，保持两帧地位一致
+
+
+    def _compute_discriminator_loss(self, pred_prev: torch.Tensor, pred_next: torch.Tensor, target_prev: torch.Tensor, target_next: torch.Tensor):
+        """
+        计算方案 C 的时序判别器损失。
+
+        判别器看到的 fake/real 不再是单帧图像，而是：
+        D_input = cat([prev_gray, next_gray, abs(next_gray - prev_gray)], dim=1)。
+        这样 D 会同时约束两帧的颗粒外观和帧间亮度变化，而不是只奖励单帧更像 HR。
+        """
+        fake_pair = self._build_temporal_discriminator_input(pred_prev.detach(), pred_next.detach())
+        real_pair = self._build_temporal_discriminator_input(target_prev, target_next)
+        pred_fake_d = self.piv_esrgan_discriminator(fake_pair)
+        pred_real_d = self.piv_esrgan_discriminator(real_pair)
+        return descriminator_loss(pred_fake_d, pred_real_d)
+
+
+    def _compute_sr_branch(self, input_lr_prev, input_lr_next, input_gr_prev, input_gr_next, flowl0, is_adversarial: bool):
+        """
+        单独计算 ESRGAN 生成器分支。
+
+        生成器总损失的语义被拆清楚：
+        VGG 感知项 + 内容子项(L1/MSE/SSIM/FFT) + 对抗项 + 图像对一致性项。
+        ESRuRAFT_PIV 额外的 EPE 项会在 RAFT 分支得到 raft_epe_tensor 后再加入。
+        """
+        if hasattr(self.piv_esrgan_generator, "forward_pair"):
+            pred_prev, pred_next = self.piv_esrgan_generator.forward_pair(input_lr_prev, input_lr_next)
+        else:
+            pred_prev = self.piv_esrgan_generator(input_lr_prev)
+            pred_next = self.piv_esrgan_generator(input_lr_next)
+
+        prev_terms = self._compute_generator_frame_terms(pred_prev, input_gr_prev)
+        next_terms = self._compute_generator_frame_terms(pred_next, input_gr_next)
+
+        vgg_loss = self._mean_loss_term(prev_terms, next_terms, "vgg_loss")
+        pixel_l1 = self._mean_loss_term(prev_terms, next_terms, "pixel_l1")
+        pixel_mse = self._mean_loss_term(prev_terms, next_terms, "pixel_mse")
+        pixel_ssim = self._mean_loss_term(prev_terms, next_terms, "pixel_ssim")
+        pixel_fft = self._mean_loss_term(prev_terms, next_terms, "pixel_fft")
+
+        # content_loss 是原来的像素总损失语义，但这里显式由四个子项分别按全局权重相加，
+        # 不再把它和 VGG 感知项混成一个含糊的 perceptual/content 复合项。
+        content_loss = (
+            float(global_data.esrgan.LAMBDA_PIXEL_L1) * pixel_l1 +
+            float(global_data.esrgan.LAMBDA_PIXEL_MSE) * pixel_mse +
+            float(global_data.esrgan.LAMBDA_SSIM) * pixel_ssim +
+            float(global_data.esrgan.LAMBDA_PIXEL_FFT) * pixel_fft
+        )
+
+        fake_pair = self._build_temporal_discriminator_input(pred_prev, pred_next)
+        real_pair = self._build_temporal_discriminator_input(input_gr_prev, input_gr_next)
+        pred_fake = self.piv_esrgan_discriminator(fake_pair)
+        pred_real = self.piv_esrgan_discriminator(real_pair)
+        adversarial_loss = perceptual_loss.adversarial(pred_fake, pred_real)
+        adversarial_weighted_loss = (
+            float(global_data.esrgan.LAMBDA_ADVERSARIAL) * adversarial_loss
+            if is_adversarial else adversarial_loss.new_zeros(())
+        )
+
+        if global_data.esrgan.use_flow_warp_consistency():
+            # 模式 1~4 保留 PIV_A_Esrgan 原有的 GT-flow warp 图像对一致性损失。
+            # 它只约束 SR previous / next 的运动一致性，不等同于 RAFT EPE。
+            _, flow_warp_dict = flow_warp_consistency_loss(pred_prev, pred_next, flowl0)
+            flow_warp_consistency = flow_warp_dict["flow_warp_consistency_loss"]
+            flow_warp_weighted_loss = float(global_data.esrgan.LAMBDA_FLOW_WARP_CONSISTENCY) * flow_warp_consistency
+        else:
+            # 模式 5 要观察“基础 ESRGAN 生成器 + 基础 ESRGAN 判别器 + RAFT EPE”的效果，
+            # 因此图像一致性项彻底置 0，既不参与反传，也不污染日志里的 sr_loss。
+            flow_warp_consistency = vgg_loss.new_zeros(())
+            flow_warp_weighted_loss = vgg_loss.new_zeros(())
+
+        manual_sr_loss = (
+            float(global_data.esrgan.LAMBDA_VGG) * vgg_loss +
+            content_loss +
+            adversarial_weighted_loss +
+            flow_warp_weighted_loss
+        )
+
+        return pred_prev, pred_next, {
+            "sr_loss": manual_sr_loss,
+            "manual_sr_loss": manual_sr_loss,
+            "perceptual_loss": vgg_loss,
+            "vgg_loss": vgg_loss,
+            "content_loss": content_loss,
+            "adversarial_loss": adversarial_loss,
+            "adversarial_weighted_loss": adversarial_weighted_loss,
+            "pixel_total": content_loss,
+            "pixel_l1": pixel_l1,
+            "pixel_mse": pixel_mse,
+            "pixel_ssim": pixel_ssim,
+            "pixel_fft": pixel_fft,
+            "flow_warp_consistency_loss": flow_warp_consistency,
+            "flow_warp_consistency_weighted_loss": flow_warp_weighted_loss,
+        }
+
+    def _compute_raft_branch(self, pred_prev: torch.Tensor, pred_next: torch.Tensor, flowl0, flow_init=None):
+        """
+        单独计算 RAFT 分支。
+
+        说明：
+            这个分支只负责：
+            1. 将超分结果转换为 RAFT 输入
+            2. 计算 RAFT 的流场预测与 raft_loss
+            3. 额外返回可反向传播的 raft_epe_tensor，供 Generator 侧直接使用
+        """
+        if not self.use_raft or self.piv_RAFT is None:
+            raise RuntimeError("USE_RAFT=False 时不应调用 _compute_raft_branch。")
+        raft_prev = self._to_raft_frame(pred_prev)  # 将前一帧 SR 图转成 RAFT 单通道输入
+        raft_next = self._to_raft_frame(pred_next)  # 将后一帧 SR 图转成 RAFT 单通道输入
+        raft_input = torch.cat([raft_prev, raft_next], dim=1)  # 拼成 [B, 2, H, W]
+        raft_flow_gt = self._to_raft_flow_gt(flowl0)  # 只保留 uv 两个通道作为监督
+
+        flow_predictions, (raft_loss, raft_metrics) = self.piv_RAFT(
+            raft_input,  # RAFT 输入图像对
+            raft_flow_gt,  # RAFT 光流真值
+            flow_init=flow_init,  # 可选初始光流
+        )
+        # 这里显式重建一个 tensor 形式的平均端点误差，
+        # 避免后续误把 raft_metrics['epe'] 这个 Python 标量拿去给 Generator 反向传播。
+        raft_epe_tensor = torch.sum((flow_predictions[-1] - raft_flow_gt) ** 2, dim=1).sqrt().mean()
+
+        return flow_predictions, {
+            "raft_input_prev": raft_prev,  # 送入 RAFT 前的前一帧单通道图
+            "raft_input_next": raft_next,  # 送入 RAFT 前的后一帧单通道图
+            "flow_predictions": flow_predictions,  # RAFT 每次迭代得到的流场预测序列
+            "raft_loss": raft_loss,  # RAFT 流场序列损失
+            "raft_metrics": raft_metrics,  # RAFT 评估指标
+            "raft_epe_tensor": raft_epe_tensor,  # 可反向传播的平均 EPE Tensor
+        }
+
+
+    def _generator_famo_task_losses(self, sr_outputs: dict, raft_outputs: dict | None = None) -> list[torch.Tensor]:
+        """
+        按 FAMO 任务顺序返回 Generator 的非对抗损失项。
+
+        ESRuRAFT_PIV 包含 EPE 约束；GAN 对抗损失不放进 FAMO，继续由动态
+        LAMBDA_ADVERSARIAL 单独控制，避免早期对抗项把多任务权重带偏。
+        """
+        task_losses = [
+            sr_outputs["vgg_loss"],
+            sr_outputs["pixel_l1"],
+            sr_outputs["pixel_mse"],
+            sr_outputs["pixel_ssim"],
+            sr_outputs["pixel_fft"],
+        ]
+        if global_data.esrgan.use_flow_warp_consistency():
+            task_losses.append(sr_outputs["flow_warp_consistency_loss"])
+        # 只在联合训练且当前消融模式允许 EPE 限制 Generator 时，才把可反传 EPE 放进 FAMO。
+        # 模式 1~4 即使训练 RAFT，也不能让 epe 影响 Generator；模式 5 才允许这一项。
+        if global_data.esrgan.generator_uses_raft_epe() and raft_outputs is not None:
+            task_losses.append(raft_outputs["raft_epe_tensor"])
+        return task_losses
+
+    def _generator_famo_scalar_logs(self) -> dict:
+        """把当前 FAMO 权重展开成日志字段，方便训练日志和 CSV 对齐排查。"""
+        if self.generator_famo is None:
+            return {}
+        with torch.no_grad():
+            weights = self.generator_famo.weights.detach().cpu().tolist()
+        return {f"generator_famo_{name}_weight": float(weight) for name, weight in zip(self.generator_famo_task_names, weights)}
+
+    def _update_generator_famo(self, sr_outputs: dict, raft_outputs: dict | None = None) -> dict:
+        """
+        Generator optimizer.step() 后，按论文方式用更新后的 loss 调整 FAMO 权重。
+
+        这里传入的是重新前向得到的新 loss；FAMO 内部会比较 step 前后的 log loss 变化，
+        更新任务 logits，而不是参与 Generator 参数梯度。
+        """
+        if self.generator_famo is None:
+            return {}
+        self.generator_famo.update(self._generator_famo_task_losses(sr_outputs, raft_outputs))
+        return self._generator_famo_scalar_logs()
+
+    def _compute_generator_loss(self, sr_outputs: dict, raft_outputs: dict | None = None) -> tuple[torch.Tensor, dict]:
+        """
+        计算 ESRuRAFT_PIV 生成器实际反传的总损失。
+
+        USE_FAMO=False 时保持手动权重：SR 手动加权损失 + RAFT_EPE_WEIGHT * EPE。
+        USE_FAMO=True 时只让 FAMO 接管非对抗项；对抗损失仍使用动态 LAMBDA_ADVERSARIAL。
+        """
+        if not self.use_raft:
+            if self.generator_famo is None:
+                return sr_outputs["manual_sr_loss"], {
+                    "generator_non_adversarial_loss": sr_outputs["manual_sr_loss"] - sr_outputs["adversarial_weighted_loss"],
+                    "generator_raft_epe_weighted_loss": sr_outputs["manual_sr_loss"].new_zeros(()),
+                }
+
+            famo_loss, _ = self.generator_famo.get_weighted_loss(self._generator_famo_task_losses(sr_outputs, None))
+            generator_loss = famo_loss + sr_outputs["adversarial_weighted_loss"]
+            logs = {
+                "generator_non_adversarial_loss": famo_loss,
+                "generator_raft_epe_weighted_loss": famo_loss.new_zeros(()),
+            }
+            logs.update(self._generator_famo_scalar_logs())
+            return generator_loss, logs
+
+        if self.generator_famo is None:
+            # 模式 1~4：RAFT 本身仍训练，但 Generator 不再吃 EPE 的梯度；
+            # 模式 5：保留 RAFT_EPE_WEIGHT * EPE，观察 EPE 反作用对基础 ESRGAN 的影响。
+            if global_data.esrgan.generator_uses_raft_epe():
+                epe_weighted_loss = float(global_data.esrgan.RAFT_EPE_WEIGHT) * raft_outputs["raft_epe_tensor"]
+            else:
+                epe_weighted_loss = raft_outputs["raft_epe_tensor"].new_zeros(())
+            manual_loss = sr_outputs["manual_sr_loss"] + epe_weighted_loss
+            return manual_loss, {
+                "generator_non_adversarial_loss": manual_loss - sr_outputs["adversarial_weighted_loss"],
+                "generator_raft_epe_weighted_loss": epe_weighted_loss,
+            }
+
+        famo_loss, _ = self.generator_famo.get_weighted_loss(self._generator_famo_task_losses(sr_outputs, raft_outputs))
+        generator_loss = famo_loss + sr_outputs["adversarial_weighted_loss"]
+        if global_data.esrgan.generator_uses_raft_epe():
+            famo_weights = self.generator_famo.weights.to(device=famo_loss.device, dtype=famo_loss.dtype)
+            epe_weighted_loss = famo_weights[-1] * raft_outputs["raft_epe_tensor"]
+        else:
+            epe_weighted_loss = famo_loss.new_zeros(())
+        logs = {
+            "generator_non_adversarial_loss": famo_loss,
+            "generator_raft_epe_weighted_loss": epe_weighted_loss,
+        }
+        logs.update(self._generator_famo_scalar_logs())
+        return generator_loss, logs
+
+    def forward(
+        self,
+        input_lr_prev,
+        input_lr_next,
+        input_gr_prev,
+        input_gr_next,
+        flowl0,
+        flow_init=None,
+        upsample=global_data.esrgan.RAFT_UPSAMPLE,
+        is_adversarial: bool = False,
+    ):
+        """
+        前向传播：返回 SR、RAFT 预测和所有主要损失。
+
+        这里复用 train_step 的分支计算逻辑，保证 forward 日志和真实训练时的损失定义一致。
+        """
+        pred_prev, pred_next, sr_outputs = self._compute_sr_branch(
+            input_lr_prev, input_lr_next, input_gr_prev, input_gr_next, flowl0, is_adversarial
+        )
+        flow_predictions = None
+        raft_outputs = None
+        if self.use_raft:
+            flow_predictions, raft_outputs = self._compute_raft_branch(pred_prev, pred_next, flowl0, flow_init=flow_init)
+        g_loss, generator_loss_logs = self._compute_generator_loss(sr_outputs, raft_outputs)
+        total_loss = g_loss + raft_outputs["raft_loss"] if self.use_raft else g_loss
+        discriminator_loss, d_fake_loss, d_real_loss = self._compute_discriminator_loss(
+            pred_prev, pred_next, input_gr_prev, input_gr_next
+        )
+
+        outputs = {
+            "sr_prev": pred_prev,
+            "sr_next": pred_next,
+            "flow_predictions": flow_predictions,
+            "sr_loss": sr_outputs["manual_sr_loss"],
+            "g_loss": g_loss,
+            "perceptual_loss": sr_outputs["perceptual_loss"],
+            "content_loss": sr_outputs["content_loss"],
+            "adversarial_loss": sr_outputs["adversarial_loss"],
+            "adversarial_weighted_loss": sr_outputs["adversarial_weighted_loss"],
+            "pixel_total": sr_outputs["pixel_total"],
+            "pixel_l1": sr_outputs["pixel_l1"],
+            "pixel_mse": sr_outputs["pixel_mse"],
+            "pixel_ssim": sr_outputs["pixel_ssim"],
+            "pixel_fft": sr_outputs["pixel_fft"],
+            "flow_warp_consistency_loss": sr_outputs["flow_warp_consistency_loss"],
+            "flow_warp_consistency_weighted_loss": sr_outputs["flow_warp_consistency_weighted_loss"],
+            "discriminator_loss": discriminator_loss,
+            "d_fake_loss": d_fake_loss,
+            "d_real_loss": d_real_loss,
+            "total_loss": total_loss,
+            **generator_loss_logs,
+        }
+        if self.use_raft and raft_outputs is not None:
+            outputs.update({
+                "raft_input_prev": raft_outputs["raft_input_prev"],
+                "raft_input_next": raft_outputs["raft_input_next"],
+                "raft_loss": raft_outputs["raft_loss"],
+                "raft_metrics": raft_outputs["raft_metrics"],
+                "raft_epe_tensor": raft_outputs["raft_epe_tensor"],
+            })
+        return pred_prev, pred_next, flow_predictions, outputs
+
+    def _train_step_sr_only(
+        self,
+        input_lr_prev,
+        input_lr_next,
+        input_gr_prev,
+        input_gr_next,
+        flowl0,
+        generator_optimizer,
+        d_optimizer,
+        scaler=None,
+        is_adversarial: bool = False,
+    ) -> dict:
+        """
+        只做超分辨率时的一次训练步骤。
+
+        这个分支完全不调用 RAFT：
+        1. Generator 只根据 VGG / L1 / MSE / SSIM / FFT / flow-warp / adversarial 更新；
+        2. Discriminator 仍然使用 [prev, next, abs(next-prev)] 的时序输入；
+        3. 返回的日志不包含 raft_loss / raft_epe / 1px / 3px / 5px，保证 CSV 和曲线不出现空列。
+
+        注意：flowl0 仍然会进入 flow_warp_consistency_loss。它不是 RAFT 网络损失，
+        而是用 GT flow 对齐 SR 图像对、约束前后帧颗粒一致性的超分辨率正则项。
+        """
+        self._set_requires_grad(self.piv_esrgan_generator, True)
+        self._set_requires_grad(self.piv_esrgan_discriminator, False)
+        generator_optimizer.zero_grad(set_to_none=True)
+
+        pred_prev, pred_next, sr_outputs = self._compute_sr_branch(
+            input_lr_prev=input_lr_prev,
+            input_lr_next=input_lr_next,
+            input_gr_prev=input_gr_prev,
+            input_gr_next=input_gr_next,
+            flowl0=flowl0,
+            is_adversarial=is_adversarial,
+        )
+        generator_g_loss, generator_loss_logs = self._compute_generator_loss(sr_outputs, None)
+
+        if scaler is not None:
+            scaler.scale(generator_g_loss).backward()
+            scaler.step(generator_optimizer)
+        else:
+            generator_g_loss.backward()
+            generator_optimizer.step()
+
+        # FAMO 只更新任务权重，不更新 Generator 参数。SR-only 模式下任务列表不包含 epe。
+        if self.generator_famo is not None and bool(global_data.esrgan.FAMO_UPDATE_AFTER_STEP):
+            with torch.no_grad():
+                _, _, sr_outputs_famo = self._compute_sr_branch(
+                    input_lr_prev=input_lr_prev,
+                    input_lr_next=input_lr_next,
+                    input_gr_prev=input_gr_prev,
+                    input_gr_next=input_gr_next,
+                    flowl0=flowl0,
+                    is_adversarial=is_adversarial,
+                )
+            generator_loss_logs.update(self._update_generator_famo(sr_outputs_famo, None))
+
+        # 判别器阶段重新生成一份 SR 图，并 detach 到 D loss 内部。
+        # 这样 D 只更新自己，不会把判别器 loss 回传到 Generator。
+        self._set_requires_grad(self.piv_esrgan_generator, False)
+        self._set_requires_grad(self.piv_esrgan_discriminator, True)
+        d_optimizer.zero_grad(set_to_none=True)
+
+        if hasattr(self.piv_esrgan_generator, "forward_pair"):
+            pred_prev_d, pred_next_d = self.piv_esrgan_generator.forward_pair(input_lr_prev, input_lr_next)
+        else:
+            pred_prev_d = self.piv_esrgan_generator(input_lr_prev)
+            pred_next_d = self.piv_esrgan_generator(input_lr_next)
+
+        discriminator_loss, d_fake_loss, d_real_loss = self._compute_discriminator_loss(
+            pred_prev_d,
+            pred_next_d,
+            input_gr_prev,
+            input_gr_next,
+        )
+
+        if scaler is not None:
+            scaler.scale(discriminator_loss).backward()
+            scaler.step(d_optimizer)
+            scaler.update()
+        else:
+            discriminator_loss.backward()
+            d_optimizer.step()
+
+        self._set_requires_grad(self.piv_esrgan_generator, True)
+        self._set_requires_grad(self.piv_esrgan_discriminator, True)
+
+        return pred_prev, pred_next, None, {
+            "sr_loss": float(sr_outputs["sr_loss"].detach().item()),
+            "g_loss": float(generator_g_loss.detach().item()),
+            "perceptual_loss": float(sr_outputs["perceptual_loss"].detach().item()),
+            "content_loss": float(sr_outputs["content_loss"].detach().item()),
+            "adversarial_loss": float(sr_outputs["adversarial_loss"].detach().item()),
+            "pixel_total": float(sr_outputs["pixel_total"].detach().item()),
+            "pixel_l1": float(sr_outputs["pixel_l1"].detach().item()),
+            "pixel_mse": float(sr_outputs["pixel_mse"].detach().item()),
+            "pixel_ssim": float(sr_outputs["pixel_ssim"].detach().item()),
+            "pixel_fft": float(sr_outputs["pixel_fft"].detach().item()),
+            "flow_warp_consistency_loss": float(sr_outputs["flow_warp_consistency_loss"].detach().item()),
+            "flow_warp_consistency_weighted_loss": float(sr_outputs["flow_warp_consistency_weighted_loss"].detach().item()),
+            "discriminator_loss": float(discriminator_loss.detach().item()),
+            "d_real_loss": float(d_real_loss.detach().item()),
+            "d_fake_loss": float(d_fake_loss.detach().item()),
+            "generator_raft_epe": 0.0,
+            "raft_epe_weight": 0.0,
+            "adversarial_weighted_loss": float(sr_outputs["adversarial_weighted_loss"].detach().item()),
+            **{key: float(value.detach().item()) if torch.is_tensor(value) else float(value) for key, value in generator_loss_logs.items()},
+        }
+
+    def train_step(
+        self,
+        input_lr_prev,
+        input_lr_next,
+        input_gr_prev,
+        input_gr_next,
+        flowl0,
+        generator_optimizer,
+        raft_optimizer,
+        d_optimizer,
+        scaler=None,
+        flow_init=None,
+        upsample=global_data.esrgan.RAFT_UPSAMPLE,
+        is_adversarial: bool = False,
+    ) -> dict:
+        """
+        执行一次完整训练步骤。
+
+        训练顺序:
+            1. 前向计算全部损失项
+            2. 使用单次 RAFT forward，同时完成 Generator 与 RAFT 的双 backward
+            3. 开启判别器，更新 Discriminator
+            4. 返回本次训练的主要日志
+
+        参数:
+            input_lr_prev/input_lr_next: 低分辨率前后帧
+            input_gr_prev/input_gr_next: 高分辨率真值前后帧
+            flowl0: 光流真值
+            args: RAFT 配置
+            generator_optimizer: Generator 的优化器
+            raft_optimizer: RAFT 的优化器
+            d_optimizer: Discriminator 的优化器
+            scaler: 可选 AMP GradScaler
+            flow_init: 可选 RAFT 初始流
+            upsample: 上采样模式
+            is_adversarial: 是否在生成器损失中启用对抗项
+
+        返回:
+            包含本次训练主要标量的字典
+        """
+        if not self.use_raft:
+            return self._train_step_sr_only(
+                input_lr_prev=input_lr_prev,
+                input_lr_next=input_lr_next,
+                input_gr_prev=input_gr_prev,
+                input_gr_next=input_gr_next,
+                flowl0=flowl0,
+                generator_optimizer=generator_optimizer,
+                d_optimizer=d_optimizer,
+                scaler=scaler,
+                is_adversarial=is_adversarial,
+            )
+
+        # 第一阶段：一次前向同时准备 Generator 和 RAFT 的训练目标。
+        self._set_requires_grad(self.piv_esrgan_generator, True)  # Generator 需要拿到 sr_loss 和 raft_epe 的梯度
+        self._set_requires_grad(self.piv_RAFT, True)  # 同一次 RAFT forward 也要服务于后续 RAFT 自身更新
+        self._set_requires_grad(self.piv_esrgan_discriminator, False)  # 训练 G/RAFT 时冻结判别器
+        generator_optimizer.zero_grad(set_to_none=True)  # 清空 Generator 梯度
+        raft_optimizer.zero_grad(set_to_none=True)  # 清空 RAFT 梯度
+
+        pred_prev, pred_next, sr_outputs = self._compute_sr_branch(
+            input_lr_prev=input_lr_prev,
+            input_lr_next=input_lr_next,
+            input_gr_prev=input_gr_prev,
+            input_gr_next=input_gr_next,
+            flowl0=flowl0,
+            is_adversarial=is_adversarial,
+        )
+        flow_predictions, raft_outputs = self._compute_raft_branch(
+            pred_prev=pred_prev,
+            pred_next=pred_next,
+            flowl0=flowl0,
+            flow_init=flow_init,
+        )
+        raft_epe_weight = float(global_data.esrgan.RAFT_EPE_WEIGHT)
+        generator_g_loss, generator_loss_logs = self._compute_generator_loss(sr_outputs, raft_outputs)
+        final_flow_prediction = flow_predictions[-1]
+
+        # 先让 Generator 拿到 sr_loss + 加权 raft_epe 的梯度，
+        # 同时保留计算图供 RAFT 再对 raft_loss 单独反向传播。
+        if scaler is not None:
+            scaled_g_loss = scaler.scale(generator_g_loss)
+            scaled_g_loss.backward(retain_graph=True)
+        else:
+            generator_g_loss.backward(retain_graph=True)
+
+        # 保存 Generator 当前梯度，后面会把第二次 backward 产生的 Generator 梯度清掉，
+        # 从而保持“Generator 只吃 sr_loss + 加权 raft_epe，RAFT 只吃 raft_loss”的分离训练语义。
+        generator_saved_grads = []
+        for param in self.piv_esrgan_generator.parameters():
+            if param.grad is None:
+                generator_saved_grads.append(None)
+            else:
+                generator_saved_grads.append(param.grad.detach().clone())
+
+        # Generator 侧的损失经过同一次 RAFT forward 也会在 RAFT 参数上留下梯度，
+        # 这里显式清掉，避免后续 raft_optimizer.step() 混入不该有的更新信号。
+        for param in self.piv_RAFT.parameters():
+            param.grad = None
+
+        # 第二次 backward 只让 RAFT 吃到 raft_loss；
+        # Generator 侧即使在图上有梯度路径，最终也会恢复成第一次 backward 保存下来的梯度。
+        if scaler is not None:
+            scaler.scale(raft_outputs["raft_loss"]).backward()
+        else:
+            raft_outputs["raft_loss"].backward()
+
+        # 恢复 Generator 梯度，确保 raft_loss 不会反向影响 Generator 的参数更新。
+        for param, saved_grad in zip(self.piv_esrgan_generator.parameters(), generator_saved_grads):
+            param.grad = saved_grad
+
+        if scaler is not None:
+            scaler.step(generator_optimizer)  # Generator 只使用第一次 backward 保留下来的梯度更新
+            scaler.step(raft_optimizer)  # RAFT 只使用第二次 backward 后的梯度更新
+        else:
+            generator_optimizer.step()
+            raft_optimizer.step()
+
+        # 如果启用了 FAMO，则在 Generator 参数更新后重新计算一次各任务 loss，
+        # 再按论文 update(curr_loss) 调整下一次迭代使用的任务权重。
+        if self.generator_famo is not None and bool(global_data.esrgan.FAMO_UPDATE_AFTER_STEP):
+            with torch.no_grad():
+                pred_prev_famo, pred_next_famo, sr_outputs_famo = self._compute_sr_branch(
+                    input_lr_prev=input_lr_prev,
+                    input_lr_next=input_lr_next,
+                    input_gr_prev=input_gr_prev,
+                    input_gr_next=input_gr_next,
+                    flowl0=flowl0,
+                    is_adversarial=is_adversarial,
+                )
+                _, raft_outputs_famo = self._compute_raft_branch(
+                    pred_prev=pred_prev_famo,
+                    pred_next=pred_next_famo,
+                    flowl0=flowl0,
+                    flow_init=flow_init,
+                )
+            generator_loss_logs.update(self._update_generator_famo(sr_outputs_famo, raft_outputs_famo))
+
+        # 第三阶段：只更新 Discriminator，严格只使用 discriminator_loss。
+        self._set_requires_grad(self.piv_esrgan_generator, False)  # 继续冻结 Generator
+        self._set_requires_grad(self.piv_RAFT, False)  # 冻结 RAFT
+        self._set_requires_grad(self.piv_esrgan_discriminator, True)  # 只开启判别器梯度
+        d_optimizer.zero_grad(set_to_none=True)  # 清空判别器梯度
+
+        if hasattr(self.piv_esrgan_generator, "forward_pair"):
+            pred_prev_d, pred_next_d = self.piv_esrgan_generator.forward_pair(input_lr_prev, input_lr_next)
+        else:
+            pred_prev_d = self.piv_esrgan_generator(input_lr_prev)
+            pred_next_d = self.piv_esrgan_generator(input_lr_next)
+
+        discriminator_loss, d_fake_loss, d_real_loss = self._compute_discriminator_loss(
+            pred_prev_d,
+            pred_next_d,
+            input_gr_prev,
+            input_gr_next,
+        )
+
+        if scaler is not None:
+            scaler.scale(discriminator_loss).backward()
+            scaler.step(d_optimizer)
+            scaler.update()
+        else:
+            discriminator_loss.backward()
+            d_optimizer.step()
+
+        # 恢复三个子模块的梯度开关，避免影响外部后续逻辑。
+        self._set_requires_grad(self.piv_esrgan_generator, True)
+        self._set_requires_grad(self.piv_RAFT, True)
+        self._set_requires_grad(self.piv_esrgan_discriminator, True)
+
+        return pred_prev, pred_next, final_flow_prediction, {
+            "sr_loss": float(sr_outputs["sr_loss"].detach().item()),  # ESRGAN 原始 SR 总损失（未叠加 raft_epe）
+            "g_loss": float(generator_g_loss.detach().item()),  # Generator 实际回传的总损失
+            "perceptual_loss": float(sr_outputs["perceptual_loss"].detach().item()),
+            "content_loss": float(sr_outputs["content_loss"].detach().item()),
+            "adversarial_loss": float(sr_outputs["adversarial_loss"].detach().item()),
+            "pixel_total": float(sr_outputs["pixel_total"].detach().item()),
+            "pixel_l1": float(sr_outputs["pixel_l1"].detach().item()),
+            "pixel_mse": float(sr_outputs["pixel_mse"].detach().item()),
+            "pixel_ssim": float(sr_outputs["pixel_ssim"].detach().item()),
+            "pixel_fft": float(sr_outputs["pixel_fft"].detach().item()),
+            "flow_warp_consistency_loss": float(sr_outputs["flow_warp_consistency_loss"].detach().item()),
+            "flow_warp_consistency_weighted_loss": float(sr_outputs["flow_warp_consistency_weighted_loss"].detach().item()),
+            "raft_loss": float(raft_outputs["raft_loss"].detach().item()),
+            "discriminator_loss": float(discriminator_loss.detach().item()),
+            "d_real_loss": float(d_real_loss.detach().item()),
+            "d_fake_loss": float(d_fake_loss.detach().item()),
+            "raft_epe": float(raft_outputs["raft_metrics"]["epe"]),
+            "generator_raft_epe": float(raft_outputs["raft_epe_tensor"].detach().item()),
+            "raft_epe_weight": raft_epe_weight,
+            "adversarial_weighted_loss": float(sr_outputs["adversarial_weighted_loss"].detach().item()),
+            **{key: float(value.detach().item()) if torch.is_tensor(value) else float(value) for key, value in generator_loss_logs.items()},
+            "raft_1px": float(raft_outputs["raft_metrics"]["1px"]),
+            "raft_3px": float(raft_outputs["raft_metrics"]["3px"]),
+            "raft_5px": float(raft_outputs["raft_metrics"]["5px"]),
+        }
+

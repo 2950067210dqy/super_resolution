@@ -21,6 +21,7 @@ from study.SRGAN.model.evaluate_image_compare_common import (
     save_particle_error_histogram,
     save_particle_error_histogram_bundle,
 )
+from study.SRGAN.model.metric_outlier_filter import robust_metric_mean
 from study.SRGAN.data_downscal import DOWNSAMPLE_METHOD, INTERPOLATION_MODE, downsample_tif
 
 try:
@@ -1217,7 +1218,7 @@ def _save_mean_spectrum(pred_curves, gt_curves, out_dir, title, file_prefix, als
         _save_energy_spectrum_plot(pred_mean, gt_mean, out_dir / "energy_spectrum_mean_compare.png", title=title)
 
 
-def _build_mean_row(rows, fixed_fields, metric_keys):
+def _build_mean_row(rows, fixed_fields, metric_keys, global_data=None):
     """根据给定指标列生成一行均值记录。"""
     mean_row = dict(fixed_fields)
     for key in metric_keys:
@@ -1230,11 +1231,13 @@ def _build_mean_row(rows, fixed_fields, metric_keys):
                 value = float("nan")
             if np.isfinite(value):
                 vals.append(value)
-        mean_row[key] = float(np.mean(vals)) if vals else float("nan")
+        # test_all 的逐样本 rows 原样保留；只有 MEAN/CLASS_MEAN 等汇总行使用稳健均值，
+        # 避免个别异常失败样本把整体平均指标拉得过差。
+        mean_row[key] = robust_metric_mean(vals, metric_key=key, global_data=global_data)
     return mean_row
 
 
-def _write_rows_with_mean(path, rows, fixed_fields, metric_keys):
+def _write_rows_with_mean(path, rows, fixed_fields, metric_keys, global_data=None):
     """
     写入明细行 + 均值行。
 
@@ -1243,7 +1246,7 @@ def _write_rows_with_mean(path, rows, fixed_fields, metric_keys):
     """
     if not rows:
         return None
-    mean_row = _build_mean_row(rows, fixed_fields, metric_keys)
+    mean_row = _build_mean_row(rows, fixed_fields, metric_keys, global_data=global_data)
     _write_csv(path, rows + [mean_row])
     return mean_row
 
@@ -2352,7 +2355,7 @@ def _save_tbl_profile_artifacts(
     v_gt,
     method_label,
     cmap_name="viridis",
-    column_ratios=(0.15, 0.33, 0.83),
+    column_ratios=(0.15, 0.265, 0.83),
     region_names=("Laminar", "Transition", "Turbulent"),
     y_limit=200,
     sample_crop_width=256,
@@ -2712,14 +2715,14 @@ def _plot_image_comparison(out_path, sample_images):
     plt.close(fig)
 
 
-def _resolve_tbl_comparison_crop_bounds(image_hw, crop_size=256, center_ratio=0.33):
+def _resolve_tbl_comparison_crop_bounds(image_hw, crop_size=256, center_ratio=0.265):
     """
     计算 TBL 长图 comparison 使用的局部裁剪窗口。
 
     设计说明：
     1. TBL 的 full-frame 颗粒图宽度远大于高度，直接把整张长图塞进 LR/HR/SR 三联图里，细节会非常小。
     2. 这里在 full-frame 原图上先标一个红框，再把红框内的局部区域单独拿出来对比。
-    3. 默认横向中心使用 `center_ratio=0.33`，与当前 Transition 位置保持一致；这样用户在看
+    3. 默认横向中心使用 `center_ratio=0.265`，与当前 Transition 位置保持一致；这样用户在看
        comparison.png 和 profile_analysis 时，更容易把两者对应起来。
     4. 高度方向优先截取 256；对当前 TBL 数据而言原图高就是 256，所以实际会覆盖完整高度。
     """
@@ -2790,7 +2793,7 @@ def _plot_tbl_image_comparison(
     out_path,
     sample_images,
     crop_size=256,
-    center_ratio=0.33,
+    center_ratio=0.265,
 ):
     """
     保存 TBL 专用的颗粒图 comparison 图。
@@ -2965,10 +2968,10 @@ def _save_image_outputs(dataset_name, dataset_dir, image_payload, start_index, p
             # TBL 的颗粒图是 full-frame 长图；普通三联图里直接显示整张长图时，细节太小不利于比较。
             # 因此这里改成：先在原始长图上画红框，再把框内 256x256 局部拿出来对比。
             tbl_profile_column_ratios = tuple(
-                plot_args.get("tbl_profile_column_ratios", (0.15, 0.33, 0.83))
+                plot_args.get("tbl_profile_column_ratios", (0.15, 0.265, 0.83))
             )
             tbl_crop_center_ratio = (
-                float(tbl_profile_column_ratios[1]) if len(tbl_profile_column_ratios) >= 2 else 0.33
+                float(tbl_profile_column_ratios[1]) if len(tbl_profile_column_ratios) >= 2 else 0.265
             )
             tbl_crop_size = int(plot_args.get("tbl_profile_sample_crop_width", 256))
             # TBL 的 comparison 显示的是红框里的局部误差图，因此额外保存 crop 版 NPY，
@@ -3049,7 +3052,7 @@ def _save_sample_plots(
     # save_npy 来自全局 IS_SAVE_NPY：普通 NPY 受它控制，误差/TBL profile/hist 例外仍会保存。
     save_npy = bool(plot_args.get("save_npy", False))
     quiver_stride = plot_args.get("vorticity_quiver_stride", None)
-    tbl_profile_column_ratios = tuple(plot_args.get("tbl_profile_column_ratios", (0.15, 0.33, 0.83)))
+    tbl_profile_column_ratios = tuple(plot_args.get("tbl_profile_column_ratios", (0.15, 0.265, 0.83)))
     tbl_profile_region_names = tuple(plot_args.get("tbl_profile_region_names", ("Laminar", "Transition", "Turbulent")))
     tbl_profile_y_limit = plot_args.get("tbl_profile_y_limit", 200)
     tbl_profile_sample_crop_width = int(plot_args.get("tbl_profile_sample_crop_width", 256))
@@ -3143,7 +3146,8 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
 
     行为：
     - 单 GPU，不启用 DDP/多进程；
-    - 顺序测试 TEST_DATASETS 中定义的全部 dataset；
+    - 默认顺序测试 TEST_DATASETS 中定义的全部 dataset；
+    - 当 global_data.esrgan.TEST_TBL=True 时，只测试 tbl 数据集，便于单独调试 TBL 大图与 profile 分析；
     - target 两通道按 prev/next 拆分，并用 data_downscal.py 生成 prev_lr/next_lr；
     - 输出目录为 OUT_PUT_DIR/class_name/data_type/scale_x/TEST_DIR/dataset_name。
     """
@@ -3164,7 +3168,15 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
         logger.warning("[test_all] TEST_DATASETS 为空，跳过测试。")
         return []
 
-    if not getattr(global_data.esrgan, "is_TEST_CLASS3", False):
+    if getattr(global_data.esrgan, "TEST_TBL", False):
+        # TEST_TBL 是更高优先级的窄化开关：
+        # 只保留 tbl，不再受 is_TEST_CLASS3=False 时“跳过 class3 大图”的旧逻辑影响。
+        # 这样用户只想重跑 TBL profile/大图结果时，不需要同时跑 twcf 或五个常规小数据集。
+        if "tbl" not in test_datasets:
+            logger.warning("[test_all] TEST_TBL=True，但 TEST_DATASETS 中没有 tbl，跳过测试。")
+            return []
+        test_datasets = {"tbl": test_datasets["tbl"]}
+    elif not getattr(global_data.esrgan, "is_TEST_CLASS3", False):
         # class3 对应 RAFT256-PIV_test.py 中的 tbl/twcf 大图数据集。
         # 默认跳过它们，避免 test_all 一打开就触发长时间全图滑窗测试。
         test_datasets = {
@@ -3203,7 +3215,7 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
         "tbl_profile_column_ratios": getattr(
             global_data.esrgan,
             "TBL_PROFILE_COLUMN_RATIOS",
-            getattr(global_data.esrgan, "TWCF_PROFILE_COLUMN_RATIOS", (0.15, 0.33, 0.83)),
+            getattr(global_data.esrgan, "TWCF_PROFILE_COLUMN_RATIOS", (0.15, 0.265, 0.83)),
         ),
         "tbl_profile_region_names": getattr(
             global_data.esrgan,
@@ -3436,8 +3448,13 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
                         f"time={time.time() - t0:.2f}s"
                     )
 
-                # dataset 级 mean_epe 和 CSV 均值同口径：只对有限 EPE 求平均。
-                mean_epe = _nanmean_or_nan(epe_array[:total_samples]) if total_samples else float("nan")
+                # dataset 级 mean_epe 也按稳健均值统计；逐样本 epe_array 仍完整保存，
+                # 这里仅影响 metrics_all.csv 里的平均指标展示。
+                mean_epe = (
+                    robust_metric_mean(epe_array[:total_samples], metric_key="epe", global_data=global_data)
+                    if total_samples
+                    else float("nan")
+                )
                 elapsed = time.time() - start_time
                 results_path = dataset_dir / "results.npy"
                 epe_path = dataset_dir / "epe_array.npy"
@@ -3524,6 +3541,7 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
                         "pair_type": "all",
                     },
                     metric_keys=image_metric_keys,
+                    global_data=global_data,
                 )
                 raft_mean_row = _write_rows_with_mean(
                     dataset_dir / "metrics_raft.csv",
@@ -3534,6 +3552,7 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
                         "pair_type": "RAFT",
                     },
                     metric_keys=raft_metric_keys,
+                    global_data=global_data,
                 )
                 # 兼容原有只看 metrics.csv 的脚本：继续保留这个名字，并让它等同于 flow/RAFT 指标表。
                 if dataset_raft_rows:
@@ -3546,6 +3565,7 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
                             "pair_type": "RAFT",
                         },
                         metric_keys=raft_metric_keys,
+                        global_data=global_data,
                     )
 
                 if image_mean_row is not None:

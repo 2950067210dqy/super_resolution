@@ -15,14 +15,14 @@ import matplotlib.pyplot as plt
 from types import SimpleNamespace
 from PIL import Image, ImageDraw, ImageFont
 
-from study.SRGAN.model.ESRuRAFT_PIV_Ground.Module.loss import pixel_loss
-from study.SRGAN.model.ESRuRAFT_PIV_Ground.global_class import global_data
-from study.SRGAN.model.ESRuRAFT_PIV_Ground.judge_delicators import _to_np_chw, _mse, _psnr_from_mse, _energy_spectrum_mse, \
+from study.SRGAN.model.PIV_A_Esrgan_Ablation.Module.loss import pixel_loss
+from study.SRGAN.model.PIV_A_Esrgan_Ablation.global_class import global_data
+from study.SRGAN.model.PIV_A_Esrgan_Ablation.judge_delicators import _to_np_chw, _mse, _psnr_from_mse, _energy_spectrum_mse, \
     _r2_score, _ssim_score, _tke_reconstruction_accuracy, _nrmse, _energy_spectrum_curves
 
 
-from study.SRGAN.model.ESRuRAFT_PIV_Ground.visual_plot_init import build_flo_uvw_pred_gt_panel, _omega_star_from_uv
-from study.SRGAN.model.ESRuRAFT_PIV_Ground.visual_plot_save import save_vorticity_quiver_compare, _save_triplet, _save_pair, \
+from study.SRGAN.model.PIV_A_Esrgan_Ablation.visual_plot_init import build_flo_uvw_pred_gt_panel, _omega_star_from_uv
+from study.SRGAN.model.PIV_A_Esrgan_Ablation.visual_plot_save import save_vorticity_quiver_compare, _save_triplet, _save_pair, \
     _save_energy_spectrum_plot
 from study.SRGAN.model.c_aee_metric_common import attach_c_aee_to_raft_rows, compute_c_aee_value
 from study.SRGAN.model.metric_outlier_filter import robust_metric_mean
@@ -45,7 +45,6 @@ def _save_evaluate_npy(path, array, save_npy: bool, *, force: bool = False) -> N
     """
     if force or bool(save_npy):
         np.save(path, array)
-
 
 """
 验证函数 start
@@ -82,25 +81,36 @@ def validate_and_save(result_dir, model, val_dataloader, device, epoch, data_typ
             # RAFT 监督只吃 uv 两个通道；评估对比仍保留三通道真值 [u, v, magnitude]。
             hr_images_uv = hr_images[:, :2, :, :]
 
-            # 联合模型 forward 当前返回 4 个值：
-            # pred_prev, pred_next, flow_predictions, outputs_dict。
-            # 这里显式解包，避免继续沿用旧版“只返回字典”的调用方式。
-            _, _, _, outputs = model.forward(
-                input_lr_prev=lr_prev,
-                input_lr_next=lr_next,
-                input_gr_prev=hr_prev,
-                input_gr_next=hr_next,
-                # 这里显式只把 uv 两个通道送给 RAFT，避免 magnitude 参与监督。
-                flowl0=hr_images_uv,
-                is_adversarial=use_adversarial,
-            )
+            if global_data.esrgan.USE_RAFT:
+                # 联合模型 forward 当前返回 4 个值：
+                # pred_prev, pred_next, flow_predictions, outputs_dict。
+                # 这里显式解包，避免继续沿用旧版“只返回字典”的调用方式。
+                _, _, _, outputs = model.forward(
+                    input_lr_prev=lr_prev,
+                    input_lr_next=lr_next,
+                    input_gr_prev=hr_prev,
+                    input_gr_next=hr_next,
+                    # 这里显式只把 uv 两个通道送给 RAFT，避免 magnitude 参与监督。
+                    flowl0=hr_images_uv,
+                    is_adversarial=use_adversarial,
+                )
 
-            fake_prev = outputs["sr_prev"]
-            fake_next = outputs["sr_next"]
-            fake_images = outputs["flow_predictions"][-1]
-            # RAFT 预测本身只有 uv 两个通道；为了和三通道真值对齐，
-            # 这里补一个 magnitude 通道，供评估指标和可视化使用。
-            fake_images_uvw = _flow_uv_to_uvw(fake_images)
+                fake_prev = outputs["sr_prev"]
+                fake_next = outputs["sr_next"]
+                fake_images = outputs["flow_predictions"][-1]
+                # RAFT 预测本身只有 uv 两个通道；为了和三通道真值对齐，
+                # 这里补一个 magnitude 通道，供评估指标和可视化使用。
+                fake_images_uvw = _flow_uv_to_uvw(fake_images)
+            elif hasattr(generator, "forward_pair"):
+                # SR-only 模式只需要生成两帧 SR 图，不调用 model.forward，避免误触发 RAFT 分支。
+                fake_prev, fake_next = generator.forward_pair(lr_prev, lr_next)
+                fake_images = None
+                fake_images_uvw = None
+            else:
+                fake_prev = generator(lr_prev)
+                fake_next = generator(lr_next)
+                fake_images = None
+                fake_images_uvw = None
 
             if SAVE_AS_GRAY:
                 if hr_prev.shape[1] < 1:
@@ -117,17 +127,21 @@ def validate_and_save(result_dir, model, val_dataloader, device, epoch, data_typ
                     logger.error(f'Unsupported next channel count: {hr_next.shape[1]}')
                     raise ValueError(f"Unsupported next channel count: {hr_next.shape[1]}")
 
-            if hr_images.shape[1] < 2 or fake_images.shape[1] < 2:
+            if global_data.esrgan.USE_RAFT and (hr_images.shape[1] < 2 or fake_images.shape[1] < 2):
                 logger.error('RAFT 联合可视化至少需要前两通道(u,v)')
                 raise ValueError("RAFT 联合可视化至少需要前两通道(u,v)")
 
-            # 统一颜色尺度：用 HR 的 uv 计算 ref_max_rad。
-            ref_max_rad = _compute_flow_ref_max_rad(hr_images)
+            if global_data.esrgan.USE_RAFT:
+                # 统一颜色尺度：用 HR 的 uv 计算 ref_max_rad。
+                ref_max_rad = _compute_flow_ref_max_rad(hr_images)
 
-            # RAFT 分支统一用 uv 转彩色可视化（不直接 save 原3通道）。
-            # 这里不再使用 flo 的 LR 图像，只保留 Pred/HR 两列。
-            fake_color = _flow_to_color_preview(fake_images[:, :2], ref_max_rad=ref_max_rad)
-            hr_color = _flow_to_color_preview(hr_images[:, :2], ref_max_rad=ref_max_rad)
+                # RAFT 分支统一用 uv 转彩色可视化（不直接 save 原3通道）。
+                # 这里不再使用 flo 的 LR 图像，只保留 Pred/HR 两列。
+                fake_color = _flow_to_color_preview(fake_images[:, :2], ref_max_rad=ref_max_rad)
+                hr_color = _flow_to_color_preview(hr_images[:, :2], ref_max_rad=ref_max_rad)
+            else:
+                fake_color = None
+                hr_color = None
 
             sample_rows = []
             for i in range(lr_prev.size(0)):
@@ -168,63 +182,65 @@ def validate_and_save(result_dir, model, val_dataloader, device, epoch, data_typ
                     separator_widths=[6, 6, 16, 6, 6],
                 )
 
-                # 下半部分：流场双联图 Pred/HR，不再包含 flo 的 LR 图像。
-                flow_row = build_pair_row(
-                    fake_color[i:i + 1],
-                    hr_color[i:i + 1],
-                    sep_width=6,
-                )
-                flow_w = fake_color.shape[3]
-                flow_row = _add_headers_to_panel(
-                    flow_row,
-                    headers=["Flow-Pred", "Flow-HR"],
-                    column_widths=[flow_w, flow_w],
-                    separator_widths=[6],
-                )
+                if global_data.esrgan.USE_RAFT:
+                    # 下半部分：流场双联图 Pred/HR，不再包含 flo 的 LR 图像。
+                    flow_row = build_pair_row(
+                        fake_color[i:i + 1],
+                        hr_color[i:i + 1],
+                        sep_width=6,
+                    )
+                    flow_w = fake_color.shape[3]
+                    flow_row = _add_headers_to_panel(
+                        flow_row,
+                        headers=["Flow-Pred", "Flow-HR"],
+                        column_widths=[flow_w, flow_w],
+                        separator_widths=[6],
+                    )
 
-                # 图像对分支在灰度保存模式下仍应保持“灰度外观”，
-                # 而 flow_row 需要继续保持 3 通道彩色。
-                # 这里采用的做法是：
-                # 仅在拼接这一刻，把单通道灰度 image_row 复制成 3 个相同通道。
-                # 这样视觉上仍然是灰度图像，但张量通道数能和 flow_row 对齐。
-                if image_row.shape[1] != flow_row.shape[1]:
-                    if image_row.shape[1] == 1 and flow_row.shape[1] == 3:
-                        image_row = image_row.repeat(1, 3, 1, 1)
-                    elif image_row.shape[1] == 3 and flow_row.shape[1] == 1:
-                        flow_row = flow_row.repeat(1, 3, 1, 1)
-                    else:
-                        raise ValueError(
-                            f"Cannot align channel counts for preview concat: "
-                            f"image_row={tuple(image_row.shape)}, flow_row={tuple(flow_row.shape)}"
-                        )
+                    # 图像对分支在灰度保存模式下仍应保持“灰度外观”，
+                    # 而 flow_row 需要继续保持 3 通道彩色。
+                    if image_row.shape[1] != flow_row.shape[1]:
+                        if image_row.shape[1] == 1 and flow_row.shape[1] == 3:
+                            image_row = image_row.repeat(1, 3, 1, 1)
+                        elif image_row.shape[1] == 3 and flow_row.shape[1] == 1:
+                            flow_row = flow_row.repeat(1, 3, 1, 1)
+                        else:
+                            raise ValueError(
+                                f"Cannot align channel counts for preview concat: "
+                                f"image_row={tuple(image_row.shape)}, flow_row={tuple(flow_row.shape)}"
+                            )
 
-                # 同一样本把图像对结果和流场结果拼成一整行，便于一次性总览。
-                h_sep = add_horizontal_separator(
-                    width=max(image_row.shape[3], flow_row.shape[3]),
-                    channels=image_row.shape[1],
-                    sep_height=10,
-                    value=1.0,
-                    device=image_row.device,
-                    dtype=image_row.dtype,
-                )
+                    # 联合模式把图像对结果和流场结果上下拼接，便于一次性总览。
+                    h_sep = add_horizontal_separator(
+                        width=max(image_row.shape[3], flow_row.shape[3]),
+                        channels=image_row.shape[1],
+                        sep_height=10,
+                        value=1.0,
+                        device=image_row.device,
+                        dtype=image_row.dtype,
+                    )
 
-                if image_row.shape[3] < h_sep.shape[3]:
-                    pad = h_sep.shape[3] - image_row.shape[3]
-                    image_row = F.pad(image_row, (0, pad, 0, 0), value=1.0)
-                if flow_row.shape[3] < h_sep.shape[3]:
-                    pad = h_sep.shape[3] - flow_row.shape[3]
-                    flow_row = F.pad(flow_row, (0, pad, 0, 0), value=1.0)
+                    if image_row.shape[3] < h_sep.shape[3]:
+                        pad = h_sep.shape[3] - image_row.shape[3]
+                        image_row = F.pad(image_row, (0, pad, 0, 0), value=1.0)
+                    if flow_row.shape[3] < h_sep.shape[3]:
+                        pad = h_sep.shape[3] - flow_row.shape[3]
+                        flow_row = F.pad(flow_row, (0, pad, 0, 0), value=1.0)
 
-                row = torch.cat([image_row, h_sep, flow_row], dim=2)
+                    row = torch.cat([image_row, h_sep, flow_row], dim=2)
+                else:
+                    # SR-only 模式只保存 image_pair 预览，不追加 flow 子图。
+                    row = image_row
                 sample_rows.append(row)
 
-            uvs_compare_panel = build_flo_uvw_pred_gt_panel(fake_images_uvw, hr_images)
-            uvs_compare_panel = _add_headers_to_panel(
-                uvs_compare_panel,
-                headers=["Flow-Pred", "Flow-HR"],
-                column_widths=[fake_images_uvw.shape[-1], hr_images.shape[-1]],
-                separator_widths=[6],
-            )
+            if global_data.esrgan.USE_RAFT:
+                uvs_compare_panel = build_flo_uvw_pred_gt_panel(fake_images_uvw, hr_images)
+                uvs_compare_panel = _add_headers_to_panel(
+                    uvs_compare_panel,
+                    headers=["Flow-Pred", "Flow-HR"],
+                    column_widths=[fake_images_uvw.shape[-1], hr_images.shape[-1]],
+                    separator_widths=[6],
+                )
 
             batch_combined = sample_rows[0]
             for row in sample_rows[1:]:
@@ -242,18 +258,19 @@ def validate_and_save(result_dir, model, val_dataloader, device, epoch, data_typ
                 result_dir,
                 f"epoch_{epoch + 1}_batch_{batch_idx}_results.png"
             )
-            # 在额外保存一张 u / v / s 对比图。
-            save_image(
-                uvs_compare_panel,
-                os.path.join(result_dir, f"epoch_{epoch + 1}_batch_{batch_idx}_results_uvs.png"),
-                normalize=False
-            )
-            # 额外保存瞬时涡流速度场图。
-            save_vorticity_quiver_compare(
-                fake_images_uvw, hr_images,
-                os.path.join(result_dir, f"epoch_{epoch + 1}_batch_{batch_idx}_vorticity_quiver.png"),
-                stride=6
-            )
+            if global_data.esrgan.USE_RAFT:
+                # 在额外保存一张 u / v / s 对比图。
+                save_image(
+                    uvs_compare_panel,
+                    os.path.join(result_dir, f"epoch_{epoch + 1}_batch_{batch_idx}_results_uvs.png"),
+                    normalize=False
+                )
+                # 额外保存瞬时涡流速度场图。
+                save_vorticity_quiver_compare(
+                    fake_images_uvw, hr_images,
+                    os.path.join(result_dir, f"epoch_{epoch + 1}_batch_{batch_idx}_vorticity_quiver.png"),
+                    stride=6
+                )
             save_image(batch_combined.clamp(0, 1), save_path, normalize=False)
             logger.info(f"Saved validation image: {save_path}")
             break
@@ -1049,9 +1066,15 @@ def _ensure_csv_columns(csvOperator, required_columns: list[str]) -> None:
         existing_columns = reader.fieldnames or []
         existing_rows = list(reader)
 
+    # 已经是最新表头时直接返回，避免每轮 evaluate 都重写 CSV。
     if existing_columns == target_columns:
         return
 
+    # 只有当文件表头确实缺少新指标列，或旧列顺序和当前 target 不一致时才迁移。
+    # 迁移策略：
+    # 1. 保留所有历史行的已有值；
+    # 2. 新增列（例如 VAL_C_AEE）填空字符串；
+    # 3. 统一改写为当前实验的标准列顺序。
     missing_required = [col for col in required_columns if col not in existing_columns]
     if missing_required or existing_columns != target_columns:
         normalized_rows = [
@@ -1070,15 +1093,23 @@ def _ensure_csv_columns(csvOperator, required_columns: list[str]) -> None:
 # 验证函数  RAFT 联合验证
 def validate_raft(model, dataloader, device, epoch, result_dir=None, data_type="RAFT", SAVE_AS_GRAY=None):
     """
-    在 RAFT 联合验证集上计算平均像素损失、平均 PSNR、平均能量谱 MSE、平均 AEE，
-    以及“每 100 个像素 EPE 累加值的平均”。
-    这里不再区分 image_pair / flo，而是固定走联合模型的一条评估路径。
+    验证阶段的统一入口。
+
+    USE_RAFT=True 时：
+        计算图像超分指标 + RAFT AEE / 每 100 像素归一化 AEE。
+    USE_RAFT=False 时：
+        只计算 previous / next 两张 SR 图的 MSE、SSIM、PSNR、能量谱 MSE；
+        AEE 相关字段返回 NaN，并且后续 CSV / 曲线不会写入这些列。
+
+    这里保留函数名 validate_raft 是为了减少外部调用改动，
+    但内部已经按 USE_RAFT 自动切换联合评估或纯 SR 评估。
 
     result_dir 不为 None 时，validate_raft 会把原来的 validate_and_save 合并进来：
     - 指标统计会遍历完整个验证集，不再只跑一个 batch；
     - 预览图只保存第一个 batch，保持旧功能的可视化输出，同时避免每个 batch 都写图拖慢验证。
     """
     model.eval()
+    generator = model.piv_esrgan_generator
     use_adversarial = epoch >= global_data.esrgan.PRE_TRIAN_G_EPOCH - 1
     total_val_ssim_loss = 0.0
     total_val_mse_loss = 0.0
@@ -1087,6 +1118,11 @@ def validate_raft(model, dataloader, device, epoch, result_dir=None, data_type="
     total_energy_spectrum_mse = 0.0
     total_aee = 0.0
     total_norm_aee_per100 = 0.0
+    # C-AEE 需要样本级统计：
+    # - sample_energy_spectrum_mse_values: 每个样本 previous/next 两帧 ESMSE 的均值；
+    # - sample_aee_values: 同一批样本对应的 RAFT EPE/AEE。
+    # 训练中 evaluate 最终使用平均 ESMSE / 平均 EPE / 平均 SSIM loss 做绝对归一化；
+    # 这里保留样本级列表主要用于数量一致性检查和后续排查。
     sample_energy_spectrum_mse_values = []
     sample_aee_values = []
     loss_count = 0
@@ -1119,22 +1155,11 @@ def validate_raft(model, dataloader, device, epoch, result_dir=None, data_type="
             # RAFT 监督只使用 uv 两个通道；这里保留三通道原始真值用于其他评估项。
             flow_gt_uv = flow_gt[:, :2, :, :]
 
-            # Ground 模式的图像输出和 PIV/光流估计器由 model.forward 根据 TRAIN_MODE 统一决定：
-            # - lr_ground_raft / hr_ground_raft / hr_ground_raft_load_models / bicubic_raft /
-            #   esrgan_raft / srgan_raft 最终都进入 RAFT；
-            # - bicubic_widim 先把 LR bicubic 上采样到 HR，再用传统窗口互相关 PIV baseline 估计位移；
-            # - bicubic_hs 先把 LR bicubic 上采样到 HR，再用 Horn-Schunck 光流法估计位移。
-            _, _, _, outputs = model.forward(
-                input_lr_prev=lr_prev,
-                input_lr_next=lr_next,
-                input_gr_prev=hr_prev,
-                input_gr_next=hr_next,
-                # 这里显式只把 uv 两个通道送给 RAFT。
-                flowl0=flow_gt_uv,
-                is_adversarial=use_adversarial,
-            )
-            fake_prev = outputs["sr_prev"]
-            fake_next = outputs["sr_next"]
+            if hasattr(generator, "forward_pair"):
+                fake_prev, fake_next = generator.forward_pair(lr_prev, lr_next)
+            else:
+                fake_prev = generator(lr_prev)
+                fake_next = generator(lr_next)
 
             batch_sample_ese_lists = [[] for _ in range(fake_prev.shape[0])]
             for fake_images, hr_images in ((fake_prev, hr_prev), (fake_next, hr_next)):
@@ -1156,47 +1181,67 @@ def validate_raft(model, dataloader, device, epoch, result_dir=None, data_type="
                     total_energy_spectrum_mse += energy_spectrum_mse
                     batch_sample_ese_lists[sample_idx].append(float(energy_spectrum_mse))
                     num_images += 1
+            # 同一验证样本会产生 previous/next 两个 image_pair 结果。
+            # C-AEE 里的 ESMSE 按样本定义，因此这里先把这两帧的 ESMSE 取平均，再存成一个 sample 级值。
             for sample_ese_list in batch_sample_ese_lists:
                 sample_energy_spectrum_mse_values.append(
                     float(np.mean(sample_ese_list)) if sample_ese_list else float("nan")
                 )
 
-            # 联合模型下直接顺带评估 RAFT 的 AEE；outputs["flow_predictions"] 已经按 HR flow 尺寸还原。
-            total_aee += float(outputs["raft_metrics"]["epe"])
-            total_norm_aee_per100 += _compute_norm_aee_per100_from_flow_tensors(
-                outputs["flow_predictions"][-1],
-                flow_gt_uv,
-            )
-            sample_aee_values.extend(
-                _compute_samplewise_aee_from_flow_tensors(outputs["flow_predictions"][-1], flow_gt_uv).tolist()
-            )
-            raft_batch_count += 1
+            if global_data.esrgan.USE_RAFT:
+                # 联合模型下直接顺带评估 RAFT 的 AEE。
+                # 联合模型 forward 当前返回 4 个值；这里取最后一个 outputs 字典读取 RAFT 指标。
+                _, _, _, outputs = model.forward(
+                    input_lr_prev=lr_prev,
+                    input_lr_next=lr_next,
+                    input_gr_prev=hr_prev,
+                    input_gr_next=hr_next,
+                    # 这里显式只把 uv 两个通道送给 RAFT。
+                    flowl0=flow_gt_uv,
+                    is_adversarial=use_adversarial,
+                )
+                total_aee += float(outputs["raft_metrics"]["epe"])
+                total_norm_aee_per100 += _compute_norm_aee_per100_from_flow_tensors(
+                    outputs["flow_predictions"][-1],
+                    flow_gt_uv,
+                )
+                sample_aee_values.extend(
+                    _compute_samplewise_aee_from_flow_tensors(outputs["flow_predictions"][-1], flow_gt_uv).tolist()
+                )
+                raft_batch_count += 1
     avg_val_ssim_loss = total_val_ssim_loss / max(loss_count, 1)
     avg_val_mse_loss = total_val_mse_loss / max(loss_count, 1)
     avg_psnr = total_psnr / max(num_images, 1)
     avg_energy_spectrum_mse = total_energy_spectrum_mse / max(num_images, 1)
     # outputs["raft_metrics"]["epe"] 本身已经是当前验证 batch 的平均 EPE/AEE，
     # 这里不能再按 image_pair 分支累计出来的 loss_count 再除一次，否则会把 AEE 额外缩小。
-    avg_aee = total_aee / max(raft_batch_count, 1)
-    avg_norm_aee_per100 = total_norm_aee_per100 / max(raft_batch_count, 1)
-    if len(sample_energy_spectrum_mse_values) != len(sample_aee_values):
-        common_len = min(len(sample_energy_spectrum_mse_values), len(sample_aee_values))
-        logger.warning(
-            "[validate_raft] sample-wise ESMSE/EPE length mismatch: esmse_count={}, epe_count={}, truncated_to={}",
-            len(sample_energy_spectrum_mse_values),
-            len(sample_aee_values),
-            common_len,
+    # SR-only 模式没有 RAFT 预测，用 NaN 明确表示该指标不适用，后续 CSV/plot 不会包含这些列。
+    avg_aee = total_aee / max(raft_batch_count, 1) if global_data.esrgan.USE_RAFT else float("nan")
+    avg_norm_aee_per100 = total_norm_aee_per100 / max(raft_batch_count, 1) if global_data.esrgan.USE_RAFT else float("nan")
+    if global_data.esrgan.USE_RAFT:
+        if len(sample_energy_spectrum_mse_values) != len(sample_aee_values):
+            # 理想情况下，两组样本级指标长度应该完全一致。
+            # 如果未来某个分支改了验证流程导致长度不一致，这里先保守截到共同长度，
+            # 同时打印告警，避免因为一个辅助指标把整套验证流程直接中断。
+            common_len = min(len(sample_energy_spectrum_mse_values), len(sample_aee_values))
+            logger.warning(
+                "[validate_raft] sample-wise ESMSE/EPE length mismatch: esmse_count={}, epe_count={}, truncated_to={}",
+                len(sample_energy_spectrum_mse_values),
+                len(sample_aee_values),
+                common_len,
+            )
+            sample_energy_spectrum_mse_values = sample_energy_spectrum_mse_values[:common_len]
+            sample_aee_values = sample_aee_values[:common_len]
+        # C-AEE 是整体验证指标：先得到平均 ESMSE / 平均 EPE / 平均 SSIM loss，
+        # 再用固定参考尺度放缩到同一无量纲尺度，避免不同量纲直接相加。
+        # avg_val_ssim_loss 来自 SSIMLoss，本身就是 1-SSIM，因此用 ssim_error_value 显式传入。
+        avg_c_aee = compute_c_aee_value(
+            avg_energy_spectrum_mse,
+            avg_aee,
+            ssim_error_value=avg_val_ssim_loss,
         )
-        sample_energy_spectrum_mse_values = sample_energy_spectrum_mse_values[:common_len]
-        sample_aee_values = sample_aee_values[:common_len]
-    # C-AEE 是整体验证指标：先得到平均 ESMSE / 平均 EPE / 平均 SSIM loss，
-    # 再用固定参考尺度放缩到同一无量纲尺度，避免不同量纲直接相加。
-    # avg_val_ssim_loss 来自 SSIMLoss，本身就是 1-SSIM，因此用 ssim_error_value 显式传入。
-    avg_c_aee = compute_c_aee_value(
-        avg_energy_spectrum_mse,
-        avg_aee,
-        ssim_error_value=avg_val_ssim_loss,
-    )
+    else:
+        avg_c_aee = float("nan")
     return avg_val_ssim_loss, avg_val_mse_loss, avg_psnr, avg_energy_spectrum_mse, avg_aee, avg_norm_aee_per100, avg_c_aee
 
 """
@@ -1210,7 +1255,7 @@ def evaluate(epoch,class_name,data_type,device,
    每轮结束后执行验证、记录日志、保存模型与损失曲线。
     :param epoch: 轮次
     :param class_name:类别
-    :param data_type: 数据类型，当前联合评估路径固定使用 "RAFT"
+    :param data_type: 数据类型，USE_RAFT=True 时为 "RAFT"，USE_RAFT=False 时为 "SR"
     :param device: cuda或者cpu
     :param model: 模型
     :param animator: 图表动画
@@ -1235,30 +1280,40 @@ def evaluate(epoch,class_name,data_type,device,
         data_type=data_type,
     )
 
+    # 历史实验目录里的 loss CSV 可能还是旧表头，没有 VAL_C_AEE。
+    # 这里在真正 create() 之前先做一次就地迁移，这样旧文件可以无损续跑。
     _ensure_csv_columns(csvOperator, ["VAL_C_AEE"])
 
-    wandb.log({
+    wandb_payload = {
         "classname": class_name,
         "data_type": data_type,
         "VAL_AVG_MSE_LOSS": avg_val_mse_loss ,
         "VAL_AVG_SSIM_LOSS": avg_val_ssim_loss ,
         "VAL_energy_spectrum_mse": avg_val_energy_spectrum_mse,
-        "VAL_AEE": avg_val_aee,
-        "VAL_NORM_AEE_PER100PIXEL": avg_val_norm_aee_per100,
-        "VAL_C_AEE": avg_val_c_aee,
         "avg_psnr": avg_psnr,
         "Epoch": epoch,
         **{
             loss_label[index]: metric[index] / (train_loader_lens)
             for index in range(len(loss_label))
         }
-    })
+    }
+    if global_data.esrgan.USE_RAFT:
+        wandb_payload.update({
+            "VAL_AEE": avg_val_aee,
+            "VAL_NORM_AEE_PER100PIXEL": avg_val_norm_aee_per100,
+            "VAL_C_AEE": avg_val_c_aee,
+        })
+    wandb.log(wandb_payload)
     current_time = time.time()
+    raft_log_text = (
+        f" | VAL_AEE: {avg_val_aee} | VAL_NORM_AEE_PER100PIXEL: {avg_val_norm_aee_per100} | VAL_C_AEE: {avg_val_c_aee}"
+        if global_data.esrgan.USE_RAFT
+        else " | RAFT metrics: disabled"
+    )
     logger.info(
         f"Epoch [{epoch + 1}/{global_data.esrgan.EPOCH_NUMS}] |{class_name} {data_type} |running time:{int(current_time - global_data.esrgan.START_TIME )}s | "
         f"VAL_AVG_MSE_LOSS: {avg_val_mse_loss} | VAL_AVG_SSIM_LOSS: {avg_val_ssim_loss} | "
-        f"VAL_energy_spectrum_mse: {avg_val_energy_spectrum_mse} | VAL_AEE: {avg_val_aee} | "
-        f"VAL_NORM_AEE_PER100PIXEL: {avg_val_norm_aee_per100} | VAL_C_AEE: {avg_val_c_aee} | Avg PSNR: {avg_psnr:.2f}"
+        f"VAL_energy_spectrum_mse: {avg_val_energy_spectrum_mse}{raft_log_text} | Avg PSNR: {avg_psnr:.2f}"
     )
     loss_str = "".join([loss_label[index] + ':' + str(metric[index] / train_loader_lens) + "," for index in
                         range(len(loss_label))])
@@ -1270,10 +1325,9 @@ def evaluate(epoch,class_name,data_type,device,
         avg_val_ssim_loss,
         avg_psnr,
         avg_val_energy_spectrum_mse,
-        avg_val_aee,
-        avg_val_norm_aee_per100,
-        avg_val_c_aee,
     ]
+    if global_data.esrgan.USE_RAFT:
+        all_loss_and_val_Datas.extend([avg_val_aee, avg_val_norm_aee_per100, avg_val_c_aee])
     animator.add(epoch + 1,all_loss_and_val_Datas )
     # 保存到csv文件中
     csv_row = {"EPOCH": epoch + 1}
@@ -1283,26 +1337,29 @@ def evaluate(epoch,class_name,data_type,device,
     csv_row["VAL_SSIM_Loss"] = avg_val_ssim_loss
     csv_row["Avg_PSNR"] = avg_psnr
     csv_row["VAL_energy_spectrum_mse"] = avg_val_energy_spectrum_mse
-    csv_row["VAL_AEE"] = avg_val_aee
-    csv_row["VAL_NORM_AEE_PER100PIXEL"] = avg_val_norm_aee_per100
-    csv_row["VAL_C_AEE"] = avg_val_c_aee
+    if global_data.esrgan.USE_RAFT:
+        csv_row["VAL_AEE"] = avg_val_aee
+        csv_row["VAL_NORM_AEE_PER100PIXEL"] = avg_val_norm_aee_per100
+        csv_row["VAL_C_AEE"] = avg_val_c_aee
     csv_row["time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     csvOperator.create(csv_row)
+    fixed_groups = [
+        ["g_loss", "d_loss"] + (["raft_loss"] if global_data.esrgan.USE_RAFT else []),
+        ["g_perceptual_loss", "g_content_loss", "g_adversarial_loss"],
+        ["g_loss_pixel", "g_loss_pixel_l1", "g_loss_pixel_mse", "g_loss_ssim", "g_loss_fft"],
+        ["g_flow_warp_consistency_loss", "g_flow_warp_consistency_weighted_loss"],
+        ["d_loss", "d_real_loss", "d_fake_loss"],
+        [validate_label[0], validate_label[1], ],
+        [validate_label[2]],
+        [validate_label[3]],
+    ]
+    if global_data.esrgan.USE_RAFT:
+        fixed_groups.extend([[validate_label[4]], [validate_label[5]], [validate_label[6]]])
     animator.save_png(
         f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.LOSS_DIR}/train_loss_epoch_{epoch + 1}_{global_data.esrgan.name}.png",
-        fixed_groups=[
-            ["g_loss", "d_loss","raft_loss"],
-            ["g_perceptual_loss", "g_content_loss", "g_adversarial_loss"],
-            ["g_loss_pixel", "g_loss_pixel_l1", "g_loss_pixel_mse", "g_loss_ssim", "g_loss_fft"],
-            ["g_flow_warp_consistency_loss", "g_flow_warp_consistency_weighted_loss"],
-            ["d_loss", "d_real_loss", "d_fake_loss"],
-            [validate_label[0], validate_label[1], ],
-            [validate_label[2]],
-            [validate_label[3]],
-            [validate_label[4]],
-            [validate_label[5]],
-            [validate_label[6]]
-        ])
+        fixed_groups=fixed_groups)
+    # 这里刻意保持 evaluate() 的返回签名不变，避免影响现有 pipeline / pipeline_2 的解包逻辑。
+    # 新增的 VAL_C_AEE 已经完整写入 wandb、CSV、日志和损失曲线。
     return avg_val_mse_loss,avg_val_ssim_loss,avg_psnr,avg_val_energy_spectrum_mse,avg_val_aee,avg_val_norm_aee_per100
 
 def evaluate_all(
@@ -1348,7 +1405,9 @@ def evaluate_all(
     # 1. 按类别写子目录
     # 2. 按类别写 metrics.csv
     # 3. 额外汇总 전체 metrics_all.csv
-    device = next(model.parameters()).device
+    generator = model.piv_esrgan_generator
+    device = next(generator.parameters()).device
+    generator.eval()
     model.eval()
     # evaluate_all 是训练完成后的全量评估路径，没有 epoch 参数；
     # 这里默认进入“允许对抗项”的正式评估口径。
@@ -1541,23 +1600,34 @@ def evaluate_all(
             # RAFT 监督只使用 uv 两个通道；这里保留三通道原始真值用于评估和可视化。
             hr_uv = hr[:, :2, :, :]
 
-            # 联合模型 forward 当前返回 4 个值；这里显式解包，后面统一从 outputs 字典取结果。
-            _, _, _, outputs = model.forward(
-                input_lr_prev=lr_prev,
-                input_lr_next=lr_next,
-                input_gr_prev=hr_prev,
-                input_gr_next=hr_next,
-                # 这里显式只把 uv 两个通道送给 RAFT。
-                flowl0=hr_uv,
-                is_adversarial=use_adversarial,
-            )
+            if global_data.esrgan.USE_RAFT:
+                # 联合模型 forward 当前返回 4 个值；这里显式解包，后面统一从 outputs 字典取结果。
+                _, _, _, outputs = model.forward(
+                    input_lr_prev=lr_prev,
+                    input_lr_next=lr_next,
+                    input_gr_prev=hr_prev,
+                    input_gr_next=hr_next,
+                    # 这里显式只把 uv 两个通道送给 RAFT。
+                    flowl0=hr_uv,
+                    is_adversarial=use_adversarial,
+                )
 
-            fake_prev = outputs["sr_prev"]
-            fake_next = outputs["sr_next"]
-            fake = outputs["flow_predictions"][-1]
-            # RAFT 预测只有 uv 两个通道；这里补出 magnitude，
-            # 这样后面和三通道真值 [u, v, magnitude] 的评估/可视化才能一一对应。
-            fake_uvw = _flow_uv_to_uvw(fake)
+                fake_prev = outputs["sr_prev"]
+                fake_next = outputs["sr_next"]
+                fake = outputs["flow_predictions"][-1]
+                # RAFT 预测只有 uv 两个通道；这里补出 magnitude，
+                # 这样后面和三通道真值 [u, v, magnitude] 的评估/可视化才能一一对应。
+                fake_uvw = _flow_uv_to_uvw(fake)
+            elif hasattr(model.piv_esrgan_generator, "forward_pair"):
+                # SR-only 模式只评估 previous / next 两张超分图，不创建 flow 预测。
+                fake_prev, fake_next = model.piv_esrgan_generator.forward_pair(lr_prev, lr_next)
+                fake = None
+                fake_uvw = None
+            else:
+                fake_prev = model.piv_esrgan_generator(lr_prev)
+                fake_next = model.piv_esrgan_generator(lr_next)
+                fake = None
+                fake_uvw = None
 
             # evaluate_all 的耗时大头不只在网络 forward，还在每个样本反复做保存和 numpy 指标。
             # 这里把 image_pair 分支的保存张量一次性裁剪/转 CPU，并把指标数组一次性缓存。
@@ -1580,16 +1650,22 @@ def evaluate_all(
                 pair_cache["fake_np"] = _batch_to_np_chw(pair_cache["fake"])
                 pair_cache["hr_np"] = _batch_to_np_chw(pair_cache["hr"])
 
-            # flow 分支同样把每个 batch 的预测/真值缓存到 CPU：
-            # 1. fake_cpu / hr_cpu 继续用于原有 png 可视化函数；
-            # 2. fake_uvw_np_batch / hr_np_batch 直接用于 npy 保存和指标计算；
-            # 3. flow_ref_max_rads 提前按 batch 计算，避免 flow_triplet 和 pred_flow/gt_flow 重复 quantile。
-            flow_ref_max_rads = _compute_flow_ref_max_rad_batch(hr)
-            fake_cpu = fake.detach().cpu()
-            fake_uvw_cpu = fake_uvw.detach().cpu()
-            hr_cpu = hr.detach().cpu()
-            fake_uvw_np_batch = _batch_to_np_chw(fake_uvw_cpu)
-            hr_np_batch = _batch_to_np_chw(hr_cpu)
+            if global_data.esrgan.USE_RAFT:
+                # flow 分支同样把每个 batch 的预测/真值缓存到 CPU：
+                # 1. fake_cpu / hr_cpu 继续用于原有 png 可视化函数；
+                # 2. fake_uvw_np_batch / hr_np_batch 直接用于 npy 保存和指标计算；
+                # 3. flow_ref_max_rads 提前按 batch 计算，避免 flow_triplet 和 pred_flow/gt_flow 重复 quantile。
+                flow_ref_max_rads = _compute_flow_ref_max_rad_batch(hr)
+                fake_cpu = fake.detach().cpu()
+                fake_uvw_cpu = fake_uvw.detach().cpu()
+                hr_cpu = hr.detach().cpu()
+                fake_uvw_np_batch = _batch_to_np_chw(fake_uvw_cpu)
+                hr_np_batch = _batch_to_np_chw(hr_cpu)
+            else:
+                # SR-only 评估不产生 flow 输出，保留这些占位变量只为让下面的分支逻辑更清晰。
+                flow_ref_max_rads = []
+                fake_cpu = fake_uvw_cpu = hr_cpu = None
+                fake_uvw_np_batch = hr_np_batch = None
 
             B = hr.shape[0]
             for i in range(B):
@@ -1669,6 +1745,11 @@ def evaluate_all(
                         "tke_acc": tke_img,
                         "nrmse": nrmse_img,
                     })
+
+                # SR-only 模式到这里已经完成该样本 previous/next 的保存和指标统计；
+                # 后面的 flow npy、U/V/S、涡度、AEE 误差图只在 USE_RAFT=True 时有意义。
+                if not global_data.esrgan.USE_RAFT:
+                    continue
 
                 # 保存流场预测及误差分析结果。
                 # lr1 = lr[i:i + 1]
@@ -2007,3 +2088,9 @@ def evaluate_all(
         "tke_acc": float("nan"),
         "nrmse": float("nan"),
     }
+
+
+
+
+
+

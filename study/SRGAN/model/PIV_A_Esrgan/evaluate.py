@@ -25,6 +25,7 @@ from study.SRGAN.model.PIV_A_Esrgan.visual_plot_init import build_flo_uvw_pred_g
 from study.SRGAN.model.PIV_A_Esrgan.visual_plot_save import save_vorticity_quiver_compare, _save_triplet, _save_pair, \
     _save_energy_spectrum_plot
 from study.SRGAN.model.c_aee_metric_common import attach_c_aee_to_raft_rows, compute_c_aee_value
+from study.SRGAN.model.metric_outlier_filter import robust_metric_mean
 from study.SRGAN.model.evaluate_image_compare_common import (
     compute_particle_image_error,
     save_image_triplet_with_error,
@@ -1534,7 +1535,9 @@ def evaluate_all(
     def build_mean_row(target_rows: list[dict], bucket_name: str) -> dict:
         def _mean_of(key: str) -> float:
             vals = [float(r[key]) for r in target_rows if np.isfinite(float(r[key]))]
-            return float(np.mean(vals)) if vals else float("nan")
+            # evaluate_all 的逐样本 CSV 行保持原始值；只有 MEAN/CLASS_MEAN 汇总行使用
+            # IQR 异常值剔除后的稳健均值，避免个别失败样本把类别/总体平均指标拉偏。
+            return robust_metric_mean(vals, metric_key=key, global_data=global_data)
 
         return {
             "class_name": bucket_name,

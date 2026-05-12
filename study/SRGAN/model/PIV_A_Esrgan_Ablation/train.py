@@ -3,10 +3,10 @@ import os
 import torch
 import torchvision
 from torch.cuda.amp import GradScaler
-from study.SRGAN.model.ESRuRAFT_PIV_Ground.Module.PIV_ESRGAN_RAFT_Model import ESRuRAFT_PIV
-from study.SRGAN.model.ESRuRAFT_PIV_Ground.global_class import global_data
-from study.SRGAN.model.ESRuRAFT_PIV_Ground.visual_plot_init import build_flo_uvw_fake_panel
-from study.SRGAN.model.ESRuRAFT_PIV_Ground.visual_plot_save import save_vorticity_quiver_single
+from study.SRGAN.model.PIV_A_Esrgan_Ablation.Module.PIV_ESRGAN_RAFT_Model import ESRuRAFT_PIV
+from study.SRGAN.model.PIV_A_Esrgan_Ablation.global_class import global_data
+from study.SRGAN.model.PIV_A_Esrgan_Ablation.visual_plot_init import build_flo_uvw_fake_panel
+from study.SRGAN.model.PIV_A_Esrgan_Ablation.visual_plot_save import save_vorticity_quiver_single
 from study.SRGAN.model.training_safety_common import raise_if_nonfinite_losses
 from study.SRGAN.util.image_util import flow_to_color_tensor
 
@@ -95,7 +95,7 @@ def esrgan_union_RAFT_train(
     i,
     data_type,
     device,
-    RAFT_optimizer:torch.optim.AdamW,
+    RAFT_optimizer:torch.optim.AdamW | None,
     scaler:GradScaler,
 
     g_optimizer:torch.optim.Adam,
@@ -107,7 +107,11 @@ def esrgan_union_RAFT_train(
     model: ESRuRAFT_PIV,
 ):
     """
-    超分辨率与RAFT联合训练。
+    PIV_A_Esrgan_Ablation 单 batch 训练入口。
+
+    global_data.esrgan.USE_RAFT=True 时执行“超分辨率 + RAFT”联合训练；
+    USE_RAFT=False 时执行“只做超分辨率”的训练，RAFT_optimizer 可以为 None，
+    metric 也只记录 SR 与判别器相关列。
     """
 
     lr_prev = batch['image_pair']["previous"]["lr_data"].to(device, non_blocking=True)
@@ -118,16 +122,7 @@ def esrgan_union_RAFT_train(
     # 这里先保留原始读取方式，再显式只取前两个通道传给 RAFT 监督。
     flow_hr = batch['flo']["gr_data"].to(device, non_blocking=True)
     flow_hr_uv = flow_hr[:, :2, :, :]
-    train_mode = global_data.esrgan.validate_train_mode()
-    if train_mode in {"esrgan_raft", "srgan_raft"}:
-        # 原始 SRGAN/ESRGAN 分支从头训练判别器和生成器。
-        # 第一轮直接启用 GAN 项时，D 的随机判别会给 G 一个很强且不稳定的纹理梯度，
-        # 粒子图像容易出现规则网格伪影；所以这些原始 SR 模式使用独立的预热轮次。
-        adversarial_start_epoch = int(global_data.esrgan.ORIGINAL_SR_ADVERSARIAL_START_EPOCH)
-    else:
-        # 其他联合训练模式继续沿用原来的 PRE_TRIAN_G_EPOCH 行为，避免影响既有实验。
-        adversarial_start_epoch = int(global_data.esrgan.PRE_TRIAN_G_EPOCH)
-    use_adversarial = epoch >= adversarial_start_epoch - 1
+    use_adversarial = epoch >= global_data.esrgan.PRE_TRIAN_G_EPOCH - 1
 
     #更新梯度
     pred_prev,pred_next,flow_predictions,loss_dict = model.train_step(
@@ -154,8 +149,8 @@ def esrgan_union_RAFT_train(
         scale=SCALE,
         global_data=global_data,
     )
-    metric.add(
-        # 注意这里的记录顺序必须和 global_class.loss_label 完全一致，否则 csv/plot 会错位。
+    # 注意这里的记录顺序必须和 global_class.loss_label 完全一致，否则 csv/plot 会错位。
+    metric_values = [
         loss_dict['sr_loss'],
         loss_dict["perceptual_loss"],
         loss_dict["content_loss"],
@@ -170,17 +165,24 @@ def esrgan_union_RAFT_train(
         loss_dict["discriminator_loss"],
         loss_dict["d_real_loss"],
         loss_dict["d_fake_loss"],
-        loss_dict["raft_loss"],
-        loss_dict["raft_epe"],
-        loss_dict["raft_1px"],
-        loss_dict["raft_3px"],
-        loss_dict["raft_5px"],
-
-
-    )
+    ]
+    if global_data.esrgan.USE_RAFT:
+        metric_values.extend([
+            loss_dict["raft_loss"],
+            loss_dict["raft_epe"],
+            loss_dict["raft_1px"],
+            loss_dict["raft_3px"],
+            loss_dict["raft_5px"],
+        ])
+    metric.add(*metric_values)
 
     _save_training_preview(epoch, i, train_progress_bar, class_name, data_type,"image_pair", pred_prev.detach(), hr_prev, "previous", SCALE)
     _save_training_preview(epoch, i, train_progress_bar, class_name, data_type,"image_pair", pred_next.detach(), hr_next, "next", SCALE)
-    # flo 预览现在直接接收最后一轮流场预测张量 [B, C, H, W]，
-    # 不再在 _save_training_preview 内部对 list 做兼容处理。
-    _save_training_preview(epoch, i, train_progress_bar, class_name, data_type,"flo", flow_predictions, flow_hr, "flo", SCALE)
+    # SR-only 模式没有 RAFT 预测，不保存 flow 预览；联合模式才保存最后一轮流场预测。
+    if global_data.esrgan.USE_RAFT and flow_predictions is not None:
+        # flo 预览现在直接接收最后一轮流场预测张量 [B, C, H, W]，
+        # 不再在 _save_training_preview 内部对 list 做兼容处理。
+        _save_training_preview(epoch, i, train_progress_bar, class_name, data_type,"flo", flow_predictions, flow_hr, "flo", SCALE)
+    # 把 train_step 返回的完整日志继续返回给 pipeline。
+    # 原有 metric.add(...) 仍然只记录固定 loss_label；这里额外返回是为了单独保存 FAMO 权重 CSV 和折线图。
+    return loss_dict

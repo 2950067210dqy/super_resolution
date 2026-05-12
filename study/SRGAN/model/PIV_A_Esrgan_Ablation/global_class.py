@@ -53,15 +53,53 @@ class global_data:
                 将对抗损失最终权重改成0.0161；后续取消生成器侧自适应多任务权重，恢复为手动全局权重组合。
                 ESRuRAFT_PIV_v8_v1 改FAMO初始权重
                 ESRuRAFT_PIV_v8_v2：去除FAMO权重
+                
+                PIV_A_Esrgan_Ablation v1:ESRuRAFT_PIV_v8基础上将判别器更改为A-ESRGAN的判别器
+                PIV_A_Esrgan_Ablation v2:PIV_A_Esrgan_Ablation v1基础上RAFT128（使用论文训练好的RAFT256部分迁移训练） 基础上去除4个类别的数据，GRU迭代次数12变更成论文的16
+                PIV_A_Esrgan_Ablation v3:PIV_A_Esrgan_Ablation v2基础上 划分数据集根据论文里来 fixed
+                PIV_A_Esrgan_Ablation v4:PIV_A_Esrgan_Ablation v2基础上 数据量从50%提升到100%，每轮evaluate不在限制一轮batch
            """
         #运行环境是否是autoDL
         IS_AUTO_DL = True
         AUTODL_DATA_PATH = rf"/root/autodl-tmp" if IS_AUTO_DL else r""
         # =========================
+        # 消融实验总开关
+        # =========================
+        # PIV_A_Esrgan_Ablation 是 PIV_A_Esrgan 的独立消融分支，下面用一个全局参数选择
+        # 当前要运行的消融方案。只改这里即可切换 5 组实验，模型构建、RAFT 结构、迁移开关、
+        # Generator 是否吃 EPE、图像一致性损失是否启用都会在 apply_ablation_config() 中同步。
+        #
+        # 5 个模式含义：
+        # 1: PIV_A 生成器 + 基础 ESRGAN 判别器 + RAFT256；不做 RAFT256->RAFT128 迁移；EPE 不限制 G。
+        # 2: PIV_A 生成器 + PIV_A 判别器 + RAFT256；不做 RAFT256->RAFT128 迁移；EPE 不限制 G。
+        # 3: PIV_A 生成器 + PIV_A 判别器 + 原配置 RAFT；EPE 不限制 G。
+        # 4: PIV_A 生成器 + 基础 ESRGAN 判别器 + 原配置 RAFT；EPE 不限制 G。
+        # 5: 基础 ESRGAN 生成器 + 基础 ESRGAN 判别器 + 原配置 RAFT；去掉图像一致性损失；EPE 限制 G。
+        ABLATION_MODE = 1
+        ABLATION_MODES = (1, 2, 3, 4, 5)
+        ABLATION_MODE_DESCRIPTIONS = {
+            1: "piv_generator_basic_esrgan_discriminator_raft256_no_g_epe",
+            2: "piv_generator_piv_discriminator_raft256_no_g_epe",
+            3: "piv_generator_piv_discriminator_original_raft_no_g_epe",
+            4: "piv_generator_basic_esrgan_discriminator_original_raft_no_g_epe",
+            5: "basic_esrgan_generator_basic_esrgan_discriminator_original_raft_with_g_epe_no_flow_warp",
+        }
+        # 消融实验默认从头训练，避免架构切换后误加载旧结构 checkpoint，也避免“迁移学习”
+        # 污染各组对照。如果确实要续训，可手动改成 False。
+        ABLATION_FORCE_TRAIN_FROM_SCRATCH = True
+        # 运行时由 apply_ablation_config() 写入，放在这里是为了保存超参数 txt 时能看见最终选择。
+        SR_GENERATOR_TYPE = "piv_a_esrgan"
+        SR_DISCRIMINATOR_TYPE = "piv_a_attention_unet"
+        GENERATOR_RAFT_EPE_LOSS = True
+        FLOW_WARP_CONSISTENCY_ENABLED = True
+        ORIGINAL_ESRGAN_NUM_RRDB = 23
+
+        # =========================
         # 训练任务标识
         # =========================
-        name = "ESRuRAFT_PIV"  # 当前实验名（用于输出目录/模型名/wandb run名）
-        DESCRIPTION = "_v8_v2"  # 实验补充描述（可写损失配置、数据版本等）
+        BASE_NAME = "PIV_A_Esrgan_Ablation"  # 固定基础名，apply_ablation_config 会按模式刷新 name
+        name = BASE_NAME  # 当前实验名（用于输出目录/模型名/wandb run名）
+        DESCRIPTION = f"_ablation_{ABLATION_MODE}"  # 实验补充描述（可写损失配置、数据版本等）
         name +=DESCRIPTION
 
         #整体项目注释
@@ -90,14 +128,25 @@ class global_data:
         # DATA_SET="class_1" 默认不再排除 JHTDB*/uniform；这些类别会正常参与训练，
         # evaluate_all 阶段再把 JHTDB* 归到 JHTDB_channel，并跳过 uniform 的全量验证输出。
         EXCLUDE_CLASS = []
-        #每个类别加载多少的数据 50%
-        CLASS_SAMPLE_RATIO =0.5
+        #每个类别加载多少的数据 50% TRAIN_CLASS_MODE=fixed时无效
+        CLASS_SAMPLE_RATIO =1
         # =========================
         # 设备与模型加载
         # =========================
         device = torch.device("cuda")  # 训练设备
-        IS_LOAD_EXISTS_MODEL = False  # 是否从已保存模型断点继续训练
+        IS_LOAD_EXISTS_MODEL = True  # 是否从已保存模型断点继续训练
         AMP =False #是否开启混合精度训练
+        # =========================
+        # 训练模式开关
+        # =========================
+        # USE_RAFT=True:
+        #   保持原来的“超分辨率 Generator + RAFT 光流估计”联合训练路径。
+        #   Generator 除了 SR 重建/对抗损失，还会吃到 RAFT EPE 反作用项。
+        # USE_RAFT=False:
+        #   只训练 PIV 图像对超分辨率，不实例化 RAFT，不创建 RAFT optimizer/scheduler，
+        #   训练日志、验证曲线、evaluate_all 也只输出 image_pair 的超分指标。
+        #   该模式适合单独验证 Attention U-Net 判别器对颗粒图像超分质量的贡献。
+        USE_RAFT = True
         # =========================
         # 可视化与保存相关
         # =========================
@@ -110,9 +159,9 @@ class global_data:
         BATCH_SIZE = 4 # batch 大小
         PRE_TRIAN_G_EPOCH = 1 #预训练G完成的轮次 从1开始 就是从第几轮开始弃用对抗损失
         TRAIN_DATA_SAVING_STEP =1000 #每隔多少steps保存一次生成的图片 50
-        SHUFFLE = True  # 训练集是否打乱
+        SHUFFLE = True  # 训练集是否打乱 TRAIN_CLASS_MODE=fixed时无效
         TARGET_SIZE = None  # 数据加载时是否统一 resize 到该尺寸
-        RANDOM_SEED = 42  # 数据划分随机种子
+        RANDOM_SEED = 42  # 数据划分随机种子 TRAIN_CLASS_MODE=fixed时无效
         # SCALES = [2,math.sqrt(8),4] # 生成器上采样倍率（内部两次 PixelShuffle）
         SCALES = [2]  # 生成器上采样倍率（内部两次 PixelShuffle）
         # =========================
@@ -127,13 +176,40 @@ class global_data:
         """
         # RAFT_MODEL_TYPE 控制 PIV_ESRGAN_RAFT_Model 里 self.piv_RAFT 的具体网络结构。
         # 可选值：
-        # - "RAFT":    最早的基础 RAFT 实现；
-        # - "RAFT128": 内部在 1/4 分辨率估计光流；
-        # - "RAFT256": 内部在 1/8 分辨率估计光流。
+        # - "RAFT":    最早的基础 RAFT 实现，保持原接口；
+        # - "RAFT128": 内部在 1/4 分辨率估计光流，适合更细的相关体/GRU 网格；
+        # - "RAFT256": 内部在 1/8 分辨率估计光流，显存更省，和 ckpt_256.tar 的结构一致。
         # 本分支之前硬编码为 RAFT128，所以默认仍为 "RAFT128"，保证旧实验不改配置时行为不变。
         RAFT_MODEL_TYPES = ("raft", "raft128", "raft256")
         RAFT_MODEL_TYPE = "RAFT128"
         RAFT_UPSAMPLE = 'convex'
+        # 仅 PIV_A_Esrgan_Ablation 支持这个迁移开关：
+        # True 时，如果 RAFT_MODEL_TYPE="RAFT128"，会尝试把一个 RAFT256 checkpoint 中 shape 完全一致的权重
+        # 迁移到 RAFT128，shape 不一致的层会跳过并保留 RAFT128 自身随机初始化。
+        # 这不是无损迁移，尤其 update_block.mask.2 的 576 通道(8x8x9)无法直接装入 RAFT128 的
+        # 144 通道(4x4x9)，因此建议只作为预训练初始化，之后继续 fine-tune。
+        RAFT128_INIT_FROM_RAFT256 = True
+        #相对 SRGAN 根目录的路径；
+        RAFT128_INIT_FROM_RAFT256_CKPT = "RAFT_CHECKPOINT/ckpt_256.tar"
+        # 下列两个开关只在 RAFT128_INIT_FROM_RAFT256=True 时生效。
+        # optimizer 迁移会按参数名和 shape 做安全过滤：只迁移 shape 匹配参数的 AdamW 状态；
+        # scheduler 迁移则直接读取 checkpoint 里的 ReduceLROnPlateau 状态。
+        # 如果当前实验已经成功从 OUT_PUT_DIR 恢复了自己的 optimizer/scheduler，pipeline 会优先保留恢复结果。
+        RAFT128_INIT_FROM_RAFT256_OPTIMIZER = True
+        RAFT128_INIT_FROM_RAFT256_SCHEDULER = True
+
+        # =========================
+        # A-ESRGAN 风格判别器配置
+        # =========================
+        # 判别器仍然接收 3 通道输入，但这 3 个通道不是 RGB，而是：
+        # [prev_gray, next_gray, abs(next_gray - prev_gray)]。
+        # 这样 U-Net 判别器的空间 logit map 能同时评价单帧颗粒外观和帧间亮度变化。
+        DISCRIMINATOR_BASE_CHANNELS = 32
+        # 第一阶段建议保持 False，只使用单尺度 Attention U-Net，降低显存和训练震荡风险；
+        # 如果单尺度稳定，再把它切成 True，启用 A-ESRGAN 类似的 1x + 2x 多尺度判别器。
+        DISCRIMINATOR_USE_MULTISCALE = True
+        # spectral normalization 用来稳定 GAN 判别器，尤其适合当前 batch size 较小的颗粒图训练。
+        DISCRIMINATOR_SPECTRAL_NORM = True
 
         # =========================
         # 损失项系数
@@ -162,7 +238,7 @@ class global_data:
         # 按你的设定：从第 0 轮开始由 0.012 线性增长，到 int(EPOCH_NUMS/2) 达到 1.2，之后保持 1.2。
         LAMBDA_FLOW_WARP_CONSISTENCY = 0.012
         FLOW_WARP_CONSISTENCY_WEIGHT_START = 0.012
-        FLOW_WARP_CONSISTENCY_WEIGHT_END = 1.057440 if CLASS_SAMPLE_RATIO != 1 else 0.2
+        FLOW_WARP_CONSISTENCY_WEIGHT_END = 1.057440 if CLASS_SAMPLE_RATIO!=1 else 0.2
         FLOW_WARP_CONSISTENCY_WARMSTART_EPOCHS = 0
         FLOW_WARP_CONSISTENCY_WARMUP_EPOCHS = int(EPOCH_NUMS / 2)
         FLOW_WARP_CONSISTENCY_WEIGHT_SCHEDULE = "linear"  # 当前支持: linear | const | constant
@@ -172,6 +248,10 @@ class global_data:
         RAFT_EPE_WEIGHT = 1
         RAFT_EPE_WEIGHT_START = 1
         RAFT_EPE_WEIGHT_END = 3 if CLASS_SAMPLE_RATIO != 1 else 1.5
+        if not USE_RAFT:
+            RAFT_EPE_WEIGHT = 0
+            RAFT_EPE_WEIGHT_START = 0
+            RAFT_EPE_WEIGHT_END = 0
         RAFT_EPE_WARMSTART_EPOCHS = int(EPOCH_NUMS / 2) + 1
         RAFT_EPE_WARMUP_EPOCHS = EPOCH_NUMS - 1
         RAFT_EPE_WEIGHT_SCHEDULE = "linear"  # 当前支持: linear | const | constant
@@ -182,9 +262,6 @@ class global_data:
         LAMBDA_PIXEL_L1 = 0.5 # 像素L1权重 0.5；主重建项，保证整体亮度与局部数值不要漂
         LAMBDA_PIXEL_FFT = 0.004  # 频域重建约束，稳住颗粒尺度与高频分布；过大容易让结果发硬
         LAMBDA_PIXEL_MSE = 1e-3  # 像素MSE权重（当前基本未启用）
-        # =========================
-        # 图像对一致性损失超参数
-        # =========================
 
         # =========================
         # 结构相似性损失超参数
@@ -208,8 +285,16 @@ class global_data:
         FAMO_W_LR = 2.5e-2  # 论文示例使用的 FAMO 权重学习率，决定任务权重调整速度
         FAMO_MAX_NORM = 1.0  # 保留论文接口字段；当前模型中不额外裁剪 Generator 梯度
         FAMO_UPDATE_AFTER_STEP = True  # Generator 更新后重新前向一次，用新 loss 按论文公式更新 FAMO 权重
-        FAMO_GENERATOR_TASK_NAMES = ['vgg', 'l1', 'mse', 'ssim', 'fft', 'flow_consistency', 'epe']
-        FAMO_GENERATOR_INIT_WEIGHTS = [0.08, 0.18, 0.22, 0.2, 0.07, 0.18, 0.07]  # 仅作为 softmax 初始比例，启用 FAMO 后权重会自动归一化为 1
+        FAMO_GENERATOR_TASK_NAMES = (
+            ['vgg', 'l1', 'mse', 'ssim', 'fft', 'flow_consistency', 'epe']
+            if USE_RAFT
+            else ['vgg', 'l1', 'mse', 'ssim', 'fft', 'flow_consistency']
+        )
+        FAMO_GENERATOR_INIT_WEIGHTS = (
+            [0.08, 0.18, 0.22, 0.2, 0.07, 0.18, 0.07]
+            if USE_RAFT
+            else [0.1, 0.24, 0.24, 0.22, 0.08, 0.12]
+        )  # 仅作为 softmax 初始比例，启用 FAMO 后权重会自动归一化为 1
 
         # =========================
         # 优化器超参数
@@ -256,14 +341,19 @@ class global_data:
         DATA_SET = "class_1"
         CLASS2_PSEUDO_CLASS_NAME = "problem_class2_raft_piv"
 
+        # class_1 保留原有目录结构；class_2 使用单独的 TFRecord 根目录。
         CLASS1_GR_DATA_ROOT_DIR = rf"{AUTODL_DATA_PATH}/study_datas/sr_dataset/class_1/data"
         CLASS1_LR_DATA_ROOT_DIR = rf"{AUTODL_DATA_PATH}/study_datas/sr_dataset/class_1_lr"
         CLASS2_GR_DATA_ROOT_DIR = rf"{AUTODL_DATA_PATH}/study_datas/sr_dataset/class_2/Data_ProblemClass2_RAFT-PIV"
 
+        # 对外暴露给 pipeline / data_load 的根目录：
+        # - class_1: 指向原来的 GT 图像根目录；
+        # - class_2: 指向 TFRecord 所在目录。
         GR_DATA_ROOT_DIR = CLASS2_GR_DATA_ROOT_DIR if DATA_SET == "class_2" else CLASS1_GR_DATA_ROOT_DIR
-        # class_2 分支不会使用 LR_DATA_ROOT_DIR；这里保留变量只为兼容旧代码中的属性引用。
+        # class_2 分支不会使用 LR_DATA_ROOT_DIR；这里仍保留该变量，确保旧代码中引用它时不会缺失。
         LR_DATA_ROOT_DIR = CLASS1_LR_DATA_ROOT_DIR
 
+        # class_2 固定使用用户指定的 train / validate TFRecord。
         CLASS2_TRAIN_TFRECORD = rf"{CLASS2_GR_DATA_ROOT_DIR}/Training_Dataset_ProblemClass2_RAFT256-PIV.tfrecord-00000-of-00001"
         CLASS2_TRAIN_TFRECORD_IDX = rf"{CLASS2_GR_DATA_ROOT_DIR}/Training_Dataset_ProblemClass2_RAFT256-PIV.tfrecord-00000-of-00001.idx"
         CLASS2_VALIDATE_TFRECORD = rf"{CLASS2_GR_DATA_ROOT_DIR}/Validation_Dataset_ProblemClass2_RAFT256-PIV.tfrecord-00000-of-00001"
@@ -273,6 +363,7 @@ class global_data:
         # 自动解析到 SRGAN 项目根目录，服务器上也可以改成绝对路径。
         CLASS2_VALIDATE_CATEGORY_CSV = rf"{CLASS2_GR_DATA_ROOT_DIR}/class2_validation_index_category_matches.csv"
 
+        # 输出目录按数据集拆分，避免 class_1 / class_2 实验日志、权重和可视化相互覆盖。
         OUT_PUT_DIR = f"{AUTODL_DATA_PATH}/train_datas/{name}/{DATA_SET}"  # 实验输出总目录
         TRAINING_DIR = "/training_data"#正在训练输出目录
         LOSS_DIR = "/train_loss"  # 损失曲线目录
@@ -286,7 +377,7 @@ class global_data:
         # 是否执行 evaluate_all 完整验证。
         # 这里恢复为纯手动总开关：无论 DATA_SET 是 class_1 还是 class_2，都由该超参数决定是否执行。
         IS_VALIDATE_ALL = True
-        IS_SAVE_VALIDATE_IMAGES = False  # evaluate_all 是否保存验证/测试样本图；False 时只保留指标 CSV，减少磁盘 IO。
+        IS_SAVE_VALIDATE_IMAGES = True  # evaluate_all 是否保存验证/测试样本图；False 时只保留指标 CSV，减少磁盘 IO。
         # 是否保存普通 NPY 数据文件。默认 False 用于减少 evaluate_all/test_all 的磁盘占用；
         # TBL 三位置 profile NPY、hist 直方图 NPY 以及误差 NPY 属于后处理必需文件，会在保存图像时绕过该开关继续保存。
         IS_SAVE_NPY = False
@@ -294,9 +385,9 @@ class global_data:
         METRIC_OUTLIER_FILTER_ENABLED = True
         METRIC_OUTLIER_FILTER_IQR_FACTOR = 0.75  # IQR 阈值系数；值越小剔除越严格，0.75 会比默认 1.5 更积极地剔除坏方向异常值。
         METRIC_OUTLIER_FILTER_MIN_COUNT = 8  # 样本数太少时不剔除，避免小类别均值被过度处理。
-        IS_TEST = False  # 是否在 evaluate_all 之后启用 test_all；默认 False，避免改变原训练/验证流程。
-        TEST_TBL = False  # True 时 test_all 只测试 tbl 数据集；False 时保持原来的 TEST_DATASETS / is_TEST_CLASS3 选择逻辑。
-        is_TEST_CLASS3 = False  # 是否额外测试 tbl/twcf 大图数据集；默认 False，节省显存和测试时间。
+        IS_TEST = True  # 是否在 evaluate_all 之后启用 test_all；默认 False，避免改变原训练/验证流程。
+        TEST_TBL = True  # True 时 test_all 只测试 tbl 数据集；False 时保持原来的 TEST_DATASETS / is_TEST_CLASS3 选择逻辑。
+        is_TEST_CLASS3 = True  # 是否额外测试 tbl/twcf 大图数据集；默认 False，节省显存和测试时间。
         TEST_DIR = "/test_all"  # test_all 统一输出目录，会在该目录下再按 dataset 名称分文件夹。
         TEST_BATCH_SIZE = 1  # RAFT256-PIV_test.py 测试默认 batch_size_test=1，这里单 GPU 保持一致。
         TEST_NUM_THREADS = 8  # DALI TFRecordReader 线程数，和参考测试脚本保持一致。
@@ -371,7 +462,7 @@ class global_data:
         Path(OUT_PUT_DIR).mkdir(parents=True, exist_ok=True)
 
         # 需要训练的数据类型  # 参与训练的数据模态
-        DATA_TYPES = ['RAFT']
+        DATA_TYPES = ['RAFT'] if USE_RAFT else ['SR']
         # DATA_TYPES = ['image_pair', 'flo']
         # DATA_TYPES = ['image_pair']
         # DATA_TYPES =['flo']
@@ -381,15 +472,23 @@ class global_data:
         """
         # 这里的顺序必须和 train.py 里 metric.add(...) 的顺序一一对应。
         # 任何一边新增/删除/换位，都要同步改另一边。
-        loss_label = ['g_loss', 'g_perceptual_loss', "g_content_loss",
-                      "g_adversarial_loss",  'g_loss_pixel',
-                      "g_loss_pixel_l1", "g_loss_pixel_mse",'g_loss_ssim', 'g_loss_fft',
-                       "g_flow_warp_consistency_loss", "g_flow_warp_consistency_weighted_loss",
-                      'd_loss', 'd_real_loss', 'd_fake_loss',
-                      'raft_loss', 'raft_epe','raft_1px', 'raft_3px','raft_5px',
-                      ]
-        validate_label = ['VAL_MSE_LOSS','VAL_SSIM_Loss', 'Avg_PSNR',"VAL_energy_spectrum_mse",
-                          "VAL_AEE", "VAL_NORM_AEE_PER100PIXEL", "VAL_C_AEE"]
+        BASE_LOSS_LABEL = [
+            'g_loss', 'g_perceptual_loss', "g_content_loss",
+            "g_adversarial_loss", 'g_loss_pixel',
+            "g_loss_pixel_l1", "g_loss_pixel_mse", 'g_loss_ssim', 'g_loss_fft',
+            "g_flow_warp_consistency_loss", "g_flow_warp_consistency_weighted_loss",
+            'd_loss', 'd_real_loss', 'd_fake_loss',
+        ]
+        RAFT_LOSS_LABEL = ['raft_loss', 'raft_epe', 'raft_1px', 'raft_3px', 'raft_5px']
+        loss_label = BASE_LOSS_LABEL + (RAFT_LOSS_LABEL if USE_RAFT else [])
+
+        BASE_VALIDATE_LABEL = ['VAL_MSE_LOSS', 'VAL_SSIM_Loss', 'Avg_PSNR', "VAL_energy_spectrum_mse"]
+        # 新增 VAL_C_AEE：
+        # C-AEE = 0.3 * ESMSE_norm + 0.3 * EPE_norm + 0.2 * (1-SSIM)_norm。
+        # 三项先按固定参考尺度放缩为无量纲量，再加权求和，避免不同量纲直接相加。
+        # 这里只负责定义训练曲线 / CSV 的列名，真正的数值计算在 evaluate.py 中完成。
+        RAFT_VALIDATE_LABEL = ["VAL_AEE", "VAL_NORM_AEE_PER100PIXEL", "VAL_C_AEE"]
+        validate_label = BASE_VALIDATE_LABEL + (RAFT_VALIDATE_LABEL if USE_RAFT else [])
 
 
         # 存储数据至csv的列名
@@ -661,6 +760,149 @@ class global_data:
             }
 
         @classmethod
+        def normalized_ablation_mode(cls) -> int:
+            """
+            返回规范化后的消融实验编号。
+
+            允许用户在配置里写 1、"1"、"ablation_1" 或 "mode1"。所有后续判断都走
+            这个入口，避免模型构建、损失构建和日志保存各自解析导致同一实验配置不一致。
+            """
+            raw_mode = str(cls.ABLATION_MODE).strip().lower()
+            raw_mode = raw_mode.replace("ablation_", "").replace("mode", "").replace(" ", "")
+            try:
+                mode = int(raw_mode)
+            except ValueError as exc:
+                raise ValueError(
+                    f"ABLATION_MODE 仅支持 {cls.ABLATION_MODES} 或 ablation_1~ablation_5，当前为: {cls.ABLATION_MODE}"
+                ) from exc
+            if mode not in cls.ABLATION_MODES:
+                raise ValueError(
+                    f"ABLATION_MODE 仅支持 {cls.ABLATION_MODES}，当前为: {cls.ABLATION_MODE}"
+                )
+            return mode
+
+        @classmethod
+        def _refresh_famo_generator_tasks(cls) -> None:
+            """
+            根据当前消融模式重建 Generator 侧 FAMO 任务列表。
+
+            FAMO 默认关闭，但这里仍然同步任务列表，原因是：
+            - 模式 1~4 中 EPE 不允许限制 Generator，因此即使用户打开 FAMO，也不能把 epe 放进去；
+            - 模式 5 去掉图像一致性损失，因此 flow_consistency 也不能作为 FAMO 任务；
+            - 任务名与初始权重长度必须完全一致，否则 FAMO 初始化会出现隐性错位。
+            """
+            task_names = ["vgg", "l1", "mse", "ssim", "fft"]
+            init_weights = [0.08, 0.18, 0.22, 0.2, 0.07]
+
+            if bool(cls.FLOW_WARP_CONSISTENCY_ENABLED):
+                task_names.append("flow_consistency")
+                init_weights.append(0.18)
+
+            if bool(cls.USE_RAFT) and bool(cls.GENERATOR_RAFT_EPE_LOSS):
+                task_names.append("epe")
+                init_weights.append(0.07)
+
+            # FAMO 内部会 softmax 归一化，这里只保证每个任务有一个相对合理的初始尺度。
+            cls.FAMO_GENERATOR_TASK_NAMES = task_names
+            cls.FAMO_GENERATOR_INIT_WEIGHTS = init_weights
+
+        @classmethod
+        def apply_ablation_config(cls) -> dict:
+            """
+            将 ABLATION_MODE 翻译成真正会被训练代码读取的全局配置。
+
+            这一步必须在模型实例化前完成：
+            - SR_GENERATOR_TYPE / SR_DISCRIMINATOR_TYPE 决定 PIV_ESRGAN_RAFT_Model 构建哪个网络；
+            - RAFT_MODEL_TYPE 和 RAFT128_INIT_FROM_RAFT256 决定 piv_RAFT 的结构与迁移初始化；
+            - GENERATOR_RAFT_EPE_LOSS 决定 EPE 是否加入 Generator 反传；
+            - FLOW_WARP_CONSISTENCY_ENABLED 决定图像对 warp 一致性项是否加入 SR 损失。
+            """
+            mode = cls.normalized_ablation_mode()
+
+            # 先恢复一组“PIV_A_Esrgan 原分支”的默认值，随后只覆盖当前消融需要变化的字段。
+            cls.SR_GENERATOR_TYPE = "piv_a_esrgan"
+            cls.SR_DISCRIMINATOR_TYPE = "piv_a_attention_unet"
+            cls.GENERATOR_RAFT_EPE_LOSS = True
+            cls.FLOW_WARP_CONSISTENCY_ENABLED = True
+
+            if mode == 1:
+                cls.SR_DISCRIMINATOR_TYPE = "basic_esrgan"
+                cls.RAFT_MODEL_TYPE = "RAFT256"
+                cls.RAFT128_INIT_FROM_RAFT256 = False
+                cls.RAFT128_INIT_FROM_RAFT256_OPTIMIZER = False
+                cls.RAFT128_INIT_FROM_RAFT256_SCHEDULER = False
+                cls.GENERATOR_RAFT_EPE_LOSS = False
+            elif mode == 2:
+                cls.RAFT_MODEL_TYPE = "RAFT256"
+                cls.RAFT128_INIT_FROM_RAFT256 = False
+                cls.RAFT128_INIT_FROM_RAFT256_OPTIMIZER = False
+                cls.RAFT128_INIT_FROM_RAFT256_SCHEDULER = False
+                cls.GENERATOR_RAFT_EPE_LOSS = False
+            elif mode == 3:
+                cls.GENERATOR_RAFT_EPE_LOSS = False
+            elif mode == 4:
+                cls.SR_DISCRIMINATOR_TYPE = "basic_esrgan"
+                cls.GENERATOR_RAFT_EPE_LOSS = False
+            elif mode == 5:
+                cls.SR_GENERATOR_TYPE = "basic_esrgan"
+                cls.SR_DISCRIMINATOR_TYPE = "basic_esrgan"
+                cls.FLOW_WARP_CONSISTENCY_ENABLED = False
+                cls.GENERATOR_RAFT_EPE_LOSS = True
+
+            # 每个消融模式使用独立输出目录，避免不同结构的 checkpoint / optimizer 混在一起。
+            cls.DESCRIPTION = f"_ablation_{mode}"
+            cls.name = f"{cls.BASE_NAME}{cls.DESCRIPTION}"
+            cls.OUT_PUT_DIR = f"{cls.AUTODL_DATA_PATH}/train_datas/{cls.name}/{cls.DATA_SET}"
+            Path(cls.OUT_PUT_DIR).mkdir(parents=True, exist_ok=True)
+
+            if bool(cls.ABLATION_FORCE_TRAIN_FROM_SCRATCH):
+                cls.IS_LOAD_EXISTS_MODEL = False
+
+            # 如果当前模式不允许 EPE 约束 Generator，权重也直接清零；RAFT 自身仍然正常训练。
+            if not bool(cls.GENERATOR_RAFT_EPE_LOSS):
+                cls.RAFT_EPE_WEIGHT = 0.0
+                cls.RAFT_EPE_WEIGHT_START = 0.0
+                cls.RAFT_EPE_WEIGHT_END = 0.0
+
+            if not bool(cls.FLOW_WARP_CONSISTENCY_ENABLED):
+                cls.LAMBDA_FLOW_WARP_CONSISTENCY = 0.0
+                cls.FLOW_WARP_CONSISTENCY_WEIGHT_START = 0.0
+                cls.FLOW_WARP_CONSISTENCY_WEIGHT_END = 0.0
+
+            cls._refresh_famo_generator_tasks()
+
+            return {
+                "ablation_mode": mode,
+                "description": cls.ABLATION_MODE_DESCRIPTIONS[mode],
+                "generator": cls.SR_GENERATOR_TYPE,
+                "discriminator": cls.SR_DISCRIMINATOR_TYPE,
+                "raft_model_type": cls.RAFT_MODEL_TYPE,
+                "generator_raft_epe_loss": cls.GENERATOR_RAFT_EPE_LOSS,
+                "flow_warp_consistency_enabled": cls.FLOW_WARP_CONSISTENCY_ENABLED,
+                "output_dir": cls.OUT_PUT_DIR,
+            }
+
+        @classmethod
+        def use_basic_esrgan_generator(cls) -> bool:
+            """当前消融模式是否使用最基础 ESRGAN 生成器。"""
+            return str(cls.SR_GENERATOR_TYPE).strip().lower() in {"basic_esrgan", "original_esrgan", "esrgan"}
+
+        @classmethod
+        def use_basic_esrgan_discriminator(cls) -> bool:
+            """当前消融模式是否使用最基础 ESRGAN 判别器。"""
+            return str(cls.SR_DISCRIMINATOR_TYPE).strip().lower() in {"basic_esrgan", "original_esrgan", "esrgan"}
+
+        @classmethod
+        def generator_uses_raft_epe(cls) -> bool:
+            """RAFT EPE 是否作为 Generator 的反向约束项；RAFT 自身训练不受这个开关影响。"""
+            return bool(cls.USE_RAFT) and bool(cls.GENERATOR_RAFT_EPE_LOSS)
+
+        @classmethod
+        def use_flow_warp_consistency(cls) -> bool:
+            """SR 图像对是否启用 GT-flow warp 一致性损失。"""
+            return bool(cls.FLOW_WARP_CONSISTENCY_ENABLED)
+
+        @classmethod
         def normalized_raft_model_type(cls) -> str:
             """
             返回规范化后的 RAFT 网络类型。
@@ -675,7 +917,7 @@ class global_data:
             """
             校验 RAFT_MODEL_TYPE 是否属于允许的三种结构。
 
-            这里启动即报错，可以避免训练跑到模型实例化时才发现
+            这里启动即报错，可以避免训练跑到模型实例化或 checkpoint 加载时才发现
             "RAFT_128"、"raft-256" 这类拼写错误。
             """
             mode = cls.normalized_raft_model_type()
@@ -794,12 +1036,23 @@ class global_data:
             因此这里更新后，本 epoch 内所有 batch 都会使用同一组固定权重，日志和复现实验也更清晰。
             """
             cls.LAMBDA_ADVERSARIAL = cls.get_adversarial_weight(epoch)
-            cls.LAMBDA_FLOW_WARP_CONSISTENCY = cls.get_flow_warp_consistency_weight(epoch)
-            cls.RAFT_EPE_WEIGHT = cls.get_raft_epe_weight(epoch)
+            # 模式 5 明确去掉图像一致性损失，因此这里不再进入动态增长，始终保持 0。
+            cls.LAMBDA_FLOW_WARP_CONSISTENCY = (
+                cls.get_flow_warp_consistency_weight(epoch)
+                if cls.use_flow_warp_consistency()
+                else 0.0
+            )
+            # 只做超分辨率，或当前消融模式声明“EPE 不限制 Generator”时，
+            # Generator 侧 EPE 权重固定为 0；RAFT 自身仍会使用 raft_loss 正常训练。
+            cls.RAFT_EPE_WEIGHT = (
+                cls.get_raft_epe_weight(epoch)
+                if cls.generator_uses_raft_epe()
+                else 0.0
+            )
             return {
                 "lambda_adversarial": cls.LAMBDA_ADVERSARIAL,
                 "lambda_flow_warp_consistency": cls.LAMBDA_FLOW_WARP_CONSISTENCY,
-                "raft_epe_weight": cls.RAFT_EPE_WEIGHT,
+                "raft_epe_weight": cls.RAFT_EPE_WEIGHT if cls.generator_uses_raft_epe() else "disabled_for_generator",
             }
 
         @classmethod
@@ -911,7 +1164,9 @@ class global_data:
         #
         #     Path(file_path).write_text("\n".join(lines), encoding="utf-8")
         #     print(f"hyper_parameter Saved to {file_path}")
-# 模块导入时只执行一次
+# 模块导入时只执行一次：先把 ABLATION_MODE 翻译成真实训练配置，再登录 wandb。
+# 这样 pipeline / model 在 import 后读到的 RAFT、Generator、Discriminator 与损失开关已经一致。
+global_data.esrgan.apply_ablation_config()
 global_data.esrgan.ensure_wandb_login()
 
 

@@ -83,6 +83,7 @@ def _load_data_compat(**kwargs):
             "class2_train_tfrecord_idx",
             "class2_validate_tfrecord",
             "class2_validate_tfrecord_idx",
+            "class2_validate_category_csv",
         )
         if not any(key in message for key in compatibility_keys):
             raise
@@ -573,6 +574,7 @@ def main():
                 class2_train_tfrecord_idx=global_data.esrgan.CLASS2_TRAIN_TFRECORD_IDX,
                 class2_validate_tfrecord=global_data.esrgan.CLASS2_VALIDATE_TFRECORD,
                 class2_validate_tfrecord_idx=global_data.esrgan.CLASS2_VALIDATE_TFRECORD_IDX,
+                class2_validate_category_csv=global_data.esrgan.CLASS2_VALIDATE_CATEGORY_CSV,
                 return_test_loader=True
             )
             # 每个类别的图像对和flo文件分别训练验证和保存模型 ！！！！！已经去除
@@ -784,22 +786,36 @@ def main():
                 else range(0)
             )
             for epoch in epoch_range:
-                # 动态更新三类损失权重。
-                # 这些权重在每个 epoch 开始时刷新一次，本 epoch 内所有 batch 保持一致：
-                # 1. LAMBDA_ADVERSARIAL: 生成器对抗损失权重，前半程从 0.0005 增长到 0.02。
-                # 2. LAMBDA_FLOW_WARP_CONSISTENCY: GT-flow warp 图像对一致性损失权重，前半程从 0.012 增长到 1.2。
-                # 3. RAFT_EPE_WEIGHT: Generator 侧 RAFT EPE 反作用权重，后半程从 1 增长到 3。
+                # 每个 epoch 开始时同步损失权重。
+                # 普通模式仍沿用原来的动态 schedule；esrgan_raft / srgan_raft 按当前实验要求
+                # 回到最初始 SRGAN/ESRGAN perceptual + L1/MSE pixel loss：
+                # - 对抗项使用原始 5e-4 初始权重；
+                # - pixel loss 使用原始固定权重 1 * (1e-2 * L1 + 1e-3 * MSE)；
+                # - 后续扩展的 SSIM/FFT/flow-warp、RAFT EPE 不进入 Generator loss；
+                # - 这里仍刷新并打印权重，是为了保持日志字段完整，便于和旧实验横向对照。
                 current_dynamic_weights = global_data.esrgan.update_dynamic_loss_weights(epoch)
+                loss_weight_mode = (
+                    "fixed_initial"
+                    if global_data.esrgan.use_fixed_initial_loss_weights_for_current_mode()
+                    else "scheduled"
+                )
+                generator_raft_epe_enabled = global_data.esrgan.use_generator_raft_epe_loss_for_current_mode()
+                original_sr_loss_mode = global_data.esrgan.uses_super_resolution()
                 logger.info(
-                    "[Train] Epoch {}/{}: current dynamic loss weights | "
+                    "[Train] Epoch {}/{}: current loss weights ({}) | "
                     "LAMBDA_ADVERSARIAL={:.6f}, "
                     "LAMBDA_FLOW_WARP_CONSISTENCY={:.6f}, "
-                    "RAFT_EPE_WEIGHT={:.6f}".format(
+                    "RAFT_EPE_WEIGHT={:.6f}, "
+                    "GENERATOR_RAFT_EPE_ENABLED={}, "
+                    "ORIGINAL_SR_LOSS_MODE={}".format(
                         epoch + 1,
                         global_data.esrgan.EPOCH_NUMS,
+                        loss_weight_mode,
                         current_dynamic_weights["lambda_adversarial"],
                         current_dynamic_weights["lambda_flow_warp_consistency"],
                         current_dynamic_weights["raft_epe_weight"],
+                        generator_raft_epe_enabled,
+                        original_sr_loss_mode,
                     )
                 )
                 ESRuRAFT_PIV_model.train()  # 确保在训练模式

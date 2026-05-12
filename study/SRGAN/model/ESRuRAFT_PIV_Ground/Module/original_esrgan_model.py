@@ -91,7 +91,7 @@ class Generator(nn.Module):
     4. 两次 2x 上采样，总共 4x
     5. 输出 RGB 图像
     """
-    def __init__(self,inner_chanel=3, num_residual_blocks=23, scale=2):
+    def __init__(self,inner_chanel=3, num_residual_blocks=8, scale=2):
         super(Generator, self).__init__()
 
 
@@ -116,7 +116,9 @@ class Generator(nn.Module):
             nn.LeakyReLU(0.2, inplace=True)
         )
 
-        # 残差块堆叠
+        # 残差块堆叠。
+        # 最初始 ESRGAN 使用 23 个 RRDB；这里保持原始默认值，避免 Ground 里的 esrgan_raft
+        # 悄悄变成更浅的 8-block 版本，导致“原始 ESRGAN + RAFT”基线不纯。
         # 每个残差块都保持 [B, 64, H, W] 不变
         self.residual_blocks = nn.Sequential(
             *[RRDB(64,growth_channels=32) for _ in range(num_residual_blocks)]

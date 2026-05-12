@@ -24,12 +24,12 @@ from study.SRGAN.data_load import filter_excluded_class_names, get_class_names, 
 
 
 
-from study.SRGAN.model.PIV_A_Esrgan.Module.PIV_ESRGAN_RAFT_Model import ESRuRAFT_PIV
-from study.SRGAN.model.PIV_A_Esrgan.evaluate import evaluate, evaluate_all
-from study.SRGAN.model.PIV_A_Esrgan.test import test_all
+from study.SRGAN.model.PIV_A_Esrgan_Ablation.Module.PIV_ESRGAN_RAFT_Model import ESRuRAFT_PIV
+from study.SRGAN.model.PIV_A_Esrgan_Ablation.evaluate import evaluate, evaluate_all
+from study.SRGAN.model.PIV_A_Esrgan_Ablation.test import test_all
 from study.SRGAN.util.famo_weight_logger import save_famo_weight_snapshot
-from study.SRGAN.model.PIV_A_Esrgan.global_class import global_data
-from study.SRGAN.model.PIV_A_Esrgan.train import esrgan_union_RAFT_train
+from study.SRGAN.model.PIV_A_Esrgan_Ablation.global_class import global_data
+from study.SRGAN.model.PIV_A_Esrgan_Ablation.train import esrgan_union_RAFT_train
 from study.SRGAN.model.training_safety_common import (
     NonFiniteLossError,
     restore_model_from_checkpoint,
@@ -119,7 +119,7 @@ def _format_dynamic_weight_for_log(value):
 
 def _resolve_raft256_pretrain_path(path_text: str | Path) -> Path:
     """
-    解析 PIV_A_Esrgan 的 RAFT256 预训练 checkpoint 路径。
+    解析 PIV_A_Esrgan_Ablation 的 RAFT256 预训练 checkpoint 路径。
 
     global_class 里默认写成 "RAFT_CHECKPOINT/ckpt_256.tar"，表示相对 SRGAN 根目录。
     这里统一转为绝对路径，避免从 PyCharm、命令行、notebook 等不同 cwd 启动时找错文件。
@@ -183,7 +183,7 @@ def _migrate_raft_optimizer_from_raft256_checkpoint(
     source_state = checkpoint.get("model_state_dict")
     source_optimizer_state = checkpoint.get("optimizer_state_dict")
     if not isinstance(source_state, dict) or not isinstance(source_optimizer_state, dict):
-        logger.warning("[PIV_A_Esrgan] RAFT256 checkpoint 中没有可迁移的 optimizer_state_dict，跳过 optimizer 迁移。")
+        logger.warning("[PIV_A_Esrgan_Ablation] RAFT256 checkpoint 中没有可迁移的 optimizer_state_dict，跳过 optimizer 迁移。")
         return
 
     current_optimizer_state = optimizer.state_dict()
@@ -250,12 +250,12 @@ def _migrate_raft_optimizer_from_raft256_checkpoint(
         "param_groups": migrated_groups,
     })
     logger.info(
-        "[PIV_A_Esrgan] RAFT optimizer initialized from RAFT256 checkpoint | "
+        "[PIV_A_Esrgan_Ablation] RAFT optimizer initialized from RAFT256 checkpoint | "
         f"migrated={len(migrated_state)}, skipped={len(skipped)}"
     )
     for name, source_shape, target_shape in skipped[:20]:
         logger.info(
-            "[PIV_A_Esrgan] skipped RAFT optimizer state | "
+            "[PIV_A_Esrgan_Ablation] skipped RAFT optimizer state | "
             f"name={name}, source_shape={source_shape}, target_shape={target_shape}"
         )
 
@@ -275,10 +275,10 @@ def _migrate_raft_scheduler_from_raft256_checkpoint(
 
     scheduler_state = checkpoint.get("scheduler_state_dict")
     if not isinstance(scheduler_state, dict):
-        logger.warning("[PIV_A_Esrgan] RAFT256 checkpoint 中没有 scheduler_state_dict，跳过 scheduler 迁移。")
+        logger.warning("[PIV_A_Esrgan_Ablation] RAFT256 checkpoint 中没有 scheduler_state_dict，跳过 scheduler 迁移。")
         return
     scheduler.load_state_dict(scheduler_state)
-    logger.info("[PIV_A_Esrgan] RAFT scheduler initialized from RAFT256 checkpoint.")
+    logger.info("[PIV_A_Esrgan_Ablation] RAFT scheduler initialized from RAFT256 checkpoint.")
 
 
 def _maybe_migrate_raft_optimizer_scheduler_from_raft256(
@@ -289,7 +289,7 @@ def _maybe_migrate_raft_optimizer_scheduler_from_raft256(
     scheduler_loaded_from_resume: bool,
 ) -> None:
     """
-    在 PIV_A_Esrgan 中可选迁移 RAFT256 的 optimizer/scheduler 到 RAFT128。
+    在 PIV_A_Esrgan_Ablation 中可选迁移 RAFT256 的 optimizer/scheduler 到 RAFT128。
 
     只在以下条件同时满足时执行：
     - USE_RAFT=True；
@@ -314,12 +314,12 @@ def _maybe_migrate_raft_optimizer_scheduler_from_raft256(
         raise ValueError(f"RAFT256 checkpoint 格式不正确: {checkpoint_path}")
 
     if optimizer_loaded_from_resume:
-        logger.info("[PIV_A_Esrgan] 当前实验已恢复 RAFT optimizer，跳过 RAFT256 optimizer 迁移。")
+        logger.info("[PIV_A_Esrgan_Ablation] 当前实验已恢复 RAFT optimizer，跳过 RAFT256 optimizer 迁移。")
     else:
         _migrate_raft_optimizer_from_raft256_checkpoint(model, optimizer, checkpoint)
 
     if scheduler_loaded_from_resume:
-        logger.info("[PIV_A_Esrgan] 当前实验已恢复 RAFT scheduler，跳过 RAFT256 scheduler 迁移。")
+        logger.info("[PIV_A_Esrgan_Ablation] 当前实验已恢复 RAFT scheduler，跳过 RAFT256 scheduler 迁移。")
     else:
         _migrate_raft_scheduler_from_raft256_checkpoint(scheduler, checkpoint)
 
@@ -919,7 +919,7 @@ def main():
                         logger.info(
                             "No pretrained optimizer ESRuRAFT_PIV_raft_scheduler found. Starting training from scratch.")
 
-            # PIV_A_Esrgan 专用：当 RAFT_MODEL_TYPE="RAFT128" 且 RAFT128_INIT_FROM_RAFT256=True 时，
+            # PIV_A_Esrgan_Ablation 专用：当 RAFT_MODEL_TYPE="RAFT128" 且 RAFT128_INIT_FROM_RAFT256=True 时，
             # 除了模型权重，RAFT optimizer / scheduler 也可以从 ckpt_256.tar 做安全迁移。
             # 已经成功恢复当前实验断点时，上面的 loaded_from_resume 标记会阻止这里覆盖恢复结果。
             _maybe_migrate_raft_optimizer_scheduler_from_raft256(

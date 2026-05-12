@@ -70,7 +70,7 @@ class global_data:
         # 训练任务标识
         # =========================
         name = "ESRuRAFT_PIV_Ground"  # 当前实验名（用于输出目录/模型名/wandb run名）
-        DESCRIPTION = "v_srgan_raft"  # 实验补充描述（可写损失配置、数据版本等）
+        DESCRIPTION = "v_esrgan_raft"  # 实验补充描述（可写损失配置、数据版本等）
         name +=DESCRIPTION
 
         #整体项目注释
@@ -107,7 +107,15 @@ class global_data:
             "bicubic_WIDIM": "bicubic_widim",
             "bicubic_HS": "bicubic_hs",
         }
-        TRAIN_MODE = "srgan_raft"
+        TRAIN_MODE = "esrgan_raft"
+        # SR+RAFT 联合训练模式的特殊损失策略：
+        # - esrgan_raft / srgan_raft 仍然训练 Generator、Discriminator 和 RAFT；
+        # - 这两个模式重新启用“对抗损失”的动态权重，但仍关闭 flow-warp / Generator EPE 等扩展项；
+        # - Generator 不再叠加 RAFT EPE 反向约束，避免光流误差直接拉动超分图像生成方向。
+        # 保留为 tuple 而不是写死在训练循环里，后续如果要加入新的 SR+RAFT 模式，只需要在这里扩展。
+        SR_RAFT_FIXED_LOSS_WEIGHT_MODES = ("esrgan_raft", "srgan_raft")
+        SR_RAFT_DYNAMIC_ADVERSARIAL_MODES = ("esrgan_raft", "srgan_raft")
+        SR_RAFT_DISABLE_GENERATOR_EPE_MODES = ("esrgan_raft", "srgan_raft")
 
         # 类别训练模式:
         # - "all":    每个类别单独训练一次；
@@ -154,6 +162,11 @@ class global_data:
         START_EPOCH  = 1#从哪个epoch开始 从1开始
         BATCH_SIZE = 4 # batch 大小
         PRE_TRIAN_G_EPOCH = 1 #预训练G完成的轮次 从1开始 就是从第几轮开始弃用对抗损失
+        # 原始 SRGAN/ESRGAN + RAFT 模式单独使用这个对抗启动轮次。
+        # 这些模式的判别器与生成器都是从头开始训练，第一轮就加入 GAN 项时，
+        # 粒子图这种稀疏高频图像很容易先被对抗/VGG 项推成规则网格纹理；
+        # 因此默认第 1 轮只用 VGG + L1/MSE 做重建预热，第 2 轮开始再启用对抗损失。
+        ORIGINAL_SR_ADVERSARIAL_START_EPOCH = 2
         TRAIN_DATA_SAVING_STEP =1000 #每隔多少steps保存一次生成的图片 50
         SHUFFLE = True  # 训练集是否打乱
         TARGET_SIZE = None  # 数据加载时是否统一 resize 到该尺寸
@@ -220,6 +233,27 @@ class global_data:
         # 损失项系数
         # =========================
         LAMBDA_VGG = 1.0  # VGG 感知损失权重；感知损失现在只表示 VGG feature L1，不再混入对抗损失
+        # 最初始 SRGAN/ESRGAN 的固定损失权重。
+        # esrgan_raft / srgan_raft 回到原始 G loss 时使用这些常量：
+        #   G_loss = perceptual_loss + ORIGINAL_SR_LAMBDA_LOSS_PIXEL
+        #            * (ORIGINAL_SR_LAMBDA_PIXEL_L1 * L1 + ORIGINAL_SR_LAMBDA_PIXEL_MSE * MSE)
+        # 这里不参与任何 epoch 动态调度，也不会混入 RAFT EPE 去限制生成器。
+        # L1 默认沿用本实验原先的 LAMBDA_PIXEL_L1=0.5，而不是原始代码里偏小的 1e-2；
+        # 粒子图像需要更强的逐像素锚定，否则 VGG/GAN 很容易生成规则纹理而不是稀疏粒子。
+        ORIGINAL_SR_LAMBDA_LOSS_PIXEL = 1.0
+        ORIGINAL_SR_LAMBDA_PIXEL_L1 = 0.5
+        ORIGINAL_SR_LAMBDA_PIXEL_MSE = 1e-3
+        # 粒子图像是“绝大部分黑背景 + 少量亮粒子”的稀疏图。
+        # 如果直接对整幅图做普通 mean L1/MSE，大量背景像素会主导损失，
+        # Generator 很容易学成全黑图；因此原始 SR 模式默认启用前景/背景均衡像素损失。
+        # 它仍然只由固定 L1/MSE 组成，不引入动态权重，也不引入 RAFT EPE。
+        ORIGINAL_SR_USE_BALANCED_PARTICLE_PIXEL_LOSS = True
+        # 根据 HR 图像亮度划分粒子前景。0.08 对 [0,1] 粒子图较保守：
+        # 亮粒子会进入前景，暗背景和弱噪声仍留在背景。
+        ORIGINAL_SR_PARTICLE_FOREGROUND_THRESHOLD = 0.08
+        # 前景 L1/MSE 的额外固定倍率。1.0 表示前景均值和背景均值地位相同，
+        # 先解决“全黑塌缩”，如果后续粒子过亮或过密，可把它调小到 0.5。
+        ORIGINAL_SR_PARTICLE_FOREGROUND_WEIGHT = 1.0
         # =========================
         # 动态损失权重调度配置
         # =========================
@@ -231,10 +265,16 @@ class global_data:
         # 因此最后一轮的 epoch index 是 EPOCH_NUMS - 1。
 
         # `LAMBDA_ADVERSARIAL` 是当前 epoch 真正生效的生成器对抗损失权重。
-        # 按你的设定：从第 0 轮开始由 0.0005 线性增长，到 int(EPOCH_NUMS/2) 达到 0.0161，之后保持 0.0161。
+        # 普通模式仍使用通用 ADVERSARIAL_WEIGHT_END=0.0161；
+        # esrgan_raft / srgan_raft 会在 get_adversarial_weight_end_for_current_mode() 中切换到各自专属终点。
         LAMBDA_ADVERSARIAL = 0.0005
         ADVERSARIAL_WEIGHT_START = 0.0005
         ADVERSARIAL_WEIGHT_END = 0.0161
+        # 原始 ESRGAN/SRGAN + RAFT 的对抗损失重新启用动态调度，但终点更保守：
+        # ESRGAN 判别器没有 Sigmoid，RaGAN 对粒子图更敏感，所以终点设置为 0.0075；
+        # SRGAN 判别器带 Sigmoid，原始 -log(D(fake)) 数值尺度较大，所以终点设置为 0.0025。
+        ESRGAN_RAFT_ADVERSARIAL_WEIGHT_END = 0.0075
+        SRGAN_RAFT_ADVERSARIAL_WEIGHT_END = 0.0025
         ADVERSARIAL_WARMSTART_EPOCHS = 0
         ADVERSARIAL_WARMUP_EPOCHS = int(EPOCH_NUMS / 2)
         ADVERSARIAL_WEIGHT_SCHEDULE = "linear"  # 当前支持: linear | const | constant
@@ -320,7 +360,7 @@ class global_data:
         # - class_2: 改为读取 RAFT-PIV TFRecord，LR 不再从 LR_DATA_ROOT_DIR 读取，而是在 data_load.py
         #   中按 test_all 同款下采样逻辑动态生成。
         DATA_SETS = ("class_1", "class_2")
-        DATA_SET = "class_1"
+        DATA_SET = "class_2"
         CLASS2_PSEUDO_CLASS_NAME = "problem_class2_raft_piv"
 
         CLASS1_GR_DATA_ROOT_DIR = rf"{AUTODL_DATA_PATH}/study_datas/sr_dataset/class_1/data"
@@ -335,6 +375,10 @@ class global_data:
         CLASS2_TRAIN_TFRECORD_IDX = rf"{CLASS2_GR_DATA_ROOT_DIR}/Training_Dataset_ProblemClass2_RAFT256-PIV.tfrecord-00000-of-00001.idx"
         CLASS2_VALIDATE_TFRECORD = rf"{CLASS2_GR_DATA_ROOT_DIR}/Validation_Dataset_ProblemClass2_RAFT256-PIV.tfrecord-00000-of-00001"
         CLASS2_VALIDATE_TFRECORD_IDX = rf"{CLASS2_GR_DATA_ROOT_DIR}/Validation_Dataset_ProblemClass2_RAFT256-PIV.tfrecord-00000-of-00001.idx"
+        # class_2 validation 的类别不再按连续数量切段，而是按这个 CSV 的 validation_index_0based
+        # 精确映射到 Backstep/JHTDB/DNS/Cylinder/SQG/Uniform/Other；相对路径会由 data_load.py
+        # 自动解析到 SRGAN 项目根目录，服务器上也可以改成绝对路径。
+        CLASS2_VALIDATE_CATEGORY_CSV = rf"{CLASS2_GR_DATA_ROOT_DIR}/class2_validation_index_category_matches.csv"
 
         OUT_PUT_DIR = f"{AUTODL_DATA_PATH}/train_datas/{name}/{DATA_SET}"  # 实验输出总目录
         TRAINING_DIR = "/training_data"#正在训练输出目录
@@ -353,7 +397,12 @@ class global_data:
         # 是否保存普通 NPY 数据文件。默认 False 用于减少 evaluate_all/test_all 的磁盘占用；
         # TBL 三位置 profile NPY、hist 直方图 NPY 以及误差 NPY 属于后处理必需文件，会在保存图像时绕过该开关继续保存。
         IS_SAVE_NPY = False
+        # evaluate_all / test_all 写平均评价指标时启用 IQR 异常值剔除；逐样本原始 CSV 行不改。
+        METRIC_OUTLIER_FILTER_ENABLED = True
+        METRIC_OUTLIER_FILTER_IQR_FACTOR = 0.75  # IQR 阈值系数；值越小剔除越严格，0.75 会比默认 1.5 更积极地剔除坏方向异常值。
+        METRIC_OUTLIER_FILTER_MIN_COUNT = 8  # 样本数太少时不剔除，避免小类别均值被过度处理。
         IS_TEST = True  # 是否在 evaluate_all 之后启用 test_all；默认 False，避免改变原训练/验证流程。
+        TEST_TBL = False  # True 时 test_all 只测试 tbl 数据集；False 时保持原来的 TEST_DATASETS / is_TEST_CLASS3 选择逻辑。
         is_TEST_CLASS3 = True  # 是否额外测试 tbl/twcf 大图数据集；默认 False，节省显存和测试时间。
         TEST_DIR = "/test_all"  # test_all 统一输出目录，会在该目录下再按 dataset 名称分文件夹。
         TEST_BATCH_SIZE = 1  # RAFT256-PIV_test.py 测试默认 batch_size_test=1，这里单 GPU 保持一致。
@@ -365,7 +414,7 @@ class global_data:
         TEST_PLOT_RESULTS = True  # 是否保存每个 sample 的 png 可视化图。
         TEST_DISPLACEMENT_CMAP = "viridis"  # tbl/twcf 位移场使用和论文图相近的紫-蓝-绿-黄色条。
         TEST_REGULAR_FLOW_CMAP = "jet"  # backstep/cylinder/dns_turb/jhtdb/sqg 常规光流图沿用 evaluate_all 的 jet 色条。
-        TBL_PROFILE_COLUMN_RATIOS = (0.15, 0.33, 0.83)  # TBL 剖面分析的 Laminar/Transition/Turbulent 三个 x 位置比例；Transition 位置设为 0.33。
+        TBL_PROFILE_COLUMN_RATIOS = (0.15, 0.265, 0.83)  # TBL 剖面分析的 Laminar/Transition/Turbulent 三个 x 位置比例；Transition 位置设为 0.265。
         TBL_PROFILE_REGION_NAMES = ("Laminar", "Transition", "Turbulent")  # TBL 剖面图中三个区域标签。
         TBL_PROFILE_Y_LIMIT = 200  # TBL 论文风格剖面只显示 y=0..200px 的有效边界层区域。
         TBL_PROFILE_SAMPLE_CROP_WIDTH = 256  # TBL 剖面位置局部对比图的截取宽度；不再假设 sample 均分。
@@ -784,6 +833,52 @@ class global_data:
             return cls.validate_train_mode() in {"esrgan_raft", "srgan_raft"}
 
         @classmethod
+        def use_fixed_initial_loss_weights_for_current_mode(cls) -> bool:
+            """
+            当前 TRAIN_MODE 是否固定使用非对抗扩展损失权重初始值。
+
+            esrgan_raft / srgan_raft 的 Generator 既要学习图像重建，又要和 RAFT 联合训练。
+            这里仍固定 flow-warp 一致性和 Generator EPE 等扩展项，避免它们在训练中逐步放大；
+            对抗损失是否动态调度由 use_dynamic_adversarial_weight_for_current_mode() 单独控制。
+            """
+            return cls.validate_train_mode() in set(cls.SR_RAFT_FIXED_LOSS_WEIGHT_MODES)
+
+        @classmethod
+        def use_dynamic_adversarial_weight_for_current_mode(cls) -> bool:
+            """
+            当前 TRAIN_MODE 是否启用动态对抗损失权重。
+
+            esrgan_raft / srgan_raft 使用最初始 SRGAN/ESRGAN 的 GAN 形式，
+            但对抗项权重按 epoch 线性增长到各自的模式专属 END。
+            """
+            return cls.validate_train_mode() in set(cls.SR_RAFT_DYNAMIC_ADVERSARIAL_MODES)
+
+        @classmethod
+        def use_generator_raft_epe_loss_for_current_mode(cls) -> bool:
+            """
+            当前 TRAIN_MODE 的 Generator 是否允许叠加 RAFT EPE 损失。
+
+            对 esrgan_raft / srgan_raft 返回 False：RAFT EPE 仍然作为指标和 RAFT 自身 loss 存在，
+            但不再反传到 Generator，因此不会再用 EPE 去限制超分生成器。
+            """
+            return cls.validate_train_mode() not in set(cls.SR_RAFT_DISABLE_GENERATOR_EPE_MODES)
+
+        @classmethod
+        def get_adversarial_weight_end_for_current_mode(cls) -> float:
+            """
+            返回当前 TRAIN_MODE 使用的对抗权重终点。
+
+            通用模式沿用 ADVERSARIAL_WEIGHT_END；
+            esrgan_raft / srgan_raft 按你的要求使用更保守的专属终点。
+            """
+            mode = cls.validate_train_mode()
+            if mode == "esrgan_raft":
+                return float(cls.ESRGAN_RAFT_ADVERSARIAL_WEIGHT_END)
+            if mode == "srgan_raft":
+                return float(cls.SRGAN_RAFT_ADVERSARIAL_WEIGHT_END)
+            return float(cls.ADVERSARIAL_WEIGHT_END)
+
+        @classmethod
         def _get_scheduled_weight(
                 cls,
                 epoch: int,
@@ -840,12 +935,12 @@ class global_data:
         def get_adversarial_weight(cls, epoch: int) -> float:
             """
             返回当前 epoch 的生成器对抗损失权重。
-            当前配置为：0 -> int(EPOCH_NUMS/2) 从 0.0005 线性增长到 0.02，之后保持 0.02。
+            当前配置为：0 -> int(EPOCH_NUMS/2) 从 0.0005 线性增长到当前模式的 END，之后保持 END。
             """
             return cls._get_scheduled_weight(
                 epoch=epoch,
                 start=cls.ADVERSARIAL_WEIGHT_START,
-                end=cls.ADVERSARIAL_WEIGHT_END,
+                end=cls.get_adversarial_weight_end_for_current_mode(),
                 warmstart_epoch=cls.ADVERSARIAL_WARMSTART_EPOCHS,
                 warmup_epoch=cls.ADVERSARIAL_WARMUP_EPOCHS,
                 schedule=cls.ADVERSARIAL_WEIGHT_SCHEDULE,
@@ -891,9 +986,20 @@ class global_data:
             训练中的 loss 函数直接读取 cls.LAMBDA_ADVERSARIAL、cls.LAMBDA_FLOW_WARP_CONSISTENCY、cls.RAFT_EPE_WEIGHT，
             因此这里更新后，本 epoch 内所有 batch 都会使用同一组固定权重，日志和复现实验也更清晰。
             """
-            cls.LAMBDA_ADVERSARIAL = cls.get_adversarial_weight(epoch)
-            cls.LAMBDA_FLOW_WARP_CONSISTENCY = cls.get_flow_warp_consistency_weight(epoch)
-            cls.RAFT_EPE_WEIGHT = cls.get_raft_epe_weight(epoch)
+            if cls.use_fixed_initial_loss_weights_for_current_mode():
+                # esrgan_raft / srgan_raft 只让“对抗项”动态增长；
+                # flow-warp 一致性和 Generator EPE 仍固定到初始值，且 EPE 是否进入 G loss 另由开关控制。
+                if cls.use_dynamic_adversarial_weight_for_current_mode():
+                    cls.LAMBDA_ADVERSARIAL = cls.get_adversarial_weight(epoch)
+                else:
+                    cls.LAMBDA_ADVERSARIAL = float(cls.ADVERSARIAL_WEIGHT_START)
+                cls.LAMBDA_FLOW_WARP_CONSISTENCY = float(cls.FLOW_WARP_CONSISTENCY_WEIGHT_START)
+                cls.RAFT_EPE_WEIGHT = float(cls.RAFT_EPE_WEIGHT_START)
+            else:
+                # 其他模式保持原来的动态调度逻辑，避免影响既有 baseline 和历史实验配置。
+                cls.LAMBDA_ADVERSARIAL = cls.get_adversarial_weight(epoch)
+                cls.LAMBDA_FLOW_WARP_CONSISTENCY = cls.get_flow_warp_consistency_weight(epoch)
+                cls.RAFT_EPE_WEIGHT = cls.get_raft_epe_weight(epoch)
             return {
                 "lambda_adversarial": cls.LAMBDA_ADVERSARIAL,
                 "lambda_flow_warp_consistency": cls.LAMBDA_FLOW_WARP_CONSISTENCY,

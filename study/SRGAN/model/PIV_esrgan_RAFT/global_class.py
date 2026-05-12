@@ -246,6 +246,10 @@ class global_data:
         CLASS2_TRAIN_TFRECORD_IDX = rf"{CLASS2_GR_DATA_ROOT_DIR}/Training_Dataset_ProblemClass2_RAFT256-PIV.tfrecord-00000-of-00001.idx"
         CLASS2_VALIDATE_TFRECORD = rf"{CLASS2_GR_DATA_ROOT_DIR}/Validation_Dataset_ProblemClass2_RAFT256-PIV.tfrecord-00000-of-00001"
         CLASS2_VALIDATE_TFRECORD_IDX = rf"{CLASS2_GR_DATA_ROOT_DIR}/Validation_Dataset_ProblemClass2_RAFT256-PIV.tfrecord-00000-of-00001.idx"
+        # class_2 validation 的类别不再按连续数量切段，而是按这个 CSV 的 validation_index_0based
+        # 精确映射到 Backstep/JHTDB/DNS/Cylinder/SQG/Uniform/Other；相对路径会由 data_load.py
+        # 自动解析到 SRGAN 项目根目录，服务器上也可以改成绝对路径。
+        CLASS2_VALIDATE_CATEGORY_CSV = rf"{CLASS2_GR_DATA_ROOT_DIR}/class2_validation_index_category_matches.csv"
 
         OUT_PUT_DIR = f"{AUTODL_DATA_PATH}/train_datas/{name}/{DATA_SET}"  # 实验输出总目录
         TRAINING_DIR = "/training_data"#正在训练输出目录
@@ -264,7 +268,12 @@ class global_data:
         # 是否保存普通 NPY 数据文件。默认 False 用于减少 evaluate_all/test_all 的磁盘占用；
         # TBL 三位置 profile NPY、hist 直方图 NPY 以及误差 NPY 属于后处理必需文件，会在保存图像时绕过该开关继续保存。
         IS_SAVE_NPY = False
+        # evaluate_all / test_all 写平均评价指标时启用 IQR 异常值剔除；逐样本原始 CSV 行不改。
+        METRIC_OUTLIER_FILTER_ENABLED = True
+        METRIC_OUTLIER_FILTER_IQR_FACTOR = 0.75  # IQR 阈值系数；值越小剔除越严格，0.75 会比默认 1.5 更积极地剔除坏方向异常值。
+        METRIC_OUTLIER_FILTER_MIN_COUNT = 8  # 样本数太少时不剔除，避免小类别均值被过度处理。
         IS_TEST = False  # 是否在 evaluate_all 之后启用 test_all；默认 False，避免改变原训练/验证流程。
+        TEST_TBL = False  # True 时 test_all 只测试 tbl 数据集；False 时保持原来的 TEST_DATASETS / is_TEST_CLASS3 选择逻辑。
         is_TEST_CLASS3 = False  # 是否额外测试 tbl/twcf 大图数据集；默认 False，节省显存和测试时间。
         TEST_DIR = "/test_all"  # test_all 统一输出目录，会在该目录下再按 dataset 名称分文件夹。
         TEST_BATCH_SIZE = 1  # RAFT256-PIV_test.py 测试默认 batch_size_test=1，这里单 GPU 保持一致。
@@ -276,7 +285,7 @@ class global_data:
         TEST_PLOT_RESULTS = True  # 是否保存每个 sample 的 png 可视化图。
         TEST_DISPLACEMENT_CMAP = "viridis"  # tbl/twcf 位移场使用和论文图相近的紫-蓝-绿-黄色条。
         TEST_REGULAR_FLOW_CMAP = "jet"  # backstep/cylinder/dns_turb/jhtdb/sqg 常规光流图沿用 evaluate_all 的 jet 色条。
-        TBL_PROFILE_COLUMN_RATIOS = (0.15, 0.33, 0.83)  # TBL 剖面分析的 Laminar/Transition/Turbulent 三个 x 位置比例；Transition 位置设为 0.33。
+        TBL_PROFILE_COLUMN_RATIOS = (0.15, 0.265, 0.83)  # TBL 剖面分析的 Laminar/Transition/Turbulent 三个 x 位置比例；Transition 位置设为 0.265。
         TBL_PROFILE_REGION_NAMES = ("Laminar", "Transition", "Turbulent")  # TBL 剖面图中三个区域标签。
         TBL_PROFILE_Y_LIMIT = 200  # TBL 论文风格剖面只显示 y=0..200px 的有效边界层区域。
         TBL_PROFILE_SAMPLE_CROP_WIDTH = 256  # TBL 剖面位置局部对比图的截取宽度；不再假设 sample 均分。

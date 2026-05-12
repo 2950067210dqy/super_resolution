@@ -193,7 +193,7 @@ pixel_loss = CombinedPixelLoss(
 ).to(global_data.esrgan.device)
 # 这里vgg是针对三通道RGB图的
 # vgg = vgg19(pretrained=True).features[:16].eval()  # 提取 VGG 特征 srgan 用的vgg
-vgg =vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1).features[:35]
+vgg =vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1).features[:15]
 # vgg模型预测模式
 vgg = vgg.to(global_data.esrgan.device).eval()
 

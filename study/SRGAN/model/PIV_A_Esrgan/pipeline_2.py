@@ -85,6 +85,7 @@ def _load_data_compat(**kwargs):
             "class2_train_tfrecord_idx",
             "class2_validate_tfrecord",
             "class2_validate_tfrecord_idx",
+            "class2_validate_category_csv",
         )
         if not any(key in message for key in compatibility_keys):
             raise
@@ -579,6 +580,7 @@ def main():
                 class2_train_tfrecord_idx=global_data.esrgan.CLASS2_TRAIN_TFRECORD_IDX,
                 class2_validate_tfrecord=global_data.esrgan.CLASS2_VALIDATE_TFRECORD,
                 class2_validate_tfrecord_idx=global_data.esrgan.CLASS2_VALIDATE_TFRECORD_IDX,
+                class2_validate_category_csv=global_data.esrgan.CLASS2_VALIDATE_CATEGORY_CSV,
                 return_test_loader=True
             )
             # 每个类别的图像对和 flo 文件仍由同一个 dataloader 读取；

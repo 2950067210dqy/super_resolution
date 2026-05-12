@@ -6,12 +6,18 @@ from pathlib import Path  # 用于解析 RAFT256 checkpoint 的相对路径
 from loguru import logger
 from study.SRGAN.model.ESRuRAFT_PIV_Ground.Module.RAFT_Model import RAFT, RAFT128, RAFT256  # 导入 RAFT 光流估计主网络
 from study.SRGAN.model.ESRuRAFT_PIV_Ground.Module.loss import (
-    descriminator_loss,  # 判别器损失，负责训练 D 区分真/假图像
-    flow_warp_consistency_loss,  # GT flow 引导的 SR 前后帧 warp 一致性损失
     perceptual_loss,  # 感知损失，内部可选带对抗项
 
     pixel_loss,  # 像素域复合损失，包含 L1/MSE/SSIM/FFT 等项
 )
+from study.SRGAN.model.esrgan.Module.loss import (
+    descriminator_loss as original_esrgan_discriminator_loss,
+    perceptual_loss as original_esrgan_perceptual_loss,
+)  # esrgan_raft 使用最初始 ESRGAN 的 VGG+RaGAN 损失；D 输出 logits，因此判别损失内部是 BCEWithLogitsLoss
+from study.SRGAN.model.basic_srgan.Module.loss import (
+    loss_d as original_srgan_discriminator_loss,
+    perceptual_loss as original_srgan_perceptual_loss,
+)  # srgan_raft 使用最初始 SRGAN 的 VGG+BCELoss 损失；D 末尾有 Sigmoid，因此判别损失必须是 BCELoss
 from study.SRGAN.model.ESRuRAFT_PIV_Ground.Module.original_esrgan_model import (
     Discriminator as OriginalESRGANDiscriminator,
     Generator as OriginalESRGANGenerator,
@@ -310,6 +316,17 @@ class ESRuRAFT_PIV(nn.Module):
         """
         return self.train_mode in {"esrgan_raft", "srgan_raft"}
 
+    def _uses_generator_raft_epe_loss(self) -> bool:
+        """
+        Generator 侧是否把 RAFT EPE 作为额外反传损失。
+
+        按当前实验要求，esrgan_raft / srgan_raft 只用最初始 SRGAN/ESRGAN 的
+        perceptual loss + 固定 L1/MSE pixel loss 训练 Generator；
+        RAFT EPE 仍然用于 RAFT 分支自身训练和日志指标，但不会再反向约束超分生成器。
+        这个判断通过 global_data 统一控制，避免 forward/train_step 两处损失定义不一致。
+        """
+        return bool(global_data.esrgan.use_generator_raft_epe_loss_for_current_mode())
+
     def _uses_traditional_piv(self) -> bool:
         """
         当前模式是否使用传统 PIV/光流估计器而不是 RAFT。
@@ -605,6 +622,9 @@ class ESRuRAFT_PIV(nn.Module):
 
         prev 和 next 都先取单通道灰度，所以最终输入仍是 3 通道：
         第 0 通道看前一帧亮度，第 1 通道看后一帧亮度，第 2 通道看帧间亮度变化。
+
+        注意：esrgan_raft / srgan_raft 已按“最初始 ESRGAN/SRGAN”要求改回单帧判别器输入，
+        不再调用这个时序拼接入口。这里保留函数只是为了兼容旧实验或后续需要恢复方案 C 时使用。
         """
         prev_gray = self._to_discriminator_gray_frame(prev)
         next_gray = self._to_discriminator_gray_frame(next_frame)
@@ -669,19 +689,226 @@ class ESRuRAFT_PIV(nn.Module):
         return 0.5 * (prev_terms[key] + next_terms[key])  # 对前后两帧的同名损失做平均，保持两帧地位一致
 
 
+    def _compute_original_srgan_esrgan_generator_loss(
+        self,
+        pred_prev: torch.Tensor,
+        pred_next: torch.Tensor,
+        target_prev: torch.Tensor,
+        target_next: torch.Tensor,
+        is_adversarial: bool,
+    ) -> dict:
+        """
+        计算 esrgan_raft / srgan_raft 的“最初始”生成器损失。
+
+        这里刻意只保留最初始 SRGAN/ESRGAN 中真正使用的项：
+        - srgan_raft: 使用 basic_srgan 最初始 VGG content + BCELoss 形式对抗项；
+        - esrgan_raft: 使用 esrgan 最初始 VGG content + RaGAN 形式对抗项；
+        - 对抗项不再使用原始 loss 模块内部的固定系数，而是乘当前 epoch 的 global_data.esrgan.LAMBDA_ADVERSARIAL；
+        - pixel loss: 使用固定权重 L1 + MSE，并按粒子前景/背景均衡平均；
+        - 不使用 Ground 后来加上的 SSIM/FFT/flow-warp，也不使用 RAFT EPE 约束 Generator。
+        - previous / next 不再在 batch 维拼接，而是分别按单帧图像计算一次损失后取平均。
+
+        这样做的原因是 ESRGAN 的 RaGAN 会用 batch mean 构造相对判别项。
+        如果把 previous 和 next 拼到同一个 batch，它们会互相参与 mean，
+        对粒子这种稀疏高频图像可能放大不稳定；分开计算更贴近“单帧 ESRGAN”原始语义。
+        """
+        def compute_single_frame_terms(fake_frame: torch.Tensor, real_frame: torch.Tensor) -> dict:
+            """
+            对单个时间帧计算原始 SRGAN/ESRGAN 的 G 侧损失。
+
+            fake_frame / real_frame 仍然可以包含 batch 内多个样本，但只来自同一个时间位置
+            previous 或 next，不再把两个时间位置混在一起。
+            """
+            if self.train_mode == "srgan_raft":
+                if is_adversarial:
+                    # SRGAN 原始 G 对抗损失只需要 D(fake) 的 Sigmoid 概率。
+                    # 判别器参数在 G 步已被冻结，但 D(fake) 的梯度仍会穿过 D 回到 fake 图像和 Generator。
+                    pred_fake = self.piv_esrgan_discriminator(fake_frame)
+                    content_loss = original_srgan_perceptual_loss.vgg_loss(fake_frame, real_frame)
+                    adversarial_loss = original_srgan_perceptual_loss.adversarial(pred_fake)
+                    # SRGAN 原始对抗项形式保持不变，但权重改为 Ground 当前 epoch 的动态权重。
+                    # esrgan_raft 和 srgan_raft 的 END 不同，由 global_class 按 TRAIN_MODE 自动选择。
+                    adversarial_weighted_loss = (
+                        float(global_data.esrgan.LAMBDA_ADVERSARIAL) * adversarial_loss
+                    )
+                    perceptual_total = content_loss + adversarial_weighted_loss
+                else:
+                    # 兼容预训练阶段：只保留原始 VGG content，不启用对抗项。
+                    content_loss = original_srgan_perceptual_loss.vgg_loss(fake_frame, real_frame)
+                    adversarial_loss = self._zero_like_loss(content_loss)
+                    adversarial_weighted_loss = self._zero_like_loss(content_loss)
+                    perceptual_total = content_loss
+
+            elif self.train_mode == "esrgan_raft":
+                if is_adversarial:
+                    # ESRGAN 原始 G 对抗损失是 relativistic average GAN。
+                    # D(real) 只作为相对判别参照，不需要给 real 或 D 参数保留梯度。
+                    # 这里的 mean 只在同一时间帧 batch 内计算，不再混入另一个时间帧。
+                    pred_fake = self.piv_esrgan_discriminator(fake_frame)
+                    with torch.no_grad():
+                        pred_real = self.piv_esrgan_discriminator(real_frame)
+                    content_loss = original_esrgan_perceptual_loss.vgg_loss(fake_frame, real_frame)
+                    adversarial_loss = original_esrgan_perceptual_loss.adversarial(pred_fake, pred_real)
+                    # ESRGAN 的 RaGAN 对抗形式保持不变；只把权重交给 Ground 的动态调度。
+                    # 当前模式为 esrgan_raft 时 END=0.0075，srgan_raft 时 END=0.0025。
+                    adversarial_weighted_loss = (
+                        float(global_data.esrgan.LAMBDA_ADVERSARIAL) * adversarial_loss
+                    )
+                    perceptual_total = content_loss + adversarial_weighted_loss
+                else:
+                    # 兼容预训练阶段：只保留原始 VGG content，不启用 RaGAN 对抗项。
+                    content_loss = original_esrgan_perceptual_loss.vgg_loss(fake_frame, real_frame)
+                    adversarial_loss = self._zero_like_loss(content_loss)
+                    adversarial_weighted_loss = self._zero_like_loss(content_loss)
+                    perceptual_total = content_loss
+
+            else:
+                raise ValueError(f"Original SR loss only supports esrgan_raft/srgan_raft, got {self.train_mode}")
+
+            # 最初始 SRGAN/ESRGAN 训练里也会计算像素重建项。
+            # 这里不用 Ground 后来的 SmoothL1/SSIM/FFT/flow-warp 组合，而是固定为 L1 + MSE：
+            #   pixel_total = ORIGINAL_SR_LAMBDA_PIXEL_L1 * L1 + ORIGINAL_SR_LAMBDA_PIXEL_MSE * MSE
+            # 权重不做任何动态调度，也不会把 RAFT EPE 反向加入生成器，避免 SR 分支被光流损失牵着走。
+            # 对粒子图默认使用前景/背景均衡平均，避免普通 mean L1 被大面积黑背景主导而生成全黑图。
+            pixel_l1, pixel_mse = self._compute_original_particle_pixel_terms(fake_frame, real_frame)
+            pixel_total = (
+                float(global_data.esrgan.ORIGINAL_SR_LAMBDA_PIXEL_L1) * pixel_l1 +
+                float(global_data.esrgan.ORIGINAL_SR_LAMBDA_PIXEL_MSE) * pixel_mse
+            )
+            pixel_weighted_loss = float(global_data.esrgan.ORIGINAL_SR_LAMBDA_LOSS_PIXEL) * pixel_total
+            return {
+                "perceptual_loss": perceptual_total,
+                "content_loss": content_loss,
+                "adversarial_loss": adversarial_loss,
+                "adversarial_weighted_loss": adversarial_weighted_loss,
+                "pixel_total": pixel_weighted_loss,
+                "pixel_l1": pixel_l1,
+                "pixel_mse": pixel_mse,
+            }
+
+        prev_terms = compute_single_frame_terms(pred_prev, target_prev)
+        next_terms = compute_single_frame_terms(pred_next, target_next)
+        # previous / next 是两个独立时间帧，最终日志和反传 loss 取算术平均，
+        # 保持两帧对 Generator 的贡献完全对称。
+        perceptual_total = 0.5 * (prev_terms["perceptual_loss"] + next_terms["perceptual_loss"])
+        content_loss = 0.5 * (prev_terms["content_loss"] + next_terms["content_loss"])
+        adversarial_loss = 0.5 * (prev_terms["adversarial_loss"] + next_terms["adversarial_loss"])
+        adversarial_weighted_loss = 0.5 * (
+            prev_terms["adversarial_weighted_loss"] + next_terms["adversarial_weighted_loss"]
+        )
+        pixel_weighted_loss = 0.5 * (prev_terms["pixel_total"] + next_terms["pixel_total"])
+        pixel_l1 = 0.5 * (prev_terms["pixel_l1"] + next_terms["pixel_l1"])
+        pixel_mse = 0.5 * (prev_terms["pixel_mse"] + next_terms["pixel_mse"])
+        manual_sr_loss = perceptual_total + pixel_weighted_loss
+        zero = self._zero_like_loss(manual_sr_loss)
+        return {
+            "sr_loss": manual_sr_loss,
+            "manual_sr_loss": manual_sr_loss,
+            "perceptual_loss": perceptual_total,
+            "vgg_loss": content_loss,
+            "content_loss": content_loss,
+            "adversarial_loss": adversarial_loss,
+            "adversarial_weighted_loss": adversarial_weighted_loss,
+            "pixel_total": pixel_weighted_loss,
+            "pixel_l1": pixel_l1,
+            "pixel_mse": pixel_mse,
+            # 下列字段仅为兼容原 CSV schema；最初始 SRGAN/ESRGAN 不使用这些扩展项。
+            "pixel_ssim": zero,
+            "pixel_fft": zero,
+            "flow_warp_consistency_loss": zero,
+            "flow_warp_consistency_weighted_loss": zero,
+        }
+
+    def _compute_original_particle_pixel_terms(
+        self,
+        fake_frames: torch.Tensor,
+        real_frames: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        计算原始 SRGAN/ESRGAN 分支使用的固定 L1/MSE 像素项。
+
+        粒子图像非常稀疏：背景像素远多于亮粒子像素。
+        如果直接对整幅图做普通 mean L1/MSE，最容易出现“全黑图”局部最优：
+        背景全部预测为 0 会让大多数像素误差很小，亮粒子虽然错了，但数量太少。
+
+        因此这里在不改变损失种类的前提下，只改变 L1/MSE 的平均方式：
+        - background_loss: 在 HR <= threshold 的背景区域求均值；
+        - foreground_loss: 在 HR > threshold 的亮粒子区域求均值；
+        - total = background_loss + foreground_weight * foreground_loss。
+
+        这样仍然是固定 L1/MSE，没有动态权重，也没有 RAFT EPE 参与 Generator，
+        但亮粒子不会被大量黑背景淹没，能避免 ESRGAN 早期塌缩成全黑。
+        """
+        if not bool(global_data.esrgan.ORIGINAL_SR_USE_BALANCED_PARTICLE_PIXEL_LOSS):
+            # 兼容开关：关闭后完全回到普通整图 mean L1/MSE。
+            return F.l1_loss(fake_frames, real_frames), F.mse_loss(fake_frames, real_frames)
+
+        threshold = float(global_data.esrgan.ORIGINAL_SR_PARTICLE_FOREGROUND_THRESHOLD)
+        foreground_weight = float(global_data.esrgan.ORIGINAL_SR_PARTICLE_FOREGROUND_WEIGHT)
+        # 多通道图像用 HR 的通道均值判定“这个像素是否属于亮粒子”。
+        # mask 使用 detach，保证前景划分只由真值决定，不会给 HR 或 mask 产生梯度路径。
+        real_gray = real_frames.detach().mean(dim=1, keepdim=True)
+        foreground_mask = real_gray > threshold
+        background_mask = ~foreground_mask
+
+        abs_error = torch.abs(fake_frames - real_frames)
+        sq_error = (fake_frames - real_frames) ** 2
+
+        def masked_mean(error: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+            # mask 是 [B,1,H,W]，需要 expand 成 [B,C,H,W] 才能和多通道误差逐像素相乘。
+            expanded_mask = mask.expand_as(error).to(dtype=error.dtype)
+            denom = expanded_mask.sum().clamp_min(1.0)
+            return (error * expanded_mask).sum() / denom
+
+        background_l1 = masked_mean(abs_error, background_mask)
+        background_mse = masked_mean(sq_error, background_mask)
+        # 如果某个 batch 没有亮粒子，foreground_mask 的分子为 0，denom 会被 clamp 到 1，
+        # 前景项自然等于 0；这里不使用 .item() 判断，避免每个 batch 触发 GPU/CPU 同步。
+        foreground_l1 = masked_mean(abs_error, foreground_mask)
+        foreground_mse = masked_mean(sq_error, foreground_mask)
+        pixel_l1 = background_l1 + foreground_weight * foreground_l1
+        pixel_mse = background_mse + foreground_weight * foreground_mse
+        return pixel_l1, pixel_mse
+
     def _compute_discriminator_loss(self, pred_prev: torch.Tensor, pred_next: torch.Tensor, target_prev: torch.Tensor, target_next: torch.Tensor):
         """
-        计算方案 C 的时序判别器损失。
+        计算最初始 SRGAN/ESRGAN 判别器损失。
 
-        判别器看到的 fake/real 不再是单帧图像，而是：
-        D_input = cat([prev_gray, next_gray, abs(next_gray - prev_gray)], dim=1)。
-        这样 D 会同时约束两帧的颗粒外观和帧间亮度变化，而不是只奖励单帧更像 HR。
+        这里不再使用 Ground 之前的时序判别器输入，而是让 D 分别看 previous / next 单帧图像。
+        previous 和 next 不再通过 batch 维拼接；它们各自走一次 D loss，然后取平均。
+        这样 ESRGAN RaGAN 的 batch mean 不会同时混入两个时间帧，输入语义更接近原始单帧 ESRGAN。
         """
-        fake_pair = self._build_temporal_discriminator_input(pred_prev.detach(), pred_next.detach())
-        real_pair = self._build_temporal_discriminator_input(target_prev, target_next)
-        pred_fake_d = self.piv_esrgan_discriminator(fake_pair)
-        pred_real_d = self.piv_esrgan_discriminator(real_pair)
-        return descriminator_loss(pred_fake_d, pred_real_d)
+        def compute_single_frame_d_loss(fake_frame: torch.Tensor, real_frame: torch.Tensor):
+            """单个时间帧的最初始 SRGAN/ESRGAN 判别器损失。"""
+            pred_fake_d = self.piv_esrgan_discriminator(fake_frame.detach())
+            pred_real_d = self.piv_esrgan_discriminator(real_frame)
+
+            if self.train_mode == "srgan_raft":
+                # 原始 SRGAN 判别器最后一层是 Sigmoid，pred_real_d/pred_fake_d 已经是 [0, 1] 概率。
+                # 因此这里必须使用 BCELoss；如果误用 BCEWithLogitsLoss，会等于对概率再做一遍 logits 版本的 BCE，
+                # 判别器梯度尺度会错，训练会偏离最初始 SRGAN 逻辑。
+                real_labels = torch.ones_like(pred_real_d)
+                fake_labels = torch.zeros_like(pred_fake_d)
+                real_loss = original_srgan_discriminator_loss(pred_real_d, real_labels)
+                fake_loss = original_srgan_discriminator_loss(pred_fake_d, fake_labels)
+                d_loss = real_loss + fake_loss
+                return d_loss, fake_loss, real_loss
+
+            if self.train_mode == "esrgan_raft":
+                # 原始 ESRGAN 判别器没有 Sigmoid，pred_real_d/pred_fake_d 是 logits。
+                # 因此这里必须使用最初始 ESRGAN 的 RaGAN 判别器损失；其内部 GANLoss 是 BCEWithLogitsLoss。
+                # RaGAN 的 mean 只来自当前时间帧 batch，不再让 previous/next 互相影响相对判别基准。
+                return original_esrgan_discriminator_loss(pred_fake_d, pred_real_d)
+
+            zero = self._zero_like_loss(pred_fake_d)
+            return zero, zero, zero
+
+        prev_d_loss, prev_fake_loss, prev_real_loss = compute_single_frame_d_loss(pred_prev, target_prev)
+        next_d_loss, next_fake_loss, next_real_loss = compute_single_frame_d_loss(pred_next, target_next)
+        d_loss = 0.5 * (prev_d_loss + next_d_loss)
+        fake_loss = 0.5 * (prev_fake_loss + next_fake_loss)
+        real_loss = 0.5 * (prev_real_loss + next_real_loss)
+        return d_loss, fake_loss, real_loss
 
 
     def _compute_ground_image_terms(self, pred_prev: torch.Tensor, pred_next: torch.Tensor, input_gr_prev: torch.Tensor, input_gr_next: torch.Tensor) -> dict:
@@ -774,66 +1001,20 @@ class ESRuRAFT_PIV(nn.Module):
                 pred_prev, pred_next, input_gr_prev, input_gr_next
             )
 
-        # esrgan_raft / srgan_raft 模式：使用对应单帧生成器分别超分 previous/next。
-        # 这两个生成器都没有 forward_pair，因此这里显式逐帧调用，避免误用 ESRuRAFT_PIV 的双帧融合结构。
+        # esrgan_raft / srgan_raft 模式：使用最初始 ESRGAN/SRGAN 的单帧生成器分别超分 previous/next。
+        # 这里不使用 ESRuRAFT_PIV 的双帧特征交互，也不在 SR loss 中加入后续扩展的
+        # SSIM/FFT/flow-warp/EPE；这些模式的 Generator loss 回到原始 perceptual + L1/MSE。
         pred_prev = self.piv_esrgan_generator(input_lr_prev)
         pred_next = self.piv_esrgan_generator(input_lr_next)
 
-        prev_terms = self._compute_generator_frame_terms(pred_prev, input_gr_prev)
-        next_terms = self._compute_generator_frame_terms(pred_next, input_gr_next)
-
-        vgg_loss = self._mean_loss_term(prev_terms, next_terms, "vgg_loss")
-        pixel_l1 = self._mean_loss_term(prev_terms, next_terms, "pixel_l1")
-        pixel_mse = self._mean_loss_term(prev_terms, next_terms, "pixel_mse")
-        pixel_ssim = self._mean_loss_term(prev_terms, next_terms, "pixel_ssim")
-        pixel_fft = self._mean_loss_term(prev_terms, next_terms, "pixel_fft")
-
-        # content_loss 是原来的像素总损失语义，但这里显式由四个子项分别按全局权重相加，
-        # 不再把它和 VGG 感知项混成一个含糊的 perceptual/content 复合项。
-        content_loss = (
-            float(global_data.esrgan.LAMBDA_PIXEL_L1) * pixel_l1 +
-            float(global_data.esrgan.LAMBDA_PIXEL_MSE) * pixel_mse +
-            float(global_data.esrgan.LAMBDA_SSIM) * pixel_ssim +
-            float(global_data.esrgan.LAMBDA_PIXEL_FFT) * pixel_fft
+        sr_outputs = self._compute_original_srgan_esrgan_generator_loss(
+            pred_prev=pred_prev,
+            pred_next=pred_next,
+            target_prev=input_gr_prev,
+            target_next=input_gr_next,
+            is_adversarial=is_adversarial,
         )
-
-        fake_pair = self._build_temporal_discriminator_input(pred_prev, pred_next)
-        real_pair = self._build_temporal_discriminator_input(input_gr_prev, input_gr_next)
-        pred_fake = self.piv_esrgan_discriminator(fake_pair)
-        pred_real = self.piv_esrgan_discriminator(real_pair)
-        adversarial_loss = perceptual_loss.adversarial(pred_fake, pred_real)
-        adversarial_weighted_loss = (
-            float(global_data.esrgan.LAMBDA_ADVERSARIAL) * adversarial_loss
-            if is_adversarial else adversarial_loss.new_zeros(())
-        )
-
-        _, flow_warp_dict = flow_warp_consistency_loss(pred_prev, pred_next, flowl0)
-        flow_warp_consistency = flow_warp_dict["flow_warp_consistency_loss"]
-        flow_warp_weighted_loss = float(global_data.esrgan.LAMBDA_FLOW_WARP_CONSISTENCY) * flow_warp_consistency
-
-        manual_sr_loss = (
-            float(global_data.esrgan.LAMBDA_VGG) * vgg_loss +
-            content_loss +
-            adversarial_weighted_loss +
-            flow_warp_weighted_loss
-        )
-
-        return pred_prev, pred_next, pred_prev, pred_next, {
-            "sr_loss": manual_sr_loss,
-            "manual_sr_loss": manual_sr_loss,
-            "perceptual_loss": vgg_loss,
-            "vgg_loss": vgg_loss,
-            "content_loss": content_loss,
-            "adversarial_loss": adversarial_loss,
-            "adversarial_weighted_loss": adversarial_weighted_loss,
-            "pixel_total": content_loss,
-            "pixel_l1": pixel_l1,
-            "pixel_mse": pixel_mse,
-            "pixel_ssim": pixel_ssim,
-            "pixel_fft": pixel_fft,
-            "flow_warp_consistency_loss": flow_warp_consistency,
-            "flow_warp_consistency_weighted_loss": flow_warp_weighted_loss,
-        }
+        return pred_prev, pred_next, pred_prev, pred_next, sr_outputs
 
     def _compute_raft_branch(self, raft_prev_source: torch.Tensor, raft_next_source: torch.Tensor, flowl0, flow_init=None):
         """
@@ -915,8 +1096,9 @@ class ESRuRAFT_PIV(nn.Module):
         """
         计算 ESRuRAFT_PIV_Ground 生成器实际反传的手动加权总损失。
 
-        自适应多任务权重已移除，恢复为全局权重手动组合：
-        VGG/L1/MSE/SSIM/FFT/flow_consistency + 动态对抗损失 + 动态 EPE。
+        esrgan_raft / srgan_raft 的 sr_outputs["manual_sr_loss"] 已经是最初始
+        SRGAN/ESRGAN perceptual + 固定 L1/MSE pixel loss；这里不再额外叠加 SSIM/FFT/flow-warp，
+        也不再把 RAFT EPE 加到 Generator loss，因此 EPE 只影响 RAFT 分支。
         """
         if not self._uses_super_resolution():
             # ground 模式没有 Generator 参数，不能也不需要对图像诊断损失或 EPE 做 G 侧反传。
@@ -927,7 +1109,15 @@ class ESRuRAFT_PIV(nn.Module):
                 "generator_raft_epe_weighted_loss": zero,
             }
 
-        epe_weighted_loss = float(global_data.esrgan.RAFT_EPE_WEIGHT) * raft_outputs["raft_epe_tensor"]
+        if self._uses_generator_raft_epe_loss():
+            # 保留兼容入口：如果未来新增模式明确允许 Generator 使用 RAFT EPE，
+            # 仍可沿用原来的“SR loss + 加权 EPE”定义。
+            epe_weighted_loss = float(global_data.esrgan.RAFT_EPE_WEIGHT) * raft_outputs["raft_epe_tensor"]
+        else:
+            # 当前 esrgan_raft / srgan_raft 按要求禁用 Generator 侧 EPE。
+            # 使用同 device/dtype 的 0 张量，保证日志、AMP 和 detach().item() 都稳定。
+            epe_weighted_loss = self._zero_like_loss(raft_outputs["raft_loss"])
+
         manual_loss = sr_outputs["manual_sr_loss"] + epe_weighted_loss
         return manual_loss, {
             "generator_non_adversarial_loss": manual_loss - sr_outputs["adversarial_weighted_loss"],
@@ -1169,7 +1359,10 @@ class ESRuRAFT_PIV(nn.Module):
             }
 
         # 第一阶段：一次前向同时准备 Generator 和 RAFT 的训练目标。
-        self._set_requires_grad(self.piv_esrgan_generator, True)  # Generator 需要拿到 sr_loss 和 raft_epe 的梯度
+        # Generator 现在只拿最初始 SRGAN/ESRGAN perceptual + L1/MSE pixel loss 的梯度；
+        # RAFT EPE 不再反传到 Generator。
+        # 这样 esrgan_raft / srgan_raft 的生成图像不会被 EPE 项直接牵引，RAFT 自身仍按 raft_loss 更新。
+        self._set_requires_grad(self.piv_esrgan_generator, True)
         self._set_requires_grad(self.piv_RAFT, True)  # 同一次 RAFT forward 也要服务于后续 RAFT 自身更新
         self._set_requires_grad(self.piv_esrgan_discriminator, False)  # 训练 G/RAFT 时冻结判别器
         generator_optimizer.zero_grad(set_to_none=True)  # 清空 Generator 梯度
@@ -1189,11 +1382,17 @@ class ESRuRAFT_PIV(nn.Module):
             flowl0=flowl0,
             flow_init=flow_init,
         )
-        raft_epe_weight = float(global_data.esrgan.RAFT_EPE_WEIGHT)
+        # loss_dict 里的 raft_epe_weight 表示“Generator 侧有效 EPE 权重”。
+        # esrgan_raft / srgan_raft 下该值为 0，说明 EPE 只作为 RAFT 指标/RAFT loss，不限制 Generator。
+        raft_epe_weight = (
+            float(global_data.esrgan.RAFT_EPE_WEIGHT)
+            if self._uses_generator_raft_epe_loss()
+            else 0.0
+        )
         generator_g_loss, generator_loss_logs = self._compute_generator_loss(sr_outputs, raft_outputs)
         final_flow_prediction = flow_predictions[-1]
 
-        # 先让 Generator 拿到 sr_loss + 加权 raft_epe 的梯度，
+        # 先让 Generator 拿到自己的图像生成损失梯度；
         # 同时保留计算图供 RAFT 再对 raft_loss 单独反向传播。
         if scaler is not None:
             scaled_g_loss = scaler.scale(generator_g_loss)
@@ -1202,7 +1401,7 @@ class ESRuRAFT_PIV(nn.Module):
             generator_g_loss.backward(retain_graph=True)
 
         # 保存 Generator 当前梯度，后面会把第二次 backward 产生的 Generator 梯度清掉，
-        # 从而保持“Generator 只吃 sr_loss + 加权 raft_epe，RAFT 只吃 raft_loss”的分离训练语义。
+        # 从而保持“Generator 只吃图像生成损失，RAFT 只吃 raft_loss”的分离训练语义。
         generator_saved_grads = []
         for param in self.piv_esrgan_generator.parameters():
             if param.grad is None:
