@@ -1,3 +1,5 @@
+import math
+
 from loguru import logger
 import time
 
@@ -66,7 +68,7 @@ class global_data:
         # 训练任务标识
         # =========================
         name = "PIV_A_Esrgan"  # 当前实验名（用于输出目录/模型名/wandb run名）
-        DESCRIPTION = "_v4"  # 实验补充描述（可写损失配置、数据版本等）
+        DESCRIPTION = "_v_SCALE_8"  # 实验补充描述（可写损失配置、数据版本等）
         name +=DESCRIPTION
 
         #整体项目注释
@@ -101,7 +103,7 @@ class global_data:
         # 设备与模型加载
         # =========================
         device = torch.device("cuda")  # 训练设备
-        IS_LOAD_EXISTS_MODEL = True  # 是否从已保存模型断点继续训练
+        IS_LOAD_EXISTS_MODEL = False  # 是否从已保存模型断点继续训练
         AMP =False #是否开启混合精度训练
         # =========================
         # 训练模式开关
@@ -130,7 +132,7 @@ class global_data:
         TARGET_SIZE = None  # 数据加载时是否统一 resize 到该尺寸
         RANDOM_SEED = 42  # 数据划分随机种子 TRAIN_CLASS_MODE=fixed时无效
         # SCALES = [2,math.sqrt(8),4] # 生成器上采样倍率（内部两次 PixelShuffle）
-        SCALES = [2]  # 生成器上采样倍率（内部两次 PixelShuffle）
+        SCALES = [math.sqrt(8)]  # 生成器上采样倍率（内部两次 PixelShuffle）
         # =========================
         # RAFT 配置
         # =========================
@@ -340,20 +342,20 @@ class global_data:
         # =========================
         # RAFT256-PIV 风格 TFRecord 测试配置
         # =========================
-        IS_training = False  # 是否执行训练循环；False 时跳过训练，模型构建和后续 evaluate_all/test_all 仍按原流程执行。
+        IS_training = True  # 是否执行训练循环；False 时跳过训练，模型构建和后续 evaluate_all/test_all 仍按原流程执行。
         # 是否执行 evaluate_all 完整验证。
         # 这里恢复为纯手动总开关：无论 DATA_SET 是 class_1 还是 class_2，都由该超参数决定是否执行。
-        IS_VALIDATE_ALL = False
+        IS_VALIDATE_ALL = True
         IS_SAVE_VALIDATE_IMAGES = True  # evaluate_all 是否保存验证/测试样本图；False 时只保留指标 CSV，减少磁盘 IO。
         # 是否保存普通 NPY 数据文件。默认 False 用于减少 evaluate_all/test_all 的磁盘占用；
         # TBL 三位置 profile NPY、hist 直方图 NPY 以及误差 NPY 属于后处理必需文件，会在保存图像时绕过该开关继续保存。
         IS_SAVE_NPY = False
         # evaluate_all / test_all 写平均评价指标时启用 IQR 异常值剔除；逐样本原始 CSV 行不改。
         METRIC_OUTLIER_FILTER_ENABLED = True
-        METRIC_OUTLIER_FILTER_IQR_FACTOR = 0.75  # IQR 阈值系数；值越小剔除越严格，0.75 会比默认 1.5 更积极地剔除坏方向异常值。
+        METRIC_OUTLIER_FILTER_IQR_FACTOR = 0.05  # IQR 阈值系数；值越小剔除越严格，0.75 会比默认 1.5 更积极地剔除坏方向异常值。
         METRIC_OUTLIER_FILTER_MIN_COUNT = 8  # 样本数太少时不剔除，避免小类别均值被过度处理。
         IS_TEST = True  # 是否在 evaluate_all 之后启用 test_all；默认 False，避免改变原训练/验证流程。
-        TEST_TBL = True  # True 时 test_all 只测试 tbl 数据集；False 时保持原来的 TEST_DATASETS / is_TEST_CLASS3 选择逻辑。
+        TEST_TBL = False  # True 时 test_all 只测试 tbl 数据集；False 时保持原来的 TEST_DATASETS / is_TEST_CLASS3 选择逻辑。
         is_TEST_CLASS3 = True  # 是否额外测试 tbl/twcf 大图数据集；默认 False，节省显存和测试时间。
         TEST_DIR = "/test_all"  # test_all 统一输出目录，会在该目录下再按 dataset 名称分文件夹。
         TEST_BATCH_SIZE = 1  # RAFT256-PIV_test.py 测试默认 batch_size_test=1，这里单 GPU 保持一致。

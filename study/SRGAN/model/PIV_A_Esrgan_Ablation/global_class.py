@@ -75,7 +75,7 @@ class global_data:
         # 3: PIV_A 生成器 + PIV_A 判别器 + 原配置 RAFT；EPE 不限制 G。
         # 4: PIV_A 生成器 + 基础 ESRGAN 判别器 + 原配置 RAFT；EPE 不限制 G。
         # 5: 基础 ESRGAN 生成器 + 基础 ESRGAN 判别器 + 原配置 RAFT；去掉图像一致性损失；EPE 限制 G。
-        ABLATION_MODE = 1
+        ABLATION_MODE = 2
         ABLATION_MODES = (1, 2, 3, 4, 5)
         ABLATION_MODE_DESCRIPTIONS = {
             1: "piv_generator_basic_esrgan_discriminator_raft256_no_g_epe",
@@ -134,7 +134,7 @@ class global_data:
         # 设备与模型加载
         # =========================
         device = torch.device("cuda")  # 训练设备
-        IS_LOAD_EXISTS_MODEL = True  # 是否从已保存模型断点继续训练
+        IS_LOAD_EXISTS_MODEL = False  # 是否从已保存模型断点继续训练
         AMP =False #是否开启混合精度训练
         # =========================
         # 训练模式开关
@@ -382,11 +382,11 @@ class global_data:
         # TBL 三位置 profile NPY、hist 直方图 NPY 以及误差 NPY 属于后处理必需文件，会在保存图像时绕过该开关继续保存。
         IS_SAVE_NPY = False
         # evaluate_all / test_all 写平均评价指标时启用 IQR 异常值剔除；逐样本原始 CSV 行不改。
-        METRIC_OUTLIER_FILTER_ENABLED = True
+        METRIC_OUTLIER_FILTER_ENABLED = False
         METRIC_OUTLIER_FILTER_IQR_FACTOR = 0.75  # IQR 阈值系数；值越小剔除越严格，0.75 会比默认 1.5 更积极地剔除坏方向异常值。
         METRIC_OUTLIER_FILTER_MIN_COUNT = 8  # 样本数太少时不剔除，避免小类别均值被过度处理。
         IS_TEST = True  # 是否在 evaluate_all 之后启用 test_all；默认 False，避免改变原训练/验证流程。
-        TEST_TBL = True  # True 时 test_all 只测试 tbl 数据集；False 时保持原来的 TEST_DATASETS / is_TEST_CLASS3 选择逻辑。
+        TEST_TBL = False  # True 时 test_all 只测试 tbl 数据集；False 时保持原来的 TEST_DATASETS / is_TEST_CLASS3 选择逻辑。
         is_TEST_CLASS3 = True  # 是否额外测试 tbl/twcf 大图数据集；默认 False，节省显存和测试时间。
         TEST_DIR = "/test_all"  # test_all 统一输出目录，会在该目录下再按 dataset 名称分文件夹。
         TEST_BATCH_SIZE = 1  # RAFT256-PIV_test.py 测试默认 batch_size_test=1，这里单 GPU 保持一致。

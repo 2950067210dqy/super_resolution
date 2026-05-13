@@ -141,14 +141,14 @@ class ESRuRAFT_PIV(nn.Module):
     2.然后用基本的RAFT进行piv估计
     """
 
-    def __init__(self,inner_chanel,batch_size):
+    def __init__(self,inner_chanel,batch_size,scale =2):
         super(ESRuRAFT_PIV, self).__init__()  # 调用父类初始化
 
         # USE_RAFT 是本分支新增的总开关：
         # - True: 维持原来的 ESRGAN + RAFT 联合训练；
         # - False: 只做 PIV 图像对超分辨率，完全跳过 RAFT 网络、RAFT loss 和 RAFT 评价指标。
         self.use_raft = bool(global_data.esrgan.USE_RAFT)
-        self.piv_esrgan_generator = Generator(inner_chanel=inner_chanel)  # 初始化超分生成器，输入 LR 图像对，输出 SR 图像对
+        self.piv_esrgan_generator = Generator(inner_chanel=inner_chanel,scale =scale)  # 初始化超分生成器，输入 LR 图像对，输出 SR 图像对
         self.piv_esrgan_discriminator = Discriminator(
             inner_chanel=inner_chanel,
             base_channels=global_data.esrgan.DISCRIMINATOR_BASE_CHANNELS,

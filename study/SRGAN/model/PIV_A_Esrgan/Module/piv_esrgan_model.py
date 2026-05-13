@@ -1,6 +1,8 @@
 """
 模型 start
 """
+import math
+
 from loguru import logger
 import torch
 from torch import nn
@@ -238,31 +240,41 @@ class Generator(nn.Module):
         # 所以如果想上采样 2 倍:
         # 先把通道升到 64 * 2^2 = 256
         # 再 PixelShuffle(2) -> 回到 64 通道，尺寸扩大 2 倍
+        blocks = []
 
-        self.upsample = nn.Sequential(
-            # 64 -> 256
-            # 为什么是 256?
-            # 因为 PixelShuffle(2) 需要输出通道数能被 2^2=4 整除
-            # 并且 PixelShuffle 后希望仍然得到 64 通道
-            # 所以卷积输出通道 = 64 * 4 = 256
-            # nn.Conv2d(64, 64 * self.scale * self.scale, kernel_size=3, stride=1, padding=1),
+        for _ in range(int(math.log2(int(scale*scale)))):
+            blocks.extend([
+                nn.Upsample(scale_factor=2, mode="nearest"),
+                nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1, padding_mode="reflect"),
+                nn.LeakyReLU(0.2, inplace=True),
+                ResidualBlock(64),
+            ])
 
-            # [B, 256, H, W] -> [B, 64, 2H, 2W]
-            # nn.PixelShuffle(self.scale),
-            nn.Upsample(scale_factor=self.scale, mode='nearest'),
-            nn.Conv2d(64, 64, 3, 1, 1,padding_mode="reflect"),
-            nn.LeakyReLU(0.2, inplace=True),
-            #后面接一个RB让上采样更清晰
-            ResidualBlock(64),
-            # nn.Conv2d(64, 64 * self.scale * self.scale, kernel_size=3, stride=1, padding=1),
-            # [B, 256, H, W] -> [B, 64, 2H, 2W]
-            # nn.PixelShuffle(self.scale),
-            nn.Upsample(scale_factor=self.scale, mode='nearest'),
-            nn.Conv2d(64, 64, 3, 1, 1,padding_mode="reflect"),
-            nn.LeakyReLU(0.2, inplace=True),
-            # 后面接一个RB让上采样更清晰
-            ResidualBlock(64),
-        )
+        self.upsample = nn.Sequential(*blocks)
+        # self.upsample = nn.Sequential(
+        #     # 64 -> 256
+
+        #     # 因为 PixelShuffle(2) 需要输出通道数能被 2^2=4 整除
+        #     # 并且 PixelShuffle 后希望仍然得到 64 通道
+        #     # 所以卷积输出通道 = 64 * 4 = 256
+        #     # nn.Conv2d(64, 64 * self.scale * self.scale, kernel_size=3, stride=1, padding=1),
+        #
+        #     # [B, 256, H, W] -> [B, 64, 2H, 2W]
+        #     # nn.PixelShuffle(self.scale),
+        #     nn.Upsample(scale_factor=self.scale, mode='nearest'),
+        #     nn.Conv2d(64, 64, 3, 1, 1,padding_mode="reflect"),
+        #     nn.LeakyReLU(0.2, inplace=True),
+        #     #后面接一个RB让上采样更清晰
+        #     ResidualBlock(64),
+        #     # nn.Conv2d(64, 64 * self.scale * self.scale, kernel_size=3, stride=1, padding=1),
+        #     # [B, 256, H, W] -> [B, 64, 2H, 2W]
+        #     # nn.PixelShuffle(self.scale),
+        #     nn.Upsample(scale_factor=self.scale, mode='nearest'),
+        #     nn.Conv2d(64, 64, 3, 1, 1,padding_mode="reflect"),
+        #     nn.LeakyReLU(0.2, inplace=True),
+        #     # 后面接一个RB让上采样更清晰
+        #     ResidualBlock(64),
+        # )
 
         # 最后一层输出 RGB 图像
         # 64 -> 3
