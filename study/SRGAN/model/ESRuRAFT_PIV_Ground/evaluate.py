@@ -27,13 +27,27 @@ from study.SRGAN.model.ESRuRAFT_PIV_Ground.visual_plot_save import save_vorticit
 from study.SRGAN.model.c_aee_metric_common import attach_c_aee_to_raft_rows, compute_c_aee_value
 from study.SRGAN.model.metric_outlier_filter import robust_metric_mean
 from study.SRGAN.model.evaluate_image_compare_common import (
+    apply_plot_axis_config,
     compute_particle_image_error,
+    prune_evaluate_all_to_best_sample_dirs,
+    save_energy_spectrum_mse_compare_npy,
+    save_energy_spectrum_curve_plot,
     save_image_triplet_with_error,
     save_particle_error_histogram,
     save_particle_error_histogram_bundle,
 )
 from study.SRGAN.util.image_util import flow_to_color_tensor, build_triplet_row, add_vertical_separator, \
     add_horizontal_separator, build_pair_row, _select_metric_or_save_channels
+
+
+def _save_energy_spectrum_plot(pred_curve: np.ndarray, gt_curve: np.ndarray, out_png: Path, title: str) -> None:
+    """
+    evaluate_all 能量谱曲线图统一入口。
+
+    坐标轴范围和 tick 读取 ENERGY_SPECTRUM_*，与 ENERGY_SPECTRUM_MSE_* 指标折线图分离，
+    保证每一种带横轴坐标轴的图都有自己的全局变量。
+    """
+    save_energy_spectrum_curve_plot(pred_curve, gt_curve, out_png, title, global_data=global_data)
 
 
 def _save_evaluate_npy(path, array, save_npy: bool, *, force: bool = False) -> None:
@@ -45,6 +59,61 @@ def _save_evaluate_npy(path, array, save_npy: bool, *, force: bool = False) -> N
     """
     if force or bool(save_npy):
         np.save(path, array)
+
+
+def _global_positive_colorbar_limit(attr_name: str, default: float) -> float:
+    """
+    从 global_data.esrgan 读取误差图色条半幅范围，并规范成正数。
+
+    例如 FLOW_ERROR_COLORBAR_LIMIT=0.5 表示 PNG 显示范围为 [-0.5, 0.5]。
+    该值只控制可视化色条，不参与原始误差 NPY、EPE/AEE、ESMSE 等指标计算。
+    """
+    try:
+        limit = float(getattr(global_data.esrgan, attr_name, default))
+        if np.isfinite(limit) and limit > 0:
+            return limit
+    except (TypeError, ValueError):
+        pass
+    return float(default)
+
+
+def _safe_sample_id_token(value, fallback: str) -> str:
+    """
+    将真实 sample_key 转成可以安全作为目录名/CSV sample_id 使用的字符串。
+
+    data_load 返回的 sample_key 通常是文件名主干，本身已经很稳定；这里仍然统一清理
+    Windows/Linux 路径不安全字符，避免后续 fixed list 或 class_2 虚拟样本里混入斜杠导致
+    evaluate_all 把一个样本错误拆成多级目录。
+    """
+    text = "" if value is None else str(value).strip()
+    if not text:
+        text = fallback
+    safe_chars = []
+    for ch in text:
+        if ch.isalnum() or ch in {"-", "_", "."}:
+            safe_chars.append(ch)
+        else:
+            safe_chars.append("_")
+    token = "".join(safe_chars).strip("._")
+    while "__" in token:
+        token = token.replace("__", "_")
+    return token or fallback
+
+
+def _build_evaluate_all_sample_id(batch_sample_keys, sample_idx: int, sample_order: int, fallback: str) -> str:
+    """
+    用真实 sample_key 生成 evaluate_all 的稳定样本 ID。
+
+    旧逻辑使用 batch_idx / idx 命名，batch size 或跳过类别变化时同一样本名字会漂移。
+    现在 sample_key 作为主体，前缀全局顺序号只用于避免极少数同名样本覆盖目录。
+    """
+    sample_key = None
+    if isinstance(batch_sample_keys, (list, tuple)) and sample_idx < len(batch_sample_keys):
+        sample_key = batch_sample_keys[sample_idx]
+    elif isinstance(batch_sample_keys, str) and sample_idx == 0:
+        sample_key = batch_sample_keys
+    token = _safe_sample_id_token(sample_key, fallback=fallback)
+    return f"{sample_order:06d}_{token}"
 
 
 """
@@ -801,15 +870,20 @@ def _save_signed_error_map(
     out_png: Path,
     title_text: str,
     colorbar_label: str,
-    vmin: float = -0.5,
-    vmax: float = 0.5,
+    vmin: float | None = None,
+    vmax: float | None = None,
     cmap: str = "bwr",
     stat_text: str | None = None,
 ) -> None:
     """
     保存带固定对称色标的误差图。
-    这里固定到 [-0.5, 0.5]，并采用蓝-白-红渐变，以对齐参考图风格。
+    这里默认读取全局 FLOW_ERROR_COLORBAR_LIMIT，并采用蓝-白-红渐变；
+    超出范围的误差只在 PNG 上饱和显示，不改变原始误差 NPY 和指标计算。
     """
+    if vmin is None or vmax is None:
+        limit = _global_positive_colorbar_limit("FLOW_ERROR_COLORBAR_LIMIT", 0.5)
+        vmin = -limit if vmin is None else float(vmin)
+        vmax = limit if vmax is None else float(vmax)
     # 这里只清洗显示数组，不改返回给指标计算的原始误差图。
     arr_show = np.nan_to_num(np.asarray(arr_2d, dtype=np.float32), nan=0.0, posinf=vmax, neginf=vmin)
     fig, ax = plt.subplots(1, 1, figsize=(4.8, 3.9), dpi=160)
@@ -852,10 +926,26 @@ def _save_error_histogram(
     max_abs = _safe_symmetric_abs_limit(values, fallback=0.05, quantile=0.995)
     fig, ax = plt.subplots(1, 1, figsize=(4.8, 3.9), dpi=160)
     ax.hist(values, bins=bins, range=(-max_abs, max_abs), color=color, alpha=0.65, edgecolor="none")
+    # 误差直方图统一用红色竖线标出 x=0 的位置；
+    # 只增强 PNG 可读性，不改变 delta_*_hist.npy 或 CSV 指标。
+    ax.axvline(0.0, color="red", linewidth=1.6, linestyle="-", alpha=0.95, zorder=5)
     ax.set_xlim(-max_abs, max_abs)
     ax.set_xlabel(xlabel)
     ax.set_ylabel("Count")
     ax.set_title(title_text)
+    # Δu/Δv/Δw 误差直方图使用 FLOW_ERROR_HIST_* 独立全局坐标轴配置；
+    # 和 EPE_HIST、PARTICLE_ERROR_HIST、ENERGY_SPECTRUM_* 互不共享范围。
+    apply_plot_axis_config(
+        ax,
+        global_data,
+        "FLOW_ERROR_HIST",
+        x_values=values,
+        y_values=np.asarray(ax.patches and [patch.get_height() for patch in ax.patches] or [0.0], dtype=np.float32),
+        default_x_min=-max_abs,
+        default_x_max=max_abs,
+        default_y_min=0.0,
+        default_y_max=None,
+    )
     fig.tight_layout()
     fig.savefig(out_png, bbox_inches="tight")
     plt.close(fig)
@@ -970,6 +1060,7 @@ def _save_flow_error_visuals(
         color="#4477AA",
         save_npy_fn=_save_evaluate_npy,
         save_npy=save_npy,
+        global_data=global_data,
     )
 
     return du.astype(np.float32), dv.astype(np.float32), dw.astype(np.float32), epe.astype(np.float32)
@@ -1355,11 +1446,18 @@ def evaluate_all(
     use_adversarial = True
 
     logger.info(f"[evaluate_all] SAVE_AS_GRAY={global_data.esrgan.SAVE_AS_GRAY}")
-    save_validate_images = bool(getattr(global_data.esrgan, "IS_SAVE_VALIDATE_IMAGES", False))
+    # 最佳样本保存模式只改变磁盘落图策略，不改变任何 batch 的前向、指标计算和 CSV 汇总。
+    # 开启后会先按原流程保存所有样本图/NPY，等所有指标和 C-AEE 计算完成后，再按类别只保留最优样本目录。
+    save_best_only = bool(getattr(global_data.esrgan, "EVALUATE_ALL_SAVE_BEST_ONLY", False))
+    # 因为最终每个类别只留一个样本，开启最佳样本模式时强制保存图像，避免 IS_SAVE_VALIDATE_IMAGES=False 导致没有可筛选对象。
+    save_validate_images = bool(getattr(global_data.esrgan, "IS_SAVE_VALIDATE_IMAGES", False)) or save_best_only
     logger.info(f"[evaluate_all] IS_SAVE_VALIDATE_IMAGES={save_validate_images}")
-    save_npy = bool(getattr(global_data.esrgan, "IS_SAVE_NPY", False))
+    logger.info(f"[evaluate_all] EVALUATE_ALL_SAVE_BEST_ONLY={save_best_only}")
+    # 开启最佳样本模式时也强制保存 NPY；非最佳目录会被删除，因此不会造成全量 NPY 长期占盘。
+    save_npy = bool(getattr(global_data.esrgan, "IS_SAVE_NPY", False)) or save_best_only
     logger.info(
-        f"[evaluate_all] IS_SAVE_NPY={save_npy}；普通 NPY 由该开关控制，hist/误差 NPY 仍按需保存。"
+        f"[evaluate_all] IS_SAVE_NPY={save_npy}；普通 NPY 由该开关控制，hist/误差 NPY 仍按需保存；"
+        f"EVALUATE_ALL_SAVE_BEST_ONLY=True 时会强制保存最佳样本相关 NPY。"
     )
 
     output_root = Path(output_root)
@@ -1459,9 +1557,10 @@ def evaluate_all(
         min_len = min(min(len(x) for x in pred_curves), min(len(x) for x in gt_curves))
         pred_mean = np.mean(np.stack([x[:min_len] for x in pred_curves], axis=0), axis=0)
         gt_mean = np.mean(np.stack([x[:min_len] for x in gt_curves], axis=0), axis=0)
-        # 均值频谱 NPY 属于普通中间结果，由 IS_SAVE_NPY 控制；PNG 仍按原逻辑保存。
-        _save_evaluate_npy(out_dir / f"{file_prefix}_energy_spectrum_pred_mean.npy", pred_mean.astype(np.float32), save_npy)
-        _save_evaluate_npy(out_dir / f"{file_prefix}_energy_spectrum_gt_mean.npy", gt_mean.astype(np.float32), save_npy)
+        # 能量谱对比图的源 NPY 属于复现实验图必需数据，不受 IS_SAVE_NPY 控制；
+        # 只要 evaluate_all 保存 energy_spectrum_mean_compare.png，就同步强制保存 pred/gt 曲线。
+        _save_evaluate_npy(out_dir / f"{file_prefix}_energy_spectrum_pred_mean.npy", pred_mean.astype(np.float32), save_npy, force=True)
+        _save_evaluate_npy(out_dir / f"{file_prefix}_energy_spectrum_gt_mean.npy", gt_mean.astype(np.float32), save_npy, force=True)
         _save_energy_spectrum_plot(
             pred_mean,
             gt_mean,
@@ -1469,8 +1568,8 @@ def evaluate_all(
             title=title,
         )
         if also_save_legacy_names:
-            _save_evaluate_npy(out_dir / "energy_spectrum_pred_mean.npy", pred_mean.astype(np.float32), save_npy)
-            _save_evaluate_npy(out_dir / "energy_spectrum_gt_mean.npy", gt_mean.astype(np.float32), save_npy)
+            _save_evaluate_npy(out_dir / "energy_spectrum_pred_mean.npy", pred_mean.astype(np.float32), save_npy, force=True)
+            _save_evaluate_npy(out_dir / "energy_spectrum_gt_mean.npy", gt_mean.astype(np.float32), save_npy, force=True)
             _save_energy_spectrum_plot(pred_mean, gt_mean, out_dir / "energy_spectrum_mean_compare.png", title=title)
 
     def build_mean_row(target_rows: list[dict], bucket_name: str) -> dict:
@@ -1518,6 +1617,10 @@ def evaluate_all(
             writer.writeheader()
             writer.writerows(mean_rows)
 
+    # 记录 data_loader 的真实遍历顺序。这个序号不依赖 batch_idx 命名，配合 sample_key
+    # 可以让不同 TRAIN_MODE 的 evaluate_all 输出稳定对齐到同一个验证样本。
+    sample_order_index = 0
+
     with torch.inference_mode():
         pbar = tqdm(
             data_loader,
@@ -1530,6 +1633,8 @@ def evaluate_all(
         for batch_idx, batch in enumerate(pbar):
             batch_class_names = batch.get("class_name", [])
             # batch['class_name'] 来自 data_load 的 collate_fn，是当前 batch 每个样本的真实类别名列表。
+            batch_sample_keys = batch.get("sample_key", [])
+            # batch['sample_key'] 是当前 batch 每个样本的真实文件主键，用它生成 sid 才能跨模式稳定对齐。
 
             # RAFT 联合评估固定同时读取图像对与流场，不再按 image_pair / flo 分路。
             lr_prev = batch["image_pair"]["previous"]["lr_data"].to(device, non_blocking=True)
@@ -1593,6 +1698,8 @@ def evaluate_all(
 
             B = hr.shape[0]
             for i in range(B):
+                sample_order = sample_order_index
+                sample_order_index += 1
                 sample_bucket = bucket_class_name(batch_class_names[i] if i < len(batch_class_names) else None)
                 if sample_bucket is None:
                     # uniform 已按用户要求从 evaluate_all 输出中跳过；不创建目录、不写指标，
@@ -1601,7 +1708,12 @@ def evaluate_all(
                 class_root = output_root / sample_bucket
                 class_root.mkdir(parents=True, exist_ok=True)
 
-                sid = f"batch_{batch_idx}_idx_{i}_fid_{batch_idx}"
+                sid = _build_evaluate_all_sample_id(
+                    batch_sample_keys,
+                    i,
+                    sample_order,
+                    fallback=f"batch_{batch_idx}_idx_{i}",
+                )
                 one_dir = class_root / sid
                 one_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1624,7 +1736,18 @@ def evaluate_all(
 
                         # evaluate_all 的颗粒图像对比图同步补 Error 面板：
                         # Error = Generated SR - Original HR，色图与 test_all 的 PIV error-U 风格一致。
-                        save_image_triplet_with_error(lr_save, fk_save, hr_save, p_img, g_img, pair_dir / "image_triplet.png")
+                        save_image_triplet_with_error(
+                            lr_save,
+                            fk_save,
+                            hr_save,
+                            p_img,
+                            g_img,
+                            pair_dir / "image_triplet.png",
+                            particle_error_colorbar_limit=_global_positive_colorbar_limit(
+                                "PARTICLE_ERROR_COLORBAR_LIMIT",
+                                1.0,
+                            ),
+                        )
                         # 颗粒图像误差 hist：和光流 Δu/Δv hist 一样保存单 sample 误差分布。
                         # sr_error.npy/hist 属于诊断结果，force=True 时不受 IS_SAVE_NPY 关闭影响。
                         image_error_map = compute_particle_image_error(p_img, g_img)
@@ -1636,6 +1759,7 @@ def evaluate_all(
                             title=f"{sid}-{pair_type} Particle Image Error Distribution",
                             save_npy_fn=_save_evaluate_npy,
                             save_npy=save_npy,
+                            global_data=global_data,
                         )
                         image_error_hist_by_class.setdefault(sample_bucket, []).append(image_error_map.reshape(-1))
                     mse_img = _mse(p_img, g_img)
@@ -1647,8 +1771,9 @@ def evaluate_all(
                     pred_curve, gt_curve = _energy_spectrum_curves(p_img, g_img)
                     es_mse_img = _energy_spectrum_mse_from_curves(pred_curve, gt_curve)
                     if save_validate_images:
-                        _save_evaluate_npy(pair_dir / "energy_spectrum_pred.npy", pred_curve.astype(np.float32), save_npy)
-                        _save_evaluate_npy(pair_dir / "energy_spectrum_gt.npy", gt_curve.astype(np.float32), save_npy)
+                        # 单样本能量谱对比图的 pred/gt 曲线同样强制保存，保证 IS_SAVE_NPY=False 时也能复现该 PNG。
+                        _save_evaluate_npy(pair_dir / "energy_spectrum_pred.npy", pred_curve.astype(np.float32), save_npy, force=True)
+                        _save_evaluate_npy(pair_dir / "energy_spectrum_gt.npy", gt_curve.astype(np.float32), save_npy, force=True)
                         _save_energy_spectrum_plot(pred_curve, gt_curve, pair_dir / "energy_spectrum_compare.png", title=f"{sid}-{pair_type} Energy Spectrum")
                     register_curve(sample_bucket, pred_curve, gt_curve, curve_group="image_pair")
 
@@ -1793,10 +1918,11 @@ def evaluate_all(
                 pred_curve, gt_curve = _energy_spectrum_curves(p, g)
                 es_mse = _energy_spectrum_mse_from_curves(pred_curve, gt_curve)
                 if save_validate_images:
-                    _save_evaluate_npy(one_dir / "energy_spectrum_pred.npy", pred_curve.astype(np.float32), save_npy)
-                    _save_evaluate_npy(one_dir / "energy_spectrum_gt.npy", gt_curve.astype(np.float32), save_npy)
-                    _save_evaluate_npy(one_dir / "flow_energy_spectrum_pred.npy", pred_curve.astype(np.float32), save_npy)
-                    _save_evaluate_npy(one_dir / "flow_energy_spectrum_gt.npy", gt_curve.astype(np.float32), save_npy)
+                    # flow 能量谱对比图的源曲线是图像复现必需数据，不受 IS_SAVE_NPY 控制。
+                    _save_evaluate_npy(one_dir / "energy_spectrum_pred.npy", pred_curve.astype(np.float32), save_npy, force=True)
+                    _save_evaluate_npy(one_dir / "energy_spectrum_gt.npy", gt_curve.astype(np.float32), save_npy, force=True)
+                    _save_evaluate_npy(one_dir / "flow_energy_spectrum_pred.npy", pred_curve.astype(np.float32), save_npy, force=True)
+                    _save_evaluate_npy(one_dir / "flow_energy_spectrum_gt.npy", gt_curve.astype(np.float32), save_npy, force=True)
                     _save_energy_spectrum_plot(pred_curve, gt_curve, one_dir / "energy_spectrum_compare.png", title=f"{sid} Energy Spectrum")
                     _save_energy_spectrum_plot(pred_curve, gt_curve, one_dir / "flow_energy_spectrum_compare.png", title=f"{sid} Flow Energy Spectrum")
                 register_curve(sample_bucket, pred_curve, gt_curve, curve_group="flow")
@@ -1831,6 +1957,25 @@ def evaluate_all(
         output_key="VAL_C_AEE",
     )
 
+    # energy_spectrum_mse 对比图的源数据属于评价指标记录，体积很小且用于复现实验图；
+    # 按用户要求不受 IS_SAVE_NPY 控制，因此这里直接强制保存。
+    if image_pair_rows:
+        save_energy_spectrum_mse_compare_npy(
+            image_pair_rows,
+            output_root,
+            "image_pair",
+            global_data=global_data,
+            title=f"{class_name}-{data_type}-x{int(SCALE*SCALE)} Image Pair Energy Spectrum MSE",
+        )
+    if raft_rows:
+        save_energy_spectrum_mse_compare_npy(
+            raft_rows,
+            output_root,
+            "flow",
+            global_data=global_data,
+            title=f"{class_name}-{data_type}-x{int(SCALE*SCALE)} Flow Energy Spectrum MSE",
+        )
+
     # 根目录下分别输出 image_pair / flow 两套均值频谱图，避免图像对和光流频谱混在一起。
     save_mean_spectrum(
         all_image_pair_pred_curves,
@@ -1864,6 +2009,7 @@ def evaluate_all(
                 title=f"{class_name}-{data_type}-x{int(SCALE*SCALE)} Particle Image Error Distribution",
                 save_npy_fn=_save_evaluate_npy,
                 save_npy=save_npy,
+                global_data=global_data,
             )
         if all_delta_vorticity_values:
             save_particle_error_histogram_bundle(
@@ -1875,6 +2021,7 @@ def evaluate_all(
                 color="#4477AA",
                 save_npy_fn=_save_evaluate_npy,
                 save_npy=save_npy,
+                global_data=global_data,
             )
         if all_delta_u_values:
             _save_evaluate_npy(output_root / "delta_u_hist_all.npy", _delta_u_histogram_matrix(np.concatenate(all_delta_u_values, axis=0)), save_npy, force=True)
@@ -1906,12 +2053,28 @@ def evaluate_all(
         # 每个类别目录下也拆成 image_pair / RAFT 两张表，避免图像超分指标和流场指标混在一起。
         if class_image_pair_rows:
             write_rows_with_mean(class_root / "metrics_image_pair.csv", class_image_pair_rows, bucket_name)
+            # 类别级 energy_spectrum_mse 图源 NPY 也强制保存，不受 IS_SAVE_NPY 影响。
+            save_energy_spectrum_mse_compare_npy(
+                class_image_pair_rows,
+                class_root,
+                "image_pair",
+                global_data=global_data,
+                title=f"{bucket_name}-{data_type}-x{int(SCALE*SCALE)} Image Pair Energy Spectrum MSE",
+            )
             image_pair_mean_row = build_mean_row(class_image_pair_rows, bucket_name)
             image_pair_mean_row["sample_id"] = "CLASS_MEAN"
             image_pair_mean_row["pair_type"] = "image_pair"
             all_class_image_pair_mean_rows.append(image_pair_mean_row)
         if class_raft_rows:
             write_rows_with_mean(class_root / "metrics_raft.csv", class_raft_rows, bucket_name)
+            # 类别级 flow energy_spectrum_mse 图源 NPY 也强制保存，不受 IS_SAVE_NPY 影响。
+            save_energy_spectrum_mse_compare_npy(
+                class_raft_rows,
+                class_root,
+                "flow",
+                global_data=global_data,
+                title=f"{bucket_name}-{data_type}-x{int(SCALE*SCALE)} Flow Energy Spectrum MSE",
+            )
             flow_mean_row = build_mean_row(class_raft_rows, bucket_name)
             flow_mean_row["sample_id"] = "CLASS_MEAN"
             flow_mean_row["pair_type"] = "flow"
@@ -1944,6 +2107,7 @@ def evaluate_all(
                 title=f"{bucket_name}-{data_type}-x{int(SCALE*SCALE)} Particle Image Error Distribution",
                 save_npy_fn=_save_evaluate_npy,
                 save_npy=save_npy,
+                global_data=global_data,
             )
 
         # 类别级涡度误差直方图：对应 vorticity_quiver.png 的 Delta omega* 面板。
@@ -1957,6 +2121,7 @@ def evaluate_all(
                 color="#4477AA",
                 save_npy_fn=_save_evaluate_npy,
                 save_npy=save_npy,
+                global_data=global_data,
             )
 
         # 类别级 Δu / EPE 统计：把该类别所有 sample 的像素误差拼起来，再统一做直方图。
@@ -1985,6 +2150,16 @@ def evaluate_all(
     if all_class_flow_mean_rows:
         logger.info(f"[evaluate_all] all class flow metrics csv: {all_class_flow_csv_path}")
     logger.info(f"[evaluate_all] sample outputs: {output_root}")
+
+    if save_best_only and save_validate_images:
+        # 指标 CSV 和类别均值已经在上面全部写完；这里才删除非最佳 sample 目录，
+        # 所以不会影响 evaluate_all 对所有样本的统计，只改变最终保留的可视化/NPY数量。
+        prune_evaluate_all_to_best_sample_dirs(
+            output_root,
+            rows,
+            logger=logger,
+            save_svg_sidecars=True,
+        )
 
     if raft_rows:
         return build_mean_row(raft_rows, class_name)

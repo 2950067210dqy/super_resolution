@@ -276,7 +276,10 @@ def save_vorticity_quiver_compare(
             row_vmin, row_vmax = _finite_color_limits(np.concatenate(row_finite_chunks))
         else:
             row_vmin, row_vmax = -1.0, 1.0
-        delta_vmin, delta_vmax = _symmetric_color_limits(delta_omega)
+        # omega* 在 visual_plot_init._omega_star_from_uv 中被归一到 [-2, 2]，
+        # 因此 Pred-HR 的理论误差范围是 [-4, 4]。固定 Error 列色条，
+        # 避免 evaluate_all 不同 sample 自动缩放后颜色含义不一致。
+        delta_vmin, delta_vmax = -4.0, 4.0
 
         im = None
         im_delta = None

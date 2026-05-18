@@ -70,7 +70,7 @@ class global_data:
         # 训练任务标识
         # =========================
         name = "ESRuRAFT_PIV_Ground"  # 当前实验名（用于输出目录/模型名/wandb run名）
-        DESCRIPTION = "v_bicubic_raft"  # 实验补充描述（可写损失配置、数据版本等）
+        DESCRIPTION = "v_srgan_raft"  # 实验补充描述（可写损失配置、数据版本等）
         name +=DESCRIPTION
 
         #整体项目注释
@@ -107,7 +107,7 @@ class global_data:
             "bicubic_WIDIM": "bicubic_widim",
             "bicubic_HS": "bicubic_hs",
         }
-        TRAIN_MODE = "bicubic_raft"
+        TRAIN_MODE = "srgan_raft"
         # SR+RAFT 联合训练模式的特殊损失策略：
         # - esrgan_raft / srgan_raft 仍然训练 Generator、Discriminator 和 RAFT；
         # - 这两个模式重新启用“对抗损失”的动态权重，但仍关闭 flow-warp / Generator EPE 等扩展项；
@@ -149,7 +149,7 @@ class global_data:
         # 设备与模型加载
         # =========================
         device = torch.device("cuda")  # 训练设备
-        IS_LOAD_EXISTS_MODEL = False  # 是否从已保存模型断点继续训练
+        IS_LOAD_EXISTS_MODEL = True  # 是否从已保存模型断点继续训练
         AMP =False #是否开启混合精度训练
         # =========================
         # 可视化与保存相关
@@ -360,7 +360,7 @@ class global_data:
         # - class_2: 改为读取 RAFT-PIV TFRecord，LR 不再从 LR_DATA_ROOT_DIR 读取，而是在 data_load.py
         #   中按 test_all 同款下采样逻辑动态生成。
         DATA_SETS = ("class_1", "class_2")
-        DATA_SET = "class_2"
+        DATA_SET = "class_1"
         CLASS2_PSEUDO_CLASS_NAME = "problem_class2_raft_piv"
 
         CLASS1_GR_DATA_ROOT_DIR = rf"{AUTODL_DATA_PATH}/study_datas/sr_dataset/class_1/data"
@@ -389,14 +389,77 @@ class global_data:
         # =========================
         # RAFT256-PIV 风格 TFRecord 测试配置
         # =========================
-        IS_training = True  # 是否执行训练循环；False 时跳过训练，模型构建和后续 evaluate_all/test_all 仍按原流程执行。
+        IS_training = False  # 是否执行训练循环；False 时跳过训练，模型构建和后续 evaluate_all/test_all 仍按原流程执行。
         # 是否执行 evaluate_all 完整验证。
         # 这里恢复为纯手动总开关：无论 DATA_SET 是 class_1 还是 class_2，都由该超参数决定是否执行。
-        IS_VALIDATE_ALL =True
+        IS_VALIDATE_ALL =False
         IS_SAVE_VALIDATE_IMAGES = True  # evaluate_all 是否保存验证/测试样本图；False 时只保留指标 CSV，减少磁盘 IO。
         # 是否保存普通 NPY 数据文件。默认 False 用于减少 evaluate_all/test_all 的磁盘占用；
         # TBL 三位置 profile NPY、hist 直方图 NPY 以及误差 NPY 属于后处理必需文件，会在保存图像时绕过该开关继续保存。
         IS_SAVE_NPY = False
+        # evaluate_all 最佳样本保存模式。
+        # False：保持原行为，是否保存全量验证图像/NPY 仍由 IS_SAVE_VALIDATE_IMAGES 和 IS_SAVE_NPY 控制。
+        # True：指标仍计算全部样本，最终每个类别只保留 VAL_AEE/VAL_C_AEE/ESMSE 最优样本的完整 PNG、SVG 和 NPY；
+        #       因为最终只留一个样本目录，所以该模式会临时强制保存图像和 NPY，不受 IS_SAVE_NPY 限制。
+        EVALUATE_ALL_SAVE_BEST_ONLY = False
+        # 光流误差图色条的半幅范围；实际显示范围为 [-FLOW_ERROR_COLORBAR_LIMIT, FLOW_ERROR_COLORBAR_LIMIT]。
+        # 这里只影响 evaluate_all/test_all 生成的 error PNG 色条，不改变 delta_*.npy、EPE、AEE 等原始指标计算。
+        FLOW_ERROR_COLORBAR_LIMIT = 0.5
+        # 颗粒图像误差图色条的半幅范围；实际显示范围为 [-PARTICLE_ERROR_COLORBAR_LIMIT, PARTICLE_ERROR_COLORBAR_LIMIT]。
+        # 当前颗粒图像在可视化链路中使用 [0, 1] 范围，因此默认 1.0 对应完整理论误差范围。
+        PARTICLE_ERROR_COLORBAR_LIMIT = 1.0
+        # energy_spectrum_mse 对比图的固定坐标轴配置，evaluate_all 与 test_all 共用。
+        # *_MIN 固定坐标起点；*_MAX=None 表示上限按当前图数据自动补齐，若需要完全固定范围可改成数值。
+        ENERGY_SPECTRUM_MSE_X_MIN = 0.0
+        ENERGY_SPECTRUM_MSE_X_MAX = None
+        ENERGY_SPECTRUM_MSE_Y_MIN = 0.0
+        ENERGY_SPECTRUM_MSE_Y_MAX = None
+        # tick 间隔固定配置；None 时根据最终坐标范围计算稳定间隔，避免 Matplotlib 每张图自动 tick 不一致。
+        ENERGY_SPECTRUM_MSE_X_TICK_INTERVAL = None
+        ENERGY_SPECTRUM_MSE_Y_TICK_INTERVAL = None
+        # 能量谱曲线图 energy_spectrum_compare.png / energy_spectrum_mean_compare.png 的独立坐标轴配置。
+        # 注意它是 log-log 曲线，和上面的 energy_spectrum_mse 指标折线图不是同一种坐标口径。
+        ENERGY_SPECTRUM_X_MIN = 1.0
+        ENERGY_SPECTRUM_X_MAX = None
+        ENERGY_SPECTRUM_Y_MIN = 1e-12
+        ENERGY_SPECTRUM_Y_MAX = None
+        ENERGY_SPECTRUM_X_TICK_INTERVAL = None
+        ENERGY_SPECTRUM_Y_TICK_INTERVAL = None
+        # 光流 Δu/Δv/Δw 误差直方图坐标轴配置；EPE 直方图单独使用 EPE_HIST_*。
+        FLOW_ERROR_HIST_X_MIN = -0.5
+        FLOW_ERROR_HIST_X_MAX = 0.5
+        FLOW_ERROR_HIST_Y_MIN = 0.0
+        FLOW_ERROR_HIST_Y_MAX = None
+        FLOW_ERROR_HIST_X_TICK_INTERVAL = 0.1
+        FLOW_ERROR_HIST_Y_TICK_INTERVAL = None
+        # EPE 直方图是非负量，独立于 Δu/Δv/Δw 的正负误差直方图。
+        EPE_HIST_X_MIN = 0.0
+        EPE_HIST_X_MAX = None
+        EPE_HIST_Y_MIN = 0.0
+        EPE_HIST_Y_MAX = None
+        EPE_HIST_X_TICK_INTERVAL = None
+        EPE_HIST_Y_TICK_INTERVAL = None
+        # 颗粒图像 SR-HR 误差直方图坐标轴配置。
+        PARTICLE_ERROR_HIST_X_MIN = -1.0
+        PARTICLE_ERROR_HIST_X_MAX = 1.0
+        PARTICLE_ERROR_HIST_Y_MIN = 0.0
+        PARTICLE_ERROR_HIST_Y_MAX = None
+        PARTICLE_ERROR_HIST_X_TICK_INTERVAL = 0.2
+        PARTICLE_ERROR_HIST_Y_TICK_INTERVAL = None
+        # 涡度误差直方图坐标轴配置，和颗粒误差 hist 分开，避免不同物理量共用范围。
+        VORTICITY_ERROR_HIST_X_MIN = -1.0
+        VORTICITY_ERROR_HIST_X_MAX = 1.0
+        VORTICITY_ERROR_HIST_Y_MIN = 0.0
+        VORTICITY_ERROR_HIST_Y_MAX = None
+        VORTICITY_ERROR_HIST_X_TICK_INTERVAL = 0.2
+        VORTICITY_ERROR_HIST_Y_TICK_INTERVAL = None
+        # TBL profile_analysis 剖面图坐标轴配置；X_MAX=None 时沿用当前样本 U/V 共同范围，填数值即可完全固定。
+        TBL_PROFILE_X_MIN = None
+        TBL_PROFILE_X_MAX = None
+        TBL_PROFILE_Y_MIN = 0.0
+        TBL_PROFILE_Y_MAX = 200.0
+        TBL_PROFILE_X_TICK_INTERVAL = None
+        TBL_PROFILE_Y_TICK_INTERVAL = 25.0
         # evaluate_all / test_all 写平均评价指标时启用 IQR 异常值剔除；逐样本原始 CSV 行不改。
         METRIC_OUTLIER_FILTER_ENABLED = False
         METRIC_OUTLIER_FILTER_IQR_FACTOR = 0.75  # IQR 阈值系数；值越小剔除越严格，0.75 会比默认 1.5 更积极地剔除坏方向异常值。

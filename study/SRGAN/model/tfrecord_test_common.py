@@ -18,6 +18,9 @@ from tqdm import tqdm
 
 from study.SRGAN.model.c_aee_metric_common import attach_c_aee_to_raft_rows
 from study.SRGAN.model.evaluate_image_compare_common import (
+    apply_energy_spectrum_mse_axis_config,
+    apply_plot_axis_config,
+    save_energy_spectrum_curve_plot,
     save_particle_error_histogram,
     save_particle_error_histogram_bundle,
 )
@@ -504,6 +507,42 @@ def _compute_flow_error_maps_np(pred_chw, gt_chw):
     return delta_u.astype(np.float32), delta_v.astype(np.float32), delta_w.astype(np.float32), epe.astype(np.float32)
 
 
+def _twcf_pascal_reference_flow(twcf_payload, sample_index, target_hw=None):
+    """
+    读取 TWCF 的 PascalPIV 参考流场。
+
+    TWCF 在 `test_all` 中有两套“真值/参考”来源：
+    - TFRecord 里的 `flow`：保留给原始数据读取和模型输入流程；
+    - `PIV_RESULTS_TWCF_PATH` 里的 PascalPIV 结果：用户指定用于 TWCF 的光流误差图、
+      误差直方图、EPE、NORM_AEE、能量谱 MSE 等评价基准。
+
+    因此 TWCF 的所有 flow 误差统计都应该调用这个函数拿 PascalPIV，而不是直接用 TFRecord flow。
+    """
+    if twcf_payload is None or "piv_results" not in twcf_payload:
+        return None
+    piv_results = np.asarray(twcf_payload["piv_results"], dtype=np.float32)
+    if piv_results.ndim < 4 or piv_results.shape[0] <= 0:
+        raise ValueError(f"Invalid TWCF PascalPIV results shape: {piv_results.shape}")
+
+    ref_index = min(max(int(sample_index), 0), int(piv_results.shape[0]) - 1)
+    raw_ref = np.asarray(piv_results[ref_index], dtype=np.float32)
+    if raw_ref.ndim == 3 and raw_ref.shape[0] >= 2:
+        ref_uv = raw_ref[:2]
+    elif raw_ref.ndim == 3 and raw_ref.shape[-1] >= 2:
+        # 兼容偶发的 HWC 保存格式，统一转成 CHW。
+        ref_uv = np.moveaxis(raw_ref[..., :2], -1, 0)
+    else:
+        raise ValueError(f"Invalid TWCF PascalPIV sample shape: {raw_ref.shape}")
+
+    if target_hw is not None:
+        target_h, target_w = int(target_hw[0]), int(target_hw[1])
+        if ref_uv.shape[-2:] != (target_h, target_w):
+            # PascalPIV 正常应和 TWCF full-frame 同尺寸；这里保留 resize 兜底，避免路径数据尺寸轻微不一致时报错。
+            ref_tensor = torch.from_numpy(ref_uv[None]).float()
+            ref_uv = F.interpolate(ref_tensor, size=(target_h, target_w), mode="bilinear", align_corners=False)[0].numpy()
+    return ref_uv.astype(np.float32, copy=False)
+
+
 def _finite_display_field(field_2d, fill_value=0.0):
     """
     将单通道场转换成可绘图数组。
@@ -550,6 +589,22 @@ def _finite_color_limits_from_arrays(arrays, symmetric=False, fallback=(-1.0, 1.
     return vmin, vmax
 
 
+def _positive_colorbar_limit(value, default):
+    """
+    将全局变量里的色条半幅范围规范成正数。
+
+    用户只需要在 global_class.py 里设置一个正数，例如 FLOW_ERROR_COLORBAR_LIMIT=0.5，
+    绘图时实际使用 [-0.5, 0.5]；如果误填 None/NaN/负数，则回退到默认值，避免测试流程中断。
+    """
+    try:
+        limit = float(value)
+        if np.isfinite(limit) and limit > 0:
+            return limit
+    except (TypeError, ValueError):
+        pass
+    return float(default)
+
+
 def _flow_component_limits_like_overview(dataset_name, component_index):
     """
     返回与原始 test_all 流场总览图一致的 U/V/S 色条范围。
@@ -574,22 +629,16 @@ def _flow_component_limits_like_overview(dataset_name, component_index):
     return limits[int(component_index)]
 
 
-def _flow_error_limits_like_overview(dataset_name, component_index, display_delta):
+def _flow_error_limits_like_overview(dataset_name, component_index, display_delta, flow_error_colorbar_limit=0.5):
     """
     返回 U/V/S compare 误差图的色条范围。
 
-    普通五类数据的原总览图 `_plot_regular()` 明确使用 `[-0.25, 0.25]`，
-    因此这里同步该范围。TBL/TWCF 总览图没有误差面板，继续用当前样本的对称范围，
-    避免把大尺寸 full-frame 的局部误差过度截断。
+    所有 test_all 的光流误差图统一读取全局 FLOW_ERROR_COLORBAR_LIMIT：
+    - 普通 256 数据、TBL、TWCF 都使用同一套色标，避免不同 sample/类别自动缩放；
+    - 超出范围的误差只在 PNG 上饱和显示，delta_*.npy 和 CSV 指标仍保留原始数值。
     """
-    dataset_key = str(dataset_name or "").lower()
-    if dataset_key not in {"tbl", "twcf"}:
-        return -0.25, 0.25
-    return _finite_color_limits_from_arrays(
-        [display_delta],
-        symmetric=True,
-        fallback=(-0.25, 0.25),
-    )
+    limit = _positive_colorbar_limit(flow_error_colorbar_limit, 0.5)
+    return -limit, limit
 
 
 def _omega_star_from_uv_np(u_2d, v_2d, eps=1e-8):
@@ -720,6 +769,8 @@ def _save_uvw_compare_artifacts(
     dataset_name=None,
     mask_2d=None,
     tbl_y_limit=None,
+    flow_error_colorbar_limit=0.5,
+    global_data=None,
 ):
     """
     保存 test_all 的 U/V/S compare 图以及对应 NPY。
@@ -755,6 +806,7 @@ def _save_uvw_compare_artifacts(
         dataset_name=dataset_name,
         mask_2d=mask_2d,
         tbl_y_limit=tbl_y_limit,
+        global_data=global_data,
     )
     # AEE 是流场误差图的核心标量指标：等价于所有有效像素 EPE 的平均值。
     # 这里使用原始 pred_chw/gt_chw 计算，不受 TBL/TWCF 绘图裁剪和填充逻辑影响。
@@ -770,6 +822,7 @@ def _save_uvw_compare_artifacts(
             dataset_name,
             row_idx,
             display_delta_uvw[row_idx],
+            flow_error_colorbar_limit=flow_error_colorbar_limit,
         )
         _plot_field_with_colorbar(
             axes[row_idx, 0],
@@ -816,6 +869,7 @@ def _save_vorticity_velocity_artifacts(
     dataset_name=None,
     mask_2d=None,
     tbl_y_limit=None,
+    global_data=None,
 ):
     """
     保存涡度-速度对比图及对应 NPY。
@@ -852,6 +906,7 @@ def _save_vorticity_velocity_artifacts(
         color="#4477AA",
         save_npy_fn=_save_optional_npy,
         save_npy=save_npy,
+        global_data=global_data,
     )
 
     # 绘图副本复用 U/V/S compare 的 dataset 专用处理，避免 TBL 顶部 0 填充区再次形成黑色条带。
@@ -892,11 +947,9 @@ def _save_vorticity_velocity_artifacts(
         symmetric=True,
         fallback=(-2.0, 2.0),
     )
-    delta_min, delta_max = _finite_color_limits_from_arrays(
-        [display_delta_omega],
-        symmetric=True,
-        fallback=(-1.0, 1.0),
-    )
+    # omega* 在 _omega_star_from_uv_np 中被归一到 [-2, 2]，因此 Pred-GT 的理论范围是 [-4, 4]。
+    # 这里固定 vorticity_quiver 第三列 Delta omega* 的色条范围，避免每个 sample 自动缩放导致颜色不可横向比较。
+    delta_min, delta_max = -4.0, 4.0
 
     fig, axes = plt.subplots(1, 3, figsize=(16, 5.2), dpi=140, facecolor="w")
     for ax, (title, omega, u_field, v_field, is_delta) in zip(axes, panels):
@@ -953,6 +1006,7 @@ def _save_flow_visual_artifacts(
     dataset_name=None,
     mask_2d=None,
     tbl_y_limit=None,
+    flow_error_colorbar_limit=0.5,
 ):
     """
     汇总保存 test_all 的光流样本级图和 NPY。
@@ -969,10 +1023,11 @@ def _save_flow_visual_artifacts(
         dataset_name=dataset_name,
         mask_2d=mask_2d,
         tbl_y_limit=tbl_y_limit,
+        flow_error_colorbar_limit=flow_error_colorbar_limit,
     )
     # 补齐 evaluate_all 的样本级误差直方图文件：每个 sample 都输出 Δu/Δv/Δw 的 png 和 npy。
     # 这些属于误差分析结果，和 delta_u.npy 一样始终保存，方便后续直接画统计图。
-    _save_sample_flow_error_histograms(sample_dir, delta_uvw, save_npy=save_npy)
+    _save_sample_flow_error_histograms(sample_dir, delta_uvw, save_npy=save_npy, global_data=global_data)
     _save_vorticity_velocity_artifacts(
         sample_dir,
         pred_uvw,
@@ -1021,7 +1076,7 @@ def _epe_histogram_matrix(values, bins=201):
     return _histogram_matrix(finite_values, edges)
 
 
-def _save_histogram_plot(hist_matrix, out_png, title, xlabel, color="#4C9F70"):
+def _save_histogram_plot(hist_matrix, out_png, title, xlabel, color="#4C9F70", *, global_data=None, axis_prefix="FLOW_ERROR_HIST"):
     """
     将两列直方图矩阵额外画成 png。
 
@@ -1042,15 +1097,31 @@ def _save_histogram_plot(hist_matrix, out_png, title, xlabel, color="#4C9F70"):
         width = 1.0
     fig, ax = plt.subplots(1, 1, figsize=(5.2, 3.8), dpi=150)
     ax.bar(centers, counts, width=width, color=color, alpha=0.72, edgecolor="none")
+    # 误差直方图统一用红色竖线标出 x=0 的位置；
+    # 只增强 PNG 可读性，不改变 hist_matrix.npy 中的 bin/count 数据。
+    ax.axvline(0.0, color="red", linewidth=1.6, linestyle="-", alpha=0.95, zorder=5)
     ax.set_title(title)
     ax.set_xlabel(xlabel)
     ax.set_ylabel("Count")
+    # test_all 的每类误差直方图都有独立坐标轴前缀：
+    # FLOW_ERROR_HIST_* 控制 Δu/Δv/Δw，EPE_HIST_* 控制 EPE，避免不同物理量共用坐标范围。
+    apply_plot_axis_config(
+        ax,
+        global_data,
+        axis_prefix,
+        x_values=centers,
+        y_values=counts,
+        default_x_min=float(np.min(centers)) if centers.size else 0.0,
+        default_x_max=float(np.max(centers)) if centers.size else 1.0,
+        default_y_min=0.0,
+        default_y_max=None,
+    )
     fig.tight_layout()
     fig.savefig(out_png, bbox_inches="tight")
     plt.close(fig)
 
 
-def _save_sample_flow_error_histograms(sample_dir, delta_uvw, save_npy=True):
+def _save_sample_flow_error_histograms(sample_dir, delta_uvw, save_npy=True, *, global_data=None):
     """
     保存单个 sample 的 U/V/W 误差直方图。
 
@@ -1069,10 +1140,18 @@ def _save_sample_flow_error_histograms(sample_dir, delta_uvw, save_npy=True):
         hist = _symmetric_histogram_matrix(values)
         # hist/误差 NPY 属于诊断结果，不受 IS_SAVE_NPY 关闭影响。
         _save_optional_npy(sample_dir / f"{prefix}_hist.npy", hist.astype(np.float32), save_npy, force=True)
-        _save_histogram_plot(hist, sample_dir / f"{prefix}_error.png", title=title, xlabel=xlabel, color=color)
+        _save_histogram_plot(
+            hist,
+            sample_dir / f"{prefix}_error.png",
+            title=title,
+            xlabel=xlabel,
+            color=color,
+            global_data=global_data,
+            axis_prefix="FLOW_ERROR_HIST",
+        )
 
 
-def _save_flow_histogram_bundle(out_dir, delta_u_values, delta_v_values, delta_w_values, epe_values):
+def _save_flow_histogram_bundle(out_dir, delta_u_values, delta_v_values, delta_w_values, epe_values, *, global_data=None):
     """
     保存 evaluate_all 同款的 Δu/Δv/Δw/EPE 汇总直方图 npy，并额外输出 png 快速预览。
 
@@ -1082,45 +1161,41 @@ def _save_flow_histogram_bundle(out_dir, delta_u_values, delta_v_values, delta_w
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     specs = [
-        ("delta_u", delta_u_values, _symmetric_histogram_matrix, "Delta U Error Distribution", "delta u displacement [px]", "#F4A142"),
-        ("delta_v", delta_v_values, _symmetric_histogram_matrix, "Delta V Error Distribution", "delta v displacement [px]", "#4C9F70"),
-        ("delta_w", delta_w_values, _symmetric_histogram_matrix, "Delta W Error Distribution", "delta w displacement [px]", "#8E6BBE"),
-        ("epe", epe_values, _epe_histogram_matrix, "EPE Distribution", "EPE [px]", "#4477AA"),
+        ("delta_u", delta_u_values, _symmetric_histogram_matrix, "Delta U Error Distribution", "delta u displacement [px]", "#F4A142", "FLOW_ERROR_HIST"),
+        ("delta_v", delta_v_values, _symmetric_histogram_matrix, "Delta V Error Distribution", "delta v displacement [px]", "#4C9F70", "FLOW_ERROR_HIST"),
+        ("delta_w", delta_w_values, _symmetric_histogram_matrix, "Delta W Error Distribution", "delta w displacement [px]", "#8E6BBE", "FLOW_ERROR_HIST"),
+        ("epe", epe_values, _epe_histogram_matrix, "EPE Distribution", "EPE [px]", "#4477AA", "EPE_HIST"),
     ]
-    for prefix, values, builder, title, xlabel, color in specs:
+    for prefix, values, builder, title, xlabel, color, axis_prefix in specs:
         if not values:
             continue
         merged = np.concatenate([np.asarray(v, dtype=np.float32).reshape(-1) for v in values], axis=0)
         hist = builder(merged)
         np.save(out_dir / f"{prefix}_hist_all.npy", hist.astype(np.float32))
-        _save_histogram_plot(hist, out_dir / f"{prefix}_hist_all.png", title=title, xlabel=xlabel, color=color)
+        _save_histogram_plot(
+            hist,
+            out_dir / f"{prefix}_hist_all.png",
+            title=title,
+            xlabel=xlabel,
+            color=color,
+            global_data=global_data,
+            axis_prefix=axis_prefix,
+        )
 
 
-def _save_energy_spectrum_plot(pred_curve, gt_curve, out_png, title):
+def _save_energy_spectrum_plot(pred_curve, gt_curve, out_png, title, *, global_data=None):
     """保存 mean energy spectrum 对比图，文件名和 evaluate_all 的均值频谱图保持同一套口径。"""
-    out_png = Path(out_png)
-    out_png.parent.mkdir(parents=True, exist_ok=True)
-    k = np.arange(1, len(pred_curve) + 1)
-    fig, ax = plt.subplots(1, 1, figsize=(6, 4), dpi=160)
-    ax.loglog(k, np.maximum(gt_curve, 1e-12), label="GT", linewidth=2)
-    ax.loglog(k, np.maximum(pred_curve, 1e-12), label="Pred", linewidth=2, linestyle="--")
-    ax.set_xlabel("Wavenumber k")
-    ax.set_ylabel("E(k)")
-    ax.set_title(title)
-    ax.grid(True, which="both", alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(out_png, bbox_inches="tight")
-    plt.close(fig)
+    save_energy_spectrum_curve_plot(pred_curve, gt_curve, out_png, title, global_data=global_data)
 
 
-def _save_energy_spectrum_mse_compare_plot(rows, out_png, title, value_key="energy_spectrum_mse"):
+def _save_energy_spectrum_mse_compare_plot(rows, out_png, title, value_key="energy_spectrum_mse", global_data=None):
     """
     将 metrics 行里的 energy_spectrum_mse 画成对比图。
 
     - dataset 级：横轴是 sample_index，用来观察每个 sample 的频谱误差波动；
     - test_all 根目录：横轴是 dataset 名，用来比较不同类别的均值频谱误差。
-    这里只保存 png，不新增普通中间 npy，因此不会和 IS_SAVE_NPY 的控制规则冲突。
+    - 同名 npy 保存的是这张图实际使用的点数据，属于指标图源数据；
+      按用户要求它不受 IS_SAVE_NPY 控制，方便后续直接复现实验曲线。
     """
     out_png = Path(out_png)
     finite_rows = []
@@ -1141,9 +1216,11 @@ def _save_energy_spectrum_mse_compare_plot(rows, out_png, title, value_key="ener
 
     fig, ax = plt.subplots(1, 1, figsize=(7.2, 4.2), dpi=160)
     all_values = []
+    all_x_values = []
     all_numeric_x = True
     label_positions = []
     label_names = []
+    plot_records = []
 
     for group_idx, (label, entries) in enumerate(grouped.items()):
         x_values = []
@@ -1161,7 +1238,19 @@ def _save_energy_spectrum_mse_compare_plot(rows, out_png, title, value_key="ener
                 label_names.append(str(row.get("dataset", sample_index)))
             x_values.append(x_value)
             y_values.append(value)
+            all_x_values.append(x_value)
             all_values.append(value)
+            # 将图中每个点同步写入 structured NPY；字段里保留 group/dataset/sample_index，
+            # 后续加载时不用回读 CSV，也能知道每个 energy_spectrum_mse 点来自哪里。
+            plot_records.append(
+                (
+                    str(label),
+                    str(row.get("dataset", "")),
+                    str(sample_index),
+                    float(x_value),
+                    float(value),
+                )
+            )
 
         all_numeric_x = all_numeric_x and numeric_x
         ax.plot(x_values, y_values, marker="o", linewidth=1.6, markersize=3.5, label=label)
@@ -1170,13 +1259,20 @@ def _save_energy_spectrum_mse_compare_plot(rows, out_png, title, value_key="ener
     if finite_values.size > 0:
         mean_value = float(np.mean(finite_values))
         ax.axhline(mean_value, color="k", linestyle=":", linewidth=1.1, label=f"mean={mean_value:.4g}")
-        positive = finite_values[finite_values > 0]
-        if positive.size > 1 and float(np.max(positive) / max(np.min(positive), 1e-12)) > 100.0:
-            ax.set_yscale("log")
 
     if not all_numeric_x and label_positions:
         ax.set_xticks(label_positions)
         ax.set_xticklabels(label_names, rotation=30, ha="right")
+
+    # 坐标范围与 tick 间隔统一由全局 ENERGY_SPECTRUM_MSE_* 控制。
+    # 数值 sample_index 横轴会固定 x/y；dataset 名这种类别横轴只固定 y 轴。
+    apply_energy_spectrum_mse_axis_config(
+        ax,
+        all_x_values,
+        finite_values,
+        global_data,
+        x_is_numeric=all_numeric_x,
+    )
 
     ax.set_xlabel("sample index" if all_numeric_x else "dataset")
     ax.set_ylabel("Energy spectrum MSE")
@@ -1185,11 +1281,35 @@ def _save_energy_spectrum_mse_compare_plot(rows, out_png, title, value_key="ener
     ax.legend(fontsize=8)
     fig.tight_layout()
     out_png.parent.mkdir(parents=True, exist_ok=True)
+    # 这个 NPY 是 energy_spectrum_mse_compare.png 的源数据，体积很小且用于复现实验图；
+    # 因此不走 _save_optional_npy，也不被全局 IS_SAVE_NPY 关闭。
+    np.save(
+        out_png.with_suffix(".npy"),
+        np.asarray(
+            plot_records,
+            dtype=[
+                ("pair_type", "U64"),
+                ("dataset", "U128"),
+                ("sample_index", "U64"),
+                ("x_value", "f4"),
+                ("energy_spectrum_mse", "f4"),
+            ],
+        ),
+    )
     fig.savefig(out_png, bbox_inches="tight")
     plt.close(fig)
 
 
-def _save_mean_spectrum(pred_curves, gt_curves, out_dir, title, file_prefix, also_save_legacy_names=False, save_npy=True):
+def _save_mean_spectrum(
+    pred_curves,
+    gt_curves,
+    out_dir,
+    title,
+    file_prefix,
+    also_save_legacy_names=False,
+    save_npy=True,
+    global_data=None,
+):
     """
     保存 evaluate_all 同款的平均能量谱 npy/png。
 
@@ -1203,19 +1323,27 @@ def _save_mean_spectrum(pred_curves, gt_curves, out_dir, title, file_prefix, als
     min_len = min(min(len(x) for x in pred_curves), min(len(x) for x in gt_curves))
     pred_mean = np.mean(np.stack([np.asarray(x[:min_len], dtype=np.float32) for x in pred_curves], axis=0), axis=0)
     gt_mean = np.mean(np.stack([np.asarray(x[:min_len], dtype=np.float32) for x in gt_curves], axis=0), axis=0)
-    # 均值频谱 NPY 属于普通中间结果，由 IS_SAVE_NPY 控制；PNG 仍按原逻辑保存。
-    _save_optional_npy(out_dir / f"{file_prefix}_energy_spectrum_pred_mean.npy", pred_mean.astype(np.float32), save_npy)
-    _save_optional_npy(out_dir / f"{file_prefix}_energy_spectrum_gt_mean.npy", gt_mean.astype(np.float32), save_npy)
+    # 能量谱对比图的源 NPY 属于复现实验图必需数据，不受 IS_SAVE_NPY 控制；
+    # test_all 只要保存 energy_spectrum_mean_compare.png，就同步强制保存 pred/gt 均值曲线。
+    _save_optional_npy(out_dir / f"{file_prefix}_energy_spectrum_pred_mean.npy", pred_mean.astype(np.float32), save_npy, force=True)
+    _save_optional_npy(out_dir / f"{file_prefix}_energy_spectrum_gt_mean.npy", gt_mean.astype(np.float32), save_npy, force=True)
     _save_energy_spectrum_plot(
         pred_mean,
         gt_mean,
         out_dir / f"{file_prefix}_energy_spectrum_mean_compare.png",
         title=title,
+        global_data=global_data,
     )
     if also_save_legacy_names:
-        _save_optional_npy(out_dir / "energy_spectrum_pred_mean.npy", pred_mean.astype(np.float32), save_npy)
-        _save_optional_npy(out_dir / "energy_spectrum_gt_mean.npy", gt_mean.astype(np.float32), save_npy)
-        _save_energy_spectrum_plot(pred_mean, gt_mean, out_dir / "energy_spectrum_mean_compare.png", title=title)
+        _save_optional_npy(out_dir / "energy_spectrum_pred_mean.npy", pred_mean.astype(np.float32), save_npy, force=True)
+        _save_optional_npy(out_dir / "energy_spectrum_gt_mean.npy", gt_mean.astype(np.float32), save_npy, force=True)
+        _save_energy_spectrum_plot(
+            pred_mean,
+            gt_mean,
+            out_dir / "energy_spectrum_mean_compare.png",
+            title=title,
+            global_data=global_data,
+        )
 
 
 def _build_mean_row(rows, fixed_fields, metric_keys, global_data=None):
@@ -2242,6 +2370,7 @@ def _save_tbl_component_profile_figure(
     top_title,
     x_zero_left=False,
     forced_xlim=None,
+    global_data=None,
 ):
     """
     保存 TBL 单个分量的论文风格剖面对比图。
@@ -2330,15 +2459,25 @@ def _save_tbl_component_profile_figure(
         if idx == 0:
             ax.set_ylabel("y-position[px]", fontsize=12)
             ax.legend(loc="upper left", fontsize=11, frameon=True)
-        ax.set_xlim(x_left, x_right)
-        # y_limit=200 表示论文图展示 0..200 px 的坐标范围；profile 数组本身有 200 行，
-        # 行索引最大是 199。这里把坐标轴上限显式设为 200，并强制加入 200 刻度，
-        # 避免 Matplotlib 自动刻度停在 175，看起来像没有画满 0..200。
-        y_ticks = list(np.arange(0, profile_height + 1, 25, dtype=np.int32))
-        if y_ticks[-1] != profile_height:
-            y_ticks.append(profile_height)
-        ax.set_ylim(0, profile_height)
-        ax.set_yticks(y_ticks)
+        # TBL profile 是独立图类型，坐标由 TBL_PROFILE_* 全局变量控制；
+        # default_* 仍保留旧逻辑计算出的范围，方便某个 MAX=None 时自动回退。
+        apply_plot_axis_config(
+            ax,
+            global_data,
+            "TBL_PROFILE",
+            x_values=np.concatenate(
+                [
+                    np.asarray(profile_gt[idx], dtype=np.float32).reshape(-1),
+                    np.asarray(profile_pred[idx], dtype=np.float32).reshape(-1),
+                ],
+                axis=0,
+            ),
+            y_values=y_positions,
+            default_x_min=x_left,
+            default_x_max=x_right,
+            default_y_min=0.0,
+            default_y_max=float(profile_height),
+        )
         ax.grid(alpha=0.15)
 
     for output_name in output_names:
@@ -2359,6 +2498,7 @@ def _save_tbl_profile_artifacts(
     region_names=("Laminar", "Transition", "Turbulent"),
     y_limit=200,
     sample_crop_width=256,
+    global_data=None,
 ):
     """
     保存 TBL 的论文风格剖面对比图，并把关键数据落成 .npy 便于和其他方法后处理比较。
@@ -2480,6 +2620,7 @@ def _save_tbl_profile_artifacts(
         cmap_name=cmap_name,
         top_title="Ground truth of horizontal direction",
         x_zero_left=True,
+        global_data=global_data,
     )
     # 新增 V 分量剖面图：使用同一组 Laminar/Transition/Turbulent 列坐标，
     # 但顶部显示 GT vertical/V 位移场，下方曲线对应 V displacement。
@@ -2498,10 +2639,11 @@ def _save_tbl_profile_artifacts(
         top_title="Ground truth of vertical direction",
         x_zero_left=False,
         forced_xlim=shared_uv_profile_xlim,
+        global_data=global_data,
     )
 
 
-def _plot_regular(out_path, u_pred, v_pred, u_gt, v_gt, cmap_name="jet"):
+def _plot_regular(out_path, u_pred, v_pred, u_gt, v_gt, cmap_name="jet", flow_error_colorbar_limit=0.5):
     """
     保存 256x256 数据集的 u/v 预测、真值和误差图。
 
@@ -2533,7 +2675,9 @@ def _plot_regular(out_path, u_pred, v_pred, u_gt, v_gt, cmap_name="jet"):
     plt.axis("off")
     plt.colorbar().ax.set_ylabel("displacement [px]", fontsize=14)
     plt.subplot(3, 2, 5)
-    plt.pcolor(u_pred - u_gt, cmap="bwr", vmin=-0.25, vmax=0.25)
+    error_limit = _positive_colorbar_limit(flow_error_colorbar_limit, 0.5)
+    # 光流 U 误差图读取全局 FLOW_ERROR_COLORBAR_LIMIT，只影响 PNG 色条显示，不改误差数组和指标。
+    plt.pcolor(u_pred - u_gt, cmap="bwr", vmin=-error_limit, vmax=error_limit)
     plt.title("Error - U (Current - GT)", fontsize=16)
     plt.axis("off")
     _annotate_metric_box(plt.gca(), sample_aee_text, fontsize=20)
@@ -2549,7 +2693,8 @@ def _plot_regular(out_path, u_pred, v_pred, u_gt, v_gt, cmap_name="jet"):
     plt.axis("off")
     plt.colorbar().ax.set_ylabel("displacement [px]", fontsize=14)
     plt.subplot(3, 2, 6)
-    plt.pcolor(v_pred - v_gt, cmap="bwr", vmin=-0.25, vmax=0.25)
+    # 光流 V 误差图与 U 误差图保持同一全局显示范围。
+    plt.pcolor(v_pred - v_gt, cmap="bwr", vmin=-error_limit, vmax=error_limit)
     plt.title("Error - V (Current - GT)", fontsize=16)
     plt.axis("off")
     _annotate_metric_box(plt.gca(), sample_aee_text, fontsize=20)
@@ -2608,7 +2753,7 @@ def _compute_particle_image_esmse(sr_img, hr_img):
     return _energy_spectrum_mse_from_curves(pred_curve, gt_curve)
 
 
-def _error_image_for_display(error_map, limit=0.25):
+def _error_image_for_display(error_map, limit=1.0):
     """
     将误差图转换成 matplotlib 可显示数组。
 
@@ -2619,12 +2764,14 @@ def _error_image_for_display(error_map, limit=0.25):
     return np.nan_to_num(arr, nan=0.0, posinf=float(limit), neginf=-float(limit))
 
 
-def _plot_particle_error_panel(ax, error_map, title, limit=0.25, metric_text=None):
+def _plot_particle_error_panel(ax, error_map, title, limit=1.0, metric_text=None):
     """
     在 comparison 图里绘制颗粒图像误差图。
 
-    色条风格仿照 PIV 的 Error-U/Error-V：bwr 表示正负误差，固定范围便于跨样本比较。
+    limit 来自全局 PARTICLE_ERROR_COLORBAR_LIMIT；默认 1.0 对应 [0, 1] 图像的完整理论误差范围。
+    这里只影响 PNG 色条显示，不改变 prev/next_sr_error.npy 和 ESMSE 等指标。
     """
+    limit = _positive_colorbar_limit(limit, 1.0)
     im = ax.imshow(_error_image_for_display(error_map, limit=limit), cmap="bwr", vmin=-limit, vmax=limit)
     ax.set_title(title, fontsize=10)
     ax.axis("off")
@@ -2662,7 +2809,7 @@ def _save_gray_image(path, arr):
     plt.imsave(str(path), _clip_image_for_display(arr), cmap="gray", vmin=0.0, vmax=1.0)
 
 
-def _plot_image_comparison(out_path, sample_images):
+def _plot_image_comparison(out_path, sample_images, particle_error_colorbar_limit=1.0):
     """
     保存 prev/next 的 LR、原图 HR、生成 SR、SR-HR 误差合并对比图。
 
@@ -2706,6 +2853,7 @@ def _plot_image_comparison(out_path, sample_images):
             axes[row_idx, 3],
             error_map,
             f"{frame_name} Error (SR-HR)",
+            limit=particle_error_colorbar_limit,
             metric_text=_format_metric_annotation("ESMSE", esmse_value),
         )
 
@@ -2794,6 +2942,7 @@ def _plot_tbl_image_comparison(
     sample_images,
     crop_size=256,
     center_ratio=0.265,
+    particle_error_colorbar_limit=1.0,
 ):
     """
     保存 TBL 专用的颗粒图 comparison 图。
@@ -2872,6 +3021,7 @@ def _plot_tbl_image_comparison(
             fig.add_subplot(grid[frame_idx * 2 + 1, 3]),
             error_crop,
             f"{frame_name} Error crop (SR-HR)",
+            limit=particle_error_colorbar_limit,
             metric_text=_format_metric_annotation("ESMSE", esmse_crop),
         )
 
@@ -2893,6 +3043,11 @@ def _save_image_outputs(dataset_name, dataset_dir, image_payload, start_index, p
         comparison.png
     """
     plot_args = plot_args or {}
+    global_axis_data = plot_args.get("global_data", None)
+    particle_error_colorbar_limit = _positive_colorbar_limit(
+        plot_args.get("particle_error_colorbar_limit", 1.0),
+        1.0,
+    )
     payload_np = {
         "prev_lr": _as_numpy_batch(image_payload["prev_lr"]),
         "next_lr": _as_numpy_batch(image_payload["next_lr"]),
@@ -2949,6 +3104,7 @@ def _save_image_outputs(dataset_name, dataset_dir, image_payload, start_index, p
             title="Previous Particle Image Error Distribution",
             save_npy_fn=_save_optional_npy,
             save_npy=save_npy,
+            global_data=global_axis_data,
         )
         save_particle_error_histogram(
             sample_dir,
@@ -2957,6 +3113,7 @@ def _save_image_outputs(dataset_name, dataset_dir, image_payload, start_index, p
             title="Next Particle Image Error Distribution",
             save_npy_fn=_save_optional_npy,
             save_npy=save_npy,
+            global_data=global_axis_data,
         )
         _save_gray_image(sample_dir / "prev_lr.png", sample_images["prev_lr"])
         _save_gray_image(sample_dir / "prev_hr.png", sample_images["prev_hr"])
@@ -3005,6 +3162,7 @@ def _save_image_outputs(dataset_name, dataset_dir, image_payload, start_index, p
                 title="Previous TBL Crop Particle Image Error Distribution",
                 save_npy_fn=_save_optional_npy,
                 save_npy=save_npy,
+                global_data=global_axis_data,
             )
             save_particle_error_histogram(
                 sample_dir,
@@ -3013,15 +3171,21 @@ def _save_image_outputs(dataset_name, dataset_dir, image_payload, start_index, p
                 title="Next TBL Crop Particle Image Error Distribution",
                 save_npy_fn=_save_optional_npy,
                 save_npy=save_npy,
+                global_data=global_axis_data,
             )
             _plot_tbl_image_comparison(
                 sample_dir / "comparison.png",
                 sample_images,
                 crop_size=tbl_crop_size,
                 center_ratio=tbl_crop_center_ratio,
+                particle_error_colorbar_limit=particle_error_colorbar_limit,
             )
         else:
-            _plot_image_comparison(sample_dir / "comparison.png", sample_images)
+            _plot_image_comparison(
+                sample_dir / "comparison.png",
+                sample_images,
+                particle_error_colorbar_limit=particle_error_colorbar_limit,
+            )
 
 
 def _save_sample_plots(
@@ -3033,6 +3197,7 @@ def _save_sample_plots(
     twcf_payload,
     image_payload=None,
     plot_args=None,
+    flow_reference_np=None,
 ):
     """
     按 dataset 类别分文件夹保存每个 sample 的 flow 可视化图，并可选保存 LR/HR/SR 图片。
@@ -3056,6 +3221,10 @@ def _save_sample_plots(
     tbl_profile_region_names = tuple(plot_args.get("tbl_profile_region_names", ("Laminar", "Transition", "Turbulent")))
     tbl_profile_y_limit = plot_args.get("tbl_profile_y_limit", 200)
     tbl_profile_sample_crop_width = int(plot_args.get("tbl_profile_sample_crop_width", 256))
+    flow_error_colorbar_limit = _positive_colorbar_limit(
+        plot_args.get("flow_error_colorbar_limit", 0.5),
+        0.5,
+    )
     if image_payload is not None:
         _save_image_outputs(dataset_name, dataset_dir, image_payload, start_index, plot_args=plot_args)
 
@@ -3064,8 +3233,11 @@ def _save_sample_plots(
         out_path = dataset_dir / f"{dataset_name}_sample_{sample_index:04d}.png"
         u_pred = predicted_np[local_idx, 0, :, :]
         v_pred = predicted_np[local_idx, 1, :, :]
-        u_gt = flow_np[local_idx, 0, :, :]
-        v_gt = flow_np[local_idx, 1, :, :]
+        # TWCF 的 flow 误差参考来自 PascalPIV；其他数据集继续使用 TFRecord flow。
+        # flow_reference_np 已在主循环中按 dataset 准备好，确保 sample 图、hist、CSV、频谱 MSE 同源。
+        reference_np = flow_reference_np[local_idx] if flow_reference_np is not None else flow_np[local_idx]
+        u_gt = reference_np[0, :, :]
+        v_gt = reference_np[1, :, :]
         # 新增 evaluate_all 同款的样本级光流细节输出：
         # - flow/sample_xxxx/uvs_compare.png 以及 U/V/S 对应 npy；
         # - flow/sample_xxxx/vorticity_quiver.png 以及涡度、速度差 npy。
@@ -3079,13 +3251,15 @@ def _save_sample_plots(
         _save_flow_visual_artifacts(
             flow_sample_dir,
             predicted_np[local_idx],
-            flow_np[local_idx],
+            reference_np,
             cmap_name=displacement_cmap if dataset_name in {"tbl", "twcf"} else regular_flow_cmap,
             quiver_stride=quiver_stride,
             save_npy=save_npy,
             dataset_name=dataset_name,
             mask_2d=twcf_mask_for_flow_plots,
             tbl_y_limit=tbl_profile_y_limit if dataset_name == "tbl" else None,
+            flow_error_colorbar_limit=flow_error_colorbar_limit,
+            global_data=global_axis_data,
         )
 
         if dataset_name == "twcf":
@@ -3124,9 +3298,18 @@ def _save_sample_plots(
                 region_names=tbl_profile_region_names,
                 y_limit=tbl_profile_y_limit,
                 sample_crop_width=tbl_profile_sample_crop_width,
+                global_data=global_axis_data,
             )
         else:
-            _plot_regular(out_path, u_pred, v_pred, u_gt, v_gt, cmap_name=regular_flow_cmap)
+            _plot_regular(
+                out_path,
+                u_pred,
+                v_pred,
+                u_gt,
+                v_gt,
+                cmap_name=regular_flow_cmap,
+                flow_error_colorbar_limit=flow_error_colorbar_limit,
+            )
 
 
 def _write_csv(path, rows):
@@ -3197,6 +3380,8 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
     )
 
     test_args = {
+        # 后续所有带横轴坐标轴的图都会通过 global_data.esrgan 读取各自独立的坐标轴超参数。
+        "global_data": global_data,
         "split_size": getattr(global_data.esrgan, "TEST_SPLIT_SIZE", 1),
         "offset": getattr(global_data.esrgan, "TEST_OFFSET", 256),
         "shift": getattr(global_data.esrgan, "TEST_SHIFT", 64),
@@ -3209,6 +3394,18 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
         # cylinder/dns_turb/jhtdb/sqg/backstep 五类常规 256x256 数据集按 evaluate_all 的光流图口径显示。
         # evaluate_all 中 U/V 位移图使用 jet，误差图使用 bwr；这里保持同样的主色条。
         "regular_flow_cmap": getattr(global_data.esrgan, "TEST_REGULAR_FLOW_CMAP", "jet"),
+        # 两个误差色条半幅范围都放到 global_class.py 统一控制：
+        # - FLOW_ERROR_COLORBAR_LIMIT 控制光流 U/V/S 的 error PNG；
+        # - PARTICLE_ERROR_COLORBAR_LIMIT 控制颗粒图像 SR-HR 的 error PNG。
+        # 它们只影响显示色条，不改变原始误差 NPY、CSV 指标和均值统计。
+        "flow_error_colorbar_limit": _positive_colorbar_limit(
+            getattr(global_data.esrgan, "FLOW_ERROR_COLORBAR_LIMIT", 0.5),
+            0.5,
+        ),
+        "particle_error_colorbar_limit": _positive_colorbar_limit(
+            getattr(global_data.esrgan, "PARTICLE_ERROR_COLORBAR_LIMIT", 1.0),
+            1.0,
+        ),
         "method_label": getattr(global_data.esrgan, "name", "Current method"),
         # TBL 的 Laminar/Transition/Turbulent 剖面位置；优先读新的 TBL_* 全局变量。
         # 为了兼容前一次临时命名，如果用户还没改 global_class，也会回退读取 TWCF_*。
@@ -3319,16 +3516,23 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
                             prediction = _predict_patch(model, images, flows, factor, device)
                         predicted_flows = prediction["flow"]
 
-                    epe_per_sample = _torch_finite_epe_per_sample(predicted_flows, flows)
-                    finite_epe_per_sample = epe_per_sample[torch.isfinite(epe_per_sample)]
                     total_samples += valid_size
-                    if int(finite_epe_per_sample.numel()) > 0:
-                        # running mean 只统计有效样本，避免某个无有效像素的 sample 把整个日志均值拖成 NaN。
-                        sum_epe += float(finite_epe_per_sample.sum().item())
-                        total_epe_samples += int(finite_epe_per_sample.numel())
 
                     predicted_np = predicted_flows.detach().cpu().numpy().astype(np.float32, copy=False)
                     flow_np = flows.detach().cpu().numpy().astype(np.float32, copy=False)
+                    if dataset_name == "twcf" and twcf_payload is not None:
+                        # TWCF 的误差/指标/频谱比较基准按用户指定切换为 PascalPIV 结果。
+                        # TFRecord flow 仍用于原始数据读取和模型推理流程，但不再作为 TWCF 误差参考。
+                        flow_reference_np = np.empty_like(flow_np, dtype=np.float32)
+                        for local_idx in range(valid_size):
+                            sample_index = sample_start + local_idx
+                            flow_reference_np[local_idx] = _twcf_pascal_reference_flow(
+                                twcf_payload,
+                                sample_index,
+                                target_hw=flow_np[local_idx].shape[-2:],
+                            )
+                    else:
+                        flow_reference_np = flow_np
                     # 图像指标和 evaluate_all 保持一致：统一按 [0,1] 范围统计。
                     pred_prev_np = _as_numpy_batch(prediction["pred_prev"].clamp(0, 1))
                     pred_next_np = _as_numpy_batch(prediction["pred_next"].clamp(0, 1))
@@ -3337,9 +3541,10 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
                     sample_end = sample_start + valid_size
                     results[sample_start:sample_end, 0, :, :] = predicted_np[:, 0, :, :]
                     results[sample_start:sample_end, 1, :, :] = predicted_np[:, 1, :, :]
-                    results[sample_start:sample_end, 2, :, :] = flow_np[:, 0, :, :]
-                    results[sample_start:sample_end, 3, :, :] = flow_np[:, 1, :, :]
-                    epe_array[sample_start:sample_end] = epe_per_sample.detach().cpu().numpy().astype(np.float32)
+                    # results.npy 的后两通道保存“当前用于评价的参考流场”：
+                    # TWCF 为 PascalPIV，其他数据集为 TFRecord flow。
+                    results[sample_start:sample_end, 2, :, :] = flow_reference_np[:, 0, :, :]
+                    results[sample_start:sample_end, 3, :, :] = flow_reference_np[:, 1, :, :]
                     # 逐样本补充 test_all 的 SR 图像指标和流场额外指标。
                     for local_idx in range(valid_size):
                         sample_index = sample_start + local_idx
@@ -3391,11 +3596,17 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
                             dataset_name,
                             sample_index,
                             predicted_np[local_idx],
-                            flow_np[local_idx],
+                            flow_reference_np[local_idx],
                         )
+                        epe_array[sample_index] = float(flow_row["epe"])
                         norm_aee_per100_array[sample_index] = float(flow_row["NORM_AEE_PER100PIXEL"])
+                        if np.isfinite(float(flow_row["epe"])):
+                            # running mean 与 metrics_raft.csv 同源：
+                            # TWCF 使用 PascalPIV，其余数据集使用 TFRecord flow。
+                            sum_epe += float(flow_row["epe"])
+                            total_epe_samples += 1
                         flow_pred_uvw = _flow_uv_to_uvw_np(predicted_np[local_idx])
-                        flow_gt_uvw = _flow_uv_to_uvw_np(flow_np[local_idx])
+                        flow_gt_uvw = _flow_uv_to_uvw_np(flow_reference_np[local_idx])
                         flow_pred_curve, flow_gt_curve = _energy_spectrum_curves(flow_pred_uvw, flow_gt_uvw)
                         # RAFT/flow 的能量谱 MSE 使用 U/V/S 三个分量的频谱曲线计算；
                         # 和后面的 mean spectrum 图复用同一组曲线，保证 CSV 指标和图像完全同源。
@@ -3410,13 +3621,13 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
                         all_flow_gt_curves.append(flow_gt_curve)
                         delta_u_map, delta_v_map, delta_w_map, epe_map = _compute_flow_error_maps_np(
                             predicted_np[local_idx],
-                            flow_np[local_idx],
+                            flow_reference_np[local_idx],
                         )
                         # vorticity_quiver.png 的误差来自 omega* 的预测-真值差；
                         # 这里累计像素级 delta omega*，用于 dataset/root 级 hist 汇总。
                         delta_vorticity_map = (
                             _omega_star_from_uv_np(predicted_np[local_idx, 0], predicted_np[local_idx, 1])
-                            - _omega_star_from_uv_np(flow_np[local_idx, 0], flow_np[local_idx, 1])
+                            - _omega_star_from_uv_np(flow_reference_np[local_idx, 0], flow_reference_np[local_idx, 1])
                         ).astype(np.float32, copy=False)
                         dataset_delta_u_values.append(delta_u_map.reshape(-1))
                         dataset_delta_v_values.append(delta_v_map.reshape(-1))
@@ -3439,6 +3650,7 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
                             twcf_payload if dataset_name == "twcf" else None,
                             image_payload=prediction,
                             plot_args=test_args,
+                            flow_reference_np=flow_reference_np,
                         )
 
                     logger.info(
@@ -3472,6 +3684,7 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
                     title=f"{dataset_name}-{data_type}-x{int(SCALE*SCALE)} Image Pair Mean Energy Spectrum",
                     file_prefix="image_pair",
                     save_npy=save_npy,
+                    global_data=global_data,
                 )
                 _save_mean_spectrum(
                     dataset_flow_pred_curves,
@@ -3480,6 +3693,7 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
                     title=f"{dataset_name}-{data_type}-x{int(SCALE*SCALE)} Flow Mean Energy Spectrum",
                     file_prefix="flow",
                     save_npy=save_npy,
+                    global_data=global_data,
                 )
                 _save_flow_histogram_bundle(
                     dataset_dir,
@@ -3487,6 +3701,7 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
                     dataset_delta_v_values,
                     dataset_delta_w_values,
                     dataset_epe_values,
+                    global_data=global_data,
                 )
                 save_particle_error_histogram_bundle(
                     dataset_dir,
@@ -3497,6 +3712,7 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
                     color="#4477AA",
                     save_npy_fn=_save_optional_npy,
                     save_npy=save_npy,
+                    global_data=global_data,
                 )
                 save_particle_error_histogram_bundle(
                     dataset_dir,
@@ -3505,16 +3721,19 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
                     title=f"{dataset_name}-{data_type}-x{int(SCALE*SCALE)} Particle Image Error Distribution",
                     save_npy_fn=_save_optional_npy,
                     save_npy=save_npy,
+                    global_data=global_data,
                 )
                 _save_energy_spectrum_mse_compare_plot(
                     dataset_image_rows,
                     dataset_dir / "image_pair_energy_spectrum_mse_compare.png",
                     title=f"{dataset_name}-{data_type}-x{int(SCALE*SCALE)} Image Pair Energy Spectrum MSE",
+                    global_data=global_data,
                 )
                 _save_energy_spectrum_mse_compare_plot(
                     dataset_raft_rows,
                     dataset_dir / "flow_energy_spectrum_mse_compare.png",
                     title=f"{dataset_name}-{data_type}-x{int(SCALE*SCALE)} Flow Energy Spectrum MSE",
+                    global_data=global_data,
                 )
 
                 # C-AEE 需要把 same sample 的 previous/next 图像 ESMSE/SSIM 与该 sample 的 RAFT EPE 配对；
@@ -3624,6 +3843,7 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
             title=f"{class_name}-{data_type}-x{int(SCALE*SCALE)} Image Pair Mean Energy Spectrum",
             file_prefix="image_pair",
             save_npy=save_npy,
+            global_data=global_data,
         )
         _save_mean_spectrum(
             all_flow_pred_curves,
@@ -3632,6 +3852,7 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
             title=f"{class_name}-{data_type}-x{int(SCALE*SCALE)} Flow Mean Energy Spectrum",
             file_prefix="flow",
             save_npy=save_npy,
+            global_data=global_data,
         )
         _save_flow_histogram_bundle(
             test_base_dir,
@@ -3639,6 +3860,7 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
             all_delta_v_values,
             all_delta_w_values,
             all_epe_values,
+            global_data=global_data,
         )
         save_particle_error_histogram_bundle(
             test_base_dir,
@@ -3649,6 +3871,7 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
             color="#4477AA",
             save_npy_fn=_save_optional_npy,
             save_npy=save_npy,
+            global_data=global_data,
         )
         save_particle_error_histogram_bundle(
             test_base_dir,
@@ -3657,16 +3880,19 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
             title=f"{class_name}-{data_type}-x{int(SCALE*SCALE)} All Dataset Particle Image Error Distribution",
             save_npy_fn=_save_optional_npy,
             save_npy=save_npy,
+            global_data=global_data,
         )
         _save_energy_spectrum_mse_compare_plot(
             all_class_image_pair_mean_rows,
             test_base_dir / "image_pair_energy_spectrum_mse_compare.png",
             title=f"{class_name}-{data_type}-x{int(SCALE*SCALE)} All Dataset Image Pair Energy Spectrum MSE",
+            global_data=global_data,
         )
         _save_energy_spectrum_mse_compare_plot(
             all_class_flow_mean_rows,
             test_base_dir / "flow_energy_spectrum_mse_compare.png",
             title=f"{class_name}-{data_type}-x{int(SCALE*SCALE)} All Dataset Flow Energy Spectrum MSE",
+            global_data=global_data,
         )
         _write_csv(test_base_dir / "ALL_CLASS_IMAGE_PAIR.CSV", all_class_image_pair_mean_rows)
         _write_csv(test_base_dir / "ALL_CLASS_flow.CSV", all_class_flow_mean_rows)
