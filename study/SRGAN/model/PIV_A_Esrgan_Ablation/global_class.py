@@ -381,17 +381,21 @@ class global_data:
         # 是否保存普通 NPY 数据文件。默认 False 用于减少 evaluate_all/test_all 的磁盘占用；
         # TBL 三位置 profile NPY、hist 直方图 NPY 以及误差 NPY 属于后处理必需文件，会在保存图像时绕过该开关继续保存。
         IS_SAVE_NPY = False
+        # 只重算 C-AEE 的快速开关。
+        # True 时 evaluate_all/test_all 不重新跑模型、不生成新图像/NPY，只读取已有 metrics CSV，
+        # 按当前公共 C-AEE 公式重算并覆盖 VAL_C_AEE / C_AEE / mean_c_aee，适合修改权重后快速更新历史结果。
+        IS_RECALCULATE_C_AEE_ONLY = False
         # evaluate_all 最佳样本保存模式。
         # False：保持原行为，是否保存全量验证图像/NPY 仍由 IS_SAVE_VALIDATE_IMAGES 和 IS_SAVE_NPY 控制。
         # True：指标仍计算全部样本，最终每个类别只保留 VAL_AEE/VAL_C_AEE/ESMSE 最优样本的完整 PNG、SVG 和 NPY；
         #       因为最终只留一个样本目录，所以该模式会临时强制保存图像和 NPY，不受 IS_SAVE_NPY 限制。
-        EVALUATE_ALL_SAVE_BEST_ONLY = False
+        EVALUATE_ALL_SAVE_BEST_ONLY = True
         # 光流误差图色条的半幅范围；实际显示范围为 [-FLOW_ERROR_COLORBAR_LIMIT, FLOW_ERROR_COLORBAR_LIMIT]。
         # 这里只影响 evaluate_all/test_all 生成的 error PNG 色条，不改变 delta_*.npy、EPE、AEE 等原始指标计算。
-        FLOW_ERROR_COLORBAR_LIMIT = 0.5
+        FLOW_ERROR_COLORBAR_LIMIT = 4.0
         # 颗粒图像误差图色条的半幅范围；实际显示范围为 [-PARTICLE_ERROR_COLORBAR_LIMIT, PARTICLE_ERROR_COLORBAR_LIMIT]。
         # 当前颗粒图像在可视化链路中使用 [0, 1] 范围，因此默认 1.0 对应完整理论误差范围。
-        PARTICLE_ERROR_COLORBAR_LIMIT = 1.0
+        PARTICLE_ERROR_COLORBAR_LIMIT = 2.0
         # energy_spectrum_mse 对比图的固定坐标轴配置，evaluate_all 与 test_all 共用。
         # *_MIN 固定坐标起点；*_MAX=None 表示上限按当前图数据自动补齐，若需要完全固定范围可改成数值。
         ENERGY_SPECTRUM_MSE_X_MIN = 0.0
@@ -404,18 +408,31 @@ class global_data:
         # 能量谱曲线图 energy_spectrum_compare.png / energy_spectrum_mean_compare.png 的独立坐标轴配置。
         # 注意它是 log-log 曲线，和上面的 energy_spectrum_mse 指标折线图不是同一种坐标口径。
         ENERGY_SPECTRUM_X_MIN = 1.0
-        ENERGY_SPECTRUM_X_MAX = None
-        ENERGY_SPECTRUM_Y_MIN = 1e-12
-        ENERGY_SPECTRUM_Y_MAX = None
+        ENERGY_SPECTRUM_X_MAX = 200
+        ENERGY_SPECTRUM_Y_MIN = -100
+        ENERGY_SPECTRUM_Y_MAX = 1e9
         ENERGY_SPECTRUM_X_TICK_INTERVAL = None
         ENERGY_SPECTRUM_Y_TICK_INTERVAL = None
         # 光流 Δu/Δv/Δw 误差直方图坐标轴配置；EPE 直方图单独使用 EPE_HIST_*。
-        FLOW_ERROR_HIST_X_MIN = -0.5
-        FLOW_ERROR_HIST_X_MAX = 0.5
+        FLOW_ERROR_HIST_X_MIN = -1.2
+        FLOW_ERROR_HIST_X_MAX = 1.2
         FLOW_ERROR_HIST_Y_MIN = 0.0
-        FLOW_ERROR_HIST_Y_MAX = None
-        FLOW_ERROR_HIST_X_TICK_INTERVAL = 0.1
-        FLOW_ERROR_HIST_Y_TICK_INTERVAL = None
+        FLOW_ERROR_HIST_Y_MAX = 2000
+        FLOW_ERROR_HIST_X_TICK_INTERVAL = 0.4
+        FLOW_ERROR_HIST_Y_TICK_INTERVAL = 400
+        # TBL 与 TWCF 分别使用两套坐标轴配置，便于按大图数据集各自的误差分布单独调整。
+        FLOW_ERROR_HIST_TBL_X_MIN = -15
+        FLOW_ERROR_HIST_TBL_X_MAX = 15
+        FLOW_ERROR_HIST_TBL_Y_MIN = 0.0
+        FLOW_ERROR_HIST_TBL_Y_MAX = 180000
+        FLOW_ERROR_HIST_TBL_X_TICK_INTERVAL = 5
+        FLOW_ERROR_HIST_TBL_Y_TICK_INTERVAL = 20000
+        FLOW_ERROR_HIST_TWCF_X_MIN = -15
+        FLOW_ERROR_HIST_TWCF_X_MAX = 15
+        FLOW_ERROR_HIST_TWCF_Y_MIN = 0.0
+        FLOW_ERROR_HIST_TWCF_Y_MAX = None
+        FLOW_ERROR_HIST_TWCF_X_TICK_INTERVAL = 5
+        FLOW_ERROR_HIST_TWCF_Y_TICK_INTERVAL = None
         # EPE 直方图是非负量，独立于 Δu/Δv/Δw 的正负误差直方图。
         EPE_HIST_X_MIN = 0.0
         EPE_HIST_X_MAX = None
@@ -423,26 +440,74 @@ class global_data:
         EPE_HIST_Y_MAX = None
         EPE_HIST_X_TICK_INTERVAL = None
         EPE_HIST_Y_TICK_INTERVAL = None
+        # TBL 与 TWCF 的 EPE 直方图分别配置；默认上限仍自动适配该类别数据。
+        EPE_HIST_TBL_X_MIN = 0.0
+        EPE_HIST_TBL_X_MAX = None
+        EPE_HIST_TBL_Y_MIN = 0.0
+        EPE_HIST_TBL_Y_MAX = None
+        EPE_HIST_TBL_X_TICK_INTERVAL = None
+        EPE_HIST_TBL_Y_TICK_INTERVAL = None
+        EPE_HIST_TWCF_X_MIN = 0.0
+        EPE_HIST_TWCF_X_MAX = None
+        EPE_HIST_TWCF_Y_MIN = 0.0
+        EPE_HIST_TWCF_Y_MAX = None
+        EPE_HIST_TWCF_X_TICK_INTERVAL = None
+        EPE_HIST_TWCF_Y_TICK_INTERVAL = None
         # 颗粒图像 SR-HR 误差直方图坐标轴配置。
-        PARTICLE_ERROR_HIST_X_MIN = -1.0
-        PARTICLE_ERROR_HIST_X_MAX = 1.0
+        PARTICLE_ERROR_HIST_X_MIN = -1
+        PARTICLE_ERROR_HIST_X_MAX = 1
         PARTICLE_ERROR_HIST_Y_MIN = 0.0
-        PARTICLE_ERROR_HIST_Y_MAX = None
-        PARTICLE_ERROR_HIST_X_TICK_INTERVAL = 0.2
-        PARTICLE_ERROR_HIST_Y_TICK_INTERVAL = None
+        PARTICLE_ERROR_HIST_Y_MAX = 9500
+        PARTICLE_ERROR_HIST_X_TICK_INTERVAL = 0.5
+        PARTICLE_ERROR_HIST_Y_TICK_INTERVAL = 1900
+        # TBL 与 TWCF 的颗粒图像误差直方图分别配置；默认仍按归一化灰度误差 [-1, 1]。
+        PARTICLE_ERROR_HIST_TBL_X_MIN = -1.0
+        PARTICLE_ERROR_HIST_TBL_X_MAX = 1.0
+        PARTICLE_ERROR_HIST_TBL_Y_MIN = 0.0
+        PARTICLE_ERROR_HIST_TBL_Y_MAX = 8500
+        PARTICLE_ERROR_HIST_TBL_X_TICK_INTERVAL = 0.5
+        PARTICLE_ERROR_HIST_TBL_Y_TICK_INTERVAL = 500
+        PARTICLE_ERROR_HIST_TWCF_X_MIN = -1.2
+        PARTICLE_ERROR_HIST_TWCF_X_MAX = 1.2
+        PARTICLE_ERROR_HIST_TWCF_Y_MIN = 0.0
+        PARTICLE_ERROR_HIST_TWCF_Y_MAX = 250000
+        PARTICLE_ERROR_HIST_TWCF_X_TICK_INTERVAL = 0.4
+        PARTICLE_ERROR_HIST_TWCF_Y_TICK_INTERVAL = 12500
+        # 颗粒二值统计图中的 HR 灰度直方图坐标轴。
+        # 阈值 T 只由 HR 原图直方图确定；当前 evaluate_all/test_all 颗粒图按 [0, 1] 灰度保存。
+        # 如果后续改成 0..255 原始灰度，只需要把 PARTICLE_BINARY_HIST_X_MAX 改为 255。
+        PARTICLE_BINARY_HIST_X_MIN = 0.0
+        PARTICLE_BINARY_HIST_X_MAX = 1.0
+        PARTICLE_BINARY_HIST_Y_MIN = 0.0
+        PARTICLE_BINARY_HIST_Y_MAX = None
+        PARTICLE_BINARY_HIST_X_TICK_INTERVAL = 0.2
+        PARTICLE_BINARY_HIST_Y_TICK_INTERVAL = None
         # 涡度误差直方图坐标轴配置，和颗粒误差 hist 分开，避免不同物理量共用范围。
-        VORTICITY_ERROR_HIST_X_MIN = -1.0
-        VORTICITY_ERROR_HIST_X_MAX = 1.0
+        VORTICITY_ERROR_HIST_X_MIN = -1.2
+        VORTICITY_ERROR_HIST_X_MAX = 1.2
         VORTICITY_ERROR_HIST_Y_MIN = 0.0
-        VORTICITY_ERROR_HIST_Y_MAX = None
-        VORTICITY_ERROR_HIST_X_TICK_INTERVAL = 0.2
-        VORTICITY_ERROR_HIST_Y_TICK_INTERVAL = None
+        VORTICITY_ERROR_HIST_Y_MAX = 2000
+        VORTICITY_ERROR_HIST_X_TICK_INTERVAL = 0.4
+        VORTICITY_ERROR_HIST_Y_TICK_INTERVAL = 400
+        # TBL 与 TWCF 的涡度误差直方图分别配置，避免两个大图数据集互相牵制坐标范围。
+        VORTICITY_ERROR_HIST_TBL_X_MIN = -15
+        VORTICITY_ERROR_HIST_TBL_X_MAX = 15
+        VORTICITY_ERROR_HIST_TBL_Y_MIN = 0.0
+        VORTICITY_ERROR_HIST_TBL_Y_MAX = 180000
+        VORTICITY_ERROR_HIST_TBL_X_TICK_INTERVAL = 5
+        VORTICITY_ERROR_HIST_TBL_Y_TICK_INTERVAL = 20000
+        VORTICITY_ERROR_HIST_TWCF_X_MIN = -15
+        VORTICITY_ERROR_HIST_TWCF_X_MAX = 15
+        VORTICITY_ERROR_HIST_TWCF_Y_MIN = 0.0
+        VORTICITY_ERROR_HIST_TWCF_Y_MAX = None
+        VORTICITY_ERROR_HIST_TWCF_X_TICK_INTERVAL = 5
+        VORTICITY_ERROR_HIST_TWCF_Y_TICK_INTERVAL = None
         # TBL profile_analysis 剖面图坐标轴配置；X_MAX=None 时沿用当前样本 U/V 共同范围，填数值即可完全固定。
-        TBL_PROFILE_X_MIN = None
-        TBL_PROFILE_X_MAX = None
+        TBL_PROFILE_X_MIN = 0
+        TBL_PROFILE_X_MAX = 9
         TBL_PROFILE_Y_MIN = 0.0
         TBL_PROFILE_Y_MAX = 200.0
-        TBL_PROFILE_X_TICK_INTERVAL = None
+        TBL_PROFILE_X_TICK_INTERVAL = 2
         TBL_PROFILE_Y_TICK_INTERVAL = 25.0
         # evaluate_all / test_all 写平均评价指标时启用 IQR 异常值剔除；逐样本原始 CSV 行不改。
         METRIC_OUTLIER_FILTER_ENABLED = False
@@ -547,7 +612,7 @@ class global_data:
 
         BASE_VALIDATE_LABEL = ['VAL_MSE_LOSS', 'VAL_SSIM_Loss', 'Avg_PSNR', "VAL_energy_spectrum_mse"]
         # 新增 VAL_C_AEE：
-        # C-AEE = 0.3 * ESMSE_norm + 0.3 * EPE_norm + 0.2 * (1-SSIM)_norm。
+        # C-AEE = 0.4 * ESMSE_norm + 0.4 * EPE_norm + 0.2 * (1-SSIM)_norm。
         # 三项先按固定参考尺度放缩为无量纲量，再加权求和，避免不同量纲直接相加。
         # 这里只负责定义训练曲线 / CSV 的列名，真正的数值计算在 evaluate.py 中完成。
         RAFT_VALIDATE_LABEL = ["VAL_AEE", "VAL_NORM_AEE_PER100PIXEL", "VAL_C_AEE"]

@@ -16,11 +16,13 @@ import torch.nn.functional as F
 from loguru import logger
 from tqdm import tqdm
 
-from study.SRGAN.model.c_aee_metric_common import attach_c_aee_to_raft_rows
+from study.SRGAN.model.c_aee_metric_common import attach_c_aee_to_raft_rows, recalculate_c_aee_for_metric_outputs
 from study.SRGAN.model.evaluate_image_compare_common import (
     apply_energy_spectrum_mse_axis_config,
     apply_plot_axis_config,
+    select_error_hist_axis_prefix,
     save_energy_spectrum_curve_plot,
+    save_particle_binary_stats_artifacts,
     save_particle_error_histogram,
     save_particle_error_histogram_bundle,
 )
@@ -725,12 +727,13 @@ def _prepare_flow_component_for_display(field_2d, dataset_name=None, mask_2d=Non
     return _finite_display_field(field, fill_value=fill_value)
 
 
-def _prepare_uvw_display_stacks(pred_uvw, gt_uvw, dataset_name=None, mask_2d=None, tbl_y_limit=None):
+def _prepare_uvw_display_stacks(pred_uvw, gt_uvw, dataset_name=None, mask_2d=None, tbl_y_limit=None, global_data=None):
     """
     为 U/V/S compare 和涡度速度图准备绘图副本。
 
     raw pred_uvw / gt_uvw 仍完整保存；这里额外生成 display_pred/display_gt/display_delta，
     让 TBL 顶部填充区和 TWCF 底部波浪区在所有 test_all flow 图中保持同一套视觉口径。
+    global_data 目前预留给后续按全局变量控制显示修复策略，先接收该参数以保持调用链一致。
     """
     display_pred = []
     display_gt = []
@@ -907,6 +910,7 @@ def _save_vorticity_velocity_artifacts(
         save_npy_fn=_save_optional_npy,
         save_npy=save_npy,
         global_data=global_data,
+        category_name=dataset_name,
     )
 
     # 绘图副本复用 U/V/S compare 的 dataset 专用处理，避免 TBL 顶部 0 填充区再次形成黑色条带。
@@ -1007,12 +1011,14 @@ def _save_flow_visual_artifacts(
     mask_2d=None,
     tbl_y_limit=None,
     flow_error_colorbar_limit=0.5,
+    global_data=None,
 ):
     """
     汇总保存 test_all 的光流样本级图和 NPY。
 
     该函数只负责新增的 evaluate_all 同款样本文件，不改动原有
     `{dataset_name}_sample_XXXX.png` 总览图，避免影响现有脚本读取路径。
+    global_data 用于继续向误差直方图、涡度图等下游绘图函数传递全局坐标轴配置。
     """
     pred_uvw, gt_uvw, delta_uvw = _save_uvw_compare_artifacts(
         sample_dir,
@@ -1024,10 +1030,17 @@ def _save_flow_visual_artifacts(
         mask_2d=mask_2d,
         tbl_y_limit=tbl_y_limit,
         flow_error_colorbar_limit=flow_error_colorbar_limit,
+        global_data=global_data,
     )
     # 补齐 evaluate_all 的样本级误差直方图文件：每个 sample 都输出 Δu/Δv/Δw 的 png 和 npy。
     # 这些属于误差分析结果，和 delta_u.npy 一样始终保存，方便后续直接画统计图。
-    _save_sample_flow_error_histograms(sample_dir, delta_uvw, save_npy=save_npy, global_data=global_data)
+    _save_sample_flow_error_histograms(
+        sample_dir,
+        delta_uvw,
+        save_npy=save_npy,
+        global_data=global_data,
+        category_name=dataset_name,
+    )
     _save_vorticity_velocity_artifacts(
         sample_dir,
         pred_uvw,
@@ -1038,6 +1051,7 @@ def _save_flow_visual_artifacts(
         dataset_name=dataset_name,
         mask_2d=mask_2d,
         tbl_y_limit=tbl_y_limit,
+        global_data=global_data,
     )
 
 
@@ -1076,7 +1090,17 @@ def _epe_histogram_matrix(values, bins=201):
     return _histogram_matrix(finite_values, edges)
 
 
-def _save_histogram_plot(hist_matrix, out_png, title, xlabel, color="#4C9F70", *, global_data=None, axis_prefix="FLOW_ERROR_HIST"):
+def _save_histogram_plot(
+    hist_matrix,
+    out_png,
+    title,
+    xlabel,
+    color="#4C9F70",
+    *,
+    global_data=None,
+    axis_prefix="FLOW_ERROR_HIST",
+    category_name=None,
+):
     """
     将两列直方图矩阵额外画成 png。
 
@@ -1103,12 +1127,14 @@ def _save_histogram_plot(hist_matrix, out_png, title, xlabel, color="#4C9F70", *
     ax.set_title(title)
     ax.set_xlabel(xlabel)
     ax.set_ylabel("Count")
-    # test_all 的每类误差直方图都有独立坐标轴前缀：
-    # FLOW_ERROR_HIST_* 控制 Δu/Δv/Δw，EPE_HIST_* 控制 EPE，避免不同物理量共用坐标范围。
+    # test_all 的误差直方图按类别自动切换三套坐标轴配置：
+    # 普通类别使用 FLOW_ERROR_HIST_* / EPE_HIST_*，
+    # TBL 使用 FLOW_ERROR_HIST_TBL_* / EPE_HIST_TBL_*，
+    # TWCF 使用 FLOW_ERROR_HIST_TWCF_* / EPE_HIST_TWCF_*。
     apply_plot_axis_config(
         ax,
         global_data,
-        axis_prefix,
+        select_error_hist_axis_prefix(axis_prefix, category_name),
         x_values=centers,
         y_values=counts,
         default_x_min=float(np.min(centers)) if centers.size else 0.0,
@@ -1121,7 +1147,7 @@ def _save_histogram_plot(hist_matrix, out_png, title, xlabel, color="#4C9F70", *
     plt.close(fig)
 
 
-def _save_sample_flow_error_histograms(sample_dir, delta_uvw, save_npy=True, *, global_data=None):
+def _save_sample_flow_error_histograms(sample_dir, delta_uvw, save_npy=True, *, global_data=None, category_name=None):
     """
     保存单个 sample 的 U/V/W 误差直方图。
 
@@ -1148,10 +1174,20 @@ def _save_sample_flow_error_histograms(sample_dir, delta_uvw, save_npy=True, *, 
             color=color,
             global_data=global_data,
             axis_prefix="FLOW_ERROR_HIST",
+            category_name=category_name,
         )
 
 
-def _save_flow_histogram_bundle(out_dir, delta_u_values, delta_v_values, delta_w_values, epe_values, *, global_data=None):
+def _save_flow_histogram_bundle(
+    out_dir,
+    delta_u_values,
+    delta_v_values,
+    delta_w_values,
+    epe_values,
+    *,
+    global_data=None,
+    category_name=None,
+):
     """
     保存 evaluate_all 同款的 Δu/Δv/Δw/EPE 汇总直方图 npy，并额外输出 png 快速预览。
 
@@ -1180,6 +1216,7 @@ def _save_flow_histogram_bundle(out_dir, delta_u_values, delta_v_values, delta_w
             color=color,
             global_data=global_data,
             axis_prefix=axis_prefix,
+            category_name=category_name,
         )
 
 
@@ -3105,6 +3142,7 @@ def _save_image_outputs(dataset_name, dataset_dir, image_payload, start_index, p
             save_npy_fn=_save_optional_npy,
             save_npy=save_npy,
             global_data=global_axis_data,
+            category_name=dataset_name,
         )
         save_particle_error_histogram(
             sample_dir,
@@ -3113,6 +3151,26 @@ def _save_image_outputs(dataset_name, dataset_dir, image_payload, start_index, p
             title="Next Particle Image Error Distribution",
             save_npy_fn=_save_optional_npy,
             save_npy=save_npy,
+            global_data=global_axis_data,
+            category_name=dataset_name,
+        )
+        # test_all 的颗粒级二值统计：阈值 T 只由 HR 原图直方图确定，
+        # previous/next 的 HR 与 SR 再共用各自的 T 二值化，统计颗粒数量、密度、面积和二值重叠质量。
+        # 这些统计结果是最终测试产物，不属于可关闭的普通中间 NPY，因此不走 IS_SAVE_NPY。
+        save_particle_binary_stats_artifacts(
+            sample_dir,
+            sample_images["pred_prev"],
+            sample_images["prev_hr"],
+            file_prefix="prev_particle_binary_stats",
+            title=f"{dataset_name} sample {sample_index:04d} previous Particle Binary Statistics",
+            global_data=global_axis_data,
+        )
+        save_particle_binary_stats_artifacts(
+            sample_dir,
+            sample_images["pred_next"],
+            sample_images["next_hr"],
+            file_prefix="next_particle_binary_stats",
+            title=f"{dataset_name} sample {sample_index:04d} next Particle Binary Statistics",
             global_data=global_axis_data,
         )
         _save_gray_image(sample_dir / "prev_lr.png", sample_images["prev_lr"])
@@ -3163,6 +3221,7 @@ def _save_image_outputs(dataset_name, dataset_dir, image_payload, start_index, p
                 save_npy_fn=_save_optional_npy,
                 save_npy=save_npy,
                 global_data=global_axis_data,
+                category_name=dataset_name,
             )
             save_particle_error_histogram(
                 sample_dir,
@@ -3171,6 +3230,25 @@ def _save_image_outputs(dataset_name, dataset_dir, image_payload, start_index, p
                 title="Next TBL Crop Particle Image Error Distribution",
                 save_npy_fn=_save_optional_npy,
                 save_npy=save_npy,
+                global_data=global_axis_data,
+                category_name=dataset_name,
+            )
+            # TBL comparison.png 展示的是红框 crop，为了让统计图和可视化局部完全对应，
+            # 这里在 full-frame 统计之外，再额外保存 crop 区域的统一阈值二值颗粒统计。
+            save_particle_binary_stats_artifacts(
+                sample_dir,
+                _crop_2d_by_bounds(sample_images["pred_prev"], prev_crop_bounds_hr),
+                _crop_2d_by_bounds(sample_images["prev_hr"], prev_crop_bounds_hr),
+                file_prefix="prev_particle_binary_stats_crop",
+                title=f"{dataset_name} sample {sample_index:04d} previous crop Particle Binary Statistics",
+                global_data=global_axis_data,
+            )
+            save_particle_binary_stats_artifacts(
+                sample_dir,
+                _crop_2d_by_bounds(sample_images["pred_next"], next_crop_bounds_hr),
+                _crop_2d_by_bounds(sample_images["next_hr"], next_crop_bounds_hr),
+                file_prefix="next_particle_binary_stats_crop",
+                title=f"{dataset_name} sample {sample_index:04d} next crop Particle Binary Statistics",
                 global_data=global_axis_data,
             )
             _plot_tbl_image_comparison(
@@ -3211,6 +3289,9 @@ def _save_sample_plots(
         - tbl_profile_sample_crop_width
     """
     plot_args = plot_args or {}
+    # test_all 的坐标轴、色条、hist 等可视化固定范围都统一从 global_data.esrgan 读取；
+    # 这里把 run_test_all 传进 plot_args 的 global_data 缓存成局部变量，供下游绘图函数复用。
+    global_axis_data = plot_args.get("global_data", None)
     displacement_cmap = str(plot_args.get("displacement_cmap", "viridis"))
     regular_flow_cmap = str(plot_args.get("regular_flow_cmap", "jet"))
     method_label = str(plot_args.get("method_label", "Current method"))
@@ -3372,6 +3453,20 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
     test_base_dir = Path(
         f"{global_data.esrgan.OUT_PUT_DIR}/{class_name}/{data_type}/scale_{int(SCALE * SCALE)}/{global_data.esrgan.TEST_DIR}"
     )
+
+    if bool(getattr(global_data.esrgan, "IS_RECALCULATE_C_AEE_ONLY", False)):
+        # 只重算 C-AEE 的快速模式：
+        # 1. 不加载/遍历 TFRecord，不做模型前向；
+        # 2. 只读取 test_all 旧 CSV 中已经保存的 ESMSE、EPE、SSIM；
+        # 3. 按当前公共 C-AEE 公式覆盖 C_AEE / mean_c_aee，便于调权重后快速修正历史结果。
+        summary = recalculate_c_aee_for_metric_outputs(
+            output_root=test_base_dir,
+            metrics_csv_path=test_base_dir / "metrics.csv",
+            logger=logger,
+        )
+        logger.info(f"[test_all] IS_RECALCULATE_C_AEE_ONLY=True，仅重算并覆盖已有 CSV 的 C-AEE：{summary}")
+        return summary
+
     test_base_dir.mkdir(parents=True, exist_ok=True)
     save_npy = bool(getattr(global_data.esrgan, "IS_SAVE_NPY", False))
     logger.info(
@@ -3702,6 +3797,7 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
                     dataset_delta_w_values,
                     dataset_epe_values,
                     global_data=global_data,
+                    category_name=dataset_name,
                 )
                 save_particle_error_histogram_bundle(
                     dataset_dir,
@@ -3713,6 +3809,7 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
                     save_npy_fn=_save_optional_npy,
                     save_npy=save_npy,
                     global_data=global_data,
+                    category_name=dataset_name,
                 )
                 save_particle_error_histogram_bundle(
                     dataset_dir,
@@ -3722,6 +3819,7 @@ def run_test_all(model, global_data, class_name, data_type, SCALE, device=None):
                     save_npy_fn=_save_optional_npy,
                     save_npy=save_npy,
                     global_data=global_data,
+                    category_name=dataset_name,
                 )
                 _save_energy_spectrum_mse_compare_plot(
                     dataset_image_rows,
