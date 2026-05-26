@@ -70,7 +70,7 @@ class global_data:
         # 训练任务标识
         # =========================
         name = "ESRuRAFT_PIV_Ground"  # 当前实验名（用于输出目录/模型名/wandb run名）
-        DESCRIPTION = "v_bicubic_widim"  # 实验补充描述（可写损失配置、数据版本等）
+        DESCRIPTION = "v_bicubic_searaft"  # 实验补充描述（可写损失配置、数据版本等）
         name +=DESCRIPTION
 
         #整体项目注释
@@ -87,6 +87,11 @@ class global_data:
         # 6. "bicubic_widim": LR 经 bicubic 上采样后，进入传统 WIDIM/窗口互相关 PIV baseline。
         # 7. "bicubic_hs": LR 经 bicubic 上采样后，进入传统 Horn-Schunck 光流 baseline。
         # 8. "srgan_raft": 使用传统 SRGAN 生成器把 LR 超分到 HR，再把 SR 图像送入 RAFT。
+        # 9. "swinir_raft": 使用最小 SwinIR 风格 Transformer 超分生成器把 LR 超分到 HR，再送入 RAFT。
+        #    这个模式用于补充“现代 Transformer SR + RAFT”对比；默认只用图像重建损失训练 Generator，
+        #    不启用判别器，也不把 RAFT EPE 反传给 Generator，避免它变成新的任务定制方法。
+        # 10. "bicubic_searaft": LR 经 bicubic 上采样到 HR 后，送入轻量 SEA-RAFT 风格估计器。
+        #     该模式用于补充“更现代/更强光流估计器”对比，图像来源仍是固定 bicubic。
         TRAIN_MODES = (
             "lr_ground_raft",
             "hr_ground_raft",
@@ -96,6 +101,9 @@ class global_data:
             "bicubic_widim",
             "bicubic_hs",
             "srgan_raft",
+            "swinir_raft",
+            ""
+            "",
         )
         # 兼容旧实验配置：外部仍写旧名字时会被 normalized_train_mode 映射成新名字。
         TRAIN_MODE_ALIASES = {
@@ -106,16 +114,22 @@ class global_data:
             "esrgan": "esrgan_raft",
             "bicubic_WIDIM": "bicubic_widim",
             "bicubic_HS": "bicubic_hs",
+            "swinir": "swinir_raft",
+            "SwinIR_raft": "swinir_raft",
+            "searaft": "bicubic_searaft",
+            "bicubic_SEA_RAFT": "bicubic_searaft",
         }
-        TRAIN_MODE = "bicubic_widim"
+        TRAIN_MODE = "bicubic_searaft"
         # SR+RAFT 联合训练模式的特殊损失策略：
         # - esrgan_raft / srgan_raft 仍然训练 Generator、Discriminator 和 RAFT；
-        # - 这两个模式重新启用“对抗损失”的动态权重，但仍关闭 flow-warp / Generator EPE 等扩展项；
+        # - swinir_raft 只训练 SwinIR 风格 Generator 和 RAFT，不训练判别器；
+        # - esrgan_raft / srgan_raft 重新启用“对抗损失”的动态权重；
+        # - 三个 SR+RAFT baseline 都关闭 flow-warp / Generator EPE 等扩展项；
         # - Generator 不再叠加 RAFT EPE 反向约束，避免光流误差直接拉动超分图像生成方向。
         # 保留为 tuple 而不是写死在训练循环里，后续如果要加入新的 SR+RAFT 模式，只需要在这里扩展。
-        SR_RAFT_FIXED_LOSS_WEIGHT_MODES = ("esrgan_raft", "srgan_raft")
+        SR_RAFT_FIXED_LOSS_WEIGHT_MODES = ("esrgan_raft", "srgan_raft", "swinir_raft")
         SR_RAFT_DYNAMIC_ADVERSARIAL_MODES = ("esrgan_raft", "srgan_raft")
-        SR_RAFT_DISABLE_GENERATOR_EPE_MODES = ("esrgan_raft", "srgan_raft")
+        SR_RAFT_DISABLE_GENERATOR_EPE_MODES = ("esrgan_raft", "srgan_raft", "swinir_raft")
 
         # 类别训练模式:
         # - "all":    每个类别单独训练一次；
@@ -360,7 +374,7 @@ class global_data:
         # - class_2: 改为读取 RAFT-PIV TFRecord，LR 不再从 LR_DATA_ROOT_DIR 读取，而是在 data_load.py
         #   中按 test_all 同款下采样逻辑动态生成。
         DATA_SETS = ("class_1", "class_2")
-        DATA_SET = "class_2"
+        DATA_SET = "class_1"
         CLASS2_PSEUDO_CLASS_NAME = "problem_class2_raft_piv"
 
         CLASS1_GR_DATA_ROOT_DIR = rf"{AUTODL_DATA_PATH}/study_datas/sr_dataset/class_1/data"
@@ -389,7 +403,7 @@ class global_data:
         # =========================
         # RAFT256-PIV 风格 TFRecord 测试配置
         # =========================
-        IS_training = False  # 是否执行训练循环；False 时跳过训练，模型构建和后续 evaluate_all/test_all 仍按原流程执行。
+        IS_training = True  # 是否执行训练循环；False 时跳过训练，模型构建和后续 evaluate_all/test_all 仍按原流程执行。
         # 是否执行 evaluate_all 完整验证。
         # 这里恢复为纯手动总开关：无论 DATA_SET 是 class_1 还是 class_2，都由该超参数决定是否执行。
         IS_VALIDATE_ALL =True
@@ -400,7 +414,7 @@ class global_data:
         # 只重算 C-AEE 的快速开关。
         # True 时 evaluate_all/test_all 不重新跑模型、不生成新图像/NPY，只读取已有 metrics CSV，
         # 按当前公共 C-AEE 公式重算并覆盖 VAL_C_AEE / C_AEE / mean_c_aee，适合修改权重后快速更新历史结果。
-        IS_RECALCULATE_C_AEE_ONLY = True
+        IS_RECALCULATE_C_AEE_ONLY = False
         # evaluate_all 最佳样本保存模式。
         # False：保持原行为，是否保存全量验证图像/NPY 仍由 IS_SAVE_VALIDATE_IMAGES 和 IS_SAVE_NPY 控制。
         # True：指标仍计算全部样本，最终每个类别只保留 VAL_AEE/VAL_C_AEE/ESMSE 最优样本的完整 PNG、SVG 和 NPY；
@@ -955,10 +969,10 @@ class global_data:
             """
             当前模式是否需要训练/调用超分辨率生成器。
 
-            只有 esrgan_raft / srgan_raft 需要训练或调用可学习超分辨率生成器；
+            esrgan_raft / srgan_raft / swinir_raft 需要训练或调用可学习超分辨率生成器；
             其他模式都是固定图像来源或传统 PIV/光流 baseline。
             """
-            return cls.validate_train_mode() in {"esrgan_raft", "srgan_raft"}
+            return cls.validate_train_mode() in {"esrgan_raft", "srgan_raft", "swinir_raft"}
 
         @classmethod
         def use_fixed_initial_loss_weights_for_current_mode(cls) -> bool:

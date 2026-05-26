@@ -203,15 +203,22 @@ def _build_piv_raft(batch_size: int) -> nn.Module:
     """
     raft_model_type = global_data.esrgan.validate_raft_model_type()
     if raft_model_type == "raft":
-        return RAFT()
-    if raft_model_type == "raft128":
+        model = RAFT()
+    elif raft_model_type == "raft128":
         model = RAFT128(upsample=global_data.esrgan.RAFT_UPSAMPLE, batch_size=batch_size)
         _init_raft128_from_raft256_if_enabled(model)
-        return model
-    if raft_model_type == "raft256":
-        return RAFT256(upsample=global_data.esrgan.RAFT_UPSAMPLE, batch_size=batch_size)
-    # validate_raft_model_type 已经拦截非法值；这里保留防御式分支，便于未来扩展时定位问题。
-    raise ValueError(f"Unsupported RAFT_MODEL_TYPE: {global_data.esrgan.RAFT_MODEL_TYPE}")
+    elif raft_model_type == "raft256":
+        model = RAFT256(upsample=global_data.esrgan.RAFT_UPSAMPLE, batch_size=batch_size)
+    else:
+        # validate_raft_model_type 已经拦截非法值；这里保留防御式分支，便于未来扩展时定位问题。
+        raise ValueError(f"Unsupported RAFT_MODEL_TYPE: {global_data.esrgan.RAFT_MODEL_TYPE}")
+
+    if global_data.esrgan.validate_train_mode() == "bicubic_searaft":
+        # bicubic_searaft 的图像来源仍然是 bicubic，上游 _compute_sr_branch 会负责插值到 HR。
+        # 这里仅把原来的 RAFT 主干包进一个轻量 SEA-RAFT 风格前端，用于对比“更强光流估计器”
+        # 是否能在不改变 SR 图像来源的情况下缩小与本文方法的差距。
+        return SEARAFTLite(model)
+    return model
 
 
 def _resolve_generator_pixel_shuffle_scale(sr_scale=None) -> int:
@@ -241,6 +248,187 @@ def _resolve_generator_pixel_shuffle_scale(sr_scale=None) -> int:
     return scale_int
 
 
+class SwinIRLiteBlock(nn.Module):
+    """
+    最小 SwinIR 风格窗口 Transformer block。
+
+    这里不是完整官方 SwinIR 复现，而是为了新增 `swinir_raft` 对比实验所需的“基础可训练模型”：
+    - 使用非重叠窗口内的 Multi-Head Self-Attention，保留 SwinIR 的局部窗口注意力思想；
+    - 使用 LayerNorm + MLP 的 Transformer 基本结构；
+    - 不实现 shifted window、相对位置偏置和复杂重建头，避免为对比实验引入大量调参变量。
+
+    这样得到的 baseline 足够表达“Transformer SR + RAFT”这一类方法，同时代码量和训练成本较低。
+    """
+
+    def __init__(self, channels: int, num_heads: int = 4, window_size: int = 8, mlp_ratio: float = 2.0):
+        super().__init__()
+        self.channels = int(channels)
+        self.window_size = int(window_size)
+        hidden_channels = int(round(self.channels * float(mlp_ratio)))
+        self.norm1 = nn.LayerNorm(self.channels)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=self.channels,
+            num_heads=int(num_heads),
+            batch_first=True,
+        )
+        self.norm2 = nn.LayerNorm(self.channels)
+        self.mlp = nn.Sequential(
+            nn.Linear(self.channels, hidden_channels),
+            nn.GELU(),
+            nn.Linear(hidden_channels, self.channels),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        对 [B, C, H, W] 特征图做窗口注意力。
+
+        实现细节：
+        1. 先把 H/W pad 到 window_size 的整数倍，保证任意输入尺寸都能整齐切窗口；
+        2. 每个窗口展平成 token 序列，做标准 MultiheadAttention；
+        3. 再把窗口还原回图像网格，并裁掉 padding；
+        4. 使用 residual 形式返回，避免最小模型训练初期破坏 bicubic/卷积已有的低频结构。
+        """
+        if x.dim() != 4:
+            raise ValueError(f"SwinIRLiteBlock expects [B, C, H, W], got shape={tuple(x.shape)}")
+
+        residual = x
+        batch, channels, height, width = x.shape
+        if channels != self.channels:
+            raise ValueError(f"SwinIRLiteBlock channel mismatch: expected={self.channels}, got={channels}")
+
+        window = max(self.window_size, 1)
+        pad_h = (window - height % window) % window
+        pad_w = (window - width % window) % window
+        if pad_h or pad_w:
+            # replicate padding 不会在边界引入全黑像素，适合颗粒图这种边界亮点敏感的输入。
+            x = F.pad(x, (0, pad_w, 0, pad_h), mode="replicate")
+
+        padded_h, padded_w = x.shape[-2:]
+        x_windows = (
+            x.permute(0, 2, 3, 1)
+            .reshape(batch, padded_h // window, window, padded_w // window, window, channels)
+            .permute(0, 1, 3, 2, 4, 5)
+            .reshape(-1, window * window, channels)
+        )
+
+        attn_input = self.norm1(x_windows)
+        attn_output, _ = self.attn(attn_input, attn_input, attn_input, need_weights=False)
+        x_windows = x_windows + attn_output
+        x_windows = x_windows + self.mlp(self.norm2(x_windows))
+
+        x = (
+            x_windows.reshape(batch, padded_h // window, padded_w // window, window, window, channels)
+            .permute(0, 1, 3, 2, 4, 5)
+            .reshape(batch, padded_h, padded_w, channels)
+            .permute(0, 3, 1, 2)
+            .contiguous()
+        )
+        if pad_h or pad_w:
+            x = x[:, :, :height, :width]
+        return residual + (x - residual)
+
+
+class SwinIRLiteGenerator(nn.Module):
+    """
+    `swinir_raft` 使用的最小 SwinIR 风格超分生成器。
+
+    设计目标是“基础可复现实验”，不是追求最佳 SR 指标：
+    - head 卷积把输入颗粒图映射到浅层特征；
+    - 多个 SwinIRLiteBlock 做窗口注意力建模；
+    - tail 使用 PixelShuffle 一次性放大到 HR 尺寸；
+    - 输出通道保持和输入 HR 图一致，方便直接复用现有图像损失与 RAFT 输入逻辑。
+    """
+
+    def __init__(
+        self,
+        inner_chanel: int,
+        upscale_factor: int,
+        embed_dim: int = 48,
+        num_blocks: int = 2,
+        num_heads: int = 4,
+        window_size: int = 8,
+    ):
+        super().__init__()
+        self.upscale_factor = int(upscale_factor)
+        self.head = nn.Conv2d(inner_chanel, embed_dim, kernel_size=3, padding=1)
+        self.body = nn.Sequential(
+            *[
+                SwinIRLiteBlock(
+                    channels=embed_dim,
+                    num_heads=num_heads,
+                    window_size=window_size,
+                )
+                for _ in range(int(num_blocks))
+            ]
+        )
+        self.body_tail = nn.Conv2d(embed_dim, embed_dim, kernel_size=3, padding=1)
+        if self.upscale_factor > 1:
+            self.upsample = nn.Sequential(
+                nn.Conv2d(
+                    embed_dim,
+                    inner_chanel * self.upscale_factor * self.upscale_factor,
+                    kernel_size=3,
+                    padding=1,
+                ),
+                nn.PixelShuffle(self.upscale_factor),
+            )
+        else:
+            self.upsample = nn.Conv2d(embed_dim, inner_chanel, kernel_size=3, padding=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        输入 LR 图像，输出 HR 尺寸的 SR 图像。
+
+        注意这里不做 clamp：
+        - 训练阶段让损失函数直接约束输出范围，梯度更连续；
+        - 保存图像时外部已有 clamp(0, 1)；
+        - RAFT 输入也会经过 `_to_raft_frame` 统一转成单通道。
+        """
+        features = self.head(x)
+        features = features + self.body_tail(self.body(features))
+        return self.upsample(features)
+
+
+class SEARAFTLite(nn.Module):
+    """
+    `bicubic_searaft` 使用的轻量 SEA-RAFT 风格封装。
+
+    这里不引入官方 SEA-RAFT 依赖，也不加载外部预训练权重；为了满足“最基础模型即可”的要求，
+    只在现有 RAFT 前面增加一个很小的上下文自适应输入增强模块：
+    - detail 分支提取输入图像对的局部高频残差；
+    - gate 分支根据当前 bicubic 图像对预测每个位置的增强强度；
+    - 增强后的图像对再送入原来的 RAFT/RAFT128/RAFT256 主干。
+
+    它的实验意义是：在同样 bicubic 图像输入下，加入一个更接近现代光流模型“输入自适应/上下文聚合”
+    思路的估计器，观察是否能追上 `PIV_A_Esrgan_v4`。
+    """
+
+    def __init__(self, base_raft: nn.Module, hidden_channels: int = 16):
+        super().__init__()
+        self.base_raft = base_raft
+        self.detail_refine = nn.Sequential(
+            nn.Conv2d(2, hidden_channels, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(hidden_channels, 2, kernel_size=3, padding=1),
+        )
+        self.detail_gate = nn.Sequential(
+            nn.Conv2d(2, 2, kernel_size=1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, raft_input: torch.Tensor, flow_gt: torch.Tensor, flow_init=None):
+        """
+        与现有 RAFT forward 保持完全相同的签名，方便 _compute_raft_branch 无感调用。
+
+        raft_input 是 [B, 2, H, W] 的前后帧拼接。这里先用平均池化构造局部低频背景，
+        再用输入减去低频背景得到高频细节，最后做 gated residual 增强。
+        """
+        low_frequency = F.avg_pool2d(raft_input, kernel_size=3, stride=1, padding=1)
+        high_frequency = raft_input - low_frequency
+        enhanced_input = raft_input + self.detail_gate(raft_input) * self.detail_refine(high_frequency)
+        return self.base_raft(enhanced_input, flow_gt, flow_init=flow_init)
+
+
 class ESRuRAFT_PIV(nn.Module):
     """
     ESRuRAFT_PIV_Ground 主网络。
@@ -254,6 +442,8 @@ class ESRuRAFT_PIV(nn.Module):
     6. bicubic_widim: LR 经 bicubic 上采样后进入传统 WIDIM/窗口互相关 PIV。
     7. bicubic_hs: LR 经 bicubic 上采样后进入 Horn-Schunck 光流法。
     8. srgan_raft: 传统 SRGAN 超分后送入 RAFT。
+    9. swinir_raft: 最小 SwinIR 风格 Transformer 超分后送入 RAFT。
+    10. bicubic_searaft: bicubic 上采样后送入轻量 SEA-RAFT 风格估计器。
     """
 
     def __init__(self,inner_chanel,batch_size,sr_scale=None):
@@ -283,6 +473,16 @@ class ESRuRAFT_PIV(nn.Module):
                 scale=self.generator_pixel_shuffle_scale,
             )
             self.piv_esrgan_discriminator = SRGANDiscriminator(inner_chanel=inner_chanel)
+        elif self.train_mode == "swinir_raft":
+            # swinir_raft 是新增的“现代 Transformer SR + RAFT”对比组。
+            # 这里使用最小 SwinIR 风格生成器：窗口注意力 + PixelShuffle 上采样。
+            # 它只作为可训练 SR baseline，不使用判别器，也不把 RAFT EPE 反传给 Generator；
+            # 因此判别器保留 Identity，pipeline 中的 d_optimizer 会自动退化为 dummy optimizer。
+            self.piv_esrgan_generator = SwinIRLiteGenerator(
+                inner_chanel=inner_chanel,
+                upscale_factor=self.generator_total_upscale,
+            )
+            self.piv_esrgan_discriminator = nn.Identity()
         else:
             # ground / bicubic / WIDIM / HS 是无学习型 SR 生成器的 baseline。
             # 仍然保留同名属性，是为了让 pipeline/evaluate 里已有的统一接口不需要大面积分叉。
@@ -312,7 +512,17 @@ class ESRuRAFT_PIV(nn.Module):
         """
         当前模式是否需要 Generator/Discriminator 参与训练。
 
-        只有 esrgan_raft / srgan_raft 才有可学习的超分模块；其余 baseline 模式不更新 G/D。
+        esrgan_raft / srgan_raft / swinir_raft 都有可学习的超分模块；
+        其中 swinir_raft 只有 Generator，没有判别器。
+        """
+        return self.train_mode in {"esrgan_raft", "srgan_raft", "swinir_raft"}
+
+    def _uses_adversarial_discriminator(self) -> bool:
+        """
+        当前模式是否真正训练判别器。
+
+        新增的 swinir_raft 是为了补“Transformer SR + RAFT”对比，而不是补一个新的 GAN。
+        因此它只训练 SwinIRLiteGenerator 和 RAFT；判别器相关字段仍输出 0，保证 CSV 列兼容。
         """
         return self.train_mode in {"esrgan_raft", "srgan_raft"}
 
@@ -952,6 +1162,62 @@ class ESRuRAFT_PIV(nn.Module):
             "flow_warp_consistency_weighted_loss": zero,
         }
 
+    def _compute_swinir_generator_loss(
+        self,
+        pred_prev: torch.Tensor,
+        pred_next: torch.Tensor,
+        target_prev: torch.Tensor,
+        target_next: torch.Tensor,
+    ) -> dict:
+        """
+        计算 swinir_raft 的 Generator 图像重建损失。
+
+        这个新增对比组的目标是回答“现代 Transformer SR 接 RAFT 是否足够强”，
+        因此这里刻意保持朴素：
+        - 使用现有工程已经稳定的 VGG perceptual loss；
+        - 使用 L1/MSE/SSIM/FFT 像素与频域诊断项；
+        - 不使用 GAN 判别器；
+        - 不使用 flow-warp 一致性；
+        - 不使用 RAFT EPE 反向拉 Generator。
+
+        这样 `swinir_raft` 和 `srgan_raft` / `esrgan_raft` 的差异更清楚：
+        它代表的是“Transformer SR 模块”本身，而不是新的联合物理损失设计。
+        """
+        prev_terms = self._compute_generator_frame_terms(pred_prev, target_prev)
+        next_terms = self._compute_generator_frame_terms(pred_next, target_next)
+
+        perceptual = self._mean_loss_term(prev_terms, next_terms, "perceptual_loss")
+        pixel_total = self._mean_loss_term(prev_terms, next_terms, "pixel_total")
+        pixel_l1 = self._mean_loss_term(prev_terms, next_terms, "pixel_l1")
+        pixel_mse = self._mean_loss_term(prev_terms, next_terms, "pixel_mse")
+        pixel_ssim = self._mean_loss_term(prev_terms, next_terms, "pixel_ssim")
+        pixel_fft = self._mean_loss_term(prev_terms, next_terms, "pixel_fft")
+        content_loss = (
+            float(global_data.esrgan.LAMBDA_PIXEL_L1) * pixel_l1 +
+            float(global_data.esrgan.LAMBDA_PIXEL_MSE) * pixel_mse +
+            float(global_data.esrgan.LAMBDA_SSIM) * pixel_ssim +
+            float(global_data.esrgan.LAMBDA_PIXEL_FFT) * pixel_fft
+        )
+        manual_sr_loss = float(global_data.esrgan.LAMBDA_VGG) * perceptual + content_loss
+        zero = self._zero_like_loss(manual_sr_loss)
+
+        return {
+            "sr_loss": manual_sr_loss,
+            "manual_sr_loss": manual_sr_loss,
+            "perceptual_loss": perceptual,
+            "vgg_loss": perceptual,
+            "content_loss": content_loss,
+            "adversarial_loss": zero,
+            "adversarial_weighted_loss": zero,
+            "pixel_total": pixel_total,
+            "pixel_l1": pixel_l1,
+            "pixel_mse": pixel_mse,
+            "pixel_ssim": pixel_ssim,
+            "pixel_fft": pixel_fft,
+            "flow_warp_consistency_loss": zero,
+            "flow_warp_consistency_weighted_loss": zero,
+        }
+
     def _compute_sr_branch(self, input_lr_prev, input_lr_next, input_gr_prev, input_gr_next, flowl0, is_adversarial: bool):
         """
         计算 Ground 模式下的“图像输出”和“RAFT 输入来源”。
@@ -974,12 +1240,12 @@ class ESRuRAFT_PIV(nn.Module):
                 pred_prev, pred_next, input_gr_prev, input_gr_next
             )
 
-        if self.train_mode in {"bicubic_raft", "bicubic_widim", "bicubic_hs"}:
+        if self.train_mode in {"bicubic_raft", "bicubic_widim", "bicubic_hs", "bicubic_searaft"}:
             # 传统 bicubic 超分 baseline：
             # 1. 不调用 Generator，不产生任何可学习的 SR 参数；
             # 2. 只用 PyTorch bicubic 双三次插值把 LR previous/next 放大到 HR 尺寸；
             # 3. 放大后的 bicubic 图像既作为 pred_prev/pred_next 参与图像诊断日志，
-            #    也作为后续 RAFT/WIDIM/HS 的输入图像。
+            #    也作为后续 RAFT/WIDIM/HS/SEA-RAFT-lite 的输入图像。
             # 这样可以单独观察“传统插值超分 + 不同 PIV 估计器”的差异。
             pred_prev = self._resize_image_to_target(input_lr_prev, input_gr_prev, mode="bicubic")
             pred_next = self._resize_image_to_target(input_lr_next, input_gr_next, mode="bicubic")
@@ -1000,6 +1266,20 @@ class ESRuRAFT_PIV(nn.Module):
             return pred_prev, pred_next, raft_prev, raft_next, self._compute_ground_image_terms(
                 pred_prev, pred_next, input_gr_prev, input_gr_next
             )
+
+        if self.train_mode == "swinir_raft":
+            # SwinIR 轻量 baseline：低分辨率 previous/next 分别进入同一个 Transformer SR 生成器。
+            # 输出图像直接作为 RAFT 输入，这和 srgan_raft/esrgan_raft 的评估路径一致；
+            # 区别在于 swinir_raft 的损失没有 GAN，也没有 RAFT EPE 对 Generator 的反传。
+            pred_prev = self.piv_esrgan_generator(input_lr_prev)
+            pred_next = self.piv_esrgan_generator(input_lr_next)
+            sr_outputs = self._compute_swinir_generator_loss(
+                pred_prev=pred_prev,
+                pred_next=pred_next,
+                target_prev=input_gr_prev,
+                target_next=input_gr_next,
+            )
+            return pred_prev, pred_next, pred_prev, pred_next, sr_outputs
 
         # esrgan_raft / srgan_raft 模式：使用最初始 ESRGAN/SRGAN 的单帧生成器分别超分 previous/next。
         # 这里不使用 ESRuRAFT_PIV 的双帧特征交互，也不在 SR loss 中加入后续扩展的
@@ -1162,12 +1442,12 @@ class ESRuRAFT_PIV(nn.Module):
             )
             g_loss, generator_loss_logs = self._compute_generator_loss(sr_outputs, raft_outputs)
             total_loss = g_loss + raft_outputs["raft_loss"]
-        if self._uses_super_resolution():
+        if self._uses_adversarial_discriminator():
             discriminator_loss, d_fake_loss, d_real_loss = self._compute_discriminator_loss(
                 pred_prev, pred_next, input_gr_prev, input_gr_next
             )
         else:
-            # ground 模式没有判别器训练；保留 0 值，保证外部日志字段完整。
+            # ground / SwinIR baseline 模式没有判别器训练；保留 0 值，保证外部日志字段完整。
             discriminator_loss = self._zero_like_loss(total_loss)
             d_fake_loss = self._zero_like_loss(total_loss)
             d_real_loss = self._zero_like_loss(total_loss)
@@ -1432,32 +1712,42 @@ class ESRuRAFT_PIV(nn.Module):
             generator_optimizer.step()
             raft_optimizer.step()
 
-        # 第三阶段：只更新 Discriminator，严格只使用 discriminator_loss。
-        self._set_requires_grad(self.piv_esrgan_generator, False)  # 继续冻结 Generator
-        self._set_requires_grad(self.piv_RAFT, False)  # 冻结 RAFT
-        self._set_requires_grad(self.piv_esrgan_discriminator, True)  # 只开启判别器梯度
-        d_optimizer.zero_grad(set_to_none=True)  # 清空判别器梯度
+        if self._uses_adversarial_discriminator():
+            # 第三阶段：只更新 Discriminator，严格只使用 discriminator_loss。
+            # 该阶段只属于 srgan_raft / esrgan_raft；swinir_raft 明确作为非 GAN 的 Transformer SR baseline。
+            self._set_requires_grad(self.piv_esrgan_generator, False)  # 继续冻结 Generator
+            self._set_requires_grad(self.piv_RAFT, False)  # 冻结 RAFT
+            self._set_requires_grad(self.piv_esrgan_discriminator, True)  # 只开启判别器梯度
+            d_optimizer.zero_grad(set_to_none=True)  # 清空判别器梯度
 
-        if hasattr(self.piv_esrgan_generator, "forward_pair"):
-            pred_prev_d, pred_next_d = self.piv_esrgan_generator.forward_pair(input_lr_prev, input_lr_next)
+            if hasattr(self.piv_esrgan_generator, "forward_pair"):
+                pred_prev_d, pred_next_d = self.piv_esrgan_generator.forward_pair(input_lr_prev, input_lr_next)
+            else:
+                pred_prev_d = self.piv_esrgan_generator(input_lr_prev)
+                pred_next_d = self.piv_esrgan_generator(input_lr_next)
+
+            discriminator_loss, d_fake_loss, d_real_loss = self._compute_discriminator_loss(
+                pred_prev_d,
+                pred_next_d,
+                input_gr_prev,
+                input_gr_next,
+            )
+
+            if scaler is not None:
+                scaler.scale(discriminator_loss).backward()
+                scaler.step(d_optimizer)
+                scaler.update()
+            else:
+                discriminator_loss.backward()
+                d_optimizer.step()
         else:
-            pred_prev_d = self.piv_esrgan_generator(input_lr_prev)
-            pred_next_d = self.piv_esrgan_generator(input_lr_next)
-
-        discriminator_loss, d_fake_loss, d_real_loss = self._compute_discriminator_loss(
-            pred_prev_d,
-            pred_next_d,
-            input_gr_prev,
-            input_gr_next,
-        )
-
-        if scaler is not None:
-            scaler.scale(discriminator_loss).backward()
-            scaler.step(d_optimizer)
-            scaler.update()
-        else:
-            discriminator_loss.backward()
-            d_optimizer.step()
+            # swinir_raft 没有判别器。这里生成同 device/dtype 的 0 张量，保持日志字段和 CSV 列不变。
+            discriminator_loss = self._zero_like_loss(generator_g_loss)
+            d_fake_loss = self._zero_like_loss(generator_g_loss)
+            d_real_loss = self._zero_like_loss(generator_g_loss)
+            if scaler is not None:
+                # 没有 D step 时仍 update 一次 scaler，和前面的 G/RAFT step 配套，避免 AMP 状态长期不刷新。
+                scaler.update()
 
         # 恢复三个子模块的梯度开关，避免影响外部后续逻辑。
         self._set_requires_grad(self.piv_esrgan_generator, True)

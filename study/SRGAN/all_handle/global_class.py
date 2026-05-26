@@ -41,9 +41,13 @@ class global_data:
         # 控制本次要生成哪些输出阶段：
         # - None 或 "all"：生成 01_energy_spectrum、02_error_maps、03_error_histograms、04_composite_panels 全部；
         # - 字符串：例如 "02_error_maps"；
-        # - 元组/列表：例如 ("01_energy_spectrum", "03_error_histograms")。
+        # - 元组/列表：例如 ("01_energy_spectrum", "03_error_histograms")；
+        #   也可以把独立阶段组合进去，例如 ("tbl_profile_overlay", "particle_stats_metrics", "flow_u_epe_hist_overlay")。
         # 支持目录名和短名混用：energy_spectrum / error_maps / error_histograms / composite_panels。
-        OUTPUT_STAGE_FILTER = None
+        # 如果只想直接处理 TBL 剖面图，设置 OUTPUT_STAGE_FILTER = "tbl_profile_overlay"；
+        # 如果只想处理颗粒统计条形图，设置 OUTPUT_STAGE_FILTER = "particle_stats_metrics"；
+        # 如果只想处理 *_flow_u_epe_hist_overlay.png，设置 OUTPUT_STAGE_FILTER = "flow_u_epe_hist_overlay"。
+        OUTPUT_STAGE_FILTER =  ("tbl_profile_overlay", "particle_stats_metrics", "flow_u_epe_hist_overlay")
         OUTPUT_STAGE_ALIASES = {
             "01_energy_spectrum": "energy_spectrum",
             "energy_spectrum": "energy_spectrum",
@@ -59,6 +63,19 @@ class global_data:
             "composite_panels": "composite_panels",
             "composites": "composite_panels",
             "panels": "composite_panels",
+            "tbl_profile_overlay": "tbl_profile_overlay",
+            "profile_overlay": "tbl_profile_overlay",
+            "tbl_profile": "tbl_profile_overlay",
+            "profile": "tbl_profile_overlay",
+            "particle_stats_metrics": "particle_stats_metrics",
+            "particle_metrics": "particle_stats_metrics",
+            "particle_bar": "particle_stats_metrics",
+            "particle_bars": "particle_stats_metrics",
+            "stats_metrics": "particle_stats_metrics",
+            "flow_u_epe_hist_overlay": "flow_u_epe_hist_overlay",
+            "flow_u_epe": "flow_u_epe_hist_overlay",
+            "u_epe_hist": "flow_u_epe_hist_overlay",
+            "epe_hist_overlay": "flow_u_epe_hist_overlay",
             "all": "all",
         }
 
@@ -86,8 +103,8 @@ class global_data:
         # 就设置 RESUME_GROUP_INDEX = 30，RESUME_STEP_NAME = "error_maps"。
         # RESUME_STEP_NAME 优先级高于 RESUME_STEP_INDEX；只对 RESUME_GROUP_INDEX 对应的 group 生效，
         # 后续 group 会从第一个 step 正常继续跑。
-        RESUME_GROUP_INDEX = 30
-        RESUME_STEP_INDEX = 3
+        RESUME_GROUP_INDEX = None
+        RESUME_STEP_INDEX = None
         RESUME_STEP_NAME = None
         # 命令行进度显示开关：全量跑 class/split/category 时耗时较长，开启后会打印当前处理到第几个 group。
         PROGRESS_ENABLED = True
@@ -211,9 +228,9 @@ class global_data:
             "bicubic_widim": "#1f77b4",
             "bicubic_hs": "#ff7f0e",
             "bicubic_raft": "#2ca02c",
-            "srgan_raft": "#d62728",
+            "srgan_raft": "#8c564b",
             "esrgan_raft": "#9467bd",
-            "PIV_A_Esrgan_v4": "#8c564b",
+            "PIV_A_Esrgan_v4": "#d62728",
             "PIV_A_Esrgan_v_SCALE_8": "#7f7f7f",
         }
 
@@ -241,6 +258,11 @@ class global_data:
         HIST_EDGE_LINE_WIDTH = 0.0
         HIST_LEGEND_EDGE_LINE_WIDTH = 0.0
         HIST_DRAW_OUTLINE = False
+        # 误差直方图里 ESRuRAFT-PIV 必须最后绘制并处在最高层，避免被其它半透明柱子覆盖。
+        HIST_TOP_EXPERIMENT_KEYS = ("PIV_A_Esrgan_v4",)
+        # flow_u_epe_hist_overlay 是左右两张子图，右图 y 轴 Count 容易贴到左图；
+        # 这里单独控制两个子图之间的横向间隔。
+        FLOW_U_EPE_HIST_WSPACE = 0.32
         IMAGE_CMAP = "viridis"
         # 光流/颗粒误差图使用 bwr 发散色图；在 pipeline.py 中会强制 vmin/vmax 关于 0 对称，
         # 因而 0 一定处于色条正中间，并且对应纯白色。
@@ -344,17 +366,20 @@ class global_data:
         TBL_PROFILE_PRED_LINE_WIDTH = 1.25
         TBL_PROFILE_ALPHA = 0.95
         TBL_PROFILE_GRID_ALPHA = 0.25
-        TBL_PROFILE_FIG_WIDTH_PER_REGION = 3.6
+        # 剖面图右侧图例文字较长（如 ESRuRAFT-PIV），适当加宽整张图和图例区域，避免文字越界。
+        TBL_PROFILE_FIG_WIDTH_PER_REGION = 3.95
         TBL_PROFILE_FIG_HEIGHT = 9.8
         # TBL 剖面图顶部 GT 流场和中间色条/图例行之间不需要太大空白；
         # 调小 hspace 可以让第一行和第二行更贴近，同时保留下方三张剖面图的可读性。
         TBL_PROFILE_HSPACE = 0.26
         TBL_PROFILE_WSPACE = 0.18
-        TBL_PROFILE_COLORBAR_LABEL_PAD = 7
+        # TBL 剖面图色条 label 默认放在色条上方，避免 "Displacement [px]" 和下方剖面子图标题挨在一起。
+        TBL_PROFILE_COLORBAR_LABEL_PAD = 3
+        TBL_PROFILE_COLORBAR_LABEL_POSITION = "top"
         # TBL 剖面图中间行改成“左色条 + 右图例”，避免图例压住三张剖面曲线。
         # 左右宽度比例、间距和图例列数都放到全局变量里，后续可以按论文版面继续微调。
-        TBL_PROFILE_COLORBAR_LEGEND_WIDTH_RATIOS = (1.15, 0.85)
-        TBL_PROFILE_COLORBAR_LEGEND_WSPACE = 0.18
+        TBL_PROFILE_COLORBAR_LEGEND_WIDTH_RATIOS = (1.05, 1.25)
+        TBL_PROFILE_COLORBAR_LEGEND_WSPACE = 0.14
         TBL_PROFILE_LEGEND_LOC = "center"
         TBL_PROFILE_LEGEND_NCOL = 2
         TBL_PROFILE_X_MIN = None
@@ -371,7 +396,7 @@ class global_data:
         # 颗粒统计组合图分成两张输出：
         # 1）particle_binary_stats_image_composite：只放 GT/SR 图和二值阈值图；
         # 2）particle_binary_stats_metrics_composite：单独放 GT 灰度直方图和统计条形图，画布更大，避免标签拥挤。
-        PARTICLE_STATS_FIG_WIDTH_PER_COL = 5.10
+        PARTICLE_STATS_FIG_WIDTH_PER_COL = 5.70
         PARTICLE_STATS_IMAGE_FIG_HEIGHT = 10.0
         PARTICLE_STATS_METRIC_FIG_HEIGHT = 15.5
         # 颗粒图/阈值图横向排版单独使用紧凑参数，避免复用条形统计图的大画布后图像之间留白过多。
@@ -384,7 +409,7 @@ class global_data:
         PARTICLE_STATS_IMAGE_ROW_RATIO = 1.35
         PARTICLE_STATS_CHART_ROW_RATIO = 2.25
         PARTICLE_STATS_BLOCK_GAP_RATIO = 0.28
-        PARTICLE_STATS_WSPACE = 0.46
+        PARTICLE_STATS_WSPACE = 0.58
         PARTICLE_STATS_HSPACE = 0.42
         PARTICLE_STATS_XTICK_ROTATION = 50
         PARTICLE_STATS_XTICK_LABEL_SIZE = 8
@@ -407,12 +432,20 @@ class global_data:
         PARTICLE_STATS_VALUE_DECIMALS = 4
         PARTICLE_STATS_SHOW_XTICK_LABELS = False
         PARTICLE_STATS_LEGEND_NCOL = 2
-        PARTICLE_STATS_LEGEND_FONT_SIZE = 6
+        PARTICLE_STATS_LEGEND_FONT_SIZE = 7.5
+        # 颗粒统计条形图左侧 previous/next 行标签和 y 轴 label 都需要留出更大空间，
+        # 避免二者挤在一起；数值越大，左侧留白越多。
+        PARTICLE_STATS_ROW_LABEL_X = -0.23
+        PARTICLE_STATS_SUBPLOTS_LEFT = 0.075
+        PARTICLE_STATS_SUBPLOTS_RIGHT = 0.985
         # 颗粒统计条形图的图例放在每张子图内部；使用 "best" 让 Matplotlib 自动寻找空白区域。
         # 同时把 y 轴顶部留白比例调高，给图例和柱顶数值留出空间，避免压住柱子或挤到边框。
         PARTICLE_STATS_LEGEND_LOC = "best"
         PARTICLE_STATS_Y_PAD_RATIO = 0.45
         PARTICLE_STATS_Y_PAD_MIN = 1.0
+        # 灰度直方图中 T=... 文字相对阈值竖线的横向偏移，使用 x 轴坐标比例；
+        # 默认略向右移动，避免文字贴着虚线。
+        PARTICLE_GRAY_HIST_THRESHOLD_TEXT_DX = 0.015
         # 颗粒阈值化图的面板标签通常包含较长实验名，例如 bicubic-widim、ESRuRAFT-PIV；
         # 这些图本身列宽较窄，因此整张颗粒阈值对比图都使用更小字号，避免 label 超过图片本身。
         PARTICLE_BINARY_PANEL_LABEL_SIZE = 5.5

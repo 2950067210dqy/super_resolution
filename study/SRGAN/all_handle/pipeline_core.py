@@ -335,7 +335,15 @@ class AllHandlePipeline:
         """读取全局输出阶段过滤参数，返回本次需要生成的 01/02/03/04 阶段集合。"""
 
         configured = getattr(self.cfg, "OUTPUT_STAGE_FILTER", None)
-        all_stages = {"energy_spectrum", "error_maps", "error_histograms", "composite_panels"}
+        all_stages = {
+            "energy_spectrum",
+            "error_maps",
+            "error_histograms",
+            "composite_panels",
+            "tbl_profile_overlay",
+            "particle_stats_metrics",
+            "flow_u_epe_hist_overlay",
+        }
         if configured is None:
             return all_stages
         if isinstance(configured, str):
@@ -769,14 +777,21 @@ class AllHandlePipeline:
                 steps.append(("energy_spectrum", self.plot_energy_spectrum))
             if "error_histograms" in enabled_stages:
                 steps.append(("histograms", self.plot_histogram_bundle))
+            if "flow_u_epe_hist_overlay" in enabled_stages:
+                steps.append(("flow_u_epe_hist_overlay", self.plot_flow_u_epe_histogram))
             if normalize_name(group.category_name) != "all":
                 if "error_maps" in enabled_stages:
                     steps.append(("error_maps", self.plot_error_map_bundle))
                 if "composite_panels" in enabled_stages:
                     steps.append(("composites", self.plot_composite_bundle))
+                if "particle_stats_metrics" in enabled_stages:
+                    steps.append(("particle_stats_metrics", self.plot_particle_stats_metric_only))
                 if "composite_panels" in enabled_stages and normalize_name(group.category_name) in ("tbl", "twcf"):
                     steps.append(("tbl_twcf_flow_uv", self.plot_tbl_twcf_flow_uv))
-                if "composite_panels" in enabled_stages and normalize_name(group.category_name) == "tbl":
+                if (
+                    ("composite_panels" in enabled_stages or "tbl_profile_overlay" in enabled_stages)
+                    and normalize_name(group.category_name) == "tbl"
+                ):
                     steps.append(("tbl_profile_overlay", self.plot_tbl_profile_overlays))
             step_total = len(steps)
             if step_total == 0:
@@ -1271,7 +1286,7 @@ class AllHandlePipeline:
             return
 
         fig, ax = plt.subplots(figsize=(5.2, 3.4))
-        for exp_key, (x, y) in self.sorted_hist_series(series):
+        for draw_idx, (exp_key, (x, y)) in enumerate(self.sorted_hist_series(series)):
             width = self.estimate_bar_width(x)
             hist_color = self.experiment_hist_color(exp_key)
             # 误差直方图按参考图只使用半透明填充，不再加粗柱边框；如需恢复轮廓线可在 global_class.py 开启。
@@ -1286,9 +1301,17 @@ class AllHandlePipeline:
                 edgecolor=edge_color,
                 linewidth=edge_width,
                 label=self.experiment_label(exp_key),
+                zorder=self.hist_zorder(exp_key, draw_idx),
             )
             if getattr(self.cfg, "HIST_DRAW_OUTLINE", False) and float(getattr(self.cfg, "HIST_LINE_WIDTH", 0.0)) > 0:
-                ax.plot(x, y, color=self.darken_color(hist_color), linewidth=self.cfg.HIST_LINE_WIDTH, alpha=0.95)
+                ax.plot(
+                    x,
+                    y,
+                    color=self.darken_color(hist_color),
+                    linewidth=self.cfg.HIST_LINE_WIDTH,
+                    alpha=0.95,
+                    zorder=self.hist_zorder(exp_key, draw_idx) + 0.1,
+                )
         ax.set_xlabel(x_label)
         ax.set_ylabel(y_label)
         self.apply_hist_legend(ax, series)
@@ -1309,12 +1332,17 @@ class AllHandlePipeline:
         if not u_series and not epe_series:
             return
 
-        fig, axes = plt.subplots(1, 2, figsize=(8.4, 3.4))
+        fig, axes = plt.subplots(
+            1,
+            2,
+            figsize=(8.4, 3.4),
+            gridspec_kw={"wspace": float(getattr(self.cfg, "FLOW_U_EPE_HIST_WSPACE", 0.32))},
+        )
         for ax, series, x_label, axis_kind in (
             (axes[0], u_series, self.cfg.FLOW_U_HIST_X_LABEL, "flow_u"),
             (axes[1], epe_series, self.cfg.EPE_HIST_X_LABEL, "epe"),
         ):
-            for exp_key, (x, y) in self.sorted_hist_series(series):
+            for draw_idx, (exp_key, (x, y)) in enumerate(self.sorted_hist_series(series)):
                 hist_color = self.experiment_hist_color(exp_key)
                 edge_width = float(getattr(self.cfg, "HIST_EDGE_LINE_WIDTH", 0.0))
                 edge_color = "none" if edge_width <= 0 else self.darken_color(hist_color)
@@ -1327,9 +1355,16 @@ class AllHandlePipeline:
                     edgecolor=edge_color,
                     linewidth=edge_width,
                     label=self.experiment_label(exp_key),
+                    zorder=self.hist_zorder(exp_key, draw_idx),
                 )
                 if getattr(self.cfg, "HIST_DRAW_OUTLINE", False) and float(getattr(self.cfg, "HIST_LINE_WIDTH", 0.0)) > 0:
-                    ax.plot(x, y, color=self.darken_color(hist_color), linewidth=self.cfg.HIST_LINE_WIDTH)
+                    ax.plot(
+                        x,
+                        y,
+                        color=self.darken_color(hist_color),
+                        linewidth=self.cfg.HIST_LINE_WIDTH,
+                        zorder=self.hist_zorder(exp_key, draw_idx) + 0.1,
+                    )
             ax.set_xlabel(x_label)
             ax.set_ylabel(self.cfg.HIST_Y_LABEL)
             ax.grid(True, alpha=0.18, linewidth=0.5)
@@ -1343,7 +1378,7 @@ class AllHandlePipeline:
     def sorted_hist_series(
         self, series: dict[str, tuple[np.ndarray, np.ndarray]]
     ) -> list[tuple[str, tuple[np.ndarray, np.ndarray]]]:
-        """按“分布宽且峰值高优先绘制”排序，使窄而低的分布最后画在外层。"""
+        """按分布宽高排序；指定顶层实验会被强制移到最后绘制，避免被覆盖。"""
 
         def score(item: tuple[str, tuple[np.ndarray, np.ndarray]]) -> tuple[float, float]:
             _, (x, y) = item
@@ -1352,7 +1387,21 @@ class AllHandlePipeline:
             height = float(np.nanmax(y)) if y.size else 0.0
             return width, height
 
-        return sorted(series.items(), key=score, reverse=True)
+        ordered = sorted(series.items(), key=score, reverse=True)
+        top_keys = tuple(getattr(self.cfg, "HIST_TOP_EXPERIMENT_KEYS", ()))
+        top_set = set(top_keys)
+        normal_items = [item for item in ordered if item[0] not in top_set]
+        # 顶层实验按全局指定顺序追加到最后，绘制顺序和 zorder 都保证它们在最上层。
+        top_items = [item for key in top_keys for item in ordered if item[0] == key]
+        return normal_items + top_items
+
+    def hist_zorder(self, exp_key: str, draw_idx: int) -> float:
+        """误差直方图层级：ESRuRAFT-PIV 等指定实验始终高于其它实验。"""
+
+        top_keys = tuple(getattr(self.cfg, "HIST_TOP_EXPERIMENT_KEYS", ()))
+        if exp_key in top_keys:
+            return 100.0 + float(top_keys.index(exp_key))
+        return 10.0 + float(draw_idx)
 
     def estimate_bar_width(self, x: np.ndarray) -> float:
         finite_x = np.asarray(x, dtype=np.float64)
@@ -1970,6 +2019,11 @@ class AllHandlePipeline:
         self.plot_flow_value_error_composites(group)
         self.plot_vorticity_composites(group)
         self.plot_particle_stats_composites(group)
+
+    def plot_particle_stats_metric_only(self, group: GroupContext) -> None:
+        """只生成颗粒统计条形统计图，不生成颗粒图/阈值图等其它组合图。"""
+
+        self.plot_particle_stats_composites(group, metrics_only=True)
 
     def limited_bundles(self, group: GroupContext, kind: str) -> list[SampleBundle]:
         bundles = self.bundle_samples(group, kind)
@@ -3054,6 +3108,11 @@ class AllHandlePipeline:
         fig_width = max(6.5, float(getattr(self.cfg, "TBL_PROFILE_FIG_WIDTH_PER_REGION", 3.4)) * n_regions)
         fig_height = float(getattr(self.cfg, "TBL_PROFILE_FIG_HEIGHT", 8.8))
         fig = plt.figure(figsize=(fig_width, fig_height))
+        # 增大左边距，避免 previous/next 行标签和灰度直方图 y 轴 label 挤在一起。
+        fig.subplots_adjust(
+            left=float(getattr(self.cfg, "PARTICLE_STATS_SUBPLOTS_LEFT", 0.075)),
+            right=float(getattr(self.cfg, "PARTICLE_STATS_SUBPLOTS_RIGHT", 0.985)),
+        )
         gs = fig.add_gridspec(
             3,
             n_regions,
@@ -3127,6 +3186,8 @@ class AllHandlePipeline:
         legend_ax.axis("off")
         if top_handle is not None and gt_map is not None and ensure_2d_image(gt_map).ndim == 2:
             cb = fig.colorbar(top_handle, cax=cax, orientation="horizontal")
+            # 色条 label 放到上方，避免和下面三张剖面图的区域标题/坐标区域挤在一起。
+            cb.ax.xaxis.set_label_position(getattr(self.cfg, "TBL_PROFILE_COLORBAR_LABEL_POSITION", "top"))
             cb.set_label(
                 self.cfg.FLOW_VALUE_COLORBAR_LABEL,
                 fontsize=self.cfg.COLORBAR_LABEL_SIZE,
@@ -3160,7 +3221,9 @@ class AllHandlePipeline:
                 ax.plot(
                     values,
                     y_pred,
-                    color=self.experiment_hist_color(exp_key),
+                    # TBL 剖面图使用普通实验图例颜色，不跟误差直方图专用配色走；
+                    # 这样 bicubic-hs 和 ESRuRAFT-PIV 会严格使用 global_class.py 中 EXPERIMENT_COLORS 的设置。
+                    color=self.experiment_color(exp_key),
                     linewidth=float(getattr(self.cfg, "TBL_PROFILE_PRED_LINE_WIDTH", 1.25)),
                     alpha=float(getattr(self.cfg, "TBL_PROFILE_ALPHA", 0.95)),
                     label=self.experiment_label(exp_key),
@@ -3224,7 +3287,7 @@ class AllHandlePipeline:
     # =========================
     # (10) 颗粒统计组合图
     # =========================
-    def plot_particle_stats_composites(self, group: GroupContext) -> None:
+    def plot_particle_stats_composites(self, group: GroupContext, metrics_only: bool = False) -> None:
         """图十：颗粒统计图拆成图像对比图和更大的指标统计图。"""
 
         for bundle in self.limited_bundles(group, "particle_stats"):
@@ -3239,12 +3302,14 @@ class AllHandlePipeline:
                 bundle.sample_name,
             )
             is_tbl = normalize_name(group.category_name) == "tbl"
-            self.plot_particle_stats_image_composite(bundle, exp_keys, out_dir, crop=False, is_tbl=is_tbl)
+            if not metrics_only:
+                self.plot_particle_stats_image_composite(bundle, exp_keys, out_dir, crop=False, is_tbl=is_tbl)
             self.plot_particle_stats_metric_composite(bundle, exp_keys, out_dir, crop=False)
             # TBL 的 crop 颗粒统计与原图统计都要保留：
             # full-frame 用原始 npy/csv，crop 版优先读取 *_crop*.npy，SR/GT 图没有 crop npy 时再按同一 crop 框裁。
             if is_tbl and getattr(self.cfg, "TBL_PARTICLE_CROP_ENABLED", True):
-                self.plot_particle_stats_image_composite(bundle, exp_keys, out_dir, crop=True, is_tbl=is_tbl)
+                if not metrics_only:
+                    self.plot_particle_stats_image_composite(bundle, exp_keys, out_dir, crop=True, is_tbl=is_tbl)
                 self.plot_particle_stats_metric_composite(bundle, exp_keys, out_dir, crop=True)
 
     def particle_stats_metric_config(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -3457,7 +3522,7 @@ class AllHandlePipeline:
             hist_ax = fig.add_subplot(gs[row_start, 0])
             self.draw_particle_gray_hist(hist_ax, bundle, time_name, crop=crop)
             hist_ax.text(
-                -0.14,
+                float(getattr(self.cfg, "PARTICLE_STATS_ROW_LABEL_X", -0.23)),
                 0.5,
                 self.cfg.PREVIOUS_ROW_LABEL if time_name == "previous" else self.cfg.NEXT_ROW_LABEL,
                 transform=hist_ax.transAxes,
@@ -3559,8 +3624,10 @@ class AllHandlePipeline:
             ax.plot(x, y, color="#333333", linewidth=1.2)
         if threshold is not None:
             ax.axvline(threshold, color="#D55E00", linestyle="--", linewidth=1.2)
+            # T=... 标注相对阈值线稍微右移，偏移量放在 global_class.py 中便于后续微调。
+            text_dx = float(getattr(self.cfg, "PARTICLE_GRAY_HIST_THRESHOLD_TEXT_DX", 0.015))
             ax.text(
-                threshold,
+                threshold + text_dx,
                 0.95,
                 f"{self.cfg.THRESHOLD_LABEL}={threshold:.3g}",
                 transform=ax.get_xaxis_transform(),
