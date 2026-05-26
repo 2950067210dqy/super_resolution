@@ -38,7 +38,29 @@ class global_data:
         METRIC_TABLE_SHEET_CSV_DIR_NAME = "category_csv_sheets"
         METRIC_TABLE_WORKBOOK_NAME = "comparison_metrics.xlsx"
 
-
+        # 控制本次要生成哪些输出阶段：
+        # - None 或 "all"：生成 01_energy_spectrum、02_error_maps、03_error_histograms、04_composite_panels 全部；
+        # - 字符串：例如 "02_error_maps"；
+        # - 元组/列表：例如 ("01_energy_spectrum", "03_error_histograms")。
+        # 支持目录名和短名混用：energy_spectrum / error_maps / error_histograms / composite_panels。
+        OUTPUT_STAGE_FILTER = None
+        OUTPUT_STAGE_ALIASES = {
+            "01_energy_spectrum": "energy_spectrum",
+            "energy_spectrum": "energy_spectrum",
+            "energy": "energy_spectrum",
+            "02_error_maps": "error_maps",
+            "error_maps": "error_maps",
+            "maps": "error_maps",
+            "03_error_histograms": "error_histograms",
+            "error_histograms": "error_histograms",
+            "histograms": "error_histograms",
+            "hist": "error_histograms",
+            "04_composite_panels": "composite_panels",
+            "composite_panels": "composite_panels",
+            "composites": "composite_panels",
+            "panels": "composite_panels",
+            "all": "all",
+        }
 
         # =========================
         # 数据层级与运行范围
@@ -183,17 +205,16 @@ class global_data:
             "PIV_A_Esrgan_v4": "#D62728",
             "PIV_A_Esrgan_v_SCALE_8": "#000000",
         }
-        # 误差直方图专用调色板：按用户要求恢复到最初版本的高区分度配色。
-        # 该配色只影响误差直方图，普通图例仍使用 EXPERIMENT_COLORS；
-        # pipeline.py 会基于 HIST_EDGE_DARKEN 自动生成更深边框，用于图例边框和直方图轮廓。
+        # 误差直方图专用调色板：按用户给出的图 1 使用 Matplotlib 默认 tab10 风格颜色。
+        # 该配色只影响误差直方图，普通图例仍使用 EXPERIMENT_COLORS。
         EXPERIMENT_HIST_COLORS = {
-            "bicubic_widim": "#005AB5",
-            "bicubic_hs": "#DC3220",
-            "bicubic_raft": "#009E73",
-            "srgan_raft": "#882255",
-            "esrgan_raft": "#E69F00",
-            "PIV_A_Esrgan_v4": "#222222",
-            "PIV_A_Esrgan_v_SCALE_8": "#56B4E9",
+            "bicubic_widim": "#1f77b4",
+            "bicubic_hs": "#ff7f0e",
+            "bicubic_raft": "#2ca02c",
+            "srgan_raft": "#d62728",
+            "esrgan_raft": "#9467bd",
+            "PIV_A_Esrgan_v4": "#8c564b",
+            "PIV_A_Esrgan_v_SCALE_8": "#7f7f7f",
         }
 
 
@@ -212,13 +233,14 @@ class global_data:
         LEGEND_FONT_SIZE = 10
         PANEL_LABEL_SIZE = 12
         COLORBAR_LABEL_SIZE = 10
-        # 直方图透明度降低，同时加粗外轮廓线：填充负责表现面积，轮廓负责区分六组实验，避免颜色混在一起发脏。
-        HIST_ALPHA = 0.34
+        # 误差直方图按参考图使用半透明填充色，不再给直方图和图例添加加粗边框。
+        HIST_ALPHA = 0.55
         HIST_BINS = 201
-        HIST_LINE_WIDTH = 1.25
+        HIST_LINE_WIDTH = 0.0
         HIST_EDGE_DARKEN = 0.72
-        HIST_EDGE_LINE_WIDTH = 1.45
-        HIST_LEGEND_EDGE_LINE_WIDTH = 2.0
+        HIST_EDGE_LINE_WIDTH = 0.0
+        HIST_LEGEND_EDGE_LINE_WIDTH = 0.0
+        HIST_DRAW_OUTLINE = False
         IMAGE_CMAP = "viridis"
         # 光流/颗粒误差图使用 bwr 发散色图；在 pipeline.py 中会强制 vmin/vmax 关于 0 对称，
         # 因而 0 一定处于色条正中间，并且对应纯白色。
