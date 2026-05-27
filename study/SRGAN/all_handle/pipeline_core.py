@@ -181,13 +181,13 @@ def flow_to_hw2(array: np.ndarray) -> np.ndarray | None:
 
 
 class AllHandlePipeline:
-    """读取六个实验已有结果，生成跨实验对比图。"""
+    """读取八个实验已有结果，生成跨实验对比图。"""
 
     def __init__(self, cfg: type[global_data.all_handle], enable_plotting: bool = True):
         self.cfg = cfg
         self.warnings: list[str] = []
         # 当前正在生成的对比组；用于决定图例 label、legend 顺序和输出子目录。
-        self.active_comparison_name = "six_experiments"
+        self.active_comparison_name = "eight_experiments"
         self.output_root_dir = self.resolve_output_root_dir()
         self.output_root_dir.mkdir(parents=True, exist_ok=True)
         # 运行时间记录用于命令行进度显示和 summary.json，便于全量生成时定位耗时最长的类别/步骤。
@@ -343,6 +343,7 @@ class AllHandlePipeline:
             "tbl_profile_overlay",
             "particle_stats_metrics",
             "flow_u_epe_hist_overlay",
+            "tbl_02_error_map",
         }
         if configured is None:
             return all_stages
@@ -373,7 +374,7 @@ class AllHandlePipeline:
 
     def experiment_label(self, exp_key: str) -> str:
         # 同一个实验在不同对比组中可能需要不同图例文字：
-        # 六组对比中 PIV_A_Esrgan_v4 显示为 ESRuRAFT-PIV，倍率对比中显示为 ESRuRAFT-PIV x4。
+        # 八组对比中 PIV_A_Esrgan_v4 显示为 ESRuRAFT-PIV，倍率对比中显示为 ESRuRAFT-PIV x4。
         group_labels = getattr(self.cfg, "COMPARISON_GROUP_LABELS", {}).get(self.active_comparison_name, {})
         return group_labels.get(exp_key, self.cfg.EXPERIMENT_LABELS.get(exp_key, exp_key))
 
@@ -382,7 +383,7 @@ class AllHandlePipeline:
 
     def experiment_hist_color(self, exp_key: str) -> str:
         # 误差直方图使用独立调色板：半透明柱子叠加后更容易混色，
-        # 单独取色可以保证六组/倍率对比的颜色既明显区分，又保持论文常用配色风格。
+        # 单独取色可以保证八组/倍率对比的颜色既明显区分，又保持论文常用配色风格。
         return getattr(self.cfg, "EXPERIMENT_HIST_COLORS", {}).get(exp_key, self.experiment_color(exp_key))
 
     def darken_color(self, color: str, factor: float | None = None) -> str:
@@ -473,6 +474,9 @@ class AllHandlePipeline:
             [label_to_handle[label] for label in ordered_labels],
             ordered_labels,
             frameon=bool(getattr(self.cfg, "ENERGY_LEGEND_FRAME", True)) if energy_style else False,
+            fontsize=float(getattr(self.cfg, "ENERGY_LEGEND_FONT_SIZE", self.cfg.LEGEND_FONT_SIZE))
+            if energy_style
+            else self.cfg.LEGEND_FONT_SIZE,
         )
         if energy_style and legend is not None:
             frame = legend.get_frame()
@@ -485,7 +489,7 @@ class AllHandlePipeline:
 
         exp_dir = self.cfg.EXPERIMENT_DIR_NAMES[exp_key]
         # x4/x8 的输出目录倍率不同，因此倍率目录按实验 key 单独读取；
-        # 没配置的旧实验仍使用 SCALE_DIR_NAME，保证兼容之前六组对比实验。
+        # 没配置的旧实验仍使用 SCALE_DIR_NAME，保证兼容之前八组对比实验。
         scale_dir = self.cfg.EXPERIMENT_SCALE_DIR_NAMES.get(exp_key, self.cfg.SCALE_DIR_NAME)
         class_norm = normalize_name(class_name)
         mode_dir = (
@@ -493,18 +497,26 @@ class AllHandlePipeline:
             if class_norm in ("class_2", "class2")
             else "mixed_all_classes"
         )
-        return (
+        # 新增实验目录可能使用长目录名，也可能直接使用 bicubic_searaft/swinir_raft 这样的短目录名；
+        # 这里按主目录名和别名依次尝试，找到已存在路径就返回，全部不存在时返回主目录路径用于后续跳过。
+        candidate_dir_names = [exp_dir]
+        for alias in getattr(self.cfg, "EXPERIMENT_DIR_NAME_ALIASES", {}).get(exp_key, ()):
+            if alias not in candidate_dir_names:
+                candidate_dir_names.append(alias)
+        candidates = [
             self.cfg.DATA_ROOT_DIR
-            / exp_dir
+            / dir_name
             / class_name
             / mode_dir
             / self.cfg.RAFT_DIR_NAME
             / scale_dir
             / split_name
-        )
+            for dir_name in candidate_dir_names
+        ]
+        return next((path for path in candidates if path.exists()), candidates[0])
 
     def output_dir(self, *parts: str) -> Path:
-        # 不同对比组必须分开输出，避免六组对比图与 x4/x8 倍率对比图混在一起。
+        # 不同对比组必须分开输出，避免八组对比图、去除 widim/hs 的补充图与 x4/x8 倍率对比图混在一起。
         path = self.output_root_dir.joinpath(
             safe_name(self.active_comparison_name),
             *(safe_name(p) for p in parts),
@@ -537,7 +549,7 @@ class AllHandlePipeline:
     # 目录发现
     # =========================
     def discover_groups(self) -> list[GroupContext]:
-        """扫描六个实验已有的 class/split/category 目录，生成后续绘图任务。"""
+        """扫描八个实验已有的 class/split/category 目录，生成后续绘图任务。"""
 
         groups: list[GroupContext] = []
         category_filter = None
@@ -547,7 +559,7 @@ class AllHandlePipeline:
         comparison_groups = getattr(
             self.cfg,
             "COMPARISON_GROUPS",
-            {"six_experiments": tuple(self.cfg.EXPERIMENT_KEYS)},
+            {"eight_experiments": tuple(self.cfg.EXPERIMENT_KEYS)},
         )
         min_counts = getattr(self.cfg, "COMPARISON_GROUP_MIN_EXPERIMENTS", {})
 
@@ -676,7 +688,7 @@ class AllHandlePipeline:
         return False
 
     def bundle_samples(self, group: GroupContext, kind: str) -> list[SampleBundle]:
-        """把同名样本在六个实验中的目录合并，便于统一色条和拼版。"""
+        """把同名样本在八个实验中的目录合并，便于统一色条和拼版。"""
 
         per_experiment = {
             exp_key: self.discover_sample_dirs(category_dir, kind)
@@ -782,6 +794,8 @@ class AllHandlePipeline:
             if normalize_name(group.category_name) != "all":
                 if "error_maps" in enabled_stages:
                     steps.append(("error_maps", self.plot_error_map_bundle))
+                if "tbl_02_error_map" in enabled_stages and normalize_name(group.category_name) == "tbl":
+                    steps.append(("tbl_02_error_map", self.plot_error_map_bundle))
                 if "composite_panels" in enabled_stages:
                     steps.append(("composites", self.plot_composite_bundle))
                 if "particle_stats_metrics" in enabled_stages:
@@ -878,7 +892,7 @@ class AllHandlePipeline:
     # 指标汇总表
     # =========================
     def write_metric_tables(self, groups: list[GroupContext]) -> None:
-        """把 ALL_CLASS_flow.csv 和 ALL_CLASS_IMAGE_PAIR.csv 按类别汇总成 CSV 与带 sheet 的 xlsx。"""
+        """把 ALL_CLASS 指标和 metrics_summary.csv 按类别汇总成 CSV 与带 sheet 的 xlsx。"""
 
         previous_comparison = self.active_comparison_name
         scopes: dict[tuple[str, str, str], list[GroupContext]] = {}
@@ -896,19 +910,31 @@ class AllHandlePipeline:
             sheet_csv_dir.mkdir(parents=True, exist_ok=True)
             category_tables: dict[str, list[dict[str, str]]] = {}
             flat_rows: list[dict[str, str]] = []
+            summary_category_tables: dict[str, list[dict[str, str]]] = {}
+            summary_flat_rows: list[dict[str, str]] = []
+            summary_columns = list(getattr(self.cfg, "METRIC_SUMMARY_METADATA_COLUMNS", ()))
 
             for group in sorted(scope_groups, key=lambda item: normalize_name(item.category_name)):
                 rows = self.build_metric_rows_for_group(group)
-                if not rows:
-                    continue
-                category_tables[group.category_name] = rows
-                flat_rows.extend(rows)
-                # CSV 本身不支持 sheet，因此每个类别额外输出一个单独 CSV，文件名对应 sheet 名。
-                self.write_csv_rows(
-                    sheet_csv_dir / f"{safe_name(group.category_name)}.csv",
-                    rows,
-                    self.cfg.METRIC_TABLE_COLUMNS,
-                )
+                if rows:
+                    category_tables[group.category_name] = rows
+                    flat_rows.extend(rows)
+                    # CSV 本身不支持 sheet，因此每个类别额外输出一个单独 CSV，文件名对应 sheet 名。
+                    self.write_csv_rows(
+                        sheet_csv_dir / f"{safe_name(group.category_name)}.csv",
+                        rows,
+                        self.cfg.METRIC_TABLE_COLUMNS,
+                    )
+
+                # metrics_summary.csv 的列数和列名可能随实验版本变化，因此先收集所有类别的列名并保持首次出现顺序。
+                summary_rows = self.build_metric_summary_rows_for_group(group)
+                if summary_rows:
+                    summary_category_tables[group.category_name] = summary_rows
+                    summary_flat_rows.extend(summary_rows)
+                    for row in summary_rows:
+                        for column in row.keys():
+                            if column not in summary_columns:
+                                summary_columns.append(column)
 
             if flat_rows:
                 self.write_csv_rows(
@@ -920,6 +946,27 @@ class AllHandlePipeline:
                     out_dir / self.cfg.METRIC_TABLE_WORKBOOK_NAME,
                     category_tables,
                     self.cfg.METRIC_TABLE_COLUMNS,
+                )
+            if summary_flat_rows:
+                summary_columns_tuple = tuple(summary_columns)
+                summary_sheet_csv_dir = out_dir / safe_name(self.cfg.METRIC_SUMMARY_SHEET_CSV_DIR_NAME)
+                summary_sheet_csv_dir.mkdir(parents=True, exist_ok=True)
+                for category_name, rows in summary_category_tables.items():
+                    # metrics_summary 的每个类别也额外输出一个 CSV，等价于 xlsx 里的一个 sheet。
+                    self.write_csv_rows(
+                        summary_sheet_csv_dir / f"{safe_name(category_name)}.csv",
+                        rows,
+                        summary_columns_tuple,
+                    )
+                self.write_csv_rows(
+                    out_dir / self.cfg.METRIC_SUMMARY_FLAT_CSV_NAME,
+                    summary_flat_rows,
+                    summary_columns_tuple,
+                )
+                self.write_xlsx_workbook(
+                    out_dir / self.cfg.METRIC_SUMMARY_WORKBOOK_NAME,
+                    summary_category_tables,
+                    summary_columns_tuple,
                 )
 
         self.active_comparison_name = previous_comparison
@@ -960,6 +1007,138 @@ class AllHandlePipeline:
             if image_path is None:
                 self.warn(f"missing ALL_CLASS_IMAGE_PAIR.csv for {group.tag}/{exp_key}: {split_root}")
         return rows
+
+    def build_metric_summary_rows_for_group(self, group: GroupContext) -> list[dict[str, str]]:
+        """读取 metrics_summary.csv，并把多行统计压缩成每个实验一行的对比记录。"""
+
+        rows: list[dict[str, str]] = []
+        file_names = tuple(getattr(self.cfg, "METRIC_SUMMARY_FILE_NAMES", ("metrics_summary.csv", "metrics_summary.CSV")))
+        metadata_columns = tuple(getattr(self.cfg, "METRIC_SUMMARY_METADATA_COLUMNS", ()))
+        for exp_key in [key for key in self.legend_order_keys() if key in group.experiment_dirs]:
+            category_dir = group.experiment_dirs[exp_key]
+            split_root = category_dir.parent if normalize_name(group.category_name) != "all" else category_dir
+            # metrics_summary.csv 可能放在类别目录，也可能放在 split 根目录；
+            # 优先使用类别目录，避免 split 根目录里的总表被每个类别重复读取。
+            summary_path = self.find_case_insensitive_file(category_dir, file_names)
+            if summary_path is None:
+                summary_path = self.find_case_insensitive_file(split_root, file_names)
+            csv_rows = self.read_csv_dict_rows(summary_path)
+            selected_rows = self.filter_metric_summary_rows(csv_rows, group.category_name)
+            if not selected_rows:
+                selected_rows = csv_rows
+            if not selected_rows:
+                if summary_path is None:
+                    self.warn(f"missing metrics_summary.csv for {group.tag}/{exp_key}: {category_dir}")
+                continue
+
+            summary_values = self.summarize_metric_summary_rows(selected_rows, metadata_columns)
+            row = {
+                "comparison": group.comparison_name,
+                "class": group.class_name,
+                "split": group.split_name,
+                "category": group.category_name,
+                "experiment": self.experiment_label(exp_key),
+            }
+            row.update(summary_values)
+            rows.append(row)
+        return rows
+
+    def filter_metric_summary_rows(self, rows: list[dict[str, str]], category_name: str) -> list[dict[str, str]]:
+        """如果 metrics_summary.csv 是 split 级总表，就按类别列筛出当前 backstep/cylinder 等类别。"""
+
+        if not rows:
+            return []
+        target = normalize_name(category_name)
+        if target == "all":
+            return rows
+        # 这些候选列名覆盖常见的类别/数据集/场景字段；找不到匹配列时返回空列表，
+        # 调用方会回退到使用整个 metrics_summary.csv，兼容类别目录中只保存本类别数据的情况。
+        category_keys = (
+            "dataset",
+            "category",
+            "class",
+            "class_name",
+            "source_class",
+            "data_type",
+            "name",
+            "case",
+            "scene",
+        )
+        matched: list[dict[str, str]] = []
+        for row in rows:
+            normalized_keys = {normalize_name(key): key for key in row.keys()}
+            for key in category_keys:
+                real_key = normalized_keys.get(normalize_name(key))
+                if real_key and normalize_name(row.get(real_key, "")) == target:
+                    matched.append(row)
+                    break
+        return matched
+
+    def summarize_metric_summary_rows(
+        self,
+        rows: list[dict[str, str]],
+        reserved_columns: tuple[str, ...],
+    ) -> dict[str, str]:
+        """把 metrics_summary.csv 多行压缩为一行：前 11 列取首行，第 12 列起取每列最大值。"""
+
+        if not rows:
+            return {}
+        fixed_count = int(getattr(self.cfg, "METRIC_SUMMARY_FIXED_COLUMN_COUNT", 11))
+        source_columns = list(rows[0].keys())
+        summary: dict[str, str] = {}
+        used_columns = set(reserved_columns)
+        for column_index, source_column in enumerate(source_columns):
+            output_column = self.metric_summary_output_column_name(source_column, used_columns)
+            used_columns.add(output_column)
+            if column_index < fixed_count:
+                # 前 11 列按用户要求“都是一行的”，直接取第一行；若第一行为空，取后续第一个非空值。
+                summary[output_column] = self.first_nonempty_metric_summary_value(rows, source_column)
+            else:
+                # 后续每列在多行中取数值最大值；如果整列无法转成数值，则保留第一个非空文本。
+                summary[output_column] = self.max_metric_summary_value(rows, source_column)
+        return summary
+
+    def metric_summary_output_column_name(self, source_column: str, used_columns: set[str]) -> str:
+        """避免 metrics_summary 原始列名和 comparison/class 等定位列重名。"""
+
+        base = str(source_column).strip() or "unnamed"
+        # 如果原表也有 class/category/experiment 等列，添加 metrics_summary_ 前缀，避免覆盖定位列。
+        candidate = base if base not in used_columns else f"metrics_summary_{base}"
+        suffix = 2
+        while candidate in used_columns:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        return candidate
+
+    def first_nonempty_metric_summary_value(self, rows: list[dict[str, str]], column: str) -> str:
+        """取首行值；首行为空时向下寻找第一个非空值。"""
+
+        first_value = str(rows[0].get(column, "")).strip()
+        if first_value:
+            return first_value
+        for row in rows[1:]:
+            text = str(row.get(column, "")).strip()
+            if text:
+                return text
+        return ""
+
+    def max_metric_summary_value(self, rows: list[dict[str, str]], column: str) -> str:
+        """取 metrics_summary 某一列的最大数值；保留原始文本格式写入表格。"""
+
+        best_number: float | None = None
+        best_text = ""
+        first_text = ""
+        for row in rows:
+            text = str(row.get(column, "")).strip()
+            if text and not first_text:
+                first_text = text
+            number = self.to_float_loose(text)
+            if number is None or not math.isfinite(number):
+                continue
+            if best_number is None or number > best_number:
+                best_number = number
+                best_text = text
+        return best_text if best_number is not None else first_text
 
     def find_case_insensitive_file(self, directory: Path, names: tuple[str, ...]) -> Path | None:
         """按文件名大小写不敏感查找 CSV，兼容 .csv/.CSV 两种历史输出。"""
@@ -1146,7 +1325,7 @@ class AllHandlePipeline:
     # (1) 能量谱
     # =========================
     def plot_energy_spectrum(self, group: GroupContext) -> None:
-        """把六个实验的 ENERGY_SPECTRUM 曲线叠加到一张图。"""
+        """把八个实验的 ENERGY_SPECTRUM 曲线叠加到一张图。"""
 
         series: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         gt_series: tuple[np.ndarray, np.ndarray] | None = None
@@ -1554,12 +1733,16 @@ class AllHandlePipeline:
     def plot_tbl_particle_error_pair_map(
         self, group: GroupContext, bundle: SampleBundle, time_name: str, crop: bool = False
     ) -> None:
-        """TBL 专用 02_error_maps：每行左侧颗粒 SR 图，右侧对应误差图；crop=True 时输出局部图。"""
+        """TBL 专用 02_error_maps：full-frame 首行加入 GT，并用红框标出 crop 位置。"""
 
         exp_keys = [key for key in self.legend_order_keys() if key in bundle.sample_dirs]
         rows: list[tuple[str, np.ndarray | None, np.ndarray | None]] = []
         sr_maps: dict[str, np.ndarray] = {}
         error_maps: dict[str, np.ndarray] = {}
+        gt = None if crop else self.first_available_particle(bundle, time_name, "gt", crop=False)
+        if gt is not None:
+            gt = ensure_2d_image(gt)
+            rows.append((self.cfg.GT_PANEL_LABEL, gt, None))
         for exp_key in exp_keys:
             sample_dir = bundle.sample_dirs.get(exp_key)
             if sample_dir is None:
@@ -1575,27 +1758,47 @@ class AllHandlePipeline:
         if not rows:
             return
 
-        image_vmin, image_vmax = self.row_limit(sr_maps.values(), self.cfg.PARTICLE_VALUE_COLORBAR_LIMIT)
+        image_arrays_for_limit = ([gt] if gt is not None else []) + list(sr_maps.values())
+        image_vmin, image_vmax = self.row_limit(image_arrays_for_limit, self.cfg.PARTICLE_VALUE_COLORBAR_LIMIT)
         error_vmin, error_vmax = self.resolve_color_limit(
             self.error_colorbar_reference_arrays(error_maps),
             self.cfg.PARTICLE_ERROR_COLORBAR_LIMIT,
             center_zero=True,
         )
+        crop_ref = gt if gt is not None else next((value for value in sr_maps.values() if value is not None), None)
+        crop_ref_hw = self.image_hw(crop_ref)
+        crop_bounds = self.resolve_tbl_particle_crop_bounds(crop_ref_hw) if not crop else None
         row_count = len(rows)
         fig_width = float(getattr(self.cfg, "TBL_ERROR_MAP_VERTICAL_FIG_WIDTH", 10.5))
         row_height = float(getattr(self.cfg, "TBL_ERROR_MAP_VERTICAL_ROW_HEIGHT", 1.15))
-        fig = plt.figure(figsize=(fig_width, max(3.0, row_height * row_count)))
-        gs = fig.add_gridspec(
-            row_count,
-            4,
-            width_ratios=[1, 1, 0.045, 0.045],
-            hspace=float(getattr(self.cfg, "TBL_ERROR_MAP_VERTICAL_HSPACE", 0.06)),
-            wspace=float(getattr(self.cfg, "TBL_ERROR_MAP_VERTICAL_WSPACE", 0.05)),
+        # 用户指定 TBL full-frame 的 particle_*_error.png 去掉第二列误差图和全部色条；
+        # crop 图仍保留原来的两列布局，便于查看局部误差细节。
+        full_frame_image_only = (
+            not crop
+            and normalize_name(group.category_name) == "tbl"
+            and bool(getattr(self.cfg, "TBL_ERROR_MAP_PARTICLE_FULL_FRAME_IMAGE_ONLY", True))
         )
+        label_loc = getattr(self.cfg, "TBL_ERROR_MAP_PARTICLE_LABEL_LOC", "upper_right") if full_frame_image_only else "upper_left"
+        fig = plt.figure(figsize=(fig_width, max(3.0, row_height * row_count)))
+        if full_frame_image_only:
+            gs = fig.add_gridspec(
+                row_count,
+                1,
+                hspace=float(getattr(self.cfg, "TBL_ERROR_MAP_VERTICAL_HSPACE", 0.06)),
+                wspace=0.0,
+            )
+        else:
+            gs = fig.add_gridspec(
+                row_count,
+                4,
+                width_ratios=[1, 1, 0.045, 0.045],
+                hspace=float(getattr(self.cfg, "TBL_ERROR_MAP_VERTICAL_HSPACE", 0.06)),
+                wspace=float(getattr(self.cfg, "TBL_ERROR_MAP_VERTICAL_WSPACE", 0.05)),
+            )
         image_handle = None
         error_handle = None
         for row_idx, (label, sr, error) in enumerate(rows):
-            ax = fig.add_subplot(gs[row_idx, 0])
+            ax = fig.add_subplot(gs[row_idx, 0] if not full_frame_image_only else gs[row_idx])
             image_handle = self.draw_map(
                 ax,
                 sr,
@@ -1603,31 +1806,36 @@ class AllHandlePipeline:
                 image_vmin,
                 image_vmax,
                 label,
-                fill_panel=True,
+                fill_panel=crop,
+                label_loc=label_loc,
             ) or image_handle
-            ax = fig.add_subplot(gs[row_idx, 1])
-            error_handle = self.draw_map(
-                ax,
-                error,
-                self.cfg.ERROR_CMAP,
-                error_vmin,
-                error_vmax,
-                label if error is not None else "",
-                fill_panel=True,
-            ) or error_handle
+            self.draw_tbl_particle_crop_box(ax, sr, crop_ref_hw, crop_bounds)
+            if not full_frame_image_only:
+                ax = fig.add_subplot(gs[row_idx, 1])
+                error_handle = self.draw_map(
+                    ax,
+                    error,
+                    self.cfg.ERROR_CMAP,
+                    error_vmin,
+                    error_vmax,
+                    label if error is not None else "",
+                    fill_panel=crop,
+                ) or error_handle
+                self.draw_tbl_particle_crop_box(ax, error, crop_ref_hw, crop_bounds)
 
-        cax_image = fig.add_subplot(gs[:, 2])
-        if image_handle is not None and image_vmin is not None and image_vmax is not None:
-            cb = fig.colorbar(image_handle, cax=cax_image)
-            cb.set_label(self.cfg.PARTICLE_VALUE_COLORBAR_LABEL, fontsize=self.cfg.COLORBAR_LABEL_SIZE)
-        else:
-            cax_image.axis("off")
-        cax_error = fig.add_subplot(gs[:, 3])
-        if error_handle is not None and error_vmin is not None and error_vmax is not None:
-            cb = fig.colorbar(error_handle, cax=cax_error)
-            cb.set_label(self.cfg.PARTICLE_ERROR_COLORBAR_LABEL, fontsize=self.cfg.COLORBAR_LABEL_SIZE)
-        else:
-            cax_error.axis("off")
+        if not full_frame_image_only:
+            cax_image = fig.add_subplot(gs[:, 2])
+            if image_handle is not None and image_vmin is not None and image_vmax is not None:
+                cb = fig.colorbar(image_handle, cax=cax_image)
+                cb.set_label(self.cfg.PARTICLE_VALUE_COLORBAR_LABEL, fontsize=self.cfg.COLORBAR_LABEL_SIZE)
+            else:
+                cax_image.axis("off")
+            cax_error = fig.add_subplot(gs[:, 3])
+            if error_handle is not None and error_vmin is not None and error_vmax is not None:
+                cb = fig.colorbar(error_handle, cax=cax_error)
+                cb.set_label(self.cfg.PARTICLE_ERROR_COLORBAR_LABEL, fontsize=self.cfg.COLORBAR_LABEL_SIZE)
+            else:
+                cax_error.axis("off")
 
         out_dir = self.output_dir(
             self.cfg.ERROR_MAP_OUTPUT_DIR_NAME,
@@ -1638,7 +1846,7 @@ class AllHandlePipeline:
         )
         suffix = getattr(self.cfg, "TBL_PARTICLE_CROP_OUTPUT_SUFFIX", "_crop") if crop else ""
         out_base = out_dir / f"particle_{time_name}_error{suffix}"
-        self.save_npy(out_base.with_suffix(".npy"), {"sr": sr_maps, "error": error_maps})
+        self.save_npy(out_base.with_suffix(".npy"), {"gt": gt, "sr": sr_maps, "error": error_maps})
         self.save_figure(fig, out_base)
 
     def plot_single_row_maps(
@@ -1949,6 +2157,35 @@ class AllHandlePipeline:
         y0, y1, x0, x1 = bounds
         return np.ascontiguousarray(arr[y0:y1, x0:x1, ...])
 
+    def draw_tbl_particle_crop_box(
+        self,
+        ax: plt.Axes,
+        array: np.ndarray | None,
+        ref_hw: tuple[int, int] | None,
+        ref_bounds: tuple[int, int, int, int] | None,
+    ) -> None:
+        """在 TBL full-frame 颗粒图/误差图上画 crop 红框；crop 图本身不再重复画框。"""
+
+        if array is None or ref_hw is None or ref_bounds is None:
+            return
+        target_hw = self.image_hw(array)
+        bounds = self.scale_crop_bounds_to_target(ref_bounds, ref_hw, target_hw)
+        if bounds is None:
+            return
+        y0, y1, x0, x1 = bounds
+        patch_cls = ensure_matplotlib().matplotlib.patches.Rectangle
+        ax.add_patch(
+            patch_cls(
+                (x0, y0),
+                x1 - x0,
+                y1 - y0,
+                fill=False,
+                edgecolor=getattr(self.cfg, "TBL_PARTICLE_CROP_BOX_COLOR", "red"),
+                linewidth=float(getattr(self.cfg, "TBL_PARTICLE_CROP_BOX_LINE_WIDTH", 1.3)),
+                zorder=8,
+            )
+        )
+
     def first_available_particle_crop_reference(self, sample_dir: Path, time_name: str) -> np.ndarray | None:
         """TBL crop 框优先以 GT 图为参考；GT 缺失时回退到 SR/LR，尽量不让 crop 图整体缺失。"""
 
@@ -2016,6 +2253,8 @@ class AllHandlePipeline:
         """统一调度颗粒、光流、涡度和颗粒统计组合图。"""
 
         self.plot_particle_sr_error_composites(group)
+        if normalize_name(group.category_name) == "experiment":
+            self.plot_experiment_particle_zoom_composites(group)
         self.plot_flow_value_error_composites(group)
         self.plot_vorticity_composites(group)
         self.plot_particle_stats_composites(group)
@@ -2032,7 +2271,7 @@ class AllHandlePipeline:
             return bundles[: int(limit)]
         return bundles
 
-    def panel_text(self, ax: plt.Axes, text: str, fontsize: float | None = None) -> None:
+    def panel_text(self, ax: plt.Axes, text: str, fontsize: float | None = None, loc: str = "upper_left") -> None:
         """用轴内文本作为面板 label，避免使用 Matplotlib title。"""
 
         if not text:
@@ -2040,12 +2279,19 @@ class AllHandlePipeline:
         # 颗粒阈值化图的 label 往往是 “实验名 + binary”，比普通面板标题更长；
         # 这里允许 draw_map 传入较小字号，防止标题文字超出图像本身。
         label_size = self.cfg.PANEL_LABEL_SIZE if fontsize is None else fontsize
+        # 个别 TBL full-frame 图左上角有 crop 红框，label 放左上会遮挡；
+        # 因此支持把 label 放到右上，其它图默认仍使用左上角，保持旧版论文图样式。
+        loc_key = normalize_name(loc)
+        if loc_key in ("upper_right", "right_top", "top_right"):
+            x, ha = 0.98, "right"
+        else:
+            x, ha = 0.02, "left"
         ax.text(
-            0.02,
+            x,
             0.98,
             text,
             transform=ax.transAxes,
-            ha="left",
+            ha=ha,
             va="top",
             fontsize=label_size,
             bbox={"facecolor": "white", "alpha": 0.78, "edgecolor": "none", "pad": 1.5},
@@ -2061,6 +2307,7 @@ class AllHandlePipeline:
         label: str,
         fill_panel: bool = False,
         label_fontsize: float | None = None,
+        label_loc: str = "upper_left",
     ):
         if array is None:
             ax.axis("off")
@@ -2075,7 +2322,7 @@ class AllHandlePipeline:
         # 未指定时，仍对 binary 阈值图自动使用颗粒阈值专用字号。
         if label_fontsize is None and "binary" in str(label).lower():
             label_fontsize = float(getattr(self.cfg, "PARTICLE_BINARY_PANEL_LABEL_SIZE", self.cfg.PANEL_LABEL_SIZE))
-        self.panel_text(ax, label, fontsize=label_fontsize)
+        self.panel_text(ax, label, fontsize=label_fontsize, loc=label_loc)
         ax.axis("off")
         return handle
 
@@ -2182,6 +2429,62 @@ class AllHandlePipeline:
         ax.axis("off")
         return handle
 
+    def experiment_zoom_bounds(
+        self,
+        region: tuple[float, float, float, float],
+        height: int,
+        width: int,
+    ) -> tuple[int, int, int, int]:
+        """把 experiment 局部放大相对区域换算成 y0/y1/x0/x1。"""
+
+        x_ratio, y_ratio, w_ratio, h_ratio = region
+        crop_w = max(8, int(round(width * float(w_ratio))))
+        crop_h = max(8, int(round(height * float(h_ratio))))
+        cx = int(round(width * float(x_ratio)))
+        cy = int(round(height * float(y_ratio)))
+        x0 = max(0, min(width - crop_w, cx - crop_w // 2))
+        y0 = max(0, min(height - crop_h, cy - crop_h // 2))
+        return y0, y0 + crop_h, x0, x0 + crop_w
+
+    def scale_zoom_bounds(
+        self,
+        bounds: tuple[int, int, int, int],
+        source_hw: tuple[int, int],
+        target_hw: tuple[int, int],
+    ) -> tuple[int, int, int, int]:
+        """把 HR/SR 坐标框缩放到 LR 坐标。"""
+
+        y0, y1, x0, x1 = bounds
+        src_h, src_w = source_hw
+        dst_h, dst_w = target_hw
+        return (
+            max(0, min(dst_h - 1, int(round(y0 * dst_h / src_h)))),
+            max(1, min(dst_h, int(round(y1 * dst_h / src_h)))),
+            max(0, min(dst_w - 1, int(round(x0 * dst_w / src_w)))),
+            max(1, min(dst_w, int(round(x1 * dst_w / src_w)))),
+        )
+
+    def draw_zoom_overview(self, ax: plt.Axes, array: np.ndarray | None, bounds_list, label: str):
+        """绘制带红框的整图 overview。"""
+
+        handle = self.draw_map(ax, array, self.cfg.IMAGE_CMAP, 0.0, 1.0, label)
+        if array is not None:
+            import matplotlib.patches as patches
+
+            for idx, (y0, y1, x0, x1) in enumerate(bounds_list, start=1):
+                ax.add_patch(
+                    patches.Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False, edgecolor="red", linewidth=1.2)
+                )
+                ax.text(
+                    x0,
+                    y0,
+                    str(idx),
+                    color="white",
+                    fontsize=8,
+                    bbox={"facecolor": "red", "edgecolor": "none", "pad": 1},
+                )
+        return handle
+
     def row_limit(
         self,
         arrays: Iterable[np.ndarray | None],
@@ -2216,6 +2519,26 @@ class AllHandlePipeline:
             pass
         mpl = ensure_matplotlib().matplotlib
         return mpl.cm.ScalarMappable(norm=mpl.colors.Normalize(vmin=vmin, vmax=vmax), cmap=cmap)
+
+    def composite_wrap_method_count(self) -> int | None:
+        """读取当前对比组组合图每块显示的实验数量；None 表示不换行。"""
+
+        mapping = getattr(self.cfg, "COMPARISON_GROUP_COMPOSITE_WRAP_METHOD_COUNT", {})
+        value = mapping.get(self.active_comparison_name)
+        if value is None:
+            return None
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    def chunk_items(self, items: list, chunk_size: int | None) -> list[list]:
+        """把实验列表按 chunk_size 分块；chunk_size=None 时保持一个整体。"""
+
+        if not chunk_size or chunk_size >= len(items):
+            return [items]
+        return [items[idx : idx + chunk_size] for idx in range(0, len(items), chunk_size)]
 
     def tbl_profile_valid_height(self, sample_dir: Path) -> int | None:
         """读取 TBL profile_analysis 中保存的有效 y 高度，用于裁掉误差图底部无效壁面区。"""
@@ -2298,8 +2621,81 @@ class AllHandlePipeline:
         if is_tbl and getattr(self.cfg, "TBL_PARTICLE_CROP_ENABLED", True):
             self.plot_particle_sr_error_composites_horizontal(group, crop=True)
 
+    def plot_experiment_particle_zoom_composites(self, group: GroupContext) -> None:
+        """experiment 专用：跨实验局部放大颗粒对比图，并在整图上标红框。"""
+
+        regions = tuple(getattr(self.cfg, "EXPERIMENT_PARTICLE_ZOOM_REGIONS", ()))
+        if not regions:
+            return
+        for bundle in self.limited_bundles(group, "particle"):
+            exp_keys = [key for key in group.experiment_keys if key in bundle.sample_dirs]
+            if not exp_keys:
+                continue
+            for time_name in ("previous", "next"):
+                gt = self.first_available_particle(bundle, time_name, "gt", crop=False)
+                sr_maps = {
+                    exp_key: self.load_particle_array_mode(sample_dir, time_name, "sr", crop=False)
+                    for exp_key, sample_dir in bundle.sample_dirs.items()
+                }
+                if gt is None or not any(value is not None for value in sr_maps.values()):
+                    continue
+                gt_arr = ensure_2d_image(gt)
+                gt_hw = self.image_hw(gt_arr)
+                if gt_hw is None:
+                    continue
+                gt_h, gt_w = gt_hw
+                bounds_list = [self.experiment_zoom_bounds(region, gt_h, gt_w) for region in regions]
+
+                # experiment 的 zoom composite 只展示 GT 和各方法 SR。
+                # LR 尺寸与 SR/GT 不同，SR-HR 误差又基于插值伪 GT；去掉它们后，
+                # 每个局部块可以画得更大，红框区域里的颗粒细节更容易直接比较。
+                n_cols = 1 + len(exp_keys)
+                n_rows = 1 + len(bounds_list)
+                fig = plt.figure(figsize=(2.65 * n_cols + 0.8, 2.45 * n_rows + 0.4))
+                gs = fig.add_gridspec(n_rows, n_cols, hspace=0.08, wspace=0.035)
+
+                self.draw_zoom_overview(fig.add_subplot(gs[0, 0]), gt_arr, bounds_list, self.cfg.GT_PANEL_LABEL)
+                for col_idx, exp_key in enumerate(exp_keys, start=1):
+                    self.draw_zoom_overview(
+                        fig.add_subplot(gs[0, col_idx]),
+                        sr_maps.get(exp_key),
+                        bounds_list,
+                        self.experiment_label(exp_key),
+                    )
+
+                for row_idx, bounds in enumerate(bounds_list, start=1):
+                    y0, y1, x0, x1 = bounds
+                    self.draw_map(
+                        fig.add_subplot(gs[row_idx, 0]),
+                        gt_arr[y0:y1, x0:x1],
+                        self.cfg.IMAGE_CMAP,
+                        0.0,
+                        1.0,
+                        f"R{row_idx} GT",
+                    )
+                    for col_idx, exp_key in enumerate(exp_keys, start=1):
+                        sr = sr_maps.get(exp_key)
+                        sr_crop = self.crop_array_by_bounds(sr, bounds) if sr is not None else None
+                        self.draw_map(
+                            fig.add_subplot(gs[row_idx, col_idx]),
+                            sr_crop,
+                            self.cfg.IMAGE_CMAP,
+                            0.0,
+                            1.0,
+                            self.experiment_label(exp_key),
+                        )
+
+                out_dir = self.output_dir(
+                    self.cfg.COMPOSITE_OUTPUT_DIR_NAME,
+                    group.class_name,
+                    group.split_name,
+                    group.category_name,
+                    bundle.sample_name,
+                )
+                self.save_figure(fig, out_dir / f"particle_zoom_composite_{time_name}")
+
     def plot_particle_sr_error_composites_horizontal(self, group: GroupContext, crop: bool = False) -> None:
-        """previous/next 的 LR、GT、六个 SR 与对应误差图；crop=True 时使用 TBL crop 数据但保持横向布局。"""
+        """previous/next 的 LR、GT、八个 SR 与对应误差图；crop=True 时使用 TBL crop 数据但保持横向布局。"""
 
         for bundle in self.limited_bundles(group, "particle"):
             rows = []
@@ -2318,22 +2714,41 @@ class AllHandlePipeline:
                 rows.append((time_name, "error", [None, None], err_maps))
 
             exp_keys = [key for key in group.experiment_keys if key in bundle.sample_dirs]
-            n_cols = 2 + len(exp_keys)
-            fig = plt.figure(figsize=(2.0 * n_cols + 0.5, 8.2))
-            gs = fig.add_gridspec(4, n_cols + 1, width_ratios=[1] * n_cols + [0.06], hspace=0.08, wspace=0.04)
-            for row_idx, (time_name, row_kind, fixed_maps, exp_maps) in enumerate(rows):
-                row_arrays = fixed_maps + [exp_maps.get(exp_key) for exp_key in exp_keys]
+            exp_chunks = self.chunk_items(exp_keys, self.composite_wrap_method_count())
+            fixed_count = 2
+            method_cols = max((len(chunk) for chunk in exp_chunks), default=0)
+            n_cols = fixed_count + method_cols
+            row_specs = []
+            for time_name, row_kind, fixed_maps, exp_maps in rows:
+                for chunk_idx, chunk in enumerate(exp_chunks):
+                    row_specs.append((time_name, row_kind, fixed_maps, exp_maps, chunk_idx, chunk))
+            fig = plt.figure(figsize=(2.0 * n_cols + 0.5, max(4.2, 2.05 * len(row_specs))))
+            gs = fig.add_gridspec(
+                len(row_specs),
+                n_cols + 1,
+                width_ratios=[1] * n_cols + [0.06],
+                hspace=0.08,
+                wspace=0.04,
+            )
+            for row_idx, (time_name, row_kind, fixed_maps, exp_maps, chunk_idx, chunk) in enumerate(row_specs):
+                show_fixed = chunk_idx == 0
+                # 颗粒图第一块保留 LR/GT；eight_experiments 的第二块只空出最左侧参考列，
+                # 让后 4 个实验从第二列开始，避免继续对齐到 GT/LR 两个固定列之后导致画面右移。
+                current_fixed_maps = fixed_maps if show_fixed else [None]
+                row_arrays = current_fixed_maps + [exp_maps.get(exp_key) for exp_key in chunk]
+                row_arrays += [None] * (n_cols - len(row_arrays))
                 # 颗粒 SR 对比图的 LR 面板使用原始低分辨率尺寸；
                 # 参考画布取 GT 和各个 SR 的最大尺寸，确保 LR 顶部与旁边图像上边缘对齐。
                 lr_reference_shape = None
                 if row_kind == "image":
                     lr_reference_shape = self.reference_hw([fixed_maps[1]] + [exp_maps.get(exp_key) for exp_key in exp_keys])
                 if row_kind == "image":
-                    vmin, vmax = self.row_limit(row_arrays, self.cfg.PARTICLE_VALUE_COLORBAR_LIMIT)
+                    all_row_arrays = fixed_maps + [exp_maps.get(exp_key) for exp_key in exp_keys]
+                    vmin, vmax = self.row_limit(all_row_arrays, self.cfg.PARTICLE_VALUE_COLORBAR_LIMIT)
                     cmap = self.cfg.IMAGE_CMAP
                     colorbar_label = self.cfg.PARTICLE_VALUE_COLORBAR_LABEL
-                    labels = [self.cfg.LR_PANEL_LABEL, self.cfg.GT_PANEL_LABEL] + [
-                        self.experiment_label(exp_key) for exp_key in exp_keys
+                    labels = ([self.cfg.LR_PANEL_LABEL, self.cfg.GT_PANEL_LABEL] if show_fixed else [""]) + [
+                        self.experiment_label(exp_key) for exp_key in chunk
                     ]
                 else:
                     # 组合图中的颗粒误差行也使用 0 居中的白色发散色条。
@@ -2344,9 +2759,10 @@ class AllHandlePipeline:
                     )
                     cmap = self.cfg.ERROR_CMAP
                     colorbar_label = self.cfg.PARTICLE_ERROR_COLORBAR_LABEL
-                    labels = [self.cfg.BLANK_PANEL_LABEL, self.cfg.BLANK_PANEL_LABEL] + [
-                        self.experiment_label(exp_key) for exp_key in exp_keys
+                    labels = ([self.cfg.BLANK_PANEL_LABEL, self.cfg.BLANK_PANEL_LABEL] if show_fixed else [""]) + [
+                        self.experiment_label(exp_key) for exp_key in chunk
                     ]
+                labels += [""] * (n_cols - len(labels))
                 image_handle = None
                 for col_idx, array in enumerate(row_arrays):
                     ax = fig.add_subplot(gs[row_idx, col_idx])
@@ -2369,7 +2785,7 @@ class AllHandlePipeline:
                         )
                         handle = self.draw_map(ax, array, cmap, vmin, vmax, labels[col_idx], fill_panel=fill_panel)
                     image_handle = handle or image_handle
-                    if col_idx == 0:
+                    if col_idx == 0 and show_fixed:
                         ax.text(
                             -0.08,
                             0.5,
@@ -2585,7 +3001,7 @@ class AllHandlePipeline:
                 )
 
     def plot_vorticity_composites(self, group: GroupContext) -> None:
-        """图八：GT 原涡度图、六个实验的涡度位移图与涡度误差图。"""
+        """图八：GT 原涡度图、八个实验的涡度位移图与涡度误差图。"""
 
         for bundle in self.limited_bundles(group, "vorticity"):
             gt_map = None
@@ -2616,73 +3032,93 @@ class AllHandlePipeline:
             if not exp_keys:
                 continue
 
-            # 第一列固定为 GT 原图，后续列是各个对比实验；第二行 GT 位置留空，只展示各实验误差图。
-            top_arrays = [gt_map] + [pred_maps.get(exp_key) for exp_key in exp_keys]
-            bottom_arrays = [err_maps.get(exp_key) for exp_key in exp_keys]
-            top_vmin, top_vmax = self.row_limit(top_arrays, self.cfg.VORTICITY_VALUE_COLORBAR_LIMIT)
-            bottom_vmin, bottom_vmax = self.row_limit(bottom_arrays, self.cfg.VORTICITY_ERROR_COLORBAR_LIMIT)
-            n_cols = 1 + len(exp_keys)
-            fig = plt.figure(figsize=(2.05 * n_cols + 0.45, 4.3))
+            # 八组对比横向排满会过挤，因此复用组合图分块策略：
+            # 第一块显示 GT + 前 4 个实验，第二块 GT 位置留空，让后 4 个实验从第二列开始。
+            # 色条按每一行单独生成，保证换行后每块图仍有对应的物理量说明。
+            exp_chunks = self.chunk_items(exp_keys, self.composite_wrap_method_count())
+            top_vmin, top_vmax = self.row_limit(
+                [gt_map] + [pred_maps.get(exp_key) for exp_key in exp_keys],
+                self.cfg.VORTICITY_VALUE_COLORBAR_LIMIT,
+            )
+            bottom_vmin, bottom_vmax = self.row_limit(
+                [err_maps.get(exp_key) for exp_key in exp_keys],
+                self.cfg.VORTICITY_ERROR_COLORBAR_LIMIT,
+            )
+            n_cols = 1 + max((len(chunk) for chunk in exp_chunks), default=0)
+            n_rows = 2 * len(exp_chunks)
+            fig = plt.figure(figsize=(2.05 * n_cols + 0.45, max(4.3, 2.15 * n_rows)))
             gs = fig.add_gridspec(
-                2,
+                n_rows,
                 n_cols + 1,
                 width_ratios=[1] * n_cols + [0.06],
                 hspace=0.08,
                 wspace=0.04,
             )
 
-            top_handle = None
-            bottom_handle = None
-            ax = fig.add_subplot(gs[0, 0])
-            top_handle = self.draw_map(
-                ax,
-                gt_map,
-                self.cfg.IMAGE_CMAP,
-                top_vmin,
-                top_vmax,
-                self.cfg.VORTICITY_GT_PANEL_LABEL,
-            ) or top_handle
-            # GT 原图也叠加 GT 位移/速度场箭头，和各实验预测涡度位移图形成同一语义对比。
-            self.draw_quiver_overlay(ax, gt_quiver, gt_map)
+            for chunk_idx, chunk in enumerate(exp_chunks):
+                top_row = chunk_idx * 2
+                bottom_row = top_row + 1
+                top_handle = None
+                bottom_handle = None
 
-            ax = fig.add_subplot(gs[1, 0])
-            ax.axis("off")
-            for col_idx, exp_key in enumerate(exp_keys):
-                plot_col = col_idx + 1
-                ax = fig.add_subplot(gs[0, plot_col])
-                top_handle = self.draw_map(
-                    ax,
-                    pred_maps.get(exp_key),
-                    self.cfg.IMAGE_CMAP,
-                    top_vmin,
-                    top_vmax,
-                    self.experiment_label(exp_key),
-                ) or top_handle
-                # 涡度位移图第一行叠加 fake_flo 位移/速度场箭头，和原始 vorticity_quiver 图保持语义一致。
-                self.draw_quiver_overlay(ax, quiver_maps.get(exp_key), pred_maps.get(exp_key))
+                ax = fig.add_subplot(gs[top_row, 0])
+                if chunk_idx == 0:
+                    top_handle = self.draw_map(
+                        ax,
+                        gt_map,
+                        self.cfg.IMAGE_CMAP,
+                        top_vmin,
+                        top_vmax,
+                        self.cfg.VORTICITY_GT_PANEL_LABEL,
+                    ) or top_handle
+                    # GT 原图也叠加 GT 位移/速度场箭头，和各实验预测涡度位移图形成同一语义对比。
+                    self.draw_quiver_overlay(ax, gt_quiver, gt_map)
+                else:
+                    ax.axis("off")
 
-                ax = fig.add_subplot(gs[1, plot_col])
-                bottom_handle = self.draw_map(
-                    ax,
-                    err_maps.get(exp_key),
-                    self.cfg.ERROR_CMAP,
-                    bottom_vmin,
-                    bottom_vmax,
-                    self.experiment_label(exp_key),
-                ) or bottom_handle
+                ax = fig.add_subplot(gs[bottom_row, 0])
+                ax.axis("off")
 
-            cax = fig.add_subplot(gs[0, n_cols])
-            if top_handle is not None and top_vmin is not None and top_vmax is not None:
-                cb = fig.colorbar(top_handle, cax=cax)
-                cb.set_label(self.cfg.VORTICITY_VALUE_COLORBAR_LABEL, fontsize=self.cfg.COLORBAR_LABEL_SIZE)
-            else:
-                cax.axis("off")
-            cax = fig.add_subplot(gs[1, n_cols])
-            if bottom_handle is not None and bottom_vmin is not None and bottom_vmax is not None:
-                cb = fig.colorbar(bottom_handle, cax=cax)
-                cb.set_label(self.cfg.VORTICITY_ERROR_COLORBAR_LABEL, fontsize=self.cfg.COLORBAR_LABEL_SIZE)
-            else:
-                cax.axis("off")
+                for col_idx, exp_key in enumerate(chunk, start=1):
+                    ax = fig.add_subplot(gs[top_row, col_idx])
+                    top_handle = self.draw_map(
+                        ax,
+                        pred_maps.get(exp_key),
+                        self.cfg.IMAGE_CMAP,
+                        top_vmin,
+                        top_vmax,
+                        self.experiment_label(exp_key),
+                    ) or top_handle
+                    # 涡度位移图第一行叠加 fake_flo 位移/速度场箭头，和原始 vorticity_quiver 图保持语义一致。
+                    self.draw_quiver_overlay(ax, quiver_maps.get(exp_key), pred_maps.get(exp_key))
+
+                    ax = fig.add_subplot(gs[bottom_row, col_idx])
+                    bottom_handle = self.draw_map(
+                        ax,
+                        err_maps.get(exp_key),
+                        self.cfg.ERROR_CMAP,
+                        bottom_vmin,
+                        bottom_vmax,
+                        self.experiment_label(exp_key),
+                    ) or bottom_handle
+
+                # 每块不足 4 个实验时，末尾空列关闭，避免留下带坐标轴的空面板。
+                for empty_col in range(1 + len(chunk), n_cols):
+                    fig.add_subplot(gs[top_row, empty_col]).axis("off")
+                    fig.add_subplot(gs[bottom_row, empty_col]).axis("off")
+
+                cax = fig.add_subplot(gs[top_row, n_cols])
+                if top_handle is not None and top_vmin is not None and top_vmax is not None:
+                    cb = fig.colorbar(top_handle, cax=cax)
+                    cb.set_label(self.cfg.VORTICITY_VALUE_COLORBAR_LABEL, fontsize=self.cfg.COLORBAR_LABEL_SIZE)
+                else:
+                    cax.axis("off")
+                cax = fig.add_subplot(gs[bottom_row, n_cols])
+                if bottom_handle is not None and bottom_vmin is not None and bottom_vmax is not None:
+                    cb = fig.colorbar(bottom_handle, cax=cax)
+                    cb.set_label(self.cfg.VORTICITY_ERROR_COLORBAR_LABEL, fontsize=self.cfg.COLORBAR_LABEL_SIZE)
+                else:
+                    cax.axis("off")
 
             out_base = self.output_dir(
                 self.cfg.COMPOSITE_OUTPUT_DIR_NAME,
@@ -2717,19 +3153,10 @@ class AllHandlePipeline:
         """通用两行拼图：第一行数值图，第二行误差图，每行末尾一个统一色条。"""
 
         exp_keys = [key for key in self.legend_order_keys() if key in method_top or key in method_bottom]
-        top_arrays = fixed_top + [method_top.get(exp_key) for exp_key in exp_keys]
-        bottom_arrays = fixed_bottom + [method_bottom.get(exp_key) for exp_key in exp_keys]
-        n_cols = max(len(top_arrays), len(bottom_arrays))
-        if n_cols == 0:
-            return
-        top_arrays += [None] * (n_cols - len(top_arrays))
-        bottom_arrays += [None] * (n_cols - len(bottom_arrays))
-        top_labels = fixed_top_labels + [method_labels.get(exp_key, self.experiment_label(exp_key)) for exp_key in exp_keys]
-        bottom_labels = fixed_bottom_labels + [method_labels.get(exp_key, self.experiment_label(exp_key)) for exp_key in exp_keys]
-        top_labels += [""] * (n_cols - len(top_labels))
-        bottom_labels += [""] * (n_cols - len(bottom_labels))
+        all_top_arrays = fixed_top + [method_top.get(exp_key) for exp_key in exp_keys]
+        all_bottom_arrays = fixed_bottom + [method_bottom.get(exp_key) for exp_key in exp_keys]
 
-        top_vmin, top_vmax = self.row_limit(top_arrays, top_limit)
+        top_vmin, top_vmax = self.row_limit(all_top_arrays, top_limit)
         # test_all 的 TBL/TWCF 光流值图可能来自 uvs_compare.png 的 RGB 裁剪图；
         # RGB 图没有原始物理数值，row_limit 会拿不到范围。此时使用全局兜底范围，
         # 只补绘色条，不改变已经裁剪好的光流面板像素内容。
@@ -2737,36 +3164,68 @@ class AllHandlePipeline:
             top_vmin, top_vmax = top_fallback_limit
         # 光流误差组合图需要 0 居中白色；其它误差图保持原配置。
         bottom_vmin, bottom_vmax = self.row_limit(
-            list(bottom_reference_arrays) if bottom_reference_arrays is not None else bottom_arrays,
+            list(bottom_reference_arrays) if bottom_reference_arrays is not None else all_bottom_arrays,
             bottom_limit,
             center_zero=bottom_center_zero,
         )
-        fig = plt.figure(figsize=(2.05 * n_cols + 0.45, 4.3))
-        gs = fig.add_gridspec(2, n_cols + 1, width_ratios=[1] * n_cols + [0.06], hspace=0.08, wspace=0.04)
-        for row_idx, (arrays, labels, cmap, vmin, vmax, cb_label) in enumerate(
-            (
-                (top_arrays, top_labels, top_cmap, top_vmin, top_vmax, top_colorbar_label),
-                (bottom_arrays, bottom_labels, bottom_cmap, bottom_vmin, bottom_vmax, bottom_colorbar_label),
-            )
-        ):
-            handle = None
-            for col_idx, array in enumerate(arrays):
-                ax = fig.add_subplot(gs[row_idx, col_idx])
-                handle = self.draw_map(
-                    ax,
-                    array,
-                    cmap,
-                    vmin,
-                    vmax,
-                    labels[col_idx],
-                    fill_panel=(row_idx == 1 and bottom_fill_panel),
-                ) or handle
-            cax = fig.add_subplot(gs[row_idx, n_cols])
-            if handle is not None and vmin is not None and vmax is not None:
-                cb = fig.colorbar(self.colorbar_mappable(handle, cmap, vmin, vmax), cax=cax)
-                cb.set_label(cb_label, fontsize=self.cfg.COLORBAR_LABEL_SIZE)
-            else:
-                cax.axis("off")
+
+        chunks = self.chunk_items(exp_keys, self.composite_wrap_method_count())
+        fixed_count = max(len(fixed_top), len(fixed_bottom))
+        method_cols = max((len(chunk) for chunk in chunks), default=0)
+        n_cols = fixed_count + method_cols
+        if n_cols == 0:
+            return
+        row_count = 2 * len(chunks)
+        fig = plt.figure(figsize=(2.05 * n_cols + 0.45, 2.15 * row_count))
+        gs = fig.add_gridspec(
+            row_count,
+            n_cols + 1,
+            width_ratios=[1] * n_cols + [0.06],
+            hspace=0.12,
+            wspace=0.04,
+        )
+
+        for chunk_idx, chunk in enumerate(chunks):
+            # 第一块显示 GT 等固定列；后续块在固定列位置留空，因此后 4 个实验从第二列开始。
+            show_fixed = chunk_idx == 0
+            top_arrays = (fixed_top if show_fixed else [None] * len(fixed_top)) + [method_top.get(exp_key) for exp_key in chunk]
+            bottom_arrays = (fixed_bottom if show_fixed else [None] * len(fixed_bottom)) + [method_bottom.get(exp_key) for exp_key in chunk]
+            top_labels = (fixed_top_labels if show_fixed else [""] * len(fixed_top_labels)) + [
+                method_labels.get(exp_key, self.experiment_label(exp_key)) for exp_key in chunk
+            ]
+            bottom_labels = (fixed_bottom_labels if show_fixed else [""] * len(fixed_bottom_labels)) + [
+                method_labels.get(exp_key, self.experiment_label(exp_key)) for exp_key in chunk
+            ]
+            top_arrays += [None] * (n_cols - len(top_arrays))
+            bottom_arrays += [None] * (n_cols - len(bottom_arrays))
+            top_labels += [""] * (n_cols - len(top_labels))
+            bottom_labels += [""] * (n_cols - len(bottom_labels))
+
+            for local_row_idx, (arrays, labels, cmap, vmin, vmax, cb_label) in enumerate(
+                (
+                    (top_arrays, top_labels, top_cmap, top_vmin, top_vmax, top_colorbar_label),
+                    (bottom_arrays, bottom_labels, bottom_cmap, bottom_vmin, bottom_vmax, bottom_colorbar_label),
+                )
+            ):
+                row_idx = 2 * chunk_idx + local_row_idx
+                handle = None
+                for col_idx, array in enumerate(arrays):
+                    ax = fig.add_subplot(gs[row_idx, col_idx])
+                    handle = self.draw_map(
+                        ax,
+                        array,
+                        cmap,
+                        vmin,
+                        vmax,
+                        labels[col_idx],
+                        fill_panel=(local_row_idx == 1 and bottom_fill_panel),
+                    ) or handle
+                cax = fig.add_subplot(gs[row_idx, n_cols])
+                if handle is not None and vmin is not None and vmax is not None:
+                    cb = fig.colorbar(self.colorbar_mappable(handle, cmap, vmin, vmax), cax=cax)
+                    cb.set_label(cb_label, fontsize=self.cfg.COLORBAR_LABEL_SIZE)
+                else:
+                    cax.axis("off")
         self.save_figure(fig, out_base)
 
     # =========================
@@ -3875,6 +4334,27 @@ class AllHandlePipeline:
             pass
         try:
             return float(value)
+        except Exception:
+            return None
+
+    def to_float_loose(self, value) -> float | None:
+        """更宽松地解析 CSV 数值，兼容千分位逗号和百分号，供 metrics_summary 最大值统计使用。"""
+
+        number = self.to_float(value)
+        if number is not None:
+            return number
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        # metrics_summary.csv 中有些列可能写成 "1,234.5" 或 "98.7%"；
+        # 这里仅用于比较大小，百分号按数值 98.7 比较，并保留原始文本写回输出表。
+        cleaned = text.replace(",", "")
+        if cleaned.endswith("%"):
+            cleaned = cleaned[:-1].strip()
+        try:
+            return float(cleaned)
         except Exception:
             return None
 

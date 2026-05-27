@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gc
 import json
 import math
 import sys
@@ -15,7 +16,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from loguru import logger
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 
 # 允许用户在 SRGAN 根目录直接执行：
@@ -48,7 +49,10 @@ from study.SRGAN.model.tfrecord_test_common import (
     _infer_model_image_channels,
     _last_flow_prediction,
     _pad_full_frame_for_sliding,
+    _plot_regular,
     _save_mean_spectrum,
+    _save_flow_visual_artifacts,
+    _save_image_outputs,
     _save_sample_plots,
     _sliding_full_coverage_size,
     _window_2d,
@@ -78,6 +82,7 @@ TRAIN_DATAS_ROOT = Path(r"/study_datas/train_datas/root/autodl-tmp/train_datas")
 
 # all_handle 合并图也放在同一批训练结果根目录下，避免写到代码仓库或 Linux 默认路径。
 MERGED_OUTPUT_DIR = Path(r"/study_datas/train_all_datas/") / "experiment_all_handle"
+PROGRESS_STATUS_PATH = TRAIN_DATAS_ROOT / "experiment_test_progress.json"
 
 # 和用户给定语义保持一致：img1 是 previous，img2 是 next。
 EXPERIMENT_SAMPLES = (
@@ -96,6 +101,29 @@ TRADITIONAL_CHECKPOINT_LABEL = "traditional_no_checkpoint"
 # 因此这里的 64 是 LR 坐标里的窗口大小：先把实验 previous/next 切成多个 64x64 LR patch，
 # 每个 patch 直接作为 input_lr_prev/input_lr_next，模型输出 SR patch 后再按倍率 fold 回完整 SR 图。
 EXPERIMENT_MODEL_INPUT_SIZE = 64
+# 不做重叠融合：模型吃 64x64 LR patch，相邻 patch 也按 64 像素步长铺块。
+EXPERIMENT_MODEL_PATCH_SHIFT = 64
+# 背景 mask 阈值作用在插值后的 HR 参考图上。低于该值的区域认为是黑背景，
+# SR 输出拼接后会被压回 0，避免模型在黑区“造”白点。
+EXPERIMENT_BACKGROUND_MASK_THRESHOLD = 10.0 / 256.0
+# mask 在 HR 尺寸上做少量膨胀，保留颗粒边缘和晕影，避免把真实弱颗粒直接切掉。
+EXPERIMENT_BACKGROUND_MASK_DILATE = 3
+
+# _save_sample_plots 会用 matplotlib 绘制 SR 图、flow 和误差图。
+# 实验图作为 LR 输入后，输出尺寸会变成原图的 scale_factor 倍；如果一次把三组样本
+# 全部交给绘图函数，matplotlib 可能在同一阶段累计很多大图对象，导致 Linux 直接 Killed。
+# 因此保留原始尺寸和输出结构，但按 sample_0000/sample_0001/sample_0002 逐个保存并及时释放内存。
+EXPERIMENT_SAVE_HEAVY_SAMPLE_PLOTS = True
+# 实验图没有真实 HR，颗粒误差是 SR - 插值 HR，数值通常很小；单独缩小实验误差图色条，
+# 避免沿用普通测试的 [-2, 2] 导致误差图几乎全白。
+EXPERIMENT_PARTICLE_ERROR_COLORBAR_LIMIT = 0.15
+# 局部放大区域，使用 HR/SR 坐标的相对位置：(x_ratio, y_ratio, width_ratio, height_ratio)。
+# 这些区域覆盖喷流主体、右侧稀疏颗粒和下方颗粒边缘，便于直观看 LR 与 SR 的差异。
+EXPERIMENT_PARTICLE_ZOOM_REGIONS = (
+    (0.18, 0.38, 0.08, 0.10),
+    (0.42, 0.45, 0.08, 0.10),
+    (0.72, 0.42, 0.08, 0.10),
+)
 
 # 遇到 {"detail":"Bad Request"} 时按用户要求不中断，先重试。
 # 这里仍设置上限，避免外部服务长期异常时脚本无限占用 GPU；每次重试都会写日志。
@@ -202,6 +230,25 @@ def _estimate_eta(elapsed_seconds: float, completed: int, total: int) -> str:
     remaining = max(0, total - completed)
     seconds_per_item = float(elapsed_seconds) / completed
     return _format_duration(seconds_per_item * remaining)
+
+
+def _write_progress_status(**status) -> None:
+    """
+    立即写入当前运行状态，避免进程被系统 Killed 时完全没有 CSV/日志线索。
+
+    这个文件只保存最近一次状态，路径固定在 train_datas 根目录：
+    experiment_test_progress.json。
+    """
+
+    payload = {
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        **status,
+    }
+    try:
+        PROGRESS_STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        PROGRESS_STATUS_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as exc:
+        logger.warning("[experiment_test] failed to write progress status: {}", exc)
 
 
 def _read_gray_image_unit(path: Path) -> np.ndarray:
@@ -512,7 +559,11 @@ def _apply_experiment_patch_geometry(test_args: dict, job: ModelJob) -> dict:
 
     patched_args = dict(test_args)
     patched_args["offset"] = int(EXPERIMENT_MODEL_INPUT_SIZE)
-    patched_args["shift"] = int(EXPERIMENT_MODEL_INPUT_SIZE)
+    patched_args["shift"] = int(EXPERIMENT_MODEL_PATCH_SHIFT)
+    patched_args["particle_error_colorbar_limit"] = float(EXPERIMENT_PARTICLE_ERROR_COLORBAR_LIMIT)
+    # 实验数据没有真实 HR，comparison.png 里的 HR 是 LR 插值得到的参考图。
+    # 因此颗粒误差面板只展示 SR-HR 误差本身，不再叠加 ESMSE 文本，避免把伪参考指标误读为真实精度。
+    patched_args["particle_error_show_metric"] = False
     return patched_args
 
 
@@ -543,6 +594,24 @@ def _upsample_lr_flow_for_reference(flow_lr: torch.Tensor, factor: int) -> torch
     h, w = flow_lr.shape[-2:]
     flow_hr = F.interpolate(flow_lr, size=(h * factor, w * factor), mode="bilinear", align_corners=True)
     return flow_hr * float(factor)
+
+
+def _background_mask_from_hr_reference(hr_reference: torch.Tensor) -> torch.Tensor:
+    """
+    根据插值后的 HR 参考颗粒图生成 HR/SR 坐标背景 mask。
+
+    用户指定实验没有真实 HR，因此 prev_hr/next_hr 是 LR 实验原图插值得到的参考图。
+    这里就在这张 HR 参考图上区分前景/背景：HR 参考图为背景的位置，最终 SR 输出也强制为黑。
+    这样 mask 的空间结构和 SR 输出同尺寸，不再使用 LR mask nearest 放大造成块状边缘。
+    """
+
+    mask_hr = (hr_reference > float(EXPERIMENT_BACKGROUND_MASK_THRESHOLD)).to(dtype=torch.float32)
+    dilate = int(EXPERIMENT_BACKGROUND_MASK_DILATE)
+    if dilate > 1:
+        if dilate % 2 == 0:
+            dilate += 1
+        mask_hr = F.max_pool2d(mask_hr, kernel_size=dilate, stride=1, padding=dilate // 2)
+    return mask_hr.detach().cpu()
 
 
 def _predict_experiment_lr_patch(
@@ -604,6 +673,7 @@ def _predict_experiment_lr_full_frame_with_folding(
     factor: int,
     device: torch.device,
     test_args: dict,
+    progress_context: dict | None = None,
 ) -> dict:
     """
     将任意尺寸实验 LR 图切成 64x64 patch，预测后合并回完整 SR 尺寸。
@@ -624,7 +694,6 @@ def _predict_experiment_lr_full_frame_with_folding(
     padded_h_lr = _sliding_full_coverage_size(original_h_lr, offset_lr, shift_lr)
     padded_w_lr = _sliding_full_coverage_size(original_w_lr, offset_lr, shift_lr)
     images_lr_original = images_lr
-    flows_lr_original = flows_lr
 
     images_lr = _pad_full_frame_for_sliding(images_lr, padded_h_lr, padded_w_lr)
     flows_lr = _pad_full_frame_for_sliding(flows_lr, padded_h_lr, padded_w_lr)
@@ -644,79 +713,119 @@ def _predict_experiment_lr_full_frame_with_folding(
         total_patches,
         split_size,
     )
+    _write_progress_status(
+        stage="patch_setup",
+        **(progress_context or {}),
+        original_lr_shape=[int(original_h_lr), int(original_w_lr)],
+        padded_lr_shape=[int(H_lr), int(W_lr)],
+        patch_grid=[int(num_y), int(num_x)],
+        total_patches=total_patches,
+        split_size=split_size,
+    )
 
     image_patches = images_lr.unfold(3, offset_lr, shift_lr).unfold(2, offset_lr, shift_lr).permute(0, 2, 3, 1, 5, 4)
     image_patches = image_patches.reshape((-1, C, offset_lr, offset_lr))
     flow_patches = flows_lr.unfold(3, offset_lr, shift_lr).unfold(2, offset_lr, shift_lr).permute(0, 2, 3, 1, 5, 4)
     flow_patches = flow_patches.reshape((-1, 2, offset_lr, offset_lr))
 
-    patch_flow_outputs = []
-    patch_flow_ref_outputs = []
-    patch_pred_prev_outputs = []
-    patch_pred_next_outputs = []
+    offset_hr = offset_lr * factor
+    original_h_hr = original_h_lr * factor
+    original_w_hr = original_w_lr * factor
+    # 不再把所有 patch 输出留在 GPU list 中最后一次性 cat/fold。
+    # 这里恢复为原始 64x64 无重叠铺块：每个 patch 推理完成后直接写回最终大图对应位置。
+    predicted_flow_cpu = torch.empty((B, 2, original_h_hr, original_w_hr), dtype=torch.float32, device="cpu")
+    flow_reference_cpu = torch.empty((B, 2, original_h_hr, original_w_hr), dtype=torch.float32, device="cpu")
+    pred_prev_cpu = torch.empty((B, 1, original_h_hr, original_w_hr), dtype=torch.float32, device="cpu")
+    pred_next_cpu = torch.empty((B, 1, original_h_hr, original_w_hr), dtype=torch.float32, device="cpu")
+
     image_splits = torch.split(image_patches, split_size, dim=0)
     flow_splits = torch.split(flow_patches, split_size, dim=0)
     total_batches = len(image_splits)
     log_every = _progress_log_interval(total_batches)
+    patches_per_sample = num_y * num_x
     for batch_idx, (image_patch, flow_patch) in enumerate(zip(image_splits, flow_splits), start=1):
         if batch_idx == 1 or batch_idx == total_batches or batch_idx % log_every == 0:
             elapsed = time.perf_counter() - start_time
+            patches_done = min(batch_idx * split_size, total_patches)
             logger.info(
                 "[experiment_test] patch inference progress: batch {}/{} patches_done={}/{} current_batch={} elapsed={} eta={}",
                 batch_idx,
                 total_batches,
-                min(batch_idx * split_size, total_patches),
+                patches_done,
                 total_patches,
                 image_patch.shape[0],
                 _format_duration(elapsed),
                 _estimate_eta(elapsed, batch_idx, total_batches),
             )
+            _write_progress_status(
+                stage="patch_inference",
+                **(progress_context or {}),
+                batch_index=batch_idx,
+                total_batches=total_batches,
+                patches_done=patches_done,
+                total_patches=total_patches,
+                elapsed=_format_duration(elapsed),
+                eta=_estimate_eta(elapsed, batch_idx, total_batches),
+            )
         patch_result = _predict_experiment_lr_patch(model, image_patch, flow_patch, factor, device)
-        patch_flow_outputs.append(patch_result["flow"])
-        patch_flow_ref_outputs.append(patch_result["flow_reference"])
-        patch_pred_prev_outputs.append(patch_result["pred_prev"])
-        patch_pred_next_outputs.append(patch_result["pred_next"])
-
-    offset_hr = offset_lr * factor
-    shift_hr = shift_lr * factor
-    H_hr = H_lr * factor
-    W_hr = W_lr * factor
-    original_h_hr = original_h_lr * factor
-    original_w_hr = original_w_lr * factor
-    window = torch.from_numpy(np.squeeze(_window_2d(window_size=offset_hr, power=2))).to(
-        device=device,
-        dtype=images_lr.dtype,
-    )
-
-    predicted_flow = _fold_weighted_patches(
-        torch.cat(patch_flow_outputs, dim=0), B, 2, H_hr, W_hr, num_y, num_x, offset_hr, shift_hr, window
-    )[:, :, :original_h_hr, :original_w_hr]
-    flow_reference = _fold_weighted_patches(
-        torch.cat(patch_flow_ref_outputs, dim=0), B, 2, H_hr, W_hr, num_y, num_x, offset_hr, shift_hr, window
-    )[:, :, :original_h_hr, :original_w_hr]
-    pred_prev = _fold_weighted_patches(
-        torch.cat(patch_pred_prev_outputs, dim=0), B, 1, H_hr, W_hr, num_y, num_x, offset_hr, shift_hr, window
-    )[:, :, :original_h_hr, :original_w_hr]
-    pred_next = _fold_weighted_patches(
-        torch.cat(patch_pred_next_outputs, dim=0), B, 1, H_hr, W_hr, num_y, num_x, offset_hr, shift_hr, window
-    )[:, :, :original_h_hr, :original_w_hr]
+        batch_start_flat = (batch_idx - 1) * split_size
+        for local_idx in range(int(image_patch.shape[0])):
+            flat_idx = batch_start_flat + local_idx
+            sample_idx = flat_idx // patches_per_sample
+            sample_patch_idx = flat_idx % patches_per_sample
+            patch_y = sample_patch_idx // num_x
+            patch_x = sample_patch_idx % num_x
+            y0 = int(patch_y * offset_hr)
+            x0 = int(patch_x * offset_hr)
+            y1 = min(y0 + int(patch_result["flow"].shape[-2]), original_h_hr)
+            x1 = min(x0 + int(patch_result["flow"].shape[-1]), original_w_hr)
+            if y0 >= original_h_hr or x0 >= original_w_hr:
+                continue
+            crop_h = y1 - y0
+            crop_w = x1 - x0
+            predicted_flow_cpu[sample_idx, :, y0:y1, x0:x1] = (
+                patch_result["flow"][local_idx, :, :crop_h, :crop_w].detach().cpu()
+            )
+            flow_reference_cpu[sample_idx, :, y0:y1, x0:x1] = (
+                patch_result["flow_reference"][local_idx, :, :crop_h, :crop_w].detach().cpu()
+            )
+            pred_prev_cpu[sample_idx, :, y0:y1, x0:x1] = (
+                patch_result["pred_prev"][local_idx, :, :crop_h, :crop_w].detach().cpu()
+            )
+            pred_next_cpu[sample_idx, :, y0:y1, x0:x1] = (
+                patch_result["pred_next"][local_idx, :, :crop_h, :crop_w].detach().cpu()
+            )
+        del patch_result
+    prev_hr_reference_cpu = _upsample_lr_image_for_reference(images_lr_original[:, 0:1, :, :], factor).detach().cpu()
+    next_hr_reference_cpu = _upsample_lr_image_for_reference(images_lr_original[:, 1:2, :, :], factor).detach().cpu()
+    prev_mask_hr = _background_mask_from_hr_reference(prev_hr_reference_cpu)
+    next_mask_hr = _background_mask_from_hr_reference(next_hr_reference_cpu)
+    flow_foreground_mask_hr = torch.clamp(prev_mask_hr + next_mask_hr, max=1.0)
+    pred_prev_cpu = pred_prev_cpu * prev_mask_hr
+    pred_next_cpu = pred_next_cpu * next_mask_hr
+    # flow 是模型 forward 中已经基于未 mask 的 SR 图算出的；为了让最终实验输出和
+    # “HR 背景区域全黑”的颗粒图一致，背景区域的预测/参考 flow 都压成 0。
+    # 使用 prev/next 的并集作为前景，避免运动后某一帧刚好变暗的真实颗粒被误删。
+    predicted_flow_cpu = predicted_flow_cpu * flow_foreground_mask_hr
+    flow_reference_cpu = flow_reference_cpu * flow_foreground_mask_hr
     logger.info(
-        "[experiment_test] patch folding finished: runtime={} sr_size={}x{} flow_shape={}",
+        "[experiment_test] 64x64 patch stitching finished: runtime={} sr_size={}x{} flow_shape={} mask_threshold={:.6f}",
         _format_duration(time.perf_counter() - start_time),
         original_h_hr,
         original_w_hr,
-        tuple(predicted_flow.shape),
+        tuple(predicted_flow_cpu.shape),
+        EXPERIMENT_BACKGROUND_MASK_THRESHOLD,
     )
 
     return {
-        "flow": predicted_flow,
-        "flow_reference": flow_reference,
+        "flow": predicted_flow_cpu,
+        "flow_reference": flow_reference_cpu,
         "prev_lr": images_lr_original[:, 0:1, :, :],
         "next_lr": images_lr_original[:, 1:2, :, :],
-        "prev_hr": _upsample_lr_image_for_reference(images_lr_original[:, 0:1, :, :], factor),
-        "next_hr": _upsample_lr_image_for_reference(images_lr_original[:, 1:2, :, :], factor),
-        "pred_prev": pred_prev,
-        "pred_next": pred_next,
+        "prev_hr": prev_hr_reference_cpu,
+        "next_hr": next_hr_reference_cpu,
+        "pred_prev": pred_prev_cpu,
+        "pred_next": pred_next_cpu,
     }
 
 
@@ -803,6 +912,382 @@ def _save_experiment_metadata(dataset_dir: Path, samples: list[ExperimentSample]
     )
 
 
+def _slice_prediction_payload_for_sample(prediction: dict, sample_index: int) -> dict:
+    """
+    为单个 sample plot 截取一份 batch=1 的 image_payload。
+
+    _save_sample_plots 的内部仍按 test_all 的 batch 结构读取 pred_prev/pred_next/prev_hr 等字段；
+    这里不改变任何图像尺寸和图像结构，只把 batch 维度从 3 个实验时刻缩成当前 1 个时刻，
+    让 matplotlib 每次只处理一组大图，降低峰值内存。
+    """
+
+    sliced = {}
+    for key, value in prediction.items():
+        if isinstance(value, torch.Tensor) and value.ndim >= 1 and value.shape[0] > sample_index:
+            sliced[key] = value[sample_index:sample_index + 1]
+        elif isinstance(value, np.ndarray) and value.ndim >= 1 and value.shape[0] > sample_index:
+            sliced[key] = value[sample_index:sample_index + 1]
+        else:
+            sliced[key] = value
+    return sliced
+
+
+def _finite_percentile_limits(*arrays: np.ndarray, fallback: float = 1.0) -> tuple[float, float]:
+    """为单通道位移图计算稳定色标范围，避免少数极端值把整张图压暗。"""
+
+    values = []
+    for arr in arrays:
+        flat = np.asarray(arr, dtype=np.float32).reshape(-1)
+        flat = flat[np.isfinite(flat)]
+        if flat.size:
+            values.append(flat)
+    if not values:
+        return -float(fallback), float(fallback)
+    merged = np.concatenate(values)
+    vmin = float(np.percentile(merged, 1))
+    vmax = float(np.percentile(merged, 99))
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or abs(vmax - vmin) < 1.0e-6:
+        center = float(np.mean(merged)) if merged.size else 0.0
+        return center - float(fallback), center + float(fallback)
+    return vmin, vmax
+
+
+def _array_to_rgb_panel(arr: np.ndarray, vmin: float, vmax: float, cmap_name: str) -> Image.Image:
+    """
+    把二维数组转成 RGB 面板图。
+
+    为了避免 regular overview 被 matplotlib 大画布杀进程，这里用轻量 numpy+PIL 做颜色映射。
+    支持常用的 jet 位移图和 bwr 误差图；其它 cmap 名称回退到灰度。
+    """
+
+    field = np.asarray(arr, dtype=np.float32)
+    normalized = (field - float(vmin)) / max(float(vmax) - float(vmin), 1.0e-6)
+    normalized = np.clip(np.nan_to_num(normalized, nan=0.5, posinf=1.0, neginf=0.0), 0.0, 1.0)
+
+    if str(cmap_name).lower() == "jet":
+        r = np.clip(1.5 - np.abs(4.0 * normalized - 3.0), 0.0, 1.0)
+        g = np.clip(1.5 - np.abs(4.0 * normalized - 2.0), 0.0, 1.0)
+        b = np.clip(1.5 - np.abs(4.0 * normalized - 1.0), 0.0, 1.0)
+    elif str(cmap_name).lower() == "bwr":
+        # 0=blue, 0.5=white, 1=red，适合 Pred-GT 误差。
+        r = np.where(normalized < 0.5, 2.0 * normalized, 1.0)
+        g = np.where(normalized < 0.5, 2.0 * normalized, 2.0 * (1.0 - normalized))
+        b = np.where(normalized < 0.5, 1.0, 2.0 * (1.0 - normalized))
+    else:
+        r = g = b = normalized
+
+    rgb = np.stack([r, g, b], axis=-1)
+    return Image.fromarray((rgb * 255.0).astype(np.uint8), mode="RGB")
+
+
+def _compose_three_panel_image(
+    out_path: Path,
+    pred: np.ndarray,
+    reference: np.ndarray,
+    error: np.ndarray,
+    component_name: str,
+    displacement_cmap: str,
+    error_limit: float,
+) -> None:
+    """
+    保存单个分量的轻量总览图：Pred / Reference / Error。
+
+    这是原 regular overview 的低内存拆分版：
+    - U 分量保存一张图；
+    - V 分量保存一张图；
+    - 不缩放、不裁剪、不改变原始场尺寸，只是不再把 U/V 同时塞进一个 matplotlib figure。
+    """
+
+    disp_vmin, disp_vmax = _finite_percentile_limits(pred, reference, fallback=1.0)
+    err_limit = float(error_limit) if np.isfinite(error_limit) and float(error_limit) > 0 else 0.5
+    panels = [
+        (f"Pred {component_name}", _array_to_rgb_panel(pred, disp_vmin, disp_vmax, displacement_cmap)),
+        (f"Reference {component_name}", _array_to_rgb_panel(reference, disp_vmin, disp_vmax, displacement_cmap)),
+        (f"Error {component_name}", _array_to_rgb_panel(error, -err_limit, err_limit, "bwr")),
+    ]
+
+    panel_w, panel_h = panels[0][1].size
+    title_h = 34
+    gap = 8
+    canvas = Image.new("RGB", (panel_w * 3 + gap * 2, panel_h + title_h), "white")
+    draw = ImageDraw.Draw(canvas)
+    try:
+        font = ImageFont.load_default()
+    except Exception:
+        font = None
+    for idx, (title, panel) in enumerate(panels):
+        x0 = idx * (panel_w + gap)
+        draw.text((x0 + 8, 10), title, fill=(0, 0, 0), font=font)
+        canvas.paste(panel, (x0, title_h))
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(out_path)
+
+
+def _save_split_regular_overview(
+    dataset_dir: Path,
+    dataset_name: str,
+    sample_index: int,
+    predicted_sample_np: np.ndarray,
+    flow_reference_sample_np: np.ndarray,
+    regular_flow_cmap: str,
+    flow_error_colorbar_limit: float,
+) -> None:
+    """把 regular overview 拆成 U/误差 和 V/误差 两张图，降低保存阶段内存峰值。"""
+
+    u_pred = predicted_sample_np[0]
+    v_pred = predicted_sample_np[1]
+    u_ref = flow_reference_sample_np[0]
+    v_ref = flow_reference_sample_np[1]
+    _compose_three_panel_image(
+        dataset_dir / f"{dataset_name}_sample_{sample_index:04d}_u.png",
+        u_pred,
+        u_ref,
+        u_pred - u_ref,
+        "U",
+        regular_flow_cmap,
+        flow_error_colorbar_limit,
+    )
+    gc.collect()
+    _compose_three_panel_image(
+        dataset_dir / f"{dataset_name}_sample_{sample_index:04d}_v.png",
+        v_pred,
+        v_ref,
+        v_pred - v_ref,
+        "V",
+        regular_flow_cmap,
+        flow_error_colorbar_limit,
+    )
+
+
+def _tensor_or_array_to_2d_unit(value) -> np.ndarray | None:
+    """把 image_payload 中的 batch=1 图像转成 0-1 的二维 numpy。"""
+
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        arr = value.detach().cpu().numpy()
+    else:
+        arr = np.asarray(value)
+    arr = np.squeeze(arr)
+    if arr.ndim == 3:
+        arr = arr[0]
+    if arr.ndim != 2:
+        return None
+    return np.clip(arr.astype(np.float32, copy=False), 0.0, 1.0)
+
+
+def _region_to_bounds(region: tuple[float, float, float, float], height: int, width: int) -> tuple[int, int, int, int]:
+    """把相对区域转换成 y0/y1/x0/x1，并裁到图像范围内。"""
+
+    x_ratio, y_ratio, w_ratio, h_ratio = region
+    crop_w = max(8, int(round(width * float(w_ratio))))
+    crop_h = max(8, int(round(height * float(h_ratio))))
+    cx = int(round(width * float(x_ratio)))
+    cy = int(round(height * float(y_ratio)))
+    x0 = max(0, min(width - crop_w, cx - crop_w // 2))
+    y0 = max(0, min(height - crop_h, cy - crop_h // 2))
+    return y0, y0 + crop_h, x0, x0 + crop_w
+
+
+def _scale_bounds(bounds: tuple[int, int, int, int], source_hw: tuple[int, int], target_hw: tuple[int, int]) -> tuple[int, int, int, int]:
+    """把 HR/SR 坐标框缩放到 LR 坐标，用于裁 LR 局部图。"""
+
+    y0, y1, x0, x1 = bounds
+    src_h, src_w = source_hw
+    dst_h, dst_w = target_hw
+    return (
+        max(0, min(dst_h - 1, int(round(y0 * dst_h / src_h)))),
+        max(1, min(dst_h, int(round(y1 * dst_h / src_h)))),
+        max(0, min(dst_w - 1, int(round(x0 * dst_w / src_w)))),
+        max(1, min(dst_w, int(round(x1 * dst_w / src_w)))),
+    )
+
+
+def _draw_rectangles_on_gray(image: np.ndarray, regions: list[tuple[int, int, int, int]]) -> np.ndarray:
+    """在灰度整图上画红框，返回 RGB 数组。"""
+
+    gray = (np.clip(image, 0.0, 1.0) * 255.0).astype(np.uint8)
+    rgb = np.repeat(gray[..., None], 3, axis=2)
+    for y0, y1, x0, x1 in regions:
+        rgb[y0:y0 + 3, x0:x1, :] = (255, 0, 0)
+        rgb[max(y1 - 3, y0):y1, x0:x1, :] = (255, 0, 0)
+        rgb[y0:y1, x0:x0 + 3, :] = (255, 0, 0)
+        rgb[y0:y1, max(x1 - 3, x0):x1, :] = (255, 0, 0)
+    return rgb
+
+
+def _save_single_experiment_particle_zoom(
+    sample_image_dir: Path,
+    time_name: str,
+    lr_img: np.ndarray,
+    hr_img: np.ndarray,
+    sr_img: np.ndarray,
+) -> None:
+    """
+    保存单模型实验颗粒局部放大对比图。
+
+    顶部是带红框的整张 HR/SR 参考，下面每行只放 HR/SR 两个局部放大块。
+    这里不再放 LR 和 SR-HR 误差：实验 LR 与 HR/SR 尺寸不一致，误差又基于插值伪 HR，
+    局部图的目标是直接看超分颗粒细节，所以保留最直观的 HR/SR 对照。
+    """
+
+    if hr_img is None or sr_img is None:
+        return
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
+
+    h, w = hr_img.shape
+    regions = [_region_to_bounds(region, h, w) for region in EXPERIMENT_PARTICLE_ZOOM_REGIONS]
+    n_regions = len(regions)
+    fig = plt.figure(figsize=(11, 3.0 + 3.1 * n_regions), dpi=150, facecolor="w")
+    gs = fig.add_gridspec(n_regions + 1, 2, height_ratios=[1.0] + [1.25] * n_regions, hspace=0.16, wspace=0.04)
+
+    for col, (title, arr) in enumerate((("HR with regions", hr_img), ("SR with regions", sr_img))):
+        ax = fig.add_subplot(gs[0, col])
+        ax.imshow(arr, cmap="gray", vmin=0.0, vmax=1.0)
+        for idx, (y0, y1, x0, x1) in enumerate(regions, start=1):
+            ax.add_patch(patches.Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False, edgecolor="red", linewidth=1.2))
+            ax.text(x0, y0, str(idx), color="white", fontsize=8, bbox={"facecolor": "red", "edgecolor": "none", "pad": 1})
+        ax.set_title(title)
+        ax.axis("off")
+
+    for row, bounds in enumerate(regions, start=1):
+        y0, y1, x0, x1 = bounds
+        panels = (
+            (f"Region {row} HR", hr_img[y0:y1, x0:x1], "gray", 0.0, 1.0),
+            (f"Region {row} SR", sr_img[y0:y1, x0:x1], "gray", 0.0, 1.0),
+        )
+        for col, (title, arr, cmap, vmin, vmax) in enumerate(panels):
+            ax = fig.add_subplot(gs[row, col])
+            ax.imshow(arr, cmap=cmap, vmin=vmin, vmax=vmax)
+            ax.set_title(title)
+            ax.axis("off")
+
+    sample_image_dir.mkdir(parents=True, exist_ok=True)
+    fig.savefig(sample_image_dir / f"{time_name}_particle_zoom_comparison.png", bbox_inches="tight", pad_inches=0.03)
+    plt.close(fig)
+
+
+def _save_experiment_particle_zoom_comparisons(dataset_dir: Path, sample_index: int, image_payload_sample: dict) -> None:
+    """为 previous/next 分别保存局部放大颗粒对比图。"""
+
+    sample_image_dir = dataset_dir / "images" / f"sample_{sample_index:04d}"
+    specs = (
+        ("prev", "prev_lr", "prev_hr", "pred_prev"),
+        ("next", "next_lr", "next_hr", "pred_next"),
+    )
+    for time_name, lr_key, hr_key, sr_key in specs:
+        _save_single_experiment_particle_zoom(
+            sample_image_dir,
+            time_name,
+            _tensor_or_array_to_2d_unit(image_payload_sample.get(lr_key)),
+            _tensor_or_array_to_2d_unit(image_payload_sample.get(hr_key)),
+            _tensor_or_array_to_2d_unit(image_payload_sample.get(sr_key)),
+        )
+
+
+def _save_experiment_sample_plot_artifacts_one_by_one(
+    dataset_name: str,
+    dataset_dir: Path,
+    sample_index: int,
+    predicted_sample_np: np.ndarray,
+    flow_reference_sample_np: np.ndarray,
+    image_payload_sample: dict,
+    test_args: dict,
+    job: ModelJob,
+    sample: ExperimentSample,
+) -> None:
+    """
+    按 artifact 粒度保存单个实验样本的图，避免 _save_sample_plots 的大包装调用不透明。
+
+    输出路径和文件结构仍沿用 test_all：
+    - image/sample_xxxx/... 由 _save_image_outputs 负责；
+    - flow/sample_xxxx/... 由 _save_flow_visual_artifacts 负责；
+    - experiment_sample_xxxx.png 由 _plot_regular 负责。
+
+    这样不改变图片结构，只把“一个 sample 内的一堆图”拆成一步一步保存，并在每步后释放内存。
+    如果再次卡住，日志会精确停在 image_outputs / flow_artifacts / regular_overview 哪一步。
+    """
+
+    plot_start = time.perf_counter()
+    regular_flow_cmap = str(test_args.get("regular_flow_cmap", "jet"))
+    flow_error_colorbar_limit = float(test_args.get("flow_error_colorbar_limit", 0.5))
+    save_npy = bool(test_args.get("save_npy", False))
+
+    logger.info("[experiment_test] sample plot step: image outputs -> sample_{:04d}", sample_index)
+    _write_progress_status(
+        stage="saving_sample_plot_image_outputs",
+        experiment_dir_name=job.experiment_dir_name,
+        class_name=job.class_name,
+        run_class_name=job.run_class_name,
+        scale_dir_name=job.scale_dir_name,
+        sample_index=sample_index,
+        sample_stage=sample.stage,
+        group_name=sample.group_name,
+        elapsed=_format_duration(time.perf_counter() - plot_start),
+    )
+    _save_image_outputs(dataset_name, dataset_dir, image_payload_sample, sample_index, plot_args=test_args)
+    logger.info("[experiment_test] sample plot step: particle zoom comparisons -> sample_{:04d}", sample_index)
+    _save_experiment_particle_zoom_comparisons(dataset_dir, sample_index, image_payload_sample)
+    gc.collect()
+
+    logger.info("[experiment_test] sample plot step: flow artifacts -> sample_{:04d}", sample_index)
+    _write_progress_status(
+        stage="saving_sample_plot_flow_artifacts",
+        experiment_dir_name=job.experiment_dir_name,
+        class_name=job.class_name,
+        run_class_name=job.run_class_name,
+        scale_dir_name=job.scale_dir_name,
+        sample_index=sample_index,
+        sample_stage=sample.stage,
+        group_name=sample.group_name,
+        elapsed=_format_duration(time.perf_counter() - plot_start),
+    )
+    _save_flow_visual_artifacts(
+        dataset_dir / "flow" / f"sample_{sample_index:04d}",
+        predicted_sample_np,
+        flow_reference_sample_np,
+        cmap_name=regular_flow_cmap,
+        quiver_stride=test_args.get("vorticity_quiver_stride", None),
+        save_npy=save_npy,
+        dataset_name=dataset_name,
+        mask_2d=None,
+        tbl_y_limit=None,
+        flow_error_colorbar_limit=flow_error_colorbar_limit,
+        global_data=test_args.get("global_data", None),
+    )
+    gc.collect()
+
+    logger.info("[experiment_test] sample plot step: split regular overview U/V -> sample_{:04d}", sample_index)
+    _write_progress_status(
+        stage="saving_sample_plot_split_regular_overview",
+        experiment_dir_name=job.experiment_dir_name,
+        class_name=job.class_name,
+        run_class_name=job.run_class_name,
+        scale_dir_name=job.scale_dir_name,
+        sample_index=sample_index,
+        sample_stage=sample.stage,
+        group_name=sample.group_name,
+        elapsed=_format_duration(time.perf_counter() - plot_start),
+    )
+    _save_split_regular_overview(
+        dataset_dir=dataset_dir,
+        dataset_name=dataset_name,
+        sample_index=sample_index,
+        predicted_sample_np=predicted_sample_np,
+        flow_reference_sample_np=flow_reference_sample_np,
+        regular_flow_cmap=regular_flow_cmap,
+        flow_error_colorbar_limit=flow_error_colorbar_limit,
+    )
+    gc.collect()
+    logger.info(
+        "[experiment_test] sample plot finished: sample_{:04d} runtime={}",
+        sample_index,
+        _format_duration(time.perf_counter() - plot_start),
+    )
+
+
 def _run_single_job(job: ModelJob, samples: list[ExperimentSample], device: torch.device) -> dict:
     """
     对一个 checkpoint 跑 start/peak/end 三组实验样本，并保存 test_all 同款产物。
@@ -852,6 +1337,12 @@ def _run_single_job(job: ModelJob, samples: list[ExperimentSample], device: torc
                 scale_factor,
                 device,
                 test_args,
+                progress_context={
+                    "experiment_dir_name": job.experiment_dir_name,
+                    "class_name": job.class_name,
+                    "run_class_name": job.run_class_name,
+                    "scale_dir_name": job.scale_dir_name,
+                },
             ),
             context=f"{job.experiment_dir_name}/{job.class_name}/{job.scale_dir_name}",
         )
@@ -1020,18 +1511,46 @@ def _run_single_job(job: ModelJob, samples: list[ExperimentSample], device: torc
         also_save_legacy_names=False,
     )
 
-    if bool(test_args["plot_results"]):
-        logger.info("[experiment_test] saving sample plots for {}", dataset_dir)
-        _save_sample_plots(
-            dataset_name,
+    if bool(test_args["plot_results"]) and EXPERIMENT_SAVE_HEAVY_SAMPLE_PLOTS:
+        logger.info("[experiment_test] saving sample plots one by one for {}", dataset_dir)
+        for plot_idx, sample in enumerate(samples):
+            logger.info(
+                "[experiment_test] saving sample plot {}/{}: {} ({})",
+                plot_idx + 1,
+                len(samples),
+                sample.stage,
+                sample.group_name,
+            )
+            _write_progress_status(
+                stage="saving_sample_plot",
+                experiment_dir_name=job.experiment_dir_name,
+                class_name=job.class_name,
+                run_class_name=job.run_class_name,
+                scale_dir_name=job.scale_dir_name,
+                output_dir=str(dataset_dir),
+                sample_index=plot_idx,
+                sample_stage=sample.stage,
+                group_name=sample.group_name,
+            )
+            _save_experiment_sample_plot_artifacts_one_by_one(
+                dataset_name=dataset_name,
+                dataset_dir=dataset_dir,
+                sample_index=plot_idx,
+                predicted_sample_np=predicted_np[plot_idx],
+                flow_reference_sample_np=flow_np[plot_idx],
+                image_payload_sample=_slice_prediction_payload_for_sample(prediction, plot_idx),
+                test_args=test_args,
+                job=job,
+                sample=sample,
+            )
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+    elif bool(test_args["plot_results"]):
+        logger.warning(
+            "[experiment_test] skip heavy sample plots to avoid OS Killed: {}. "
+            "Set EXPERIMENT_SAVE_HEAVY_SAMPLE_PLOTS=True only for small/manual runs.",
             dataset_dir,
-            predicted_np,
-            flow_np,
-            0,
-            None,
-            image_payload=prediction,
-            plot_args=test_args,
-            flow_reference_np=flow_np,
         )
     _save_experiment_metadata(dataset_dir, samples, job)
     logger.info(
@@ -1065,12 +1584,26 @@ def _merge_with_all_handle() -> None:
         "SPLIT_NAMES": cfg.SPLIT_NAMES,
         "OUTPUT_ROOT_DIR": cfg.OUTPUT_ROOT_DIR,
         "CATEGORY_FILTER": getattr(cfg, "CATEGORY_FILTER", None),
+        "OUTPUT_STAGE_FILTER": getattr(cfg, "OUTPUT_STAGE_FILTER", None),
+        "PARTICLE_ERROR_COLORBAR_LIMIT": getattr(cfg, "PARTICLE_ERROR_COLORBAR_LIMIT", "auto"),
     }
     try:
         cfg.DATA_ROOT_DIR = TRAIN_DATAS_ROOT
         cfg.SPLIT_NAMES = ("experiment",)
         cfg.OUTPUT_ROOT_DIR = MERGED_OUTPUT_DIR
         cfg.CATEGORY_FILTER = ("experiment",)
+        # all_handle/global_class.py 当前可能为了调试被设置成只跑少数阶段，
+        # 例如 ("tbl_profile_overlay", "particle_stats_metrics", "flow_u_epe_hist_overlay")。
+        # experiment 合并必须和 all_handle/pipeline.py 的完整输出逻辑一致，因此这里临时
+        # 打开全部阶段：01_energy_spectrum、02_error_maps、03_error_histograms、
+        # 04_composite_panels，以及 run_all 末尾固定写出的 05_metric_tables。
+        cfg.OUTPUT_STAGE_FILTER = "all"
+        # 实验图的颗粒误差是 SR - 插值 HR，数值很小；单独缩小 experiment 合并图色条，
+        # 避免 auto 被少数极端像素撑大后整行误差图发白。
+        cfg.PARTICLE_ERROR_COLORBAR_LIMIT = (
+            -float(EXPERIMENT_PARTICLE_ERROR_COLORBAR_LIMIT),
+            float(EXPERIMENT_PARTICLE_ERROR_COLORBAR_LIMIT),
+        )
         pipeline = AllHandlePipeline(cfg, enable_plotting=True)
         pipeline.run_all()
         logger.info(
@@ -1133,9 +1666,31 @@ def run_experiment_tests(skip_merge: bool = False, only_merge: bool = False) -> 
             _format_duration(elapsed_total),
             _estimate_eta(elapsed_total, job_idx - 1, len(jobs)) if job_idx > 1 else "unknown",
         )
+        _write_progress_status(
+            stage="job_start",
+            job_index=job_idx,
+            total_jobs=len(jobs),
+            experiment_dir_name=job.experiment_dir_name,
+            class_name=job.class_name,
+            run_class_name=job.run_class_name,
+            scale_dir_name=job.scale_dir_name,
+            checkpoint_path=_checkpoint_label(job),
+            elapsed=_format_duration(elapsed_total),
+        )
         try:
             summaries.append(_run_single_job(job, samples, device))
             logger.info("[experiment_test] job succeeded {}/{}", job_idx, len(jobs))
+            _write_progress_status(
+                stage="job_succeeded",
+                job_index=job_idx,
+                total_jobs=len(jobs),
+                experiment_dir_name=job.experiment_dir_name,
+                class_name=job.class_name,
+                run_class_name=job.run_class_name,
+                scale_dir_name=job.scale_dir_name,
+                success_count=len(summaries),
+                error_count=len(errors),
+            )
         except Exception as exc:
             logger.error("[experiment_test] job failed: {}\n{}", job, traceback.format_exc())
             errors.append(
@@ -1150,6 +1705,25 @@ def run_experiment_tests(skip_merge: bool = False, only_merge: bool = False) -> 
                 }
             )
             logger.warning("[experiment_test] job failed {}/{}; continuing with next job", job_idx, len(jobs))
+            _write_progress_status(
+                stage="job_failed",
+                job_index=job_idx,
+                total_jobs=len(jobs),
+                experiment_dir_name=job.experiment_dir_name,
+                class_name=job.class_name,
+                run_class_name=job.run_class_name,
+                scale_dir_name=job.scale_dir_name,
+                error=repr(exc),
+                success_count=len(summaries),
+                error_count=len(errors),
+            )
+        finally:
+            # 每个 job 后立刻落盘，避免系统级 Killed 时没有 summary/error CSV。
+            _write_csv(TRAIN_DATAS_ROOT / "experiment_test_summary.csv", summaries)
+            _write_csv(TRAIN_DATAS_ROOT / "experiment_test_errors.csv", errors)
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
     _write_csv(TRAIN_DATAS_ROOT / "experiment_test_summary.csv", summaries)
     _write_csv(TRAIN_DATAS_ROOT / "experiment_test_errors.csv", errors)

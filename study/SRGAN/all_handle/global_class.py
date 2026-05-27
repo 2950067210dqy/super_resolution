@@ -5,14 +5,14 @@ class global_data:
     class all_handle:
         """
         all_handle 只负责“已完成实验结果”的统一后处理，不重新训练、不加载模型。
-        这里集中保存所有可调参数：数据目录、六个对比实验的路径映射、图例文字、
+        这里集中保存所有可调参数：数据目录、八个对比实验的路径映射、图例文字、
         坐标轴 label、色条 label、配色、输出目录与样本筛选规则。
         """
 
         # =========================
         # 数据目录与输出目录
         # =========================
-        # 原始实验结果根目录；pipeline.py 会在该目录下寻找六个对比实验的 predict_all/test_all 结果。
+        # 原始实验结果根目录；pipeline.py 会在该目录下寻找八个对比实验的 predict_all/test_all 结果。
         # DATA_ROOT_DIR = Path(
         #     r"D:\BaiduSyncdisk\AYanJiuSheng\data\train_datas\root\autodl-tmp\train_datas"
         # )
@@ -37,6 +37,16 @@ class global_data:
         METRIC_TABLE_FLAT_CSV_NAME = "comparison_metrics.csv"
         METRIC_TABLE_SHEET_CSV_DIR_NAME = "category_csv_sheets"
         METRIC_TABLE_WORKBOOK_NAME = "comparison_metrics.xlsx"
+        # metrics_summary.csv 里包含每个类别/样本的多行统计；这里单独输出一套对比表，
+        # 避免和 ALL_CLASS_flow / ALL_CLASS_IMAGE_PAIR 汇总表混在一起。
+        METRIC_SUMMARY_FILE_NAMES = ("metrics_summary.csv", "metrics_summary.CSV")
+        METRIC_SUMMARY_FLAT_CSV_NAME = "metrics_summary_comparison.csv"
+        METRIC_SUMMARY_SHEET_CSV_DIR_NAME = "metrics_summary_category_csv_sheets"
+        METRIC_SUMMARY_WORKBOOK_NAME = "metrics_summary_comparison.xlsx"
+        # metrics_summary.csv 的前 11 列按用户要求直接取一行的值；第 12 列开始按每列最大值汇总。
+        METRIC_SUMMARY_FIXED_COLUMN_COUNT = 11
+        # 输出表开头补充这些定位列，便于在同一个 CSV/xlsx 中比较不同对比组、class、split、类别和实验。
+        METRIC_SUMMARY_METADATA_COLUMNS = ("comparison", "class", "split", "category", "experiment")
 
         # 控制本次要生成哪些输出阶段：
         # - None 或 "all"：生成 01_energy_spectrum、02_error_maps、03_error_histograms、04_composite_panels 全部；
@@ -47,7 +57,8 @@ class global_data:
         # 如果只想直接处理 TBL 剖面图，设置 OUTPUT_STAGE_FILTER = "tbl_profile_overlay"；
         # 如果只想处理颗粒统计条形图，设置 OUTPUT_STAGE_FILTER = "particle_stats_metrics"；
         # 如果只想处理 *_flow_u_epe_hist_overlay.png，设置 OUTPUT_STAGE_FILTER = "flow_u_epe_hist_overlay"。
-        OUTPUT_STAGE_FILTER =  ("tbl_profile_overlay", "particle_stats_metrics", "flow_u_epe_hist_overlay")
+        # 如果只想处理 TBL 的 02_error_maps，设置 OUTPUT_STAGE_FILTER = "tbl_02_error_map"。
+        OUTPUT_STAGE_FILTER = None
         OUTPUT_STAGE_ALIASES = {
             "01_energy_spectrum": "energy_spectrum",
             "energy_spectrum": "energy_spectrum",
@@ -76,6 +87,10 @@ class global_data:
             "flow_u_epe": "flow_u_epe_hist_overlay",
             "u_epe_hist": "flow_u_epe_hist_overlay",
             "epe_hist_overlay": "flow_u_epe_hist_overlay",
+            "tbl_02_error_map": "tbl_02_error_map",
+            "tbl_02_error_maps": "tbl_02_error_map",
+            "tbl_error_map": "tbl_02_error_map",
+            "tbl_error_maps": "tbl_02_error_map",
             "all": "all",
         }
 
@@ -119,7 +134,7 @@ class global_data:
 
 
         # =========================
-        # 六个对比实验与图例
+        # 八个对比实验与图例
         # =========================
         # key 是内部稳定标识；label 是最终出现在图例上的英文文本，按用户要求统一放在全局变量中。
         # 现在把 PIV_A_Esrgan_v4 明确标成 ESRuRAFT-PIV x4，并新增 PIV_A_Esrgan_v_SCALE_8 作为 ESRuRAFT-PIV x8。
@@ -127,7 +142,9 @@ class global_data:
             "bicubic_widim",
             "bicubic_hs",
             "bicubic_raft",
+            "bicubic_searaft",
             "srgan_raft",
+            "swinir_raft",
             "esrgan_raft",
             "PIV_A_Esrgan_v4",
             "PIV_A_Esrgan_v_SCALE_8",
@@ -138,7 +155,9 @@ class global_data:
             "bicubic_widim",
             "bicubic_hs",
             "bicubic_raft",
+            "bicubic_searaft",
             "srgan_raft",
+            "swinir_raft",
             "esrgan_raft",
             "PIV_A_Esrgan_v4",
             "PIV_A_Esrgan_v_SCALE_8",
@@ -147,21 +166,33 @@ class global_data:
             "bicubic_widim": "bicubic-widim",
             "bicubic_hs": "bicubic-hs",
             "bicubic_raft": "bicubic-raft",
+            "bicubic_searaft": "bicubic-searaft",
             "srgan_raft": "srgan-raft",
+            "swinir_raft": "swinir_raft",
             "esrgan_raft": "esrgan-raft",
             "PIV_A_Esrgan_v4": "ESRuRAFT-PIV x4",
             "PIV_A_Esrgan_v_SCALE_8": "ESRuRAFT-PIV x8",
         }
         # 两套图分开生成：
-        # 1）six_experiments：原始六组对比实验，PIV_A_Esrgan_v4 在这套图里仍显示为 ESRuRAFT-PIV；
-        # 2）scale_x4_x8：只比较 ESRuRAFT-PIV x4 与 ESRuRAFT-PIV x8。
-        # pipeline.py 会把两套图分别写入 output/six_experiments 与 output/scale_x4_x8。
+        # 1）eight_experiments：原始八组对比实验，PIV_A_Esrgan_v4 在这套图里显示为 ESRuRAFT-PIV；
+        # 2）eight_experiments_without_widim_hs：去掉 bicubic-widim 和 bicubic-hs 的补充对比图；
+        # 3）scale_x4_x8：只比较 ESRuRAFT-PIV x4 与 ESRuRAFT-PIV x8。
         COMPARISON_GROUPS = {
-            "six_experiments": (
+            "eight_experiments": (
                 "bicubic_widim",
                 "bicubic_hs",
                 "bicubic_raft",
+                "bicubic_searaft",
                 "srgan_raft",
+                "swinir_raft",
+                "esrgan_raft",
+                "PIV_A_Esrgan_v4",
+            ),
+            "eight_experiments_without_widim_hs": (
+                "bicubic_raft",
+                "bicubic_searaft",
+                "srgan_raft",
+                "swinir_raft",
                 "esrgan_raft",
                 "PIV_A_Esrgan_v4",
             ),
@@ -172,12 +203,16 @@ class global_data:
         }
         # 每套对比图的图例顺序；legend 从上到下严格按这里排列。
         COMPARISON_GROUP_LEGEND_ORDER = {
-            "six_experiments": COMPARISON_GROUPS["six_experiments"],
+            "eight_experiments": COMPARISON_GROUPS["eight_experiments"],
+            "eight_experiments_without_widim_hs": COMPARISON_GROUPS["eight_experiments_without_widim_hs"],
             "scale_x4_x8": COMPARISON_GROUPS["scale_x4_x8"],
         }
-        # 同一个实验在不同对比组里可以显示不同 label：x4 在六组对比里是 ESRuRAFT-PIV，在倍率对比里是 ESRuRAFT-PIV x4。
+        # 同一个实验在不同对比组里可以显示不同 label：x4 在八组对比里是 ESRuRAFT-PIV，在倍率对比里是 ESRuRAFT-PIV x4。
         COMPARISON_GROUP_LABELS = {
-            "six_experiments": {
+            "eight_experiments": {
+                "PIV_A_Esrgan_v4": "ESRuRAFT-PIV",
+            },
+            "eight_experiments_without_widim_hs": {
                 "PIV_A_Esrgan_v4": "ESRuRAFT-PIV",
             },
             "scale_x4_x8": {
@@ -187,7 +222,8 @@ class global_data:
         }
         # 最小实验数量限制；倍率对比必须同时找到 x4 与 x8，避免只画单独 x4 的无意义图。
         COMPARISON_GROUP_MIN_EXPERIMENTS = {
-            "six_experiments": 1,
+            "eight_experiments": 1,
+            "eight_experiments_without_widim_hs": 1,
             "scale_x4_x8": 2,
         }
         # 实际磁盘目录名与用户口径不完全一致，因此这里显式建立映射；若目录改名，只改这一个位置。
@@ -195,17 +231,32 @@ class global_data:
             "bicubic_widim": "ESRuRAFT_PIV_Groundv_bicubic_widim",
             "bicubic_hs": "ESRuRAFT_PIV_Groundv_bicubic_hs",
             "bicubic_raft": "ESRuRAFT_PIV_Groundv_bicubic_raft",
+            "bicubic_searaft": "ESRuRAFT_PIV_Groundv_bicubic_searaft",
             "srgan_raft": "ESRuRAFT_PIV_Groundv_srgan_raft",
+            "swinir_raft": "ESRuRAFT_PIV_Groundv_swinir_raft",
             "esrgan_raft": "ESRuRAFT_PIV_Groundv_esrgan_raft",
             "PIV_A_Esrgan_v4": "PIV_A_Esrgan_v4",
             "PIV_A_Esrgan_v_SCALE_8": "PIV_A_Esrgan_v_SCALE_8",
+        }
+        # 新增实验有时会直接用用户口径的短目录名保存；这里保留备用目录名。
+        # pipeline.py 会优先使用 EXPERIMENT_DIR_NAMES，找不到时再尝试这些别名，避免因为目录命名差异漏画。
+        EXPERIMENT_DIR_NAME_ALIASES = {
+            "bicubic_widim": ("bicubic_widim",),
+            "bicubic_hs": ("bicubic_hs",),
+            "bicubic_raft": ("bicubic_raft",),
+            "bicubic_searaft": ("bicubic_searaft",),
+            "srgan_raft": ("srgan_raft",),
+            "swinir_raft": ("swinir_raft",),
+            "esrgan_raft": ("esrgan_raft",),
         }
         # 大多数实验在 scale_4 目录；x8 消融结果单独保存在 scale_8，所以对每个实验做独立倍率映射。
         EXPERIMENT_SCALE_DIR_NAMES = {
             "bicubic_widim": "scale_4",
             "bicubic_hs": "scale_4",
             "bicubic_raft": "scale_4",
+            "bicubic_searaft": "scale_4",
             "srgan_raft": "scale_4",
+            "swinir_raft": "scale_4",
             "esrgan_raft": "scale_4",
             "PIV_A_Esrgan_v4": "scale_4",
             "PIV_A_Esrgan_v_SCALE_8": "scale_8",
@@ -217,7 +268,9 @@ class global_data:
             "bicubic_widim": "#0072B2",
             "bicubic_hs": "#785EF0",
             "bicubic_raft": "#009E73",
+            "bicubic_searaft": "#56B4E9",
             "srgan_raft": "#CC79A7",
+            "swinir_raft": "#D55E00",
             "esrgan_raft": "#E69F00",
             "PIV_A_Esrgan_v4": "#D62728",
             "PIV_A_Esrgan_v_SCALE_8": "#000000",
@@ -228,7 +281,9 @@ class global_data:
             "bicubic_widim": "#1f77b4",
             "bicubic_hs": "#ff7f0e",
             "bicubic_raft": "#2ca02c",
+            "bicubic_searaft": "#17becf",
             "srgan_raft": "#8c564b",
+            "swinir_raft": "#bcbd22",
             "esrgan_raft": "#9467bd",
             "PIV_A_Esrgan_v4": "#d62728",
             "PIV_A_Esrgan_v_SCALE_8": "#7f7f7f",
@@ -286,6 +341,7 @@ class global_data:
         ENERGY_LEGEND_FACE_COLOR = "#E6E6E6"
         ENERGY_LEGEND_EDGE_COLOR = "#808080"
         ENERGY_LEGEND_ALPHA = 0.58
+        ENERGY_LEGEND_FONT_SIZE = 8
         FLOW_VALUE_COLORBAR_LABEL = "Displacement [px]"
         FLOW_ERROR_COLORBAR_LABEL = "Error [px]"
         PARTICLE_VALUE_COLORBAR_LABEL = "Intensity"
@@ -403,8 +459,9 @@ class global_data:
         # crop 图仍保持横向多列，但列宽、行距和 previous/next 的间隔都会明显收紧。
         PARTICLE_STATS_IMAGE_WIDTH_PER_COL = 1.35
         PARTICLE_STATS_IMAGE_COMPACT_FIG_HEIGHT = 4.90
-        PARTICLE_STATS_IMAGE_COMPACT_WSPACE = 0.025
-        PARTICLE_STATS_IMAGE_COMPACT_HSPACE = 0.025
+        # 颗粒阈值图横向间距继续收紧，并和上下间距保持一致。
+        PARTICLE_STATS_IMAGE_COMPACT_WSPACE = 0.015
+        PARTICLE_STATS_IMAGE_COMPACT_HSPACE = 0.015
         PARTICLE_STATS_IMAGE_COMPACT_BLOCK_GAP_RATIO = 0.08
         PARTICLE_STATS_IMAGE_ROW_RATIO = 1.35
         PARTICLE_STATS_CHART_ROW_RATIO = 2.25
@@ -421,7 +478,9 @@ class global_data:
             "bicubic_widim": "#4477AA",
             "bicubic_hs": "#785EF0",
             "bicubic_raft": "#228833",
+            "bicubic_searaft": "#56B4E9",
             "srgan_raft": "#CCBB44",
+            "swinir_raft": "#D55E00",
             "esrgan_raft": "#66CCEE",
             "PIV_A_Esrgan_v4": "#D62728",
             "PIV_A_Esrgan_v_SCALE_8": "#111111",
@@ -455,6 +514,11 @@ class global_data:
         TBL_FULL_FRAME_VERTICAL_LAYOUT = True
         TBL_PARTICLE_STATS_IMAGE_VERTICAL_LAYOUT = True
         TBL_ERROR_MAP_PARTICLE_PAIR_LAYOUT = True
+        # TBL full-frame 的 02_error_maps/particle_*_error.png 只保留 GT/SR 颗粒图和 crop 红框；
+        # 第二列误差图及其色条关闭，避免误差图大面积空白和红框/label 混在一起。
+        TBL_ERROR_MAP_PARTICLE_FULL_FRAME_IMAGE_ONLY = True
+        # 该图的 label 放到右上角，避开左上角附近的 crop 红框和长实验名。
+        TBL_ERROR_MAP_PARTICLE_LABEL_LOC = "upper_right"
         TBL_FULL_FRAME_ERROR_FILL_PANEL = True
         TBL_FULL_FRAME_FIG_WIDTH = 10.5
         TBL_FULL_FRAME_ROW_HEIGHT = 1.85
@@ -464,8 +528,9 @@ class global_data:
         # 这里把整张图宽度和每行高度加大，让每个小图有足够宽高，避免标题文字伸出图像边界。
         TBL_STATS_IMAGE_VERTICAL_FIG_WIDTH = 14.5
         TBL_STATS_IMAGE_VERTICAL_ROW_HEIGHT = 1.55
-        TBL_STATS_IMAGE_VERTICAL_HSPACE = 0.08
-        TBL_STATS_IMAGE_VERTICAL_WSPACE = 0.08
+        # 颗粒阈值图横向和纵向间隔保持一致，并继续收紧，避免多列图之间出现大块空白。
+        TBL_STATS_IMAGE_VERTICAL_HSPACE = 0.04
+        TBL_STATS_IMAGE_VERTICAL_WSPACE = 0.04
         TBL_ERROR_MAP_VERTICAL_FIG_WIDTH = 10.5
         TBL_ERROR_MAP_VERTICAL_ROW_HEIGHT = 1.15
         TBL_ERROR_MAP_VERTICAL_HSPACE = 0.06
@@ -484,6 +549,9 @@ class global_data:
         TBL_PARTICLE_CROP_SIZE = 256
         TBL_PARTICLE_CROP_CENTER_RATIO = 0.265
         TBL_PARTICLE_CROP_OUTPUT_SUFFIX = "_crop"
+        # TBL full-frame 颗粒 02_error_maps 中用于标出 crop 区域的红色正方形框。
+        TBL_PARTICLE_CROP_BOX_COLOR = "red"
+        TBL_PARTICLE_CROP_BOX_LINE_WIDTH = 1.3
         TBL_PARTICLE_CROP_FILE_NAMES = {
             "error": "{prefix}_sr_error_crop.npy",
             "hist": "{prefix}_particle_binary_stats_crop_hist.npy",
@@ -497,6 +565,11 @@ class global_data:
         TBL_FLOW_UV_ROW_COLORBAR = True
         TBL_FLOW_UV_FIG_WIDTH = 6.0
         TBL_FLOW_UV_ROW_HEIGHT = 1.55
+        # 八实验对比图如果全部横排会太挤；这类“数值图一行 + 误差图一行”的组合图，
+        # 在 eight_experiments 中每块只放 4 个实验，后 4 个实验换到下一块，并从 GT 后面的第二列开始。
+        COMPARISON_GROUP_COMPOSITE_WRAP_METHOD_COUNT = {
+            "eight_experiments": 4,
+        }
         # 指标汇总表列名全部集中到全局变量，后续如果论文表格需要改列名，只需要改这里。
         METRIC_TABLE_COLUMNS = (
             "comparison",
@@ -549,6 +622,13 @@ class global_data:
         # - (min, max): 手动固定色条范围，例如 (-0.5, 0.5)。
         FLOW_ERROR_COLORBAR_LIMIT = "auto"
         PARTICLE_ERROR_COLORBAR_LIMIT = "auto"
+        # experiment 专用局部放大颗粒对比区域，格式为 HR/SR 坐标的相对
+        # (x_center, y_center, width, height)。用于 all_handle 的 experiment 局部放大 composite。
+        EXPERIMENT_PARTICLE_ZOOM_REGIONS = (
+            (0.18, 0.38, 0.08, 0.10),
+            (0.42, 0.45, 0.08, 0.10),
+            (0.72, 0.42, 0.08, 0.10),
+        )
         VORTICITY_ERROR_COLORBAR_LIMIT = "auto"
         FLOW_VALUE_COLORBAR_LIMIT = "auto"
         # 当 test_all 只保存了 uvs_compare.png、没有原始 fake_flo/hr_flo.npy 时，
@@ -582,10 +662,11 @@ class global_data:
             "esrgan_raft",
             "PIV_A_Esrgan_v4",
         )
-        # 不同对比组可以单独覆盖参考实验。六组对比严格使用上面的四个实验；
+        # 不同对比组可以单独覆盖参考实验。八组对比严格使用上面的四个实验；
         # x4/x8 对比没有 bicubic/srgan/esrgan，因此使用 x4 与 x8 自身确定色条。
         COMPARISON_GROUP_ERROR_COLORBAR_REFERENCE_KEYS = {
-            "six_experiments": ERROR_COLORBAR_REFERENCE_EXPERIMENT_KEYS,
+            "eight_experiments": ERROR_COLORBAR_REFERENCE_EXPERIMENT_KEYS,
+            "eight_experiments_without_widim_hs": ERROR_COLORBAR_REFERENCE_EXPERIMENT_KEYS,
             "scale_x4_x8": ("PIV_A_Esrgan_v4", "PIV_A_Esrgan_v_SCALE_8"),
         }
         # 涡度位移对比图的速度/位移场箭头配置；第一行涡度底图会叠加 fake_flo 的 quiver 箭头。
@@ -643,7 +724,7 @@ class global_data:
             "energy_spectrum_pred.npy",
             "flow_energy_spectrum_pred.npy",
         )
-        # GT 真实图像/真实光流的 ENERGY_SPECTRUM 候选文件；只画一条 GT 曲线，避免六个实验重复覆盖。
+        # GT 真实图像/真实光流的 ENERGY_SPECTRUM 候选文件；只画一条 GT 曲线，避免八个实验重复覆盖。
         ENERGY_SPECTRUM_GT_FILE_CANDIDATES = (
             "flow_energy_spectrum_gt_mean.npy",
             "image_pair_energy_spectrum_gt_mean.npy",

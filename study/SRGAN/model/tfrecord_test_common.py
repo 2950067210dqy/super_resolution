@@ -872,18 +872,19 @@ def _save_vorticity_velocity_artifacts(
     dataset_name=None,
     mask_2d=None,
     tbl_y_limit=None,
+    flow_error_colorbar_limit=0.5,
     global_data=None,
 ):
     """
     保存涡度-速度对比图及对应 NPY。
 
-    图中三列分别是：
-        1. Pred omega* + 预测速度矢量
-        2. GT omega* + 真值速度矢量
-        3. Delta omega* + 速度差矢量
+    NPY 仍保留 omega* / delta omega*，兼容已有后处理；PNG 按用户要求改成：
+        1. Pred S + 预测速度矢量
+        2. HR S + 参考速度矢量
+        3. Error S(Pred-HR) + 速度误差矢量
 
     这样既保留 evaluate_all 的 vorticity_quiver.png 命名，又补上用户要求的
-    “涡流速度差对比”信息。
+    “用 S 速度幅值当底色”的直观流场对比。
     """
     sample_dir = Path(sample_dir)
     sample_dir.mkdir(parents=True, exist_ok=True)
@@ -921,18 +922,8 @@ def _save_vorticity_velocity_artifacts(
         mask_2d=mask_2d,
         tbl_y_limit=tbl_y_limit,
     )
-    # png 绘图副本额外修复 vorticity 顶部边界条纹：
-    # U/V/S 本身已经按 dataset 处理过无效区，但 omega* 是梯度量，最高 y 边界仍可能产生单边差分色带。
-    display_pred_omega = _repair_vorticity_top_edge_for_display(
-        _omega_star_from_uv_np(display_pred_uvw[0], display_pred_uvw[1])
-    )
-    display_gt_omega = _repair_vorticity_top_edge_for_display(
-        _omega_star_from_uv_np(display_gt_uvw[0], display_gt_uvw[1])
-    )
-    display_delta_omega = _repair_vorticity_top_edge_for_display(
-        (display_pred_omega - display_gt_omega).astype(np.float32, copy=False)
-    )
     display_delta_uv = (display_pred_uvw[:2] - display_gt_uvw[:2]).astype(np.float32, copy=False)
+    display_delta_s = (display_pred_uvw[2] - display_gt_uvw[2]).astype(np.float32, copy=False)
 
     h, w = int(display_pred_uvw.shape[-2]), int(display_pred_uvw.shape[-1])
     if stride is None:
@@ -942,28 +933,28 @@ def _save_vorticity_velocity_artifacts(
 
     yy, xx = np.mgrid[0:h, 0:w]
     panels = [
-        ("Pred omega* + velocity", display_pred_omega, display_pred_uvw[0], display_pred_uvw[1], False),
-        ("GT omega* + velocity", display_gt_omega, display_gt_uvw[0], display_gt_uvw[1], False),
-        ("Delta omega* + velocity error", display_delta_omega, display_delta_uv[0], display_delta_uv[1], True),
+        ("Pred", display_pred_uvw[2], display_pred_uvw[0], display_pred_uvw[1], False),
+        ("HR", display_gt_uvw[2], display_gt_uvw[0], display_gt_uvw[1], False),
+        ("Error (Pred-HR)", display_delta_s, display_delta_uv[0], display_delta_uv[1], True),
     ]
-    omega_min, omega_max = _finite_color_limits_from_arrays(
-        [display_pred_omega, display_gt_omega],
-        symmetric=True,
-        fallback=(-2.0, 2.0),
+    # S 面板和 uvs_compare.png 的 S 行共用固定范围，误差面板也共用 flow error 色条范围。
+    # 这样同一个样本的 vorticity_quiver.png 与 uvs_compare.png 颜色含义一致。
+    speed_min, speed_max = _flow_component_limits_like_overview(dataset_name, 2)
+    delta_min, delta_max = _flow_error_limits_like_overview(
+        dataset_name,
+        2,
+        display_delta_s,
+        flow_error_colorbar_limit=flow_error_colorbar_limit,
     )
-    # omega* 在 _omega_star_from_uv_np 中被归一到 [-2, 2]，因此 Pred-GT 的理论范围是 [-4, 4]。
-    # 这里固定 vorticity_quiver 第三列 Delta omega* 的色条范围，避免每个 sample 自动缩放导致颜色不可横向比较。
-    delta_min, delta_max = -4.0, 4.0
 
     fig, axes = plt.subplots(1, 3, figsize=(16, 5.2), dpi=140, facecolor="w")
-    for ax, (title, omega, u_field, v_field, is_delta) in zip(axes, panels):
-        vmin, vmax = (delta_min, delta_max) if is_delta else (omega_min, omega_max)
+    for ax, (title, background, u_field, v_field, is_delta) in zip(axes, panels):
+        vmin, vmax = (delta_min, delta_max) if is_delta else (speed_min, speed_max)
         im = ax.imshow(
-            _finite_display_field(omega, fill_value=0.0),
+            _finite_display_field(background, fill_value=0.0),
             origin="lower",
-            # 涡度/速度场图片使用和当前 flow 图一致的色条风格：
-            # TBL/TWCF 是 viridis，普通 256 数据集是 jet。
-            cmap=cmap_name,
+            # Pred/HR 使用 S 速度幅值色图；误差面板使用红蓝发散色图，和 uvs_compare 的误差列一致。
+            cmap="bwr" if is_delta else cmap_name,
             vmin=vmin,
             vmax=vmax,
             aspect="auto",
@@ -979,16 +970,16 @@ def _save_vorticity_velocity_artifacts(
             pivot="mid",
             angles="xy",
             scale_units="xy",
-            scale=0.25,
-            width=0.003,
+            scale=0.8,
+            width=0.0025,
         )
-        ax.set_title(title, fontsize=11)
+        ax.set_title(title, fontsize=14)
         ax.set_xlim(0, w - 1)
         ax.set_ylim(0, h - 1)
         ax.set_xticks([])
         ax.set_yticks([])
         cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        cb.ax.set_ylabel("omega*", fontsize=10)
+        cb.ax.set_ylabel("S error [px]" if is_delta else "S displacement [px]", fontsize=12)
 
     fig.tight_layout()
     # evaluate_all 兼容命名。
@@ -1051,6 +1042,7 @@ def _save_flow_visual_artifacts(
         dataset_name=dataset_name,
         mask_2d=mask_2d,
         tbl_y_limit=tbl_y_limit,
+        flow_error_colorbar_limit=flow_error_colorbar_limit,
         global_data=global_data,
     )
 
@@ -2801,7 +2793,7 @@ def _error_image_for_display(error_map, limit=1.0):
     return np.nan_to_num(arr, nan=0.0, posinf=float(limit), neginf=-float(limit))
 
 
-def _plot_particle_error_panel(ax, error_map, title, limit=1.0, metric_text=None):
+def _plot_particle_error_panel(ax, error_map, title, limit=1.0, metric_text=None, show_metric=True):
     """
     在 comparison 图里绘制颗粒图像误差图。
 
@@ -2812,9 +2804,15 @@ def _plot_particle_error_panel(ax, error_map, title, limit=1.0, metric_text=None
     im = ax.imshow(_error_image_for_display(error_map, limit=limit), cmap="bwr", vmin=-limit, vmax=limit)
     ax.set_title(title, fontsize=10)
     ax.axis("off")
-    # 在颗粒误差图上标注 ESMSE，方便直接从 comparison.png 判断频域重建误差。
-    _annotate_metric_box(ax, metric_text, fontsize=12)
-    cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    # 实验样本的 HR 是 LR 插值得到的伪参考；调用方可关闭 ESMSE 标注，只保留误差场本身。
+    if show_metric:
+        _annotate_metric_box(ax, metric_text, fontsize=12)
+    # 用 axes_grid1 让色条高度严格跟误差图轴一致，避免宽画布 tight_layout 后色条显得过高。
+    from mpl_toolkits.axes_grid1 import make_axes_locatable
+
+    divider = make_axes_locatable(ax)
+    cax = divider.append_axes("right", size="3%", pad=0.04)
+    cbar = ax.figure.colorbar(im, cax=cax)
     cbar.ax.set_ylabel("error", fontsize=9)
     return im
 
@@ -2846,7 +2844,7 @@ def _save_gray_image(path, arr):
     plt.imsave(str(path), _clip_image_for_display(arr), cmap="gray", vmin=0.0, vmax=1.0)
 
 
-def _plot_image_comparison(out_path, sample_images, particle_error_colorbar_limit=1.0):
+def _plot_image_comparison(out_path, sample_images, particle_error_colorbar_limit=1.0, show_particle_error_metric=True):
     """
     保存 prev/next 的 LR、原图 HR、生成 SR、SR-HR 误差合并对比图。
 
@@ -2892,6 +2890,7 @@ def _plot_image_comparison(out_path, sample_images, particle_error_colorbar_limi
             f"{frame_name} Error (SR-HR)",
             limit=particle_error_colorbar_limit,
             metric_text=_format_metric_annotation("ESMSE", esmse_value),
+            show_metric=show_particle_error_metric,
         )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2980,6 +2979,7 @@ def _plot_tbl_image_comparison(
     crop_size=256,
     center_ratio=0.265,
     particle_error_colorbar_limit=1.0,
+    show_particle_error_metric=True,
 ):
     """
     保存 TBL 专用的颗粒图 comparison 图。
@@ -3060,6 +3060,7 @@ def _plot_tbl_image_comparison(
             f"{frame_name} Error crop (SR-HR)",
             limit=particle_error_colorbar_limit,
             metric_text=_format_metric_annotation("ESMSE", esmse_crop),
+            show_metric=show_particle_error_metric,
         )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3085,6 +3086,7 @@ def _save_image_outputs(dataset_name, dataset_dir, image_payload, start_index, p
         plot_args.get("particle_error_colorbar_limit", 1.0),
         1.0,
     )
+    show_particle_error_metric = bool(plot_args.get("particle_error_show_metric", True))
     payload_np = {
         "prev_lr": _as_numpy_batch(image_payload["prev_lr"]),
         "next_lr": _as_numpy_batch(image_payload["next_lr"]),
@@ -3257,12 +3259,14 @@ def _save_image_outputs(dataset_name, dataset_dir, image_payload, start_index, p
                 crop_size=tbl_crop_size,
                 center_ratio=tbl_crop_center_ratio,
                 particle_error_colorbar_limit=particle_error_colorbar_limit,
+                show_particle_error_metric=show_particle_error_metric,
             )
         else:
             _plot_image_comparison(
                 sample_dir / "comparison.png",
                 sample_images,
                 particle_error_colorbar_limit=particle_error_colorbar_limit,
+                show_particle_error_metric=show_particle_error_metric,
             )
 
 

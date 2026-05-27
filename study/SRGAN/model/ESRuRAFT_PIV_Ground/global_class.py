@@ -70,7 +70,7 @@ class global_data:
         # 训练任务标识
         # =========================
         name = "ESRuRAFT_PIV_Ground"  # 当前实验名（用于输出目录/模型名/wandb run名）
-        DESCRIPTION = "v_bicubic_searaft"  # 实验补充描述（可写损失配置、数据版本等）
+        DESCRIPTION = ("v_bicubic_searaft")  # 实验补充描述（可写损失配置、数据版本等）
         name +=DESCRIPTION
 
         #整体项目注释
@@ -102,7 +102,7 @@ class global_data:
             "bicubic_hs",
             "srgan_raft",
             "swinir_raft",
-            ""
+            "bicubic_searaft"
             "",
         )
         # 兼容旧实验配置：外部仍写旧名字时会被 normalized_train_mode 映射成新名字。
@@ -374,7 +374,7 @@ class global_data:
         # - class_2: 改为读取 RAFT-PIV TFRecord，LR 不再从 LR_DATA_ROOT_DIR 读取，而是在 data_load.py
         #   中按 test_all 同款下采样逻辑动态生成。
         DATA_SETS = ("class_1", "class_2")
-        DATA_SET = "class_1"
+        DATA_SET = "class_2"
         CLASS2_PSEUDO_CLASS_NAME = "problem_class2_raft_piv"
 
         CLASS1_GR_DATA_ROOT_DIR = rf"{AUTODL_DATA_PATH}/study_datas/sr_dataset/class_1/data"
