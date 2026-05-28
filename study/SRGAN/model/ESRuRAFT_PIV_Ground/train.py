@@ -125,7 +125,7 @@ def esrgan_union_RAFT_train(
         # 粒子图像容易出现规则网格伪影；所以这些原始 SR 模式使用独立的预热轮次。
         adversarial_start_epoch = int(global_data.esrgan.ORIGINAL_SR_ADVERSARIAL_START_EPOCH)
     elif train_mode == "swinir_raft":
-        # SwinIR_raft 是新增的非 GAN Transformer SR baseline。
+        # SwinIR_raft 是新增的“官方 SwinIR + RAFT”非 GAN Transformer SR baseline。
         # 即使外部传入 is_adversarial，也不应该训练判别器；这里把启动轮次放到训练轮数之后，
         # 让 use_adversarial 在整个训练过程中保持 False，避免和 SRGAN/ESRGAN 的对抗实验混淆。
         adversarial_start_epoch = int(global_data.esrgan.EPOCH_NUMS) + 1

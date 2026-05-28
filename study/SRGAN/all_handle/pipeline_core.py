@@ -332,21 +332,35 @@ class AllHandlePipeline:
         return max(0, min(len(steps), resume_step - 1))
 
     def enabled_output_stages(self) -> set[str]:
-        """读取全局输出阶段过滤参数，返回本次需要生成的 01/02/03/04 阶段集合。"""
+        """读取全局输出阶段过滤参数；None 只跑标准阶段，单独重跑阶段必须显式指定。"""
 
         configured = getattr(self.cfg, "OUTPUT_STAGE_FILTER", None)
-        all_stages = {
+        # 标准阶段对应输出目录 01/02/03/04；05_metric_tables 在 run_all 末尾统一写出，
+        # 虽然在这里作为可过滤阶段返回，但不会进入每个 group 的绘图步骤。
+        standard_stages = {
             "energy_spectrum",
             "error_maps",
             "error_histograms",
             "composite_panels",
+            "metric_tables",
+        }
+        # 下面这些是“单独重跑某张图”的快捷阶段：
+        # - tbl_profile_overlay 已包含在 composite_panels 的 TBL 流程里；
+        # - particle_stats_metrics 已包含在 composite_panels 的颗粒统计流程里；
+        # - particle_binary_count 用于单独重跑颗粒阈值图 + count/pixels 条形图；
+        # - flow_u_epe_hist_overlay 已包含在 error_histograms 里；
+        # - tbl_02_error_map 已包含在 error_maps 的 TBL 流程里。
+        # 因此 OUTPUT_STAGE_FILTER=None 时不再默认跑它们，只有显式指定时才运行。
+        standalone_stages = {
             "tbl_profile_overlay",
             "particle_stats_metrics",
+            "particle_binary_count",
             "flow_u_epe_hist_overlay",
             "tbl_02_error_map",
         }
+        all_known_stages = standard_stages | standalone_stages
         if configured is None:
-            return all_stages
+            return set(standard_stages)
         if isinstance(configured, str):
             raw_items = [configured]
         else:
@@ -360,12 +374,13 @@ class AllHandlePipeline:
             key = normalize_name(str(item))
             stage = aliases.get(key, key)
             if stage == "all":
-                return all_stages
-            if stage in all_stages:
+                enabled.update(standard_stages)
+                continue
+            if stage in all_known_stages:
                 enabled.add(stage)
             else:
                 self.warn(f"unknown output stage ignored: {item}")
-        return enabled or all_stages
+        return enabled or set(standard_stages)
 
     def group_progress_label(self, group: GroupContext) -> str:
         """把当前分组压缩成一行可读文本，避免进度输出里出现很长的路径。"""
@@ -425,6 +440,8 @@ class AllHandlePipeline:
 
         if exp_key is None:
             return getattr(self.cfg, "PARTICLE_STATS_GT_BAR_COLOR", "#666666")
+        if exp_key == "__lr__":
+            return getattr(self.cfg, "PARTICLE_STATS_LR_BAR_COLOR", "#999999")
         color_map = getattr(self.cfg, "PARTICLE_STATS_EXPERIMENT_BAR_COLORS", {})
         return color_map.get(exp_key, getattr(self.cfg, "PARTICLE_STATS_BAR_COLOR", self.experiment_color(exp_key)))
 
@@ -544,6 +561,17 @@ class AllHandlePipeline:
             return
         path.parent.mkdir(parents=True, exist_ok=True)
         np.save(path, data, allow_pickle=True)
+
+    def add_colorbar(self, fig: plt.Figure, mappable, cax: plt.Axes, **kwargs):
+        """统一创建色条，并按全局规则格式化 tick label。"""
+
+        cb = fig.colorbar(mappable, cax=cax, **kwargs)
+        if bool(getattr(self.cfg, "COLORBAR_PAD_POSITIVE_TICKS", True)):
+            self.pad_positive_colorbar_tick_labels(
+                cb,
+                int(getattr(self.cfg, "COLORBAR_TICK_DECIMALS", 1)),
+            )
+        return cb
 
     # =========================
     # 目录发现
@@ -780,77 +808,82 @@ class AllHandlePipeline:
         enabled_stages = self.enabled_output_stages()
         self.progress(f"discovered {total_groups} groups.")
         self.progress(f"enabled output stages: {', '.join(sorted(enabled_stages))}")
-        for group_index, group in enumerate(groups, start=1):
-            group_start = time.perf_counter()
-            self.active_comparison_name = group.comparison_name
-            self.progress(f"group {group_index}/{total_groups}: {self.group_progress_label(group)}")
-            steps = []
-            if "energy_spectrum" in enabled_stages:
-                steps.append(("energy_spectrum", self.plot_energy_spectrum))
-            if "error_histograms" in enabled_stages:
-                steps.append(("histograms", self.plot_histogram_bundle))
-            if "flow_u_epe_hist_overlay" in enabled_stages:
-                steps.append(("flow_u_epe_hist_overlay", self.plot_flow_u_epe_histogram))
-            if normalize_name(group.category_name) != "all":
-                if "error_maps" in enabled_stages:
-                    steps.append(("error_maps", self.plot_error_map_bundle))
-                if "tbl_02_error_map" in enabled_stages and normalize_name(group.category_name) == "tbl":
-                    steps.append(("tbl_02_error_map", self.plot_error_map_bundle))
-                if "composite_panels" in enabled_stages:
-                    steps.append(("composites", self.plot_composite_bundle))
-                if "particle_stats_metrics" in enabled_stages:
-                    steps.append(("particle_stats_metrics", self.plot_particle_stats_metric_only))
-                if "composite_panels" in enabled_stages and normalize_name(group.category_name) in ("tbl", "twcf"):
-                    steps.append(("tbl_twcf_flow_uv", self.plot_tbl_twcf_flow_uv))
-                if (
-                    ("composite_panels" in enabled_stages or "tbl_profile_overlay" in enabled_stages)
-                    and normalize_name(group.category_name) == "tbl"
-                ):
-                    steps.append(("tbl_profile_overlay", self.plot_tbl_profile_overlays))
-            step_total = len(steps)
-            if step_total == 0:
-                self.progress(f"group {group_index}/{total_groups} has no enabled steps: {self.group_progress_label(group)}")
-                continue
-            start_step_idx = self.resume_step_start_index(group_index, steps)
-            if start_step_idx >= step_total:
-                self.progress(f"group {group_index}/{total_groups} skipped by resume settings: {self.group_progress_label(group)}")
-                continue
-            if start_step_idx > 0:
-                self.progress(
-                    f"group {group_index}/{total_groups} resume from step "
-                    f"{start_step_idx + 1}/{step_total}: {steps[start_step_idx][0]}"
-                )
-            for step_index, (step_name, step_func) in enumerate(steps[start_step_idx:], start=start_step_idx + 1):
-                self.progress_step(group_index, total_groups, step_index, step_total, step_name)
-                step_start = time.perf_counter()
-                step_func(group)
-                step_elapsed = time.perf_counter() - step_start
-                self.timing_records.append(
-                    {
-                        "comparison": group.comparison_name,
-                        "class": group.class_name,
-                        "split": group.split_name,
-                        "category": group.category_name,
-                        "step": step_name,
-                        "seconds": step_elapsed,
-                        "duration": self.format_duration(step_elapsed),
-                        "group_index": group_index,
-                        "step_index": step_index,
-                    }
-                )
-                self.progress_step_done(group_index, total_groups, step_index, step_total, step_name, step_elapsed)
-            group_elapsed = time.perf_counter() - group_start
-            group_done = f"group {group_index}/{total_groups} done: {self.group_progress_label(group)}"
-            if getattr(self.cfg, "PROGRESS_SHOW_RUNTIME", True):
-                group_done = f"{group_done} in {self.format_duration(group_elapsed)}"
-            self.progress(group_done)
-        self.progress("writing metric tables.")
-        metric_start = time.perf_counter()
-        self.write_metric_tables(groups)
-        metric_elapsed = time.perf_counter() - metric_start
-        self.timing_records.append(
-            {"comparison": "all", "class": "all", "split": "all", "category": "all", "step": "metric_tables", "seconds": metric_elapsed, "duration": self.format_duration(metric_elapsed)}
-        )
+        plotting_stages = enabled_stages - {"metric_tables"}
+        if plotting_stages:
+            for group_index, group in enumerate(groups, start=1):
+                group_start = time.perf_counter()
+                self.active_comparison_name = group.comparison_name
+                self.progress(f"group {group_index}/{total_groups}: {self.group_progress_label(group)}")
+                steps = []
+                if "energy_spectrum" in enabled_stages:
+                    steps.append(("energy_spectrum", self.plot_energy_spectrum))
+                if "error_histograms" in enabled_stages:
+                    steps.append(("histograms", self.plot_histogram_bundle))
+                if "flow_u_epe_hist_overlay" in enabled_stages:
+                    steps.append(("flow_u_epe_hist_overlay", self.plot_flow_u_epe_histogram))
+                if normalize_name(group.category_name) != "all":
+                    if "error_maps" in enabled_stages:
+                        steps.append(("error_maps", self.plot_error_map_bundle))
+                    if "tbl_02_error_map" in enabled_stages and normalize_name(group.category_name) == "tbl":
+                        steps.append(("tbl_02_error_map", self.plot_error_map_bundle))
+                    if "composite_panels" in enabled_stages:
+                        steps.append(("composites", self.plot_composite_bundle))
+                    if "particle_stats_metrics" in enabled_stages:
+                        steps.append(("particle_stats_metrics", self.plot_particle_stats_metric_only))
+                    if "particle_binary_count" in enabled_stages:
+                        steps.append(("particle_binary_count", self.plot_particle_binary_count_only))
+                    if "composite_panels" in enabled_stages and normalize_name(group.category_name) in ("tbl", "twcf"):
+                        steps.append(("tbl_twcf_flow_uv", self.plot_tbl_twcf_flow_uv))
+                    if (
+                        ("composite_panels" in enabled_stages or "tbl_profile_overlay" in enabled_stages)
+                        and normalize_name(group.category_name) == "tbl"
+                    ):
+                        steps.append(("tbl_profile_overlay", self.plot_tbl_profile_overlays))
+                step_total = len(steps)
+                if step_total == 0:
+                    self.progress(f"group {group_index}/{total_groups} has no enabled steps: {self.group_progress_label(group)}")
+                    continue
+                start_step_idx = self.resume_step_start_index(group_index, steps)
+                if start_step_idx >= step_total:
+                    self.progress(f"group {group_index}/{total_groups} skipped by resume settings: {self.group_progress_label(group)}")
+                    continue
+                if start_step_idx > 0:
+                    self.progress(
+                        f"group {group_index}/{total_groups} resume from step "
+                        f"{start_step_idx + 1}/{step_total}: {steps[start_step_idx][0]}"
+                    )
+                for step_index, (step_name, step_func) in enumerate(steps[start_step_idx:], start=start_step_idx + 1):
+                    self.progress_step(group_index, total_groups, step_index, step_total, step_name)
+                    step_start = time.perf_counter()
+                    step_func(group)
+                    step_elapsed = time.perf_counter() - step_start
+                    self.timing_records.append(
+                        {
+                            "comparison": group.comparison_name,
+                            "class": group.class_name,
+                            "split": group.split_name,
+                            "category": group.category_name,
+                            "step": step_name,
+                            "seconds": step_elapsed,
+                            "duration": self.format_duration(step_elapsed),
+                            "group_index": group_index,
+                            "step_index": step_index,
+                        }
+                    )
+                    self.progress_step_done(group_index, total_groups, step_index, step_total, step_name, step_elapsed)
+                group_elapsed = time.perf_counter() - group_start
+                group_done = f"group {group_index}/{total_groups} done: {self.group_progress_label(group)}"
+                if getattr(self.cfg, "PROGRESS_SHOW_RUNTIME", True):
+                    group_done = f"{group_done} in {self.format_duration(group_elapsed)}"
+                self.progress(group_done)
+        if "metric_tables" in enabled_stages:
+            self.progress("writing metric tables.")
+            metric_start = time.perf_counter()
+            self.write_metric_tables(groups)
+            metric_elapsed = time.perf_counter() - metric_start
+            self.timing_records.append(
+                {"comparison": "all", "class": "all", "split": "all", "category": "all", "step": "metric_tables", "seconds": metric_elapsed, "duration": self.format_duration(metric_elapsed)}
+            )
         self.progress("writing summary.")
         self.write_summary(groups)
         total_elapsed = time.perf_counter() - self.run_started_at if self.run_started_at is not None else 0.0
@@ -1017,18 +1050,25 @@ class AllHandlePipeline:
         for exp_key in [key for key in self.legend_order_keys() if key in group.experiment_dirs]:
             category_dir = group.experiment_dirs[exp_key]
             split_root = category_dir.parent if normalize_name(group.category_name) != "all" else category_dir
-            # metrics_summary.csv 可能放在类别目录，也可能放在 split 根目录；
-            # 优先使用类别目录，避免 split 根目录里的总表被每个类别重复读取。
-            summary_path = self.find_case_insensitive_file(category_dir, file_names)
-            if summary_path is None:
-                summary_path = self.find_case_insensitive_file(split_root, file_names)
+            # metrics_summary.csv 的实际保存位置是 experiment/class_*/metrics_summary.csv；
+            # 同时保留类别目录和 split 根目录作为兼容兜底，避免历史目录结构无法读取。
+            class_root = self.experiment_class_root_from_split_root(split_root, group.class_name)
+            candidate_dirs = [category_dir, split_root]
+            if class_root is not None:
+                candidate_dirs.append(class_root)
+            summary_path = None
+            for candidate_dir in candidate_dirs:
+                summary_path = self.find_case_insensitive_file(candidate_dir, file_names)
+                if summary_path is not None:
+                    break
             csv_rows = self.read_csv_dict_rows(summary_path)
             selected_rows = self.filter_metric_summary_rows(csv_rows, group.category_name)
             if not selected_rows:
                 selected_rows = csv_rows
             if not selected_rows:
                 if summary_path is None:
-                    self.warn(f"missing metrics_summary.csv for {group.tag}/{exp_key}: {category_dir}")
+                    checked = ", ".join(str(path) for path in candidate_dirs)
+                    self.warn(f"missing metrics_summary.csv for {group.tag}/{exp_key}; checked: {checked}")
                 continue
 
             summary_values = self.summarize_metric_summary_rows(selected_rows, metadata_columns)
@@ -1042,6 +1082,20 @@ class AllHandlePipeline:
             row.update(summary_values)
             rows.append(row)
         return rows
+
+    def experiment_class_root_from_split_root(self, split_root: Path, class_name: str) -> Path | None:
+        """从 .../class_*/.../test_all 反推 class_* 根目录，用于读取 class_* 下的 metrics_summary.csv。"""
+
+        target = normalize_name(class_name)
+        for path in (split_root, *split_root.parents):
+            if normalize_name(path.name) == target:
+                return path
+        # 如果 class_name 使用 class_2，而目录叫 class2 或反过来，按全局 CLASS_NAMES 再做一次兼容查找。
+        configured_classes = {normalize_name(name) for name in getattr(self.cfg, "CLASS_NAMES", ())}
+        for path in (split_root, *split_root.parents):
+            if normalize_name(path.name) in configured_classes:
+                return path
+        return None
 
     def filter_metric_summary_rows(self, rows: list[dict[str, str]], category_name: str) -> list[dict[str, str]]:
         """如果 metrics_summary.csv 是 split 级总表，就按类别列筛出当前 backstep/cylinder 等类别。"""
@@ -1826,13 +1880,13 @@ class AllHandlePipeline:
         if not full_frame_image_only:
             cax_image = fig.add_subplot(gs[:, 2])
             if image_handle is not None and image_vmin is not None and image_vmax is not None:
-                cb = fig.colorbar(image_handle, cax=cax_image)
+                cb = self.add_colorbar(fig, image_handle, cax=cax_image)
                 cb.set_label(self.cfg.PARTICLE_VALUE_COLORBAR_LABEL, fontsize=self.cfg.COLORBAR_LABEL_SIZE)
             else:
                 cax_image.axis("off")
             cax_error = fig.add_subplot(gs[:, 3])
             if error_handle is not None and error_vmin is not None and error_vmax is not None:
-                cb = fig.colorbar(error_handle, cax=cax_error)
+                cb = self.add_colorbar(fig, error_handle, cax=cax_error)
                 cb.set_label(self.cfg.PARTICLE_ERROR_COLORBAR_LABEL, fontsize=self.cfg.COLORBAR_LABEL_SIZE)
             else:
                 cax_error.axis("off")
@@ -1858,23 +1912,41 @@ class AllHandlePipeline:
         vmax: float,
         colorbar_label: str,
     ) -> None:
-        """把多个实验的同类误差图横向排布，末尾只放一个统一色条。"""
+        """把多个实验的同类误差图排布；eight_experiments 自动分两行，每行末尾一个统一色条。"""
 
         exp_keys = [key for key in self.legend_order_keys() if key in maps]
         if not exp_keys:
             return
-        fig = plt.figure(figsize=(2.2 * len(exp_keys) + 0.45, 2.2))
-        gs = fig.add_gridspec(1, len(exp_keys) + 1, width_ratios=[1] * len(exp_keys) + [0.06])
-        image_handle = None
-        for idx, exp_key in enumerate(exp_keys):
-            ax = fig.add_subplot(gs[0, idx])
-            image_handle = ax.imshow(maps[exp_key], cmap=cmap, vmin=vmin, vmax=vmax)
-            self.panel_text(ax, self.experiment_label(exp_key))
-            ax.axis("off")
-        cax = fig.add_subplot(gs[0, len(exp_keys)])
-        if image_handle is not None:
-            cb = fig.colorbar(image_handle, cax=cax)
-            cb.set_label(colorbar_label, fontsize=self.cfg.COLORBAR_LABEL_SIZE)
+        exp_chunks = self.chunk_items(exp_keys, self.composite_wrap_method_count())
+        max_cols = max((len(chunk) for chunk in exp_chunks), default=0)
+        fig = plt.figure(figsize=(2.2 * max_cols + 0.45, max(2.2, 2.2 * len(exp_chunks))))
+        gs = fig.add_gridspec(
+            len(exp_chunks),
+            max_cols + 1,
+            width_ratios=[1] * max_cols + [0.06],
+            hspace=0.08,
+            wspace=0.04,
+        )
+        for row_idx, chunk in enumerate(exp_chunks):
+            image_handle = None
+            row_axes: list[plt.Axes] = []
+            for col_idx, exp_key in enumerate(chunk):
+                ax = fig.add_subplot(gs[row_idx, col_idx])
+                row_axes.append(ax)
+                image_handle = ax.imshow(maps[exp_key], cmap=cmap, vmin=vmin, vmax=vmax)
+                self.panel_text(ax, self.experiment_label(exp_key))
+                ax.axis("off")
+            # 第二行如果不足 max_cols，关闭末尾空格，避免出现多余坐标轴。
+            for empty_col in range(len(chunk), max_cols):
+                fig.add_subplot(gs[row_idx, empty_col]).axis("off")
+            cax = fig.add_subplot(gs[row_idx, max_cols])
+            if image_handle is not None:
+                cb = self.add_colorbar(fig, image_handle, cax=cax)
+                cb.set_label(colorbar_label, fontsize=self.cfg.COLORBAR_LABEL_SIZE)
+                # 误差图保持等比例显示时，色条需要跟当前行图片真实高度对齐。
+                self.align_colorbar_to_axes(cax, row_axes)
+            else:
+                cax.axis("off")
         self.save_figure(fig, out_base)
 
     def resolve_color_limit(
@@ -2264,6 +2336,11 @@ class AllHandlePipeline:
 
         self.plot_particle_stats_composites(group, metrics_only=True)
 
+    def plot_particle_binary_count_only(self, group: GroupContext) -> None:
+        """只生成颗粒阈值对比图和 count/pixels 条形统计图，便于单独修这两张论文图。"""
+
+        self.plot_particle_stats_composites(group, metrics_only=False)
+
     def limited_bundles(self, group: GroupContext, kind: str) -> list[SampleBundle]:
         bundles = self.bundle_samples(group, kind)
         limit = self.cfg.MAX_SAMPLE_COMPOSITES_PER_CATEGORY
@@ -2428,6 +2505,36 @@ class AllHandlePipeline:
         self.panel_text(ax, label)
         ax.axis("off")
         return handle
+
+    def align_colorbar_to_axes(self, cax: plt.Axes, axes: list[plt.Axes]) -> None:
+        """让色条轴的上下边界与当前行中真正显示图片的轴对齐。"""
+
+        valid_positions = []
+        for ax in axes:
+            if not ax.has_data():
+                continue
+            pos = ax.get_position()
+            if pos.width > 0 and pos.height > 0:
+                valid_positions.append(pos)
+        if not valid_positions:
+            return
+        y0 = min(pos.y0 for pos in valid_positions)
+        y1 = max(pos.y1 for pos in valid_positions)
+        colorbar_pos = cax.get_position()
+        cax.set_position([colorbar_pos.x0, y0, colorbar_pos.width, y1 - y0])
+
+    def pad_positive_colorbar_tick_labels(self, colorbar, decimals: int = 1) -> None:
+        """把色条正数 tick 前补一个空格，让正负数标签在论文图中视觉对齐。"""
+
+        mpl = ensure_matplotlib().matplotlib
+        decimals = max(0, int(decimals))
+
+        def formatter(value, _position):
+            text = f"{float(value):.{decimals}f}"
+            return f" {text}" if float(value) >= 0 else text
+
+        colorbar.ax.yaxis.set_major_formatter(mpl.ticker.FuncFormatter(formatter))
+        colorbar.update_ticks()
 
     def experiment_zoom_bounds(
         self,
@@ -2719,9 +2826,13 @@ class AllHandlePipeline:
             method_cols = max((len(chunk) for chunk in exp_chunks), default=0)
             n_cols = fixed_count + method_cols
             row_specs = []
-            for time_name, row_kind, fixed_maps, exp_maps in rows:
+            for time_name in ("previous", "next"):
+                time_rows = [row for row in rows if row[0] == time_name]
+                # eight_experiments 分成 4+4 两块时，每一块都按“颗粒图一行、误差图一行”排列；
+                # 不再先连续画两行颗粒图再画两行误差图，避免 SR 图和对应误差图上下关系被打散。
                 for chunk_idx, chunk in enumerate(exp_chunks):
-                    row_specs.append((time_name, row_kind, fixed_maps, exp_maps, chunk_idx, chunk))
+                    for row_time_name, row_kind, fixed_maps, exp_maps in time_rows:
+                        row_specs.append((row_time_name, row_kind, fixed_maps, exp_maps, chunk_idx, chunk))
             fig = plt.figure(figsize=(2.0 * n_cols + 0.5, max(4.2, 2.05 * len(row_specs))))
             gs = fig.add_gridspec(
                 len(row_specs),
@@ -2732,9 +2843,9 @@ class AllHandlePipeline:
             )
             for row_idx, (time_name, row_kind, fixed_maps, exp_maps, chunk_idx, chunk) in enumerate(row_specs):
                 show_fixed = chunk_idx == 0
-                # 颗粒图第一块保留 LR/GT；eight_experiments 的第二块只空出最左侧参考列，
-                # 让后 4 个实验从第二列开始，避免继续对齐到 GT/LR 两个固定列之后导致画面右移。
-                current_fixed_maps = fixed_maps if show_fixed else [None]
+                # 颗粒图第一块保留 LR/GT；eight_experiments 的第二块也空出 LR 和 GT 两列，
+                # 让后 4 个实验与第一行的实验列对齐，而不是落到 GT 那一列下面。
+                current_fixed_maps = fixed_maps if show_fixed else [None] * fixed_count
                 row_arrays = current_fixed_maps + [exp_maps.get(exp_key) for exp_key in chunk]
                 row_arrays += [None] * (n_cols - len(row_arrays))
                 # 颗粒 SR 对比图的 LR 面板使用原始低分辨率尺寸；
@@ -2747,7 +2858,7 @@ class AllHandlePipeline:
                     vmin, vmax = self.row_limit(all_row_arrays, self.cfg.PARTICLE_VALUE_COLORBAR_LIMIT)
                     cmap = self.cfg.IMAGE_CMAP
                     colorbar_label = self.cfg.PARTICLE_VALUE_COLORBAR_LABEL
-                    labels = ([self.cfg.LR_PANEL_LABEL, self.cfg.GT_PANEL_LABEL] if show_fixed else [""]) + [
+                    labels = ([self.cfg.LR_PANEL_LABEL, self.cfg.GT_PANEL_LABEL] if show_fixed else [""] * fixed_count) + [
                         self.experiment_label(exp_key) for exp_key in chunk
                     ]
                 else:
@@ -2759,13 +2870,17 @@ class AllHandlePipeline:
                     )
                     cmap = self.cfg.ERROR_CMAP
                     colorbar_label = self.cfg.PARTICLE_ERROR_COLORBAR_LABEL
-                    labels = ([self.cfg.BLANK_PANEL_LABEL, self.cfg.BLANK_PANEL_LABEL] if show_fixed else [""]) + [
+                    labels = (
+                        [self.cfg.BLANK_PANEL_LABEL, self.cfg.BLANK_PANEL_LABEL] if show_fixed else [""] * fixed_count
+                    ) + [
                         self.experiment_label(exp_key) for exp_key in chunk
                     ]
                 labels += [""] * (n_cols - len(labels))
                 image_handle = None
+                row_axes: list[plt.Axes] = []
                 for col_idx, array in enumerate(row_arrays):
                     ax = fig.add_subplot(gs[row_idx, col_idx])
+                    row_axes.append(ax)
                     if row_kind == "image" and col_idx == 0:
                         handle = self.draw_map_original_size(
                             ax,
@@ -2798,8 +2913,12 @@ class AllHandlePipeline:
                         )
                 cax = fig.add_subplot(gs[row_idx, n_cols])
                 if image_handle is not None and vmin is not None and vmax is not None:
-                    cb = fig.colorbar(image_handle, cax=cax)
+                    cb = self.add_colorbar(fig, image_handle, cax=cax)
                     cb.set_label(colorbar_label, fontsize=self.cfg.COLORBAR_LABEL_SIZE)
+                    # eight_experiments 的颗粒图/误差图是等比例方图，GridSpec 行高通常大于图片实际高度；
+                    # 如果色条直接占满整行，就会出现上下边界和误差图不齐。这里取当前行有效图片轴的实际位置，
+                    # 把色条轴高度裁到同样的 y0/y1，保证每条色条上下都和对应图片对齐。
+                    self.align_colorbar_to_axes(cax, row_axes)
                 else:
                     cax.axis("off")
 
@@ -2921,13 +3040,13 @@ class AllHandlePipeline:
                 # LR/GT 行没有误差图时只关闭误差色条轴；实验行会同时显示图像色条和误差色条。
                 cax_image = fig.add_subplot(gs[row_idx, 2])
                 if row_image_handle is not None and image_vmin is not None and image_vmax is not None:
-                    cb = fig.colorbar(row_image_handle, cax=cax_image)
+                    cb = self.add_colorbar(fig, row_image_handle, cax=cax_image)
                     cb.set_label(self.cfg.PARTICLE_VALUE_COLORBAR_LABEL, fontsize=self.cfg.COLORBAR_LABEL_SIZE)
                 else:
                     cax_image.axis("off")
                 cax_error = fig.add_subplot(gs[row_idx, 3])
                 if row_error_handle is not None and error_vmin is not None and error_vmax is not None:
-                    cb = fig.colorbar(row_error_handle, cax=cax_error)
+                    cb = self.add_colorbar(fig, row_error_handle, cax=cax_error)
                     cb.set_label(self.cfg.PARTICLE_ERROR_COLORBAR_LABEL, fontsize=self.cfg.COLORBAR_LABEL_SIZE)
                 else:
                     cax_error.axis("off")
@@ -3109,13 +3228,13 @@ class AllHandlePipeline:
 
                 cax = fig.add_subplot(gs[top_row, n_cols])
                 if top_handle is not None and top_vmin is not None and top_vmax is not None:
-                    cb = fig.colorbar(top_handle, cax=cax)
+                    cb = self.add_colorbar(fig, top_handle, cax=cax)
                     cb.set_label(self.cfg.VORTICITY_VALUE_COLORBAR_LABEL, fontsize=self.cfg.COLORBAR_LABEL_SIZE)
                 else:
                     cax.axis("off")
                 cax = fig.add_subplot(gs[bottom_row, n_cols])
                 if bottom_handle is not None and bottom_vmin is not None and bottom_vmax is not None:
-                    cb = fig.colorbar(bottom_handle, cax=cax)
+                    cb = self.add_colorbar(fig, bottom_handle, cax=cax)
                     cb.set_label(self.cfg.VORTICITY_ERROR_COLORBAR_LABEL, fontsize=self.cfg.COLORBAR_LABEL_SIZE)
                 else:
                     cax.axis("off")
@@ -3222,7 +3341,7 @@ class AllHandlePipeline:
                     ) or handle
                 cax = fig.add_subplot(gs[row_idx, n_cols])
                 if handle is not None and vmin is not None and vmax is not None:
-                    cb = fig.colorbar(self.colorbar_mappable(handle, cmap, vmin, vmax), cax=cax)
+                    cb = self.add_colorbar(fig, self.colorbar_mappable(handle, cmap, vmin, vmax), cax=cax)
                     cb.set_label(cb_label, fontsize=self.cfg.COLORBAR_LABEL_SIZE)
                 else:
                     cax.axis("off")
@@ -3296,7 +3415,7 @@ class AllHandlePipeline:
                 ) or row_handle
                 cax = fig.add_subplot(gs[row_idx, 2])
                 if row_handle is not None:
-                    cb = fig.colorbar(row_handle, cax=cax)
+                    cb = self.add_colorbar(fig, row_handle, cax=cax)
                     cb.set_label(self.cfg.FLOW_VALUE_COLORBAR_LABEL, fontsize=self.cfg.COLORBAR_LABEL_SIZE)
                 else:
                     cax.axis("off")
@@ -3644,7 +3763,7 @@ class AllHandlePipeline:
         legend_ax = fig.add_subplot(colorbar_row[0, 1])
         legend_ax.axis("off")
         if top_handle is not None and gt_map is not None and ensure_2d_image(gt_map).ndim == 2:
-            cb = fig.colorbar(top_handle, cax=cax, orientation="horizontal")
+            cb = self.add_colorbar(fig, top_handle, cax=cax, orientation="horizontal")
             # 色条 label 放到上方，避免和下面三张剖面图的区域标题/坐标区域挤在一起。
             cb.ax.xaxis.set_label_position(getattr(self.cfg, "TBL_PROFILE_COLORBAR_LABEL_POSITION", "top"))
             cb.set_label(
@@ -3792,7 +3911,7 @@ class AllHandlePipeline:
             self.plot_particle_stats_image_composite_vertical(bundle, exp_keys, out_dir)
             return
 
-        n_cols = 1 + len(exp_keys)
+        n_cols = 2 + len(exp_keys)
         # 颗粒图/阈值图只需要展示图像本身，不能复用条形统计图的宽列参数；
         # 这里使用单独的紧凑画布，避免 crop 阈值图在横向多列时被大片空白隔开。
         fig_width = max(7.5, float(getattr(self.cfg, "PARTICLE_STATS_IMAGE_WIDTH_PER_COL", 1.35)) * n_cols)
@@ -3818,7 +3937,10 @@ class AllHandlePipeline:
         for block_idx, time_name in enumerate(("previous", "next")):
             row0 = 0 if block_idx == 0 else 3
             gt = self.first_available_particle(bundle, time_name, "gt", crop=crop)
+            lr = self.first_available_particle(bundle, time_name, "lr", crop=crop)
             gt_binary = self.first_available_particle(bundle, time_name, "gt_binary", crop=crop)
+            lr_payload = self.compute_lr_particle_binary_stats_payload(bundle, time_name, crop=crop)
+            lr_binary = lr_payload.get("pred_binary") if lr_payload else None
             sr_maps = {
                 exp_key: self.load_particle_array_mode(sample_dir, time_name, "sr", crop=crop)
                 for exp_key, sample_dir in bundle.sample_dirs.items()
@@ -3827,13 +3949,19 @@ class AllHandlePipeline:
                 exp_key: self.load_particle_array_mode(sample_dir, time_name, "sr_binary", crop=crop)
                 for exp_key, sample_dir in bundle.sample_dirs.items()
             }
-            image_vmin, image_vmax = self.row_limit([gt] + list(sr_maps.values()), self.cfg.PARTICLE_VALUE_COLORBAR_LIMIT)
+            image_vmin, image_vmax = self.row_limit([gt, lr] + list(sr_maps.values()), self.cfg.PARTICLE_VALUE_COLORBAR_LIMIT)
             binary_vmin, binary_vmax = 0.0, 1.0
 
-            first_row_arrays = [gt] + [sr_maps.get(exp_key) for exp_key in exp_keys]
-            first_row_labels = [self.cfg.GT_PANEL_LABEL] + [self.experiment_label(exp_key) for exp_key in exp_keys]
-            second_row_arrays = [gt_binary] + [sr_binary_maps.get(exp_key) for exp_key in exp_keys]
-            second_row_labels = [self.cfg.GT_PANEL_LABEL] + [self.experiment_label(exp_key) for exp_key in exp_keys]
+            # 颗粒阈值对比图在 GT 后面加入 LR：第一行是 GT/LR/SR，第二行是对应二值图。
+            # LR 通常没有单独保存 binary npy，因此使用当前样本阈值 T 即时生成 LR binary。
+            first_row_arrays = [gt, lr] + [sr_maps.get(exp_key) for exp_key in exp_keys]
+            first_row_labels = [self.cfg.GT_PANEL_LABEL, self.cfg.LR_PANEL_LABEL] + [
+                self.experiment_label(exp_key) for exp_key in exp_keys
+            ]
+            second_row_arrays = [gt_binary, lr_binary] + [sr_binary_maps.get(exp_key) for exp_key in exp_keys]
+            second_row_labels = [self.cfg.GT_PANEL_LABEL, self.cfg.LR_PANEL_LABEL] + [
+                self.experiment_label(exp_key) for exp_key in exp_keys
+            ]
             label_size = float(getattr(self.cfg, "PARTICLE_BINARY_PANEL_LABEL_SIZE", self.cfg.PANEL_LABEL_SIZE))
             for col_idx in range(n_cols):
                 ax = fig.add_subplot(gs[row0, col_idx])
@@ -3880,8 +4008,12 @@ class AllHandlePipeline:
         rows: list[tuple[str, str, np.ndarray | None, np.ndarray | None]] = []
         for time_name in ("previous", "next"):
             gt = self.first_available_particle(bundle, time_name, "gt", crop=False)
+            lr = self.first_available_particle(bundle, time_name, "lr", crop=False)
             gt_binary = self.first_available_particle(bundle, time_name, "gt_binary", crop=False)
+            lr_payload = self.compute_lr_particle_binary_stats_payload(bundle, time_name, crop=False)
+            lr_binary = lr_payload.get("pred_binary") if lr_payload else None
             rows.append((time_name, self.cfg.GT_PANEL_LABEL, gt, gt_binary))
+            rows.append((time_name, self.cfg.LR_PANEL_LABEL, lr, lr_binary))
             for exp_key in exp_keys:
                 sample_dir = bundle.sample_dirs.get(exp_key)
                 sr = self.load_particle_array_mode(sample_dir, time_name, "sr", crop=False) if sample_dir is not None else None
@@ -3972,9 +4104,9 @@ class AllHandlePipeline:
         patch_cls = ensure_matplotlib().matplotlib.patches.Patch
         legend_handles = [
             patch_cls(facecolor=self.particle_stats_bar_color(key), edgecolor=self.cfg.PARTICLE_STATS_BAR_EDGE_COLOR)
-            for key in ([None] + exp_keys)
+            for key in ([None, "__lr__"] + exp_keys)
         ]
-        legend_labels = [self.cfg.GT_PANEL_LABEL] + [self.experiment_label(k) for k in exp_keys]
+        legend_labels = [self.cfg.GT_PANEL_LABEL, self.cfg.LR_PANEL_LABEL] + [self.experiment_label(k) for k in exp_keys]
 
         for block_idx, time_name in enumerate(("previous", "next")):
             row_start = block_idx
@@ -3995,8 +4127,9 @@ class AllHandlePipeline:
                 for exp_key, sample_dir in bundle.sample_dirs.items()
             }
             gt_stats = self.load_particle_gt_stats(bundle, time_name, crop=crop)
-            bar_labels = [self.cfg.GT_PANEL_LABEL] + [self.experiment_label(k) for k in exp_keys]
-            bar_exp_keys = [None] + exp_keys
+            lr_stats = self.load_particle_lr_stats(bundle, time_name, crop=crop)
+            bar_labels = [self.cfg.GT_PANEL_LABEL, self.cfg.LR_PANEL_LABEL] + [self.experiment_label(k) for k in exp_keys]
+            bar_exp_keys = [None, "__lr__"] + exp_keys
             bar_colors = [self.particle_stats_bar_color(key) for key in bar_exp_keys]
 
             for metric_idx, (metric, label) in enumerate(zip(metrics, metric_labels)):
@@ -4005,7 +4138,7 @@ class AllHandlePipeline:
                 plot_col = metric_idx + 1
                 ax = fig.add_subplot(gs[plot_row, plot_col])
                 values = np.asarray(
-                    [gt_stats.get(metric, np.nan)]
+                    [gt_stats.get(metric, np.nan), lr_stats.get(metric, np.nan)]
                     + [stats.get(exp_key, {}).get(metric, np.nan) for exp_key in exp_keys],
                     dtype=np.float64,
                 )
@@ -4049,14 +4182,22 @@ class AllHandlePipeline:
                 ax.set_ylabel(self.cfg.PARTICLE_METRIC_Y_LABEL if metric not in ("count", "pixels") else self.cfg.PARTICLE_COUNT_Y_LABEL)
                 self.panel_text(ax, label)
                 ax.grid(True, alpha=0.18, linewidth=0.5)
-                # 按用户要求，每张条形统计图内部都放图例；loc="best" 会自动寻找当前子图的空白区域。
+                # 按用户要求，每张条形统计图内部都放图例；固定到右上角，避免自动布局把图例放到左上，
+                # 从而和 count / particle pixels 的面板 label 挤在一起。
+                legend_kwargs = {
+                    "loc": getattr(self.cfg, "PARTICLE_STATS_LEGEND_LOC", "upper right"),
+                    "frameon": False,
+                    "fontsize": float(getattr(self.cfg, "PARTICLE_STATS_LEGEND_FONT_SIZE", max(5, self.cfg.LEGEND_FONT_SIZE - 3))),
+                    "ncol": min(len(legend_labels), int(getattr(self.cfg, "PARTICLE_STATS_LEGEND_NCOL", 2))),
+                }
+                legend_bbox = getattr(self.cfg, "PARTICLE_STATS_LEGEND_BBOX", None)
+                if legend_bbox is not None:
+                    legend_kwargs["bbox_to_anchor"] = legend_bbox
+                    legend_kwargs["borderaxespad"] = 0.0
                 ax.legend(
                     legend_handles,
                     legend_labels,
-                    loc=getattr(self.cfg, "PARTICLE_STATS_LEGEND_LOC", "best"),
-                    frameon=False,
-                    fontsize=float(getattr(self.cfg, "PARTICLE_STATS_LEGEND_FONT_SIZE", max(5, self.cfg.LEGEND_FONT_SIZE - 3))),
-                    ncol=min(len(legend_labels), int(getattr(self.cfg, "PARTICLE_STATS_LEGEND_NCOL", 2))),
+                    **legend_kwargs,
                 )
 
         suffix = getattr(self.cfg, "TBL_PARTICLE_CROP_OUTPUT_SUFFIX", "_crop") if crop else ""
@@ -4165,6 +4306,107 @@ class AllHandlePipeline:
             "recall": float(self.cfg.PARTICLE_GT_SELF_METRIC_VALUE),
             "f1": float(self.cfg.PARTICLE_GT_SELF_METRIC_VALUE),
         }
+
+    def load_particle_lr_stats(self, bundle: SampleBundle, time_name: str, crop: bool = False) -> dict[str, float]:
+        """用 tfrecord_test_common.compute_particle_binary_stats 计算 LR 的 count 和 particle pixels。"""
+
+        payload = self.compute_lr_particle_binary_stats_payload(bundle, time_name, crop=crop)
+        stats = payload.get("stats", {}) if payload else {}
+        if not stats:
+            return {}
+        return {
+            "count": float(stats["pred_particle_count"]) if "pred_particle_count" in stats else float("nan"),
+            "pixels": float(stats["pred_particle_pixels"]) if "pred_particle_pixels" in stats else float("nan"),
+            "iou": float(stats["binary_iou"]) if "binary_iou" in stats else float("nan"),
+            "precision": float(stats["binary_precision"]) if "binary_precision" in stats else float("nan"),
+            "recall": float(stats["binary_recall"]) if "binary_recall" in stats else float("nan"),
+            "f1": float(stats["binary_f1"]) if "binary_f1" in stats else float("nan"),
+        }
+
+    def compute_lr_particle_binary_stats_payload(
+        self, bundle: SampleBundle, time_name: str, crop: bool = False
+    ) -> dict:
+        """把 LR 当作 pred、GT 当作 gt，复用测试公共函数计算颗粒二值统计。"""
+
+        lr = self.first_available_particle(bundle, time_name, "lr", crop=crop)
+        gt = self.first_available_particle(bundle, time_name, "gt", crop=crop)
+        if lr is None or gt is None:
+            return {}
+        try:
+            compute_stats = self.import_compute_particle_binary_stats()
+            return compute_stats(ensure_2d_image(lr), ensure_2d_image(gt))
+        except Exception as exc:
+            self.warn(f"failed to compute LR particle stats via compute_particle_binary_stats: {bundle.sample_name}/{time_name}: {exc}")
+            return {}
+
+    def import_compute_particle_binary_stats(self):
+        """优先从 tfrecord_test_common.py 导入公共统计函数，失败时回退到实际定义模块。"""
+
+        try:
+            from study.SRGAN.model.tfrecord_test_common import compute_particle_binary_stats
+
+            return compute_particle_binary_stats
+        except Exception:
+            pass
+        try:
+            from model.tfrecord_test_common import compute_particle_binary_stats
+
+            return compute_particle_binary_stats
+        except Exception:
+            pass
+        try:
+            from study.SRGAN.model.evaluate_image_compare_common import compute_particle_binary_stats
+
+            return compute_particle_binary_stats
+        except Exception:
+            from model.evaluate_image_compare_common import compute_particle_binary_stats
+
+            return compute_particle_binary_stats
+
+    def first_available_particle_threshold(self, bundle: SampleBundle, time_name: str, crop: bool = False) -> float | None:
+        """从同一样本任意实验目录读取阈值 T；LR binary 和 LR 统计都复用这个阈值。"""
+
+        for sample_dir in bundle.sample_dirs.values():
+            threshold = self.read_particle_threshold(sample_dir, time_name, crop=crop)
+            if threshold is not None:
+                return threshold
+        return None
+
+    def particle_binary_from_threshold(self, array: np.ndarray | None, threshold: float | None) -> np.ndarray | None:
+        """按阈值把 LR/颗粒灰度图转成二值图；阈值缺失时不伪造结果。"""
+
+        if array is None or threshold is None:
+            return None
+        arr = ensure_2d_image(array)
+        if arr.ndim == 3:
+            arr = np.mean(arr[..., :3], axis=-1)
+        arr = np.asarray(arr, dtype=np.float64)
+        # 颗粒图有些历史 png/npy 是 0-255，阈值 T 通常是 0-1；此处只做显示/统计的一致归一化。
+        if np.nanmax(arr) > 1.5 and float(threshold) <= 1.0:
+            arr = arr / 255.0
+        return (arr >= float(threshold)).astype(np.float32)
+
+    def count_binary_components(self, mask: np.ndarray) -> int:
+        """统计二值颗粒连通域数量；优先用 cv2/scipy，缺库时退化为白色像素数。"""
+
+        binary = np.asarray(mask, dtype=np.uint8)
+        if binary.size == 0:
+            return 0
+        try:
+            import cv2
+
+            component_count, _labels = cv2.connectedComponents(binary, connectivity=8)
+            return max(0, int(component_count) - 1)
+        except Exception:
+            pass
+        try:
+            from scipy import ndimage
+
+            _labels, component_count = ndimage.label(binary)
+            return int(component_count)
+        except Exception:
+            # 兜底只保证图能生成；如果环境缺少连通域库，count 会退化成白色像素数。
+            return int(np.count_nonzero(binary))
 
     def load_particle_stats_raw(self, sample_dir: Path, time_name: str, crop: bool = False) -> dict:
         """读取未映射的颗粒统计字段；crop=True 时读取 TBL 局部统计 npy。"""

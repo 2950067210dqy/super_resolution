@@ -20,6 +20,7 @@ from study.SRGAN.model.c_aee_metric_common import attach_c_aee_to_raft_rows, rec
 from study.SRGAN.model.evaluate_image_compare_common import (
     apply_energy_spectrum_mse_axis_config,
     apply_plot_axis_config,
+    compute_particle_binary_stats,
     select_error_hist_axis_prefix,
     save_energy_spectrum_curve_plot,
     save_particle_binary_stats_artifacts,

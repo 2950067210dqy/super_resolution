@@ -50,15 +50,19 @@ class global_data:
 
         # 控制本次要生成哪些输出阶段：
         # - None 或 "all"：生成 01_energy_spectrum、02_error_maps、03_error_histograms、04_composite_panels 全部；
+        #   05_metric_tables 不在 group 步骤里重复运行，而是在所有 group 处理完成后统一写出。
         # - 字符串：例如 "02_error_maps"；
         # - 元组/列表：例如 ("01_energy_spectrum", "03_error_histograms")；
-        #   也可以把独立阶段组合进去，例如 ("tbl_profile_overlay", "particle_stats_metrics", "flow_u_epe_hist_overlay")。
+        #   也可以把独立重跑阶段组合进去，例如 ("tbl_profile_overlay", "particle_stats_metrics", "flow_u_epe_hist_overlay")。
+        # 注意：这些独立重跑阶段在 None/all 默认模式下不会额外执行，因为它们已经分别包含在标准阶段中：
+        # tbl_profile_overlay 属于 04_composite_panels，particle_stats_metrics 属于 04_composite_panels，
+        # flow_u_epe_hist_overlay 属于 03_error_histograms，tbl_02_error_map 属于 02_error_maps。
         # 支持目录名和短名混用：energy_spectrum / error_maps / error_histograms / composite_panels。
         # 如果只想直接处理 TBL 剖面图，设置 OUTPUT_STAGE_FILTER = "tbl_profile_overlay"；
         # 如果只想处理颗粒统计条形图，设置 OUTPUT_STAGE_FILTER = "particle_stats_metrics"；
         # 如果只想处理 *_flow_u_epe_hist_overlay.png，设置 OUTPUT_STAGE_FILTER = "flow_u_epe_hist_overlay"。
         # 如果只想处理 TBL 的 02_error_maps，设置 OUTPUT_STAGE_FILTER = "tbl_02_error_map"。
-        OUTPUT_STAGE_FILTER = None
+        OUTPUT_STAGE_FILTER = "particle_binary_count"
         OUTPUT_STAGE_ALIASES = {
             "01_energy_spectrum": "energy_spectrum",
             "energy_spectrum": "energy_spectrum",
@@ -74,6 +78,10 @@ class global_data:
             "composite_panels": "composite_panels",
             "composites": "composite_panels",
             "panels": "composite_panels",
+            "05_metric_tables": "metric_tables",
+            "metric_tables": "metric_tables",
+            "metrics": "metric_tables",
+            "tables": "metric_tables",
             "tbl_profile_overlay": "tbl_profile_overlay",
             "profile_overlay": "tbl_profile_overlay",
             "tbl_profile": "tbl_profile_overlay",
@@ -83,6 +91,10 @@ class global_data:
             "particle_bar": "particle_stats_metrics",
             "particle_bars": "particle_stats_metrics",
             "stats_metrics": "particle_stats_metrics",
+            "particle_binary_count": "particle_binary_count",
+            "particle_binary_counts": "particle_binary_count",
+            "binary_count": "particle_binary_count",
+            "binary_counts": "particle_binary_count",
             "flow_u_epe_hist_overlay": "flow_u_epe_hist_overlay",
             "flow_u_epe": "flow_u_epe_hist_overlay",
             "u_epe_hist": "flow_u_epe_hist_overlay",
@@ -168,7 +180,7 @@ class global_data:
             "bicubic_raft": "bicubic-raft",
             "bicubic_searaft": "bicubic-searaft",
             "srgan_raft": "srgan-raft",
-            "swinir_raft": "swinir_raft",
+            "swinir_raft": "swinir-raft",
             "esrgan_raft": "esrgan-raft",
             "PIV_A_Esrgan_v4": "ESRuRAFT-PIV x4",
             "PIV_A_Esrgan_v_SCALE_8": "ESRuRAFT-PIV x8",
@@ -305,6 +317,9 @@ class global_data:
         LEGEND_FONT_SIZE = 10
         PANEL_LABEL_SIZE = 12
         COLORBAR_LABEL_SIZE = 10
+        # 所有色条 tick 统一格式：正数和 0 前补空白，让 " 1.0" 与 "-1.0" 这类正负范围对齐。
+        COLORBAR_PAD_POSITIVE_TICKS = True
+        COLORBAR_TICK_DECIMALS = 1
         # 误差直方图按参考图使用半透明填充色，不再给直方图和图例添加加粗边框。
         HIST_ALPHA = 0.55
         HIST_BINS = 201
@@ -474,7 +489,9 @@ class global_data:
         # 横轴不再显示长实验名，避免旋转标签挤占图像空间。
         PARTICLE_STATS_BAR_COLOR = "#4477AA"
         PARTICLE_STATS_GT_BAR_COLOR = "#666666"
+        PARTICLE_STATS_LR_BAR_COLOR = "#999999"
         PARTICLE_STATS_EXPERIMENT_BAR_COLORS = {
+            "__lr__": "#999999",
             "bicubic_widim": "#4477AA",
             "bicubic_hs": "#785EF0",
             "bicubic_raft": "#228833",
@@ -499,8 +516,12 @@ class global_data:
         PARTICLE_STATS_SUBPLOTS_RIGHT = 0.985
         # 颗粒统计条形图的图例放在每张子图内部；使用 "best" 让 Matplotlib 自动寻找空白区域。
         # 同时把 y 轴顶部留白比例调高，给图例和柱顶数值留出空间，避免压住柱子或挤到边框。
-        PARTICLE_STATS_LEGEND_LOC = "best"
-        PARTICLE_STATS_Y_PAD_RATIO = 0.45
+        # 条形统计图内部图例固定在右上角，避免 Matplotlib 的 "best" 自动把图例放到左上，
+        # 与 count / particle pixels 面板 label 挤在一起。
+        PARTICLE_STATS_LEGEND_LOC = "upper right"
+        PARTICLE_STATS_LEGEND_BBOX = (0.985, 0.985)
+        # y 轴顶部额外留白稍微加大，让右上角图例和柱顶数值都有空间。
+        PARTICLE_STATS_Y_PAD_RATIO = 0.70
         PARTICLE_STATS_Y_PAD_MIN = 1.0
         # 灰度直方图中 T=... 文字相对阈值竖线的横向偏移，使用 x 轴坐标比例；
         # 默认略向右移动，避免文字贴着虚线。

@@ -2,6 +2,10 @@ import torch  # 导入 PyTorch 主库
 from torch import nn  # 导入神经网络模块基类和常用层接口
 import torch.nn.functional as F  # 导入函数式接口，便于直接调用 loss / 激活等函数
 from pathlib import Path  # 用于解析 RAFT256 checkpoint 的相对路径
+import importlib.util  # 用于从 third_party/official 中按文件路径加载官方模型代码
+import sys  # 用于临时加入官方仓库根目录，满足官方代码内部的相对 import
+from types import SimpleNamespace  # 用于给官方 SEA-RAFT 构造最小 args 配置
+import json  # 用于读取官方 SEA-RAFT config json
 
 from loguru import logger
 from study.SRGAN.model.ESRuRAFT_PIV_Ground.Module.RAFT_Model import RAFT, RAFT128, RAFT256  # 导入 RAFT 光流估计主网络
@@ -60,6 +64,67 @@ def _resolve_raft256_pretrain_path(path_text: str | Path) -> Path:
         return path
     srgan_root = Path(__file__).resolve().parents[3]
     return srgan_root / path
+
+
+def _srgan_root_dir() -> Path:
+    """
+    返回当前 SRGAN 包根目录。
+
+    PIV_ESRGAN_RAFT_Model.py 位于:
+        SRGAN/model/ESRuRAFT_PIV_Ground/Module/PIV_ESRGAN_RAFT_Model.py
+    因此 parents[3] 正好是 SRGAN 根目录。所有官方第三方仓库路径都以这里为基准，
+    避免从 PyCharm、命令行、notebook 等不同 cwd 启动时找错路径。
+    """
+    return Path(__file__).resolve().parents[3]
+
+
+def _official_repo_root(repo_name: str) -> Path:
+    """
+    返回 third_party/official/<repo_name> 的绝对路径。
+
+    本工程把官方对比方法作为源码依赖放在项目内，而不是复制粘贴到模型文件里：
+    - SwinIR:    third_party/official/SwinIR
+    - SEA-RAFT: third_party/official/SEA-RAFT
+
+    这样论文里可以明确写“采用官方实现”，同时代码也能保留官方仓库目录结构和 LICENSE。
+    """
+    return _srgan_root_dir() / "third_party" / "official" / repo_name
+
+
+def _import_module_from_file(module_name: str, file_path: Path, extra_sys_path: Path | None = None):
+    """
+    按文件路径导入官方仓库中的 Python 模块。
+
+    说明：
+    - 官方 SwinIR 的 network_swinir.py 不在当前包路径内；
+    - 官方 SEA-RAFT 也通常使用仓库内相对 import；
+    - 因此这里在导入期间临时把官方仓库根目录放到 sys.path 最前面。
+
+    这个函数只做导入，不修改官方源码，避免把第三方实现和本文模型代码混在一起。
+    """
+    file_path = Path(file_path)
+    if not file_path.exists():
+        raise FileNotFoundError(f"官方模型文件不存在: {file_path}")
+
+    added_path = None
+    if extra_sys_path is not None:
+        extra_sys_path = str(Path(extra_sys_path))
+        if extra_sys_path not in sys.path:
+            sys.path.insert(0, extra_sys_path)
+            added_path = extra_sys_path
+
+    try:
+        spec = importlib.util.spec_from_file_location(module_name, file_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"无法构造模块导入 spec: {file_path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        # 只移除本函数临时插入的路径，避免影响调用前已有的 sys.path。
+        if added_path is not None and sys.path and sys.path[0] == added_path:
+            sys.path.pop(0)
 
 
 def _init_raft128_from_raft256_if_enabled(model: nn.Module) -> None:
@@ -201,6 +266,11 @@ def _build_piv_raft(batch_size: int) -> nn.Module:
     这个函数只替代原来硬编码的 RAFT256 实例化，不改变 Ground 分支的 TRAIN_MODE 逻辑。
     默认 RAFT_MODEL_TYPE="RAFT256"，因此用户不改配置时，行为与原来完全一致。
     """
+    if global_data.esrgan.validate_train_mode() == "bicubic_searaft":
+        # bicubic_searaft 不再构造本工程内置 RAFT，而是直接接入官方 SEA-RAFT。
+        # 这样论文中该组可以清楚表述为“bicubic + official SEA-RAFT”，不会混入普通 RAFT 主干。
+        return OfficialSEARAFTWrapper()
+
     raft_model_type = global_data.esrgan.validate_raft_model_type()
     if raft_model_type == "raft":
         model = RAFT()
@@ -213,11 +283,6 @@ def _build_piv_raft(batch_size: int) -> nn.Module:
         # validate_raft_model_type 已经拦截非法值；这里保留防御式分支，便于未来扩展时定位问题。
         raise ValueError(f"Unsupported RAFT_MODEL_TYPE: {global_data.esrgan.RAFT_MODEL_TYPE}")
 
-    if global_data.esrgan.validate_train_mode() == "bicubic_searaft":
-        # bicubic_searaft 的图像来源仍然是 bicubic，上游 _compute_sr_branch 会负责插值到 HR。
-        # 这里仅把原来的 RAFT 主干包进一个轻量 SEA-RAFT 风格前端，用于对比“更强光流估计器”
-        # 是否能在不改变 SR 图像来源的情况下缩小与本文方法的差距。
-        return SEARAFTLite(model)
     return model
 
 
@@ -248,185 +313,173 @@ def _resolve_generator_pixel_shuffle_scale(sr_scale=None) -> int:
     return scale_int
 
 
-class SwinIRLiteBlock(nn.Module):
+class OfficialSwinIRGenerator(nn.Module):
     """
-    最小 SwinIR 风格窗口 Transformer block。
+    `swinir_raft` 使用的官方 SwinIR 包装器。
 
-    这里不是完整官方 SwinIR 复现，而是为了新增 `swinir_raft` 对比实验所需的“基础可训练模型”：
-    - 使用非重叠窗口内的 Multi-Head Self-Attention，保留 SwinIR 的局部窗口注意力思想；
-    - 使用 LayerNorm + MLP 的 Transformer 基本结构；
-    - 不实现 shifted window、相对位置偏置和复杂重建头，避免为对比实验引入大量调参变量。
-
-    这样得到的 baseline 足够表达“Transformer SR + RAFT”这一类方法，同时代码量和训练成本较低。
+    关键点：
+    - 模型类直接来自 JingyunLiang/SwinIR 官方仓库的 `models/network_swinir.py`；
+    - 本文件只负责路径导入、参数配置和通道/尺度适配，不重新实现 SwinIR block；
+    - 默认使用官方 lightweight image SR 配置（pixelshuffledirect），因为它训练成本更适合做对比实验；
+    - 如果后续要使用官方预训练权重，可以在此包装器里加载官方 `.pth`，但目前按你的要求只接入基础模型。
     """
 
-    def __init__(self, channels: int, num_heads: int = 4, window_size: int = 8, mlp_ratio: float = 2.0):
+    def __init__(self, inner_chanel: int, upscale_factor: int):
         super().__init__()
-        self.channels = int(channels)
-        self.window_size = int(window_size)
-        hidden_channels = int(round(self.channels * float(mlp_ratio)))
-        self.norm1 = nn.LayerNorm(self.channels)
-        self.attn = nn.MultiheadAttention(
-            embed_dim=self.channels,
-            num_heads=int(num_heads),
-            batch_first=True,
+        swinir_root = _official_repo_root("SwinIR")
+        network_file = swinir_root / "models" / "network_swinir.py"
+        module = _import_module_from_file(
+            module_name="official_swinir_network_swinir",
+            file_path=network_file,
+            extra_sys_path=swinir_root,
         )
-        self.norm2 = nn.LayerNorm(self.channels)
-        self.mlp = nn.Sequential(
-            nn.Linear(self.channels, hidden_channels),
-            nn.GELU(),
-            nn.Linear(hidden_channels, self.channels),
+        official_swinir_cls = getattr(module, "SwinIR")
+
+        # 官方 lightweight SwinIR 示例使用 depths=[6,6,6,6]、embed_dim=60、num_heads=[6,6,6,6]、
+        # window_size=8、upsampler="pixelshuffledirect"。这里保留这些官方结构配置，只把
+        # in_chans 和 upscale 改成当前 PIV 数据需要的通道数和倍率。
+        self.model = official_swinir_cls(
+            upscale=int(upscale_factor),
+            img_size=(64, 64),
+            window_size=8,
+            img_range=1.0,
+            depths=[6, 6, 6, 6],
+            embed_dim=60,
+            num_heads=[6, 6, 6, 6],
+            mlp_ratio=2,
+            upsampler="pixelshuffledirect",
+            resi_connection="1conv",
+            in_chans=int(inner_chanel),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        对 [B, C, H, W] 特征图做窗口注意力。
+        直接调用官方 SwinIR forward。
 
-        实现细节：
-        1. 先把 H/W pad 到 window_size 的整数倍，保证任意输入尺寸都能整齐切窗口；
-        2. 每个窗口展平成 token 序列，做标准 MultiheadAttention；
-        3. 再把窗口还原回图像网格，并裁掉 padding；
-        4. 使用 residual 形式返回，避免最小模型训练初期破坏 bicubic/卷积已有的低频结构。
+        官方实现内部会按 window_size 自动 pad 输入尺寸，输出后再裁回目标大小；
+        因此这里不额外做插值或裁剪，避免改变官方模型的行为。
         """
-        if x.dim() != 4:
-            raise ValueError(f"SwinIRLiteBlock expects [B, C, H, W], got shape={tuple(x.shape)}")
-
-        residual = x
-        batch, channels, height, width = x.shape
-        if channels != self.channels:
-            raise ValueError(f"SwinIRLiteBlock channel mismatch: expected={self.channels}, got={channels}")
-
-        window = max(self.window_size, 1)
-        pad_h = (window - height % window) % window
-        pad_w = (window - width % window) % window
-        if pad_h or pad_w:
-            # replicate padding 不会在边界引入全黑像素，适合颗粒图这种边界亮点敏感的输入。
-            x = F.pad(x, (0, pad_w, 0, pad_h), mode="replicate")
-
-        padded_h, padded_w = x.shape[-2:]
-        x_windows = (
-            x.permute(0, 2, 3, 1)
-            .reshape(batch, padded_h // window, window, padded_w // window, window, channels)
-            .permute(0, 1, 3, 2, 4, 5)
-            .reshape(-1, window * window, channels)
-        )
-
-        attn_input = self.norm1(x_windows)
-        attn_output, _ = self.attn(attn_input, attn_input, attn_input, need_weights=False)
-        x_windows = x_windows + attn_output
-        x_windows = x_windows + self.mlp(self.norm2(x_windows))
-
-        x = (
-            x_windows.reshape(batch, padded_h // window, padded_w // window, window, window, channels)
-            .permute(0, 1, 3, 2, 4, 5)
-            .reshape(batch, padded_h, padded_w, channels)
-            .permute(0, 3, 1, 2)
-            .contiguous()
-        )
-        if pad_h or pad_w:
-            x = x[:, :, :height, :width]
-        return residual + (x - residual)
+        return self.model(x)
 
 
-class SwinIRLiteGenerator(nn.Module):
+class OfficialSEARAFTWrapper(nn.Module):
     """
-    `swinir_raft` 使用的最小 SwinIR 风格超分生成器。
+    `bicubic_searaft` 使用的官方 SEA-RAFT 包装器。
 
-    设计目标是“基础可复现实验”，不是追求最佳 SR 指标：
-    - head 卷积把输入颗粒图映射到浅层特征；
-    - 多个 SwinIRLiteBlock 做窗口注意力建模；
-    - tail 使用 PixelShuffle 一次性放大到 HR 尺寸；
-    - 输出通道保持和输入 HR 图一致，方便直接复用现有图像损失与 RAFT 输入逻辑。
+    这个类不再提供 lite fallback：如果 `third_party/official/SEA-RAFT` 不存在，或者官方仓库结构
+    与预期不一致，会直接报清楚的错误。这样论文实验不会在无意间退回自实现版本。
+
+    由于 SEA-RAFT 官方仓库在不同提交中入口文件可能有差异，包装器会按常见路径尝试查找模型类：
+    - core/raft.py
+    - raft.py
+    - core/sea_raft.py
+    - sea_raft.py
+
+    找到后优先使用 RAFT / SEARAFT / SEA_RAFT 类，并把本工程的 [B,2,H,W] 灰度图对拆成
+    官方模型常见的 image1/image2 输入形式。
     """
 
-    def __init__(
-        self,
-        inner_chanel: int,
-        upscale_factor: int,
-        embed_dim: int = 48,
-        num_blocks: int = 2,
-        num_heads: int = 4,
-        window_size: int = 8,
-    ):
+    def __init__(self):
         super().__init__()
-        self.upscale_factor = int(upscale_factor)
-        self.head = nn.Conv2d(inner_chanel, embed_dim, kernel_size=3, padding=1)
-        self.body = nn.Sequential(
-            *[
-                SwinIRLiteBlock(
-                    channels=embed_dim,
-                    num_heads=num_heads,
-                    window_size=window_size,
-                )
-                for _ in range(int(num_blocks))
-            ]
-        )
-        self.body_tail = nn.Conv2d(embed_dim, embed_dim, kernel_size=3, padding=1)
-        if self.upscale_factor > 1:
-            self.upsample = nn.Sequential(
-                nn.Conv2d(
-                    embed_dim,
-                    inner_chanel * self.upscale_factor * self.upscale_factor,
-                    kernel_size=3,
-                    padding=1,
-                ),
-                nn.PixelShuffle(self.upscale_factor),
+        searaft_root = _official_repo_root("SEA-RAFT")
+        if not searaft_root.exists():
+            raise FileNotFoundError(
+                "bicubic_searaft 需要官方 SEA-RAFT 仓库，但当前未找到: "
+                f"{searaft_root}。请先执行: "
+                "git clone --depth 1 https://github.com/princeton-vl/SEA-RAFT.git "
+                "third_party/official/SEA-RAFT"
             )
-        else:
-            self.upsample = nn.Conv2d(embed_dim, inner_chanel, kernel_size=3, padding=1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        输入 LR 图像，输出 HR 尺寸的 SR 图像。
+        candidate_files = [
+            searaft_root / "core" / "raft.py",
+            searaft_root / "raft.py",
+            searaft_root / "core" / "sea_raft.py",
+            searaft_root / "sea_raft.py",
+        ]
+        model_file = next((path for path in candidate_files if path.exists()), None)
+        if model_file is None:
+            raise FileNotFoundError(
+                "已找到 SEA-RAFT 仓库，但未找到可识别的官方模型入口文件。"
+                f"已检查: {[str(path) for path in candidate_files]}"
+            )
 
-        注意这里不做 clamp：
-        - 训练阶段让损失函数直接约束输出范围，梯度更连续；
-        - 保存图像时外部已有 clamp(0, 1)；
-        - RAFT 输入也会经过 `_to_raft_frame` 统一转成单通道。
-        """
-        features = self.head(x)
-        features = features + self.body_tail(self.body(features))
-        return self.upsample(features)
-
-
-class SEARAFTLite(nn.Module):
-    """
-    `bicubic_searaft` 使用的轻量 SEA-RAFT 风格封装。
-
-    这里不引入官方 SEA-RAFT 依赖，也不加载外部预训练权重；为了满足“最基础模型即可”的要求，
-    只在现有 RAFT 前面增加一个很小的上下文自适应输入增强模块：
-    - detail 分支提取输入图像对的局部高频残差；
-    - gate 分支根据当前 bicubic 图像对预测每个位置的增强强度；
-    - 增强后的图像对再送入原来的 RAFT/RAFT128/RAFT256 主干。
-
-    它的实验意义是：在同样 bicubic 图像输入下，加入一个更接近现代光流模型“输入自适应/上下文聚合”
-    思路的估计器，观察是否能追上 `PIV_A_Esrgan_v4`。
-    """
-
-    def __init__(self, base_raft: nn.Module, hidden_channels: int = 16):
-        super().__init__()
-        self.base_raft = base_raft
-        self.detail_refine = nn.Sequential(
-            nn.Conv2d(2, hidden_channels, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(hidden_channels, 2, kernel_size=3, padding=1),
+        module = _import_module_from_file(
+            module_name="official_searaft_model",
+            file_path=model_file,
+            # 官方 core/raft.py 内部使用 `from update import ...` 和 `from utils.utils import ...`，
+            # 因此 sys.path 需要指向 core 目录，而不是只指向仓库根目录。
+            extra_sys_path=model_file.parent,
         )
-        self.detail_gate = nn.Sequential(
-            nn.Conv2d(2, 2, kernel_size=1),
-            nn.Sigmoid(),
-        )
+        model_cls = None
+        for class_name in ("RAFT", "SEARAFT", "SEA_RAFT"):
+            if hasattr(module, class_name):
+                model_cls = getattr(module, class_name)
+                break
+        if model_cls is None:
+            raise AttributeError(
+                f"SEA-RAFT 官方入口 {model_file} 中未找到 RAFT/SEARAFT/SEA_RAFT 类。"
+            )
+
+        # 官方 SEA-RAFT 使用 config/*.json 中的 argparse.Namespace 初始化。
+        # 这里默认读取官方 eval/sintel-M.json：它是中等规模模型，iters=4，适合作为基础对比。
+        # 之后再用本工程 GRU_ITERS 覆盖迭代次数，让训练/评估轮数仍由现有配置统一管理。
+        config_path = searaft_root / "config" / "eval" / "sintel-M.json"
+        if not config_path.exists():
+            raise FileNotFoundError(f"SEA-RAFT 官方默认配置不存在: {config_path}")
+        with config_path.open("r", encoding="utf-8") as f:
+            args = SimpleNamespace(**json.load(f))
+        args.iters = int(global_data.esrgan.GRU_ITERS)
+        self.model = model_cls(args)
+
+    @staticmethod
+    def _to_three_channel_image(frame: torch.Tensor) -> torch.Tensor:
+        """
+        SEA-RAFT 官方代码通常面向 RGB 光流输入。
+
+        本工程 PIV 图像是单通道颗粒灰度图；为了使用官方模型接口，这里把 [B,1,H,W]
+        复制成 [B,3,H,W]。这一步只做通道适配，不改变亮度数值和空间尺寸。
+        """
+        if frame.size(1) == 3:
+            return frame
+        if frame.size(1) == 1:
+            return frame.repeat(1, 3, 1, 1)
+        return frame.mean(dim=1, keepdim=True).repeat(1, 3, 1, 1)
 
     def forward(self, raft_input: torch.Tensor, flow_gt: torch.Tensor, flow_init=None):
         """
-        与现有 RAFT forward 保持完全相同的签名，方便 _compute_raft_branch 无感调用。
+        将本工程 RAFT 分支签名适配到官方 SEA-RAFT 常见 forward 签名。
 
-        raft_input 是 [B, 2, H, W] 的前后帧拼接。这里先用平均池化构造局部低频背景，
-        再用输入减去低频背景得到高频细节，最后做 gated residual 增强。
+        返回值继续整理成：
+            flow_predictions, (loss, aux)
+        这样 `_compute_raft_branch` 和训练循环不需要再为官方 SEA-RAFT 单独分叉。
         """
-        low_frequency = F.avg_pool2d(raft_input, kernel_size=3, stride=1, padding=1)
-        high_frequency = raft_input - low_frequency
-        enhanced_input = raft_input + self.detail_gate(raft_input) * self.detail_refine(high_frequency)
-        return self.base_raft(enhanced_input, flow_gt, flow_init=flow_init)
+        # 本工程图像张量通常在 [0, 1]；官方 SEA-RAFT forward 内部会执行 image / 255.0，
+        # 因此这里乘回 255，保持官方模型预期的输入强度口径。
+        image1 = self._to_three_channel_image(raft_input[:, 0:1]) * 255.0
+        image2 = self._to_three_channel_image(raft_input[:, 1:2]) * 255.0
+        output = self.model(
+            image1,
+            image2,
+            iters=int(global_data.esrgan.GRU_ITERS),
+            flow_gt=flow_gt,
+            test_mode=False,
+        )
+
+        if isinstance(output, dict):
+            flow_predictions = output.get("flow", output.get("final"))
+        elif isinstance(output, tuple):
+            flow_predictions = output[0]
+        else:
+            flow_predictions = output
+        if torch.is_tensor(flow_predictions):
+            flow_predictions = [flow_predictions]
+
+        final_flow = flow_predictions[-1]
+        if final_flow.shape[-2:] != flow_gt.shape[-2:]:
+            final_flow = ESRuRAFT_PIV._restore_flow_to_target_size(final_flow, flow_gt)
+            flow_predictions = list(flow_predictions[:-1]) + [final_flow]
+        loss = torch.sum((flow_predictions[-1] - flow_gt) ** 2, dim=1).sqrt().mean()
+        return flow_predictions, (loss, None)
 
 
 class ESRuRAFT_PIV(nn.Module):
@@ -442,8 +495,8 @@ class ESRuRAFT_PIV(nn.Module):
     6. bicubic_widim: LR 经 bicubic 上采样后进入传统 WIDIM/窗口互相关 PIV。
     7. bicubic_hs: LR 经 bicubic 上采样后进入 Horn-Schunck 光流法。
     8. srgan_raft: 传统 SRGAN 超分后送入 RAFT。
-    9. swinir_raft: 最小 SwinIR 风格 Transformer 超分后送入 RAFT。
-    10. bicubic_searaft: bicubic 上采样后送入轻量 SEA-RAFT 风格估计器。
+    9. swinir_raft: 官方 SwinIR 超分后送入 RAFT。
+    10. bicubic_searaft: bicubic 上采样后送入官方 SEA-RAFT。
     """
 
     def __init__(self,inner_chanel,batch_size,sr_scale=None):
@@ -474,11 +527,11 @@ class ESRuRAFT_PIV(nn.Module):
             )
             self.piv_esrgan_discriminator = SRGANDiscriminator(inner_chanel=inner_chanel)
         elif self.train_mode == "swinir_raft":
-            # swinir_raft 是新增的“现代 Transformer SR + RAFT”对比组。
-            # 这里使用最小 SwinIR 风格生成器：窗口注意力 + PixelShuffle 上采样。
-            # 它只作为可训练 SR baseline，不使用判别器，也不把 RAFT EPE 反传给 Generator；
-            # 因此判别器保留 Identity，pipeline 中的 d_optimizer 会自动退化为 dummy optimizer。
-            self.piv_esrgan_generator = SwinIRLiteGenerator(
+            # swinir_raft 是新增的“官方 SwinIR + RAFT”对比组。
+            # 生成器直接来自 third_party/official/SwinIR/models/network_swinir.py 的官方 SwinIR 类；
+            # 本工程只负责把输入通道数和上采样倍率传进去，不再使用自实现的 SwinIR-like 结构。
+            # 该模式仍作为非 GAN SR baseline，不训练判别器，也不把 RAFT EPE 反传给 Generator。
+            self.piv_esrgan_generator = OfficialSwinIRGenerator(
                 inner_chanel=inner_chanel,
                 upscale_factor=self.generator_total_upscale,
             )
@@ -521,8 +574,8 @@ class ESRuRAFT_PIV(nn.Module):
         """
         当前模式是否真正训练判别器。
 
-        新增的 swinir_raft 是为了补“Transformer SR + RAFT”对比，而不是补一个新的 GAN。
-        因此它只训练 SwinIRLiteGenerator 和 RAFT；判别器相关字段仍输出 0，保证 CSV 列兼容。
+        新增的 swinir_raft 是为了补“官方 SwinIR + RAFT”对比，而不是补一个新的 GAN。
+        因此它只训练官方 SwinIR Generator 和 RAFT；判别器相关字段仍输出 0，保证 CSV 列兼容。
         """
         return self.train_mode in {"esrgan_raft", "srgan_raft"}
 
@@ -1245,7 +1298,7 @@ class ESRuRAFT_PIV(nn.Module):
             # 1. 不调用 Generator，不产生任何可学习的 SR 参数；
             # 2. 只用 PyTorch bicubic 双三次插值把 LR previous/next 放大到 HR 尺寸；
             # 3. 放大后的 bicubic 图像既作为 pred_prev/pred_next 参与图像诊断日志，
-            #    也作为后续 RAFT/WIDIM/HS/SEA-RAFT-lite 的输入图像。
+            #    也作为后续 RAFT/WIDIM/HS/官方 SEA-RAFT 的输入图像。
             # 这样可以单独观察“传统插值超分 + 不同 PIV 估计器”的差异。
             pred_prev = self._resize_image_to_target(input_lr_prev, input_gr_prev, mode="bicubic")
             pred_next = self._resize_image_to_target(input_lr_next, input_gr_next, mode="bicubic")

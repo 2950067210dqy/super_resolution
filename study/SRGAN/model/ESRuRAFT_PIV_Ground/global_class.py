@@ -87,11 +87,11 @@ class global_data:
         # 6. "bicubic_widim": LR 经 bicubic 上采样后，进入传统 WIDIM/窗口互相关 PIV baseline。
         # 7. "bicubic_hs": LR 经 bicubic 上采样后，进入传统 Horn-Schunck 光流 baseline。
         # 8. "srgan_raft": 使用传统 SRGAN 生成器把 LR 超分到 HR，再把 SR 图像送入 RAFT。
-        # 9. "swinir_raft": 使用最小 SwinIR 风格 Transformer 超分生成器把 LR 超分到 HR，再送入 RAFT。
-        #    这个模式用于补充“现代 Transformer SR + RAFT”对比；默认只用图像重建损失训练 Generator，
+        # 9. "swinir_raft": 使用官方 SwinIR 生成器把 LR 超分到 HR，再送入 RAFT。
+        #    这个模式用于补充“官方现代 Transformer SR + RAFT”对比；默认只用图像重建损失训练 Generator，
         #    不启用判别器，也不把 RAFT EPE 反传给 Generator，避免它变成新的任务定制方法。
-        # 10. "bicubic_searaft": LR 经 bicubic 上采样到 HR 后，送入轻量 SEA-RAFT 风格估计器。
-        #     该模式用于补充“更现代/更强光流估计器”对比，图像来源仍是固定 bicubic。
+        # 10. "bicubic_searaft": LR 经 bicubic 上采样到 HR 后，送入官方 SEA-RAFT 估计器。
+        #     该模式用于补充“官方更现代/更强光流估计器”对比，图像来源仍是固定 bicubic。
         TRAIN_MODES = (
             "lr_ground_raft",
             "hr_ground_raft",
@@ -122,7 +122,7 @@ class global_data:
         TRAIN_MODE = "bicubic_searaft"
         # SR+RAFT 联合训练模式的特殊损失策略：
         # - esrgan_raft / srgan_raft 仍然训练 Generator、Discriminator 和 RAFT；
-        # - swinir_raft 只训练 SwinIR 风格 Generator 和 RAFT，不训练判别器；
+        # - swinir_raft 只训练官方 SwinIR Generator 和 RAFT，不训练判别器；
         # - esrgan_raft / srgan_raft 重新启用“对抗损失”的动态权重；
         # - 三个 SR+RAFT baseline 都关闭 flow-warp / Generator EPE 等扩展项；
         # - Generator 不再叠加 RAFT EPE 反向约束，避免光流误差直接拉动超分图像生成方向。
