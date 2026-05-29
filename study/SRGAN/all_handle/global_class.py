@@ -62,7 +62,7 @@ class global_data:
         # 如果只想处理颗粒统计条形图，设置 OUTPUT_STAGE_FILTER = "particle_stats_metrics"；
         # 如果只想处理 *_flow_u_epe_hist_overlay.png，设置 OUTPUT_STAGE_FILTER = "flow_u_epe_hist_overlay"。
         # 如果只想处理 TBL 的 02_error_maps，设置 OUTPUT_STAGE_FILTER = "tbl_02_error_map"。
-        OUTPUT_STAGE_FILTER = "particle_binary_count"
+        OUTPUT_STAGE_FILTER =None
         OUTPUT_STAGE_ALIASES = {
             "01_energy_spectrum": "energy_spectrum",
             "energy_spectrum": "energy_spectrum",
@@ -320,6 +320,11 @@ class global_data:
         # 所有色条 tick 统一格式：正数和 0 前补空白，让 " 1.0" 与 "-1.0" 这类正负范围对齐。
         COLORBAR_PAD_POSITIVE_TICKS = True
         COLORBAR_TICK_DECIMALS = 1
+        # 所有 auto 色条默认用分位数范围，避免极少数尖峰像素把整张图的色条撑得过大。
+        # center_zero=True 的误差图会使用 abs(value) 的该分位数，并保持 [-p, p] 对称；
+        # 普通值图会使用双侧分位数 [0.25%, 99.75%]（当这里为 99.5 时）。
+        # 如果需要恢复严格 min/max，把该值设为 None。
+        COLORBAR_AUTO_PERCENTILE = 99.5
         # 误差直方图按参考图使用半透明填充色，不再给直方图和图例添加加粗边框。
         HIST_ALPHA = 0.55
         HIST_BINS = 201
@@ -328,11 +333,87 @@ class global_data:
         HIST_EDGE_LINE_WIDTH = 0.0
         HIST_LEGEND_EDGE_LINE_WIDTH = 0.0
         HIST_DRAW_OUTLINE = False
-        # 误差直方图里 ESRuRAFT-PIV 必须最后绘制并处在最高层，避免被其它半透明柱子覆盖。
-        HIST_TOP_EXPERIMENT_KEYS = ("PIV_A_Esrgan_v4",)
+        # 误差直方图里 ESRuRAFT-PIV 必须最后绘制并处在最高层，避免被其它半透明柱子覆盖；
+        # 倍率对比图里的 x4/x8 也属于本文方法，因此同样放到顶层。
+        HIST_TOP_EXPERIMENT_KEYS = ("PIV_A_Esrgan_v4", "PIV_A_Esrgan_v_SCALE_8")
+        # 顶层实验只负责“最后绘制、最高 zorder”，透明度仍回到 HIST_ALPHA；
+        # 这样 ESRuRAFT-PIV 不会被遮挡，同时也不会变成不透明色块盖住其它方法。
+        HIST_HIGHLIGHT_EXPERIMENT_KEYS = ()
+        HIST_HIGHLIGHT_ALPHA = HIST_ALPHA
         # flow_u_epe_hist_overlay 是左右两张子图，右图 y 轴 Count 容易贴到左图；
         # 这里单独控制两个子图之间的横向间隔。
         FLOW_U_EPE_HIST_WSPACE = 0.32
+        # 八组实验的 flow_u_epe_hist_overlay 图例如果放在右侧 EPE 子图内部，会和 0 附近的高峰挤在一起；
+        # 因此当实验数量达到阈值时，把图例放到右侧子图外部。下面几个参数可单独调图宽、锚点和图例列数。
+        FLOW_U_EPE_HIST_LEGEND_OUTSIDE = True
+        FLOW_U_EPE_HIST_LEGEND_OUTSIDE_MIN_SERIES = 7
+        FLOW_U_EPE_HIST_OUTSIDE_LEGEND_FIG_WIDTH = 10.2
+        FLOW_U_EPE_HIST_LEGEND_OUTSIDE_LOC = "upper left"
+        FLOW_U_EPE_HIST_LEGEND_OUTSIDE_BBOX = (1.02, 1.0)
+        FLOW_U_EPE_HIST_LEGEND_OUTSIDE_NCOL = 1
+        # 3D 瀑布图开关与统一风格；只控制新增的 *_waterfall_3d.png/svg，
+        # 不改变原来的二维能谱图和误差直方图。
+        WATERFALL_3D_ENABLED = True
+        # 单独 3D 瀑布图底部需要足够空间显示带单位的 x-label，例如 "Flow error [px]"。
+        WATERFALL_3D_FIG_SIZE = (9.2, 7.2)
+        # 单独 3D 图把坐标轴整体往上挪一点，给底部 x-label 的 "[px]" 留出空间；
+        # 这个参数只作用于 *_waterfall_3d 单图，不影响 2D+3D 合图。
+        WATERFALL_3D_SUBPLOT_BOTTOM = 0.12
+        WATERFALL_3D_PAIR_FIG_SIZE = (10.8, 4.6)
+        WATERFALL_3D_ELEV = 24
+        # 3D 视角默认把 x 轴放到左前侧，避免 y 轴方向的实验名抢占主要视觉位置。
+        WATERFALL_3D_AZIM = -60
+        # 3D 瀑布图使用正交投影，减少透视带来的 z 轴倾斜观感，让 z 轴更接近竖直 90 度。
+        # Matplotlib 支持 "ortho" 和 "persp"；如果想恢复透视效果可改回 "persp"。
+        WATERFALL_3D_PROJECTION = "ortho"
+        # 3D 坐标盒比例：适当放大 x/z 方向，避免合图中 3D 曲线显得比左侧 2D 图小一圈。
+        WATERFALL_3D_BOX_ASPECT = (1.28, 0.92, 0.92)
+        # 3D 坐标盒在子图中的缩放；增大后合图右侧 3D 图会更接近左侧 2D 图的视觉大小。
+        WATERFALL_3D_BOX_ZOOM = 1.16
+        # Matplotlib 3D 默认会把 z 轴放在右侧；这里用私有轴布局参数把 z 轴挪到左侧，
+        # 让图形更接近用户给出的瀑布图示例。若当前 Matplotlib 版本不支持，会自动忽略。
+        WATERFALL_3D_FORCE_Z_AXIS_LEFT = True
+        WATERFALL_3D_LINE_WIDTH = 1.45
+        WATERFALL_3D_GRID_ALPHA = 0.18
+        WATERFALL_3D_MAX_POINTS = 700
+        WATERFALL_3D_LEGEND_FONT_SIZE = 7
+        WATERFALL_3D_LEGEND_LOC = "upper left"
+        # 单独 3D 瀑布图的图例位置；第二个值控制上下，第一个值越小图例越靠近图体。
+        # 用户反馈图例离图太远，因此这里从旧版 1.42 收到 1.16。
+        WATERFALL_3D_LEGEND_BBOX = (0.92, 1.0)
+        WATERFALL_3D_LEGEND_LABEL_SPACING = 0.35
+        WATERFALL_3D_LEGEND_HANDLE_LENGTH = 2.0
+        # 2D+3D “大图”尺寸与子图间距：左侧复用原二维图，右侧放新增 3D 瀑布图。
+        WATERFALL_3D_COMPOSITE_FIG_SIZE = (12.8, 4.6)
+        # 合图右侧 3D 子图给更多宽度，使其视觉面积接近左侧 2D 图，不再显得偏小。
+        WATERFALL_3D_COMPOSITE_WIDTH_RATIOS = (1.0, 1.36)
+        # 右侧 3D 图的 z 轴 label 会放在 3D 子图左侧；合图中适当加大 wspace，
+        # 避免 Count / log10(...) 这类 z-label 与左侧二维图或 z 轴刻度挤在一起。
+        # 合图左右两张图的间距只控制 2D/3D 子图距离，不再用它解决 z-label 重叠问题；
+        # z-label 位置由 WATERFALL_3D_COMPOSITE_LEFT_Z_LABEL_X 单独控制。
+        WATERFALL_3D_COMPOSITE_WSPACE = 0.18
+        # flow_u_epe_hist_overlay 的大图比较特殊：第一行是原来的左右二维图，
+        # 第二行是对应的两个 3D 瀑布图，因此单独给更高的画布和行列间距。
+        WATERFALL_3D_FLOW_U_EPE_COMPOSITE_FIG_SIZE = (11.8, 7.2)
+        WATERFALL_3D_FLOW_U_EPE_COMPOSITE_WSPACE = 0.28
+        WATERFALL_3D_FLOW_U_EPE_COMPOSITE_HSPACE = 0.36
+        # y 方向已经由图例说明实验顺序，因此默认隐藏 y 轴刻度文字和 y 轴 label，避免和图例重复且挤在一起。
+        WATERFALL_3D_SHOW_Y_TICK_LABELS = False
+        WATERFALL_3D_SHOW_Y_LABEL = False
+        WATERFALL_3D_HIDE_Y_AXIS_LINE = True
+        WATERFALL_3D_USE_LEFT_Z_LABEL_TEXT = True
+        # z-label 使用 2D 文本固定在 3D 坐标轴左侧；负值表示继续向左移，
+        # 用来避开 z 轴刻度数字，解决 Count 和 300000/400000 等刻度挤在一起的问题。
+        WATERFALL_3D_LEFT_Z_LABEL_X = -0.16
+        # 2D+3D 合图里右侧 3D 子图更窄，z-label 更容易和 z 轴刻度挤在一起；
+        # 因此合图单独使用更靠左的位置，而不增加两张图之间的间隔。
+        WATERFALL_3D_COMPOSITE_LEFT_Z_LABEL_X = -0.24
+        WATERFALL_3D_LEFT_Z_LABEL_Y = 0.55
+        WATERFALL_3D_Z_TICK_PAD = 2
+        # 能谱跨度很大，默认把 x/z 都转成 log10 后画 3D 瀑布图，这样不同曲线不会被数量级压扁。
+        ENERGY_WATERFALL_USE_LOG10 = True
+        # 误差直方图默认保留原始 Count 高度；若后续峰值过高，可改成 True 使用 log10(Count + 1)。
+        HIST_WATERFALL_USE_LOG10_COUNT = False
         IMAGE_CMAP = "viridis"
         # 光流/颗粒误差图使用 bwr 发散色图；在 pipeline.py 中会强制 vmin/vmax 关于 0 对称，
         # 因而 0 一定处于色条正中间，并且对应纯白色。
@@ -351,6 +432,11 @@ class global_data:
         GT_ENERGY_LINESTYLE = "--"
         ENERGY_X_LABEL = "Wavenumber"
         ENERGY_Y_LABEL = "Energy spectrum"
+        ENERGY_WATERFALL_X_LABEL = "log10(Wavenumber)"
+        ENERGY_WATERFALL_Z_LABEL = "log10(Energy spectrum)"
+        WATERFALL_3D_Y_LABEL = "Experiment"
+        HIST_WATERFALL_Z_LABEL = "Count"
+        HIST_WATERFALL_LOG_Z_LABEL = "log10(Count + 1)"
         # 能谱图图例使用带透明度的灰色底框，避免多条 log-log 曲线穿过图例文字后影响阅读。
         ENERGY_LEGEND_FRAME = True
         ENERGY_LEGEND_FACE_COLOR = "#E6E6E6"
@@ -459,6 +545,7 @@ class global_data:
         TBL_PROFILE_Y_MAX = None
         PARTICLE_STAT_COUNT_LABEL = "count"
         PARTICLE_STAT_PIXEL_LABEL = "particle pixels"
+        PARTICLE_STAT_MEAN_AREA_LABEL = "mean area"
         PARTICLE_STAT_IOU_LABEL = "IoU"
         PARTICLE_STAT_PRECISION_LABEL = "precision"
         PARTICLE_STAT_RECALL_LABEL = "recall"
@@ -563,6 +650,9 @@ class global_data:
         TBL_FLOW_ERROR_TRIM_MIN_ROWS = 4
         TBL_FLOW_ERROR_TRIM_STD_RATIO = 0.18
         TBL_FLOW_ERROR_TRIM_MEAN_RATIO = 0.20
+        # TBL full-frame 光流误差即使排除了 bicubic-widim/bicubic-hs，也可能被参考实验中的极少数尖峰像素撑大色条。
+        # 因此 TBL 光流误差色条默认按参考实验绝对误差的分位数做 0 居中对称范围；设为 None 可恢复原始 min/max。
+        TBL_FLOW_ERROR_COLORBAR_PERCENTILE = 99.5
         # TBL 颗粒 crop 框与原 evaluate 代码保持一致：框选区域 256x256，横向中心比例默认 0.265。
         # 颗粒 SR crop 没有单独 npy 时，pipeline.py 会用这里的 crop 框直接从原 LR/GT/SR npy 中裁；
         # 误差、二值图、统计 hist/stats 若存在 *_crop*.npy，则优先直接读取这些已有 crop 文件。
@@ -590,6 +680,12 @@ class global_data:
         # 在 eight_experiments 中每块只放 4 个实验，后 4 个实验换到下一块，并从 GT 后面的第二列开始。
         COMPARISON_GROUP_COMPOSITE_WRAP_METHOD_COUNT = {
             "eight_experiments": 4,
+        }
+        # 颗粒阈值对比图包含 GT 和 LR 两个固定列；八组图后半部分从第三列开始对齐实验列。
+        # 去掉 widim/hs 的六组补充图按 3+3 分块，同样从第三列开始。
+        COMPARISON_GROUP_PARTICLE_BINARY_WRAP_METHOD_COUNT = {
+            "eight_experiments": 4,
+            "eight_experiments_without_widim_hs": 3,
         }
         # 指标汇总表列名全部集中到全局变量，后续如果论文表格需要改列名，只需要改这里。
         METRIC_TABLE_COLUMNS = (
@@ -834,6 +930,16 @@ class global_data:
             # 所以 count 和 pixels 优先映射 pred_* 字段，而不是 gt_* 或图像尺寸字段。
             "count": ("pred_particle_count", "pred_count", "count", "num_particles", "particle_count"),
             "pixels": ("pred_particle_pixels", "pred_pixels", "particle_pixels", "pixel_count", "area"),
+            "mean_area": (
+                "pred_area_mean",
+                "pred_mean_area",
+                "pred_particle_mean_area",
+                "mean_area",
+                "particle_mean_area",
+                "avg_area",
+                "average_area",
+                "mean_particle_area",
+            ),
             # IoU / precision / recall / F1 是预测阈值图与 GT 阈值图的二值重叠指标，实际字段带 binary_ 前缀。
             "iou": ("binary_iou", "iou", "IoU"),
             "precision": ("binary_precision", "precision", "Precision"),
@@ -844,5 +950,14 @@ class global_data:
         PARTICLE_GT_STATS_FIELD_ALIASES = {
             "count": ("gt_particle_count", "gt_count", "gt_num_particles", "gt_particle_count"),
             "pixels": ("gt_particle_pixels", "gt_pixels", "gt_pixel_count", "gt_area"),
+            "mean_area": (
+                "gt_area_mean",
+                "gt_area_meanton",
+                "gt_mean_area",
+                "gt_particle_mean_area",
+                "gt_avg_area",
+                "gt_average_area",
+                "gt_mean_particle_area",
+            ),
         }
         PARTICLE_GT_SELF_METRIC_VALUE = 1.0

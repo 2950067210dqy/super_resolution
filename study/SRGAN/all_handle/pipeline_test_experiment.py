@@ -70,7 +70,7 @@ from study.SRGAN.model.tfrecord_test_common import (
 DATA_ROOT_DIR = Path(
     r"/study_datas/train_datas/root/autodl-tmp/train_datas/"
 )
-# 用户指定的三组实验图片已经由 experiment_handle/pre_handle.py 预处理完成；
+# 用户指定的六组实验图片已经由 experiment_handle/pre_handle.py 预处理完成；
 # 本脚本只读取这些结果，不重新减背景，也不重新生成 OpenPIV flo。
 # EXPERIMENT_HANDLE_DIR = Path(r"D:\BaiduSyncdisk\AYanJiuSheng\data\train_datas\experiment_handle")
 EXPERIMENT_HANDLE_DIR = Path(r"/study_datas/train_datas/experiment_handle")
@@ -86,9 +86,12 @@ PROGRESS_STATUS_PATH = TRAIN_DATAS_ROOT / "experiment_test_progress.json"
 
 # 和用户给定语义保持一致：img1 是 previous，img2 是 next。
 EXPERIMENT_SAMPLES = (
-    ("start", "exp_0042"),
-    ("peak", "exp_0152"),
-    ("end", "exp_0802"),
+    ("start_1", "exp_0042"),
+    ("start_2", "exp_0043"),
+    ("peak_1", "exp_0152"),
+    ("peak_2", "exp_0153"),
+    ("end_1", "exp_0802"),
+    ("end_2", "exp_0803"),
 )
 
 # ESRuRAFT_PIV_Ground 里的这两个实验不是神经网络 checkpoint baseline：
@@ -110,9 +113,9 @@ EXPERIMENT_BACKGROUND_MASK_THRESHOLD = 10.0 / 256.0
 EXPERIMENT_BACKGROUND_MASK_DILATE = 3
 
 # _save_sample_plots 会用 matplotlib 绘制 SR 图、flow 和误差图。
-# 实验图作为 LR 输入后，输出尺寸会变成原图的 scale_factor 倍；如果一次把三组样本
+# 实验图作为 LR 输入后，输出尺寸会变成原图的 scale_factor 倍；如果一次把六组样本
 # 全部交给绘图函数，matplotlib 可能在同一阶段累计很多大图对象，导致 Linux 直接 Killed。
-# 因此保留原始尺寸和输出结构，但按 sample_0000/sample_0001/sample_0002 逐个保存并及时释放内存。
+# 因此保留原始尺寸和输出结构，但按 sample_0000...sample_0005 逐个保存并及时释放内存。
 EXPERIMENT_SAVE_HEAVY_SAMPLE_PLOTS = True
 # 实验图没有真实 HR，颗粒误差是 SR - 插值 HR，数值通常很小；单独缩小实验误差图色条，
 # 避免沿用普通测试的 [-2, 2] 导致误差图几乎全白。
@@ -264,7 +267,7 @@ def _read_gray_image_unit(path: Path) -> np.ndarray:
 
 
 def _load_experiment_samples(input_dir: Path = EXPERIMENT_HANDLE_DIR) -> list[ExperimentSample]:
-    """读取用户指定的 start/peak/end 三组 previous-next-flow 样本。"""
+    """读取用户指定的 start/peak/end 各两组 previous-next-flow 实验样本。"""
 
     logger.info("[experiment_test] loading experiment samples from {}", input_dir)
     samples: list[ExperimentSample] = []
@@ -298,7 +301,7 @@ def _load_experiment_samples(input_dir: Path = EXPERIMENT_HANDLE_DIR) -> list[Ex
 
 def _samples_to_tensors(samples: list[ExperimentSample], device: torch.device):
     """
-    将三组实验样本整理成 test_all 兼容的张量：
+    将多组实验样本整理成 test_all 兼容的张量：
         images: [B, 2, H, W]，第 0 通道 previous，第 1 通道 next；
         flows:  [B, 2, H, W]，第 0 通道 u，第 1 通道 v。
     """
@@ -879,7 +882,7 @@ def _save_experiment_metadata(dataset_dir: Path, samples: list[ExperimentSample]
     写入样本索引到真实 exp_XXXX 名称的映射。
 
     all_handle 依赖 sample_0000 这类统一目录名做横向合并；metadata 负责保留
-    sample_0000 = start/exp_0042 这种实验语义。
+    sample_0000 = start_1/exp_0042 这种实验语义。
     """
 
     rows = []
@@ -1290,7 +1293,7 @@ def _save_experiment_sample_plot_artifacts_one_by_one(
 
 def _run_single_job(job: ModelJob, samples: list[ExperimentSample], device: torch.device) -> dict:
     """
-    对一个 checkpoint 跑 start/peak/end 三组实验样本，并保存 test_all 同款产物。
+    对一个 checkpoint 跑 start/peak/end 各两组实验样本，并保存 test_all 同款产物。
 
     输出目录固定为：
       {experiment}/{class}/{run_class}/{data_type}/{scale}/experiment/experiment/
@@ -1429,7 +1432,7 @@ def _run_single_job(job: ModelJob, samples: list[ExperimentSample], device: torc
         raft_rows,
         # c_aee_metric_common 通过 sample key 把两条 image_pair 行
         # (previous/next) 与同一个样本的一条 RAFT 行配对；这里的 dataset 固定为
-        # experiment，sample_index 对应 start/peak/end 的 0/1/2。
+        # experiment，sample_index 对应 EXPERIMENT_SAMPLES 中固定的六组实验样本顺序。
         ("dataset", "sample_index"),
         ese_key="energy_spectrum_mse",
         ssim_key="ssim",

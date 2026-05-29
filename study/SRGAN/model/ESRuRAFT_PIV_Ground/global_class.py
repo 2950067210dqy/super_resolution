@@ -66,12 +66,6 @@ class global_data:
         #运行环境是否是autoDL
         IS_AUTO_DL = True
         AUTODL_DATA_PATH = rf"/root/autodl-tmp" if IS_AUTO_DL else r""
-        # =========================
-        # 训练任务标识
-        # =========================
-        name = "ESRuRAFT_PIV_Ground"  # 当前实验名（用于输出目录/模型名/wandb run名）
-        DESCRIPTION = ("v_bicubic_searaft")  # 实验补充描述（可写损失配置、数据版本等）
-        name +=DESCRIPTION
 
         #整体项目注释
         # =========================
@@ -119,17 +113,30 @@ class global_data:
             "searaft": "bicubic_searaft",
             "bicubic_SEA_RAFT": "bicubic_searaft",
         }
-        TRAIN_MODE = "bicubic_searaft"
+        TRAIN_MODE = "swinir_raft"
+        # =========================
+        # 训练任务标识
+        # =========================
+        name = "ESRuRAFT_PIV_Ground"  # 当前实验名（用于输出目录/模型名/wandb run名）
+        DESCRIPTION = (f"v_{TRAIN_MODE}")  # 实验补充描述（可写损失配置、数据版本等）
+        name +=DESCRIPTION
+        DATA_SETS = ("class_1", "class_2")
+        DATA_SET = "class_2"
+
+        AMP = False  # 是否开启混合精度训练
+
+        # bicubic_searaft 使用官方 SEA-RAFT，验证时显存/共享内存压力比普通 RAFT baseline 更高。
+        # 这里把验证集 DataLoader worker 设为 1，减少并发 worker 带来的共享内存压力。
+        # 训练集仍保持 load_data 默认并行度，尽量不影响训练吞吐。
+        BICUBIC_SEARAFT_VALIDATE_NUM_WORKERS = 1
         # SR+RAFT 联合训练模式的特殊损失策略：
         # - esrgan_raft / srgan_raft 仍然训练 Generator、Discriminator 和 RAFT；
         # - swinir_raft 只训练官方 SwinIR Generator 和 RAFT，不训练判别器；
         # - esrgan_raft / srgan_raft 重新启用“对抗损失”的动态权重；
-        # - 三个 SR+RAFT baseline 都关闭 flow-warp / Generator EPE 等扩展项；
-        # - Generator 不再叠加 RAFT EPE 反向约束，避免光流误差直接拉动超分图像生成方向。
-        # 保留为 tuple 而不是写死在训练循环里，后续如果要加入新的 SR+RAFT 模式，只需要在这里扩展。
+        # - ESRuRAFT_PIV_Ground 是对比实验外壳，所有 TRAIN_MODE 都不让 RAFT EPE 反传到 Generator；
+        # - Generator 只吃自身图像/GAN损失，RAFT 只吃 RAFT loss，避免光流误差直接拉动超分图像生成方向。
         SR_RAFT_FIXED_LOSS_WEIGHT_MODES = ("esrgan_raft", "srgan_raft", "swinir_raft")
         SR_RAFT_DYNAMIC_ADVERSARIAL_MODES = ("esrgan_raft", "srgan_raft")
-        SR_RAFT_DISABLE_GENERATOR_EPE_MODES = ("esrgan_raft", "srgan_raft", "swinir_raft")
 
         # 类别训练模式:
         # - "all":    每个类别单独训练一次；
@@ -163,8 +170,8 @@ class global_data:
         # 设备与模型加载
         # =========================
         device = torch.device("cuda")  # 训练设备
-        IS_LOAD_EXISTS_MODEL = True  # 是否从已保存模型断点继续训练
-        AMP =False #是否开启混合精度训练
+        IS_LOAD_EXISTS_MODEL = False  # 是否从已保存模型断点继续训练
+
         # =========================
         # 可视化与保存相关
         # =========================
@@ -373,8 +380,6 @@ class global_data:
         # - class_1: 继续沿用原来的“目录扫描 + 预生成 LR 文件”流程。
         # - class_2: 改为读取 RAFT-PIV TFRecord，LR 不再从 LR_DATA_ROOT_DIR 读取，而是在 data_load.py
         #   中按 test_all 同款下采样逻辑动态生成。
-        DATA_SETS = ("class_1", "class_2")
-        DATA_SET = "class_2"
         CLASS2_PSEUDO_CLASS_NAME = "problem_class2_raft_piv"
 
         CLASS1_GR_DATA_ROOT_DIR = rf"{AUTODL_DATA_PATH}/study_datas/sr_dataset/class_1/data"
@@ -965,6 +970,19 @@ class global_data:
             return mode
 
         @classmethod
+        def validate_num_workers_for_current_mode(cls, default_num_workers=24):
+            """
+            返回当前 TRAIN_MODE 应使用的验证集 DataLoader worker 数。
+
+            - bicubic_searaft: 固定为 1，降低验证阶段多进程 worker 崩溃概率；
+            - 其他模式: 返回 24，保持 load_data() 的 validate_num_workers 默认值。
+            """
+            mode = cls.validate_train_mode()
+            if mode == "bicubic_searaft":
+                return int(cls.BICUBIC_SEARAFT_VALIDATE_NUM_WORKERS)
+            return default_num_workers
+
+        @classmethod
         def uses_super_resolution(cls) -> bool:
             """
             当前模式是否需要训练/调用超分辨率生成器。
@@ -1000,10 +1018,12 @@ class global_data:
             """
             当前 TRAIN_MODE 的 Generator 是否允许叠加 RAFT EPE 损失。
 
-            对 esrgan_raft / srgan_raft 返回 False：RAFT EPE 仍然作为指标和 RAFT 自身 loss 存在，
-            但不再反传到 Generator，因此不会再用 EPE 去限制超分生成器。
+            ESRuRAFT_PIV_Ground 的所有 TRAIN_MODE 都固定返回 False：
+            RAFT EPE 仍然作为指标和 RAFT 自身 loss 存在，但不反传到 Generator，
+            因此不会再用 EPE 去限制超分生成器，也不会为此保留额外计算图。
             """
-            return cls.validate_train_mode() not in set(cls.SR_RAFT_DISABLE_GENERATOR_EPE_MODES)
+            cls.validate_train_mode()
+            return False
 
         @classmethod
         def get_adversarial_weight_end_for_current_mode(cls) -> float:

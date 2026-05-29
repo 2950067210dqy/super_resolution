@@ -2596,6 +2596,7 @@ def load_data(
     class2_validate_tfrecord: str | Path | None = None,
     class2_validate_tfrecord_idx: str | Path | None = None,
     class2_validate_category_csv: str | Path | None = None,
+    validate_num_workers: int | None = 24,
 ):
     """
     加载超分辨率 GR/LR 成对数据集。
@@ -2621,7 +2622,10 @@ def load_data(
         - class_sample_ratio: 每个类别读取比例，1.0 表示全部读取。
           例如 0.25 表示每个类别只保留约 25% 的配对样本，再参与后续 train/val/test 划分。
         - batch_size: DataLoader 批大小
-        - num_workers: DataLoader 并行加载进程数
+        - num_workers: DataLoader 并行加载进程数，默认同时用于 train/validate/test。
+        - validate_num_workers: 仅覆盖验证集 DataLoader 的子进程数，默认 24；None 表示沿用 num_workers。
+          这个参数用于个别推理较重的 baseline，例如 bicubic_searaft，可降低验证阶段 worker
+          被系统杀掉的概率，同时不影响训练集 DataLoader 的原始并行度。
         - shuffle: 是否打乱训练集
         - target_size: 统一 resize 尺寸 (H, W)，None 表示保持原尺寸
         - train_nums_rate: 训练集比例（按类内划分或全局划分）
@@ -2684,7 +2688,12 @@ def load_data(
     logger.info("[Start] Begin loading SR dataset")
     logger.info(f"[Start] GR root: {gr_root}")
     logger.info(f"[Start] LR root: {lr_root} (variant={lr_data_variant})")
-    logger.info(f"[Start] batch_size={batch_size}, num_workers={num_workers}, shuffle={shuffle}")
+    effective_validate_num_workers = num_workers if validate_num_workers is None else int(validate_num_workers)
+
+    logger.info(
+        f"[Start] batch_size={batch_size}, num_workers={num_workers}, "
+        f"validate_num_workers={effective_validate_num_workers}, shuffle={shuffle}"
+    )
     logger.info(f"[Start] target_size={target_size}, random_seed={random_seed}")
     logger.info(f"[Start] selected_classes={selected_classes}")
     logger.info(f"[Start] excluded_classes={excluded_classes}")
@@ -2943,7 +2952,8 @@ def load_data(
         prefetch_factor=2,  # 每个 worker 提前准备后面的 batch，减少 GPU 等待。
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
+        # 验证集 worker 可以被 TRAIN_MODE 单独覆盖；bicubic_searaft 会在 pipeline 中传入配置值。
+        num_workers=effective_validate_num_workers,
         collate_fn=sr_paired_collate_fn,
     )
     test_dataloader = DataLoader(

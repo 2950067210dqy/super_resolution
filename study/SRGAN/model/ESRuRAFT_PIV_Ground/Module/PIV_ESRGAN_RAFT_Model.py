@@ -351,7 +351,6 @@ class OfficialSwinIRGenerator(nn.Module):
             resi_connection="1conv",
             in_chans=int(inner_chanel),
         )
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         直接调用官方 SwinIR forward。
@@ -421,14 +420,15 @@ class OfficialSEARAFTWrapper(nn.Module):
             )
 
         # 官方 SEA-RAFT 使用 config/*.json 中的 argparse.Namespace 初始化。
-        # 这里默认读取官方 eval/sintel-M.json：它是中等规模模型，iters=4，适合作为基础对比。
-        # 之后再用本工程 GRU_ITERS 覆盖迭代次数，让训练/评估轮数仍由现有配置统一管理。
+        # 这里默认读取官方 eval/sintel-M.json：它是中等规模模型，官方配置 iters=4。
+        # 注意：bicubic_searaft 是“官方 SEA-RAFT 对比组”，因此这里不再用本工程
+        # global_data.esrgan.GRU_ITERS 覆盖迭代次数，避免把官方 M 配置悄悄改成 12 次迭代。
         config_path = searaft_root / "config" / "eval" / "sintel-M.json"
         if not config_path.exists():
             raise FileNotFoundError(f"SEA-RAFT 官方默认配置不存在: {config_path}")
         with config_path.open("r", encoding="utf-8") as f:
             args = SimpleNamespace(**json.load(f))
-        args.iters = int(global_data.esrgan.GRU_ITERS)
+        self.searaft_iters = int(args.iters)
         self.model = model_cls(args)
 
     @staticmethod
@@ -460,7 +460,7 @@ class OfficialSEARAFTWrapper(nn.Module):
         output = self.model(
             image1,
             image2,
-            iters=int(global_data.esrgan.GRU_ITERS),
+            iters=self.searaft_iters,
             flow_gt=flow_gt,
             test_mode=False,
         )
@@ -1223,50 +1223,38 @@ class ESRuRAFT_PIV(nn.Module):
         target_next: torch.Tensor,
     ) -> dict:
         """
-        计算 swinir_raft 的 Generator 图像重建损失。
+        计算 swinir_raft 的官方 SR baseline 损失。
 
-        这个新增对比组的目标是回答“现代 Transformer SR 接 RAFT 是否足够强”，
-        因此这里刻意保持朴素：
-        - 使用现有工程已经稳定的 VGG perceptual loss；
-        - 使用 L1/MSE/SSIM/FFT 像素与频域诊断项；
-        - 不使用 GAN 判别器；
-        - 不使用 flow-warp 一致性；
-        - 不使用 RAFT EPE 反向拉 Generator。
-
-        这样 `swinir_raft` 和 `srgan_raft` / `esrgan_raft` 的差异更清楚：
-        它代表的是“Transformer SR 模块”本身，而不是新的联合物理损失设计。
+        这里故意不调用 `_compute_generator_frame_terms`，因为那个公共函数会额外计算
+        VGG perceptual loss、SSIM、FFT 等本文方法使用的复合损失项。为了让
+        `swinir_raft` 更像干净的官方 SwinIR 对比基线，本分支只保留最基础的
+        L1 reconstruction loss，并且不读取任何全局损失权重。
         """
-        prev_terms = self._compute_generator_frame_terms(pred_prev, target_prev)
-        next_terms = self._compute_generator_frame_terms(pred_next, target_next)
-
-        perceptual = self._mean_loss_term(prev_terms, next_terms, "perceptual_loss")
-        pixel_total = self._mean_loss_term(prev_terms, next_terms, "pixel_total")
-        pixel_l1 = self._mean_loss_term(prev_terms, next_terms, "pixel_l1")
-        pixel_mse = self._mean_loss_term(prev_terms, next_terms, "pixel_mse")
-        pixel_ssim = self._mean_loss_term(prev_terms, next_terms, "pixel_ssim")
-        pixel_fft = self._mean_loss_term(prev_terms, next_terms, "pixel_fft")
-        content_loss = (
-            float(global_data.esrgan.LAMBDA_PIXEL_L1) * pixel_l1 +
-            float(global_data.esrgan.LAMBDA_PIXEL_MSE) * pixel_mse +
-            float(global_data.esrgan.LAMBDA_SSIM) * pixel_ssim +
-            float(global_data.esrgan.LAMBDA_PIXEL_FFT) * pixel_fft
+        # 官方 SwinIR 的经典/轻量 SR 训练通常采用直接的像素 L1 重建目标。
+        # 这里 previous/next 两帧各算一次 L1 后取平均，保证时序样本两帧权重一致。
+        pixel_l1 = 0.5 * (
+            F.l1_loss(pred_prev, target_prev) +
+            F.l1_loss(pred_next, target_next)
         )
-        manual_sr_loss = float(global_data.esrgan.LAMBDA_VGG) * perceptual + content_loss
+
+        # `manual_sr_loss` 是训练图像超分分支真正反传的损失。
+        # 对 swinir_raft，它等于纯 L1，不再乘 LAMBDA_PIXEL_L1 / LAMBDA_VGG 等全局权重。
+        manual_sr_loss = pixel_l1
         zero = self._zero_like_loss(manual_sr_loss)
 
         return {
             "sr_loss": manual_sr_loss,
             "manual_sr_loss": manual_sr_loss,
-            "perceptual_loss": perceptual,
-            "vgg_loss": perceptual,
-            "content_loss": content_loss,
+            "perceptual_loss": zero,
+            "vgg_loss": zero,
+            "content_loss": pixel_l1,
             "adversarial_loss": zero,
             "adversarial_weighted_loss": zero,
-            "pixel_total": pixel_total,
+            "pixel_total": pixel_l1,
             "pixel_l1": pixel_l1,
-            "pixel_mse": pixel_mse,
-            "pixel_ssim": pixel_ssim,
-            "pixel_fft": pixel_fft,
+            "pixel_mse": zero,
+            "pixel_ssim": zero,
+            "pixel_fft": zero,
             "flow_warp_consistency_loss": zero,
             "flow_warp_consistency_weighted_loss": zero,
         }
@@ -1321,11 +1309,12 @@ class ESRuRAFT_PIV(nn.Module):
             )
 
         if self.train_mode == "swinir_raft":
-            # SwinIR 轻量 baseline：低分辨率 previous/next 分别进入同一个 Transformer SR 生成器。
-            # 输出图像直接作为 RAFT 输入，这和 srgan_raft/esrgan_raft 的评估路径一致；
+            # SwinIR 轻量 baseline：把 previous/next 在 batch 维拼起来，一次送入同一个官方 SwinIR。
+            # 这样不改变网络结构和损失定义，但能减少两次 Transformer forward 的 Python/Kernel 调度开销。
+            # SwinIR 没有 BatchNorm，按 batch 维合并不会引入跨样本统计差异。
             # 区别在于 swinir_raft 的损失没有 GAN，也没有 RAFT EPE 对 Generator 的反传。
-            pred_prev = self.piv_esrgan_generator(input_lr_prev)
-            pred_next = self.piv_esrgan_generator(input_lr_next)
+            pred_pair = self.piv_esrgan_generator(torch.cat([input_lr_prev, input_lr_next], dim=0))
+            pred_prev, pred_next = torch.chunk(pred_pair, chunks=2, dim=0)
             sr_outputs = self._compute_swinir_generator_loss(
                 pred_prev=pred_prev,
                 pred_next=pred_next,
@@ -1359,6 +1348,12 @@ class ESRuRAFT_PIV(nn.Module):
             2. 计算 RAFT 的流场预测与 raft_loss
             3. 必要时将预测还原回 flow 真值尺寸，供统一评估和可视化使用
         """
+        # ESRuRAFT_PIV_Ground 的所有 TRAIN_MODE 都不让 RAFT EPE 反传到图像来源。
+        # RAFT 分支只把当前图像作为输入来训练/评估 RAFT 自身；Generator 的更新由图像/GAN损失单独负责。
+        # 对 SwinIR/SRGAN/ESRGAN 这类可学习 SR baseline，这能避免 raft_loss.backward()
+        # 白白再穿过一次 Generator；对 ground/bicubic baseline，detach 也是无害的统一处理。
+        raft_prev_source = raft_prev_source.detach()
+        raft_next_source = raft_next_source.detach()
         raft_prev = self._to_raft_frame(raft_prev_source)  # 将前一帧图像转成 RAFT 单通道输入
         raft_next = self._to_raft_frame(raft_next_source)  # 将后一帧图像转成 RAFT 单通道输入
         raft_input = torch.cat([raft_prev, raft_next], dim=1)  # 拼成 [B, 2, H, W]
@@ -1447,7 +1442,7 @@ class ESRuRAFT_PIV(nn.Module):
             # 仍可沿用原来的“SR loss + 加权 EPE”定义。
             epe_weighted_loss = float(global_data.esrgan.RAFT_EPE_WEIGHT) * raft_outputs["raft_epe_tensor"]
         else:
-            # 当前 esrgan_raft / srgan_raft 按要求禁用 Generator 侧 EPE。
+            # ESRuRAFT_PIV_Ground 全部模式都禁用 Generator 侧 EPE。
             # 使用同 device/dtype 的 0 张量，保证日志、AMP 和 detach().item() 都稳定。
             epe_weighted_loss = self._zero_like_loss(raft_outputs["raft_loss"])
 
@@ -1692,9 +1687,8 @@ class ESRuRAFT_PIV(nn.Module):
             }
 
         # 第一阶段：一次前向同时准备 Generator 和 RAFT 的训练目标。
-        # Generator 现在只拿最初始 SRGAN/ESRGAN perceptual + L1/MSE pixel loss 的梯度；
-        # RAFT EPE 不再反传到 Generator。
-        # 这样 esrgan_raft / srgan_raft 的生成图像不会被 EPE 项直接牵引，RAFT 自身仍按 raft_loss 更新。
+        # Generator 只拿自身图像/GAN损失的梯度；RAFT EPE 不反传到 Generator。
+        # _compute_raft_branch 会统一 detach RAFT 输入，确保 raft_loss.backward() 不会穿回 SR Generator。
         self._set_requires_grad(self.piv_esrgan_generator, True)
         self._set_requires_grad(self.piv_RAFT, True)  # 同一次 RAFT forward 也要服务于后续 RAFT 自身更新
         self._set_requires_grad(self.piv_esrgan_discriminator, False)  # 训练 G/RAFT 时冻结判别器
@@ -1716,54 +1710,30 @@ class ESRuRAFT_PIV(nn.Module):
             flow_init=flow_init,
         )
         # loss_dict 里的 raft_epe_weight 表示“Generator 侧有效 EPE 权重”。
-        # esrgan_raft / srgan_raft 下该值为 0，说明 EPE 只作为 RAFT 指标/RAFT loss，不限制 Generator。
-        raft_epe_weight = (
-            float(global_data.esrgan.RAFT_EPE_WEIGHT)
-            if self._uses_generator_raft_epe_loss()
-            else 0.0
-        )
+        # ESRuRAFT_PIV_Ground 中该值恒为 0，说明 EPE 只作为 RAFT 指标/RAFT loss，不限制 Generator。
+        raft_epe_weight = 0.0
         generator_g_loss, generator_loss_logs = self._compute_generator_loss(sr_outputs, raft_outputs)
         final_flow_prediction = flow_predictions[-1]
 
-        # 先让 Generator 拿到自己的图像生成损失梯度；
-        # 同时保留计算图供 RAFT 再对 raft_loss 单独反向传播。
+        # 先让 Generator 拿到自己的图像生成损失梯度。
         if scaler is not None:
-            scaled_g_loss = scaler.scale(generator_g_loss)
-            scaled_g_loss.backward(retain_graph=True)
+            scaler.scale(generator_g_loss).backward()
         else:
-            generator_g_loss.backward(retain_graph=True)
-
-        # 保存 Generator 当前梯度，后面会把第二次 backward 产生的 Generator 梯度清掉，
-        # 从而保持“Generator 只吃图像生成损失，RAFT 只吃 raft_loss”的分离训练语义。
-        generator_saved_grads = []
-        for param in self.piv_esrgan_generator.parameters():
-            if param.grad is None:
-                generator_saved_grads.append(None)
-            else:
-                generator_saved_grads.append(param.grad.detach().clone())
-
-        # Generator 侧的损失经过同一次 RAFT forward 也会在 RAFT 参数上留下梯度，
-        # 这里显式清掉，避免后续 raft_optimizer.step() 混入不该有的更新信号。
-        for param in self.piv_RAFT.parameters():
-            param.grad = None
+            generator_g_loss.backward()
 
         # 第二次 backward 只让 RAFT 吃到 raft_loss；
-        # Generator 侧即使在图上有梯度路径，最终也会恢复成第一次 backward 保存下来的梯度。
+        # 当前 Ground 版本已在 _compute_raft_branch 中 detach RAFT 输入，所以不会再穿过 Generator。
         if scaler is not None:
             scaler.scale(raft_outputs["raft_loss"]).backward()
+            scaler.step(raft_optimizer)
         else:
             raft_outputs["raft_loss"].backward()
-
-        # 恢复 Generator 梯度，确保 raft_loss 不会反向影响 Generator 的参数更新。
-        for param, saved_grad in zip(self.piv_esrgan_generator.parameters(), generator_saved_grads):
-            param.grad = saved_grad
+            raft_optimizer.step()
 
         if scaler is not None:
-            scaler.step(generator_optimizer)  # Generator 只使用第一次 backward 保留下来的梯度更新
-            scaler.step(raft_optimizer)  # RAFT 只使用第二次 backward 后的梯度更新
+            scaler.step(generator_optimizer)  # Generator 只使用图像/GAN损失更新
         else:
             generator_optimizer.step()
-            raft_optimizer.step()
 
         if self._uses_adversarial_discriminator():
             # 第三阶段：只更新 Discriminator，严格只使用 discriminator_loss。

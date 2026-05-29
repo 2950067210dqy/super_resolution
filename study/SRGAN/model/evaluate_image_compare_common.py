@@ -1218,6 +1218,162 @@ def _save_particle_binary_stats_plot(
     plt.close(fig)
 
 
+def _save_particle_binary_threshold_plot(
+    out_png: Path,
+    payload: dict,
+    *,
+    title: str,
+    global_data=None,
+) -> None:
+    """
+    保存拆分后的颗粒阈值图。
+
+    这张图只展示阈值相关内容：HR/SR 灰度图、同一阈值得到的 HR/SR 二值图、
+    以及只由 HR 计算得到的灰度直方图和阈值 T。统计柱状图单独输出到
+    `{prefix}_metrics_bar.png`，避免原来的 compare 图信息过密。
+    """
+    out_png = Path(out_png)
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    stats = payload["stats"]
+    gt_gray = payload["gt_gray"]
+    pred_gray = payload["pred_gray"]
+    gt_binary = payload["gt_binary"]
+    pred_binary = payload["pred_binary"]
+    hist_centers = payload["hist_centers"]
+    hist_counts = payload["hist_counts"]
+    threshold = float(stats.get("threshold", float("nan")))
+
+    gray_values = np.concatenate([
+        gt_gray[np.isfinite(gt_gray)].reshape(-1),
+        pred_gray[np.isfinite(pred_gray)].reshape(-1),
+    ])
+    if gray_values.size > 0:
+        gray_vmin, gray_vmax = float(np.min(gray_values)), float(np.max(gray_values))
+        if gray_vmax <= gray_vmin:
+            gray_vmax = gray_vmin + 1.0
+    else:
+        gray_vmin, gray_vmax = 0.0, 1.0
+
+    fig, axes = plt.subplots(2, 3, figsize=(12.5, 6.2), dpi=160)
+    fig.suptitle(title, fontsize=12)
+    panels = (
+        (axes[0, 0], gt_gray, "HR gray", "gray", gray_vmin, gray_vmax),
+        (axes[0, 1], pred_gray, "SR gray", "gray", gray_vmin, gray_vmax),
+        (axes[1, 0], gt_binary, f"HR binary (T={threshold:.4g})", "gray", 0, 1),
+        (axes[1, 1], pred_binary, "SR binary (same T)", "gray", 0, 1),
+    )
+    for ax, arr, panel_title, cmap, vmin, vmax in panels:
+        ax.imshow(arr, cmap=cmap, vmin=vmin, vmax=vmax)
+        ax.set_title(panel_title)
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    ax_hist = axes[0, 2]
+    if hist_centers.size > 0:
+        width = float(np.median(np.diff(hist_centers))) if hist_centers.size > 1 else 1.0
+        if not np.isfinite(width) or width <= 0:
+            width = 1.0
+        ax_hist.bar(hist_centers, hist_counts, width=width, color="#4C72B0", alpha=0.72, edgecolor="none")
+        ax_hist.axvline(threshold, color="red", linestyle="-", linewidth=1.7, label=f"T={threshold:.4g}")
+        apply_plot_axis_config(
+            ax_hist,
+            global_data,
+            "PARTICLE_BINARY_HIST",
+            x_values=hist_centers,
+            y_values=hist_counts,
+            default_x_min=float(np.min(hist_centers)),
+            default_x_max=float(np.max(hist_centers)),
+            default_y_min=0.0,
+            default_y_max=None,
+        )
+        ax_hist.legend(fontsize=8)
+    ax_hist.set_title("HR gray histogram")
+    ax_hist.set_xlabel("gray value")
+    ax_hist.set_ylabel("count")
+
+    axes[1, 2].axis("off")
+    axes[1, 2].text(
+        0.02,
+        0.96,
+        "\n".join([
+            f"threshold = {threshold:.6g}",
+            f"method = {stats.get('threshold_method')}",
+            f"foreground = {stats.get('foreground_rule')}",
+            f"size = {stats.get('width')} x {stats.get('height')}",
+        ]),
+        transform=axes[1, 2].transAxes,
+        ha="left",
+        va="top",
+        fontsize=10,
+    )
+
+    fig.tight_layout()
+    fig.savefig(out_png, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _save_particle_binary_metrics_bar_plot(out_png: Path, payload: dict, *, title: str) -> None:
+    """
+    保存拆分后的颗粒条形统计图。
+
+    三个指标分别单独占一个子图，避免 particle_pixels 数值远大于 count / area_mean 时
+    把其它柱子压得看不见。指标顺序按用户要求：particle pixels / count / area_mean。
+    """
+    out_png = Path(out_png)
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    stats = payload["stats"]
+    metric_specs = (
+        ("particle pixels", "gt_particle_pixels", "pred_particle_pixels"),
+        ("count", "gt_particle_count", "pred_particle_count"),
+        ("area_mean", "gt_area_mean", "pred_area_mean"),
+    )
+
+    fig, axes = plt.subplots(1, 3, figsize=(11.5, 3.8), dpi=160)
+    fig.suptitle(title, fontsize=12)
+    for ax, (metric_label, gt_key, pred_key) in zip(axes, metric_specs):
+        values = [
+            float(stats.get(gt_key, float("nan"))),
+            float(stats.get(pred_key, float("nan"))),
+        ]
+        finite_values = [value for value in values if np.isfinite(value)]
+        x = np.arange(2)
+        bars = ax.bar(
+            x,
+            values,
+            width=0.55,
+            color=("#555555", "#DD8452"),
+            edgecolor="#222222",
+            linewidth=0.6,
+        )
+        ax.set_title(metric_label)
+        ax.set_xticks(x)
+        ax.set_xticklabels(("HR", "SR"))
+        ax.grid(True, axis="y", alpha=0.25)
+        max_value = max([0.0] + finite_values)
+        if max_value > 0:
+            ax.set_ylim(top=max_value * 1.18)
+        for bar, value in zip(bars, values):
+            if not np.isfinite(value):
+                text = "nan"
+            elif abs(value) >= 100:
+                text = f"{value:.0f}"
+            else:
+                text = f"{value:.2f}"
+            ax.annotate(
+                text,
+                xy=(bar.get_x() + bar.get_width() / 2.0, bar.get_height() if np.isfinite(value) else 0.0),
+                xytext=(0, 3),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
+
+    fig.tight_layout()
+    fig.savefig(out_png, bbox_inches="tight")
+    plt.close(fig)
+
+
 def save_particle_binary_stats_artifacts(
     out_dir,
     pred_chw,
@@ -1236,7 +1392,9 @@ def save_particle_binary_stats_artifacts(
     - `{prefix}_stats.npy`：与 CSV 同内容的 key/value 数组，便于脚本读取；
     - `{prefix}_hist.npy`：只由 HR 计算得到的灰度直方图 `[gray_center, count]`；
     - `{prefix}_gt_binary.npy` / `{prefix}_pred_binary.npy`：同阈值二值化结果；
-    - `{prefix}_compare.png`：灰度图、二值图、HR 直方图和统计对比图。
+    - `{prefix}_compare.png`：拆分后的颗粒阈值图，保留旧文件名便于已有路径继续打开；
+    - `{prefix}_threshold_compare.png`：同上，使用更明确的文件名；
+    - `{prefix}_metrics_bar.png`：particle pixels / count / area_mean 条形统计图。
 
     注意：该函数的 NPY 是“统计结果与阈值复现实验”的必要产物，不走 IS_SAVE_NPY，
     因为用户明确要求保存统计结果、对比图和阈值。
@@ -1268,11 +1426,22 @@ def save_particle_binary_stats_artifacts(
     np.save(out_dir / f"{file_prefix}_hist.npy", hist_matrix.astype(np.float32, copy=False))
     np.save(out_dir / f"{file_prefix}_gt_binary.npy", payload["gt_binary"].astype(np.uint8, copy=False))
     np.save(out_dir / f"{file_prefix}_pred_binary.npy", payload["pred_binary"].astype(np.uint8, copy=False))
-    _save_particle_binary_stats_plot(
+    _save_particle_binary_threshold_plot(
         out_dir / f"{file_prefix}_compare.png",
         payload,
         title=title,
         global_data=global_data,
+    )
+    _save_particle_binary_threshold_plot(
+        out_dir / f"{file_prefix}_threshold_compare.png",
+        payload,
+        title=title,
+        global_data=global_data,
+    )
+    _save_particle_binary_metrics_bar_plot(
+        out_dir / f"{file_prefix}_metrics_bar.png",
+        payload,
+        title=title,
     )
     return stats
 

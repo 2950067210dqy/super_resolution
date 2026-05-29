@@ -97,6 +97,7 @@ def _load_data_compat(**kwargs):
             "class2_validate_tfrecord",
             "class2_validate_tfrecord_idx",
             "class2_validate_category_csv",
+            "validate_num_workers",
         )
         if not any(key in message for key in compatibility_keys):
             raise
@@ -730,6 +731,9 @@ def main():
         for SCALE in global_data.esrgan.SCALES:
             # 获取数据 自动根据类别划分数据集并读取，每个类别都安装比例划分训练集和验证集
             # 根据类别和上采样读取数据
+            # bicubic_searaft 使用官方 SEA-RAFT，验证阶段 DataLoader 多 worker 更容易触发
+            # worker aborted；这里只覆盖 validate_loader 的 worker 数，训练 loader 仍沿用默认值。
+            validate_num_workers = global_data.esrgan.validate_num_workers_for_current_mode()
             train_loader, validate_loader, test_loader, class_names, samples = _load_data_compat(
                 gr_data_root_dir=global_data.esrgan.GR_DATA_ROOT_DIR,
                 lr_data_root_dir=f"{global_data.esrgan.LR_DATA_ROOT_DIR}/x{int(SCALE * SCALE)}/data",
@@ -754,6 +758,7 @@ def main():
                 class2_validate_tfrecord=global_data.esrgan.CLASS2_VALIDATE_TFRECORD,
                 class2_validate_tfrecord_idx=global_data.esrgan.CLASS2_VALIDATE_TFRECORD_IDX,
                 class2_validate_category_csv=global_data.esrgan.CLASS2_VALIDATE_CATEGORY_CSV,
+                validate_num_workers=validate_num_workers,
                 return_test_loader=True
             )
             # 每个类别的图像对和flo文件分别训练验证和保存模型 ！！！！！已经去除
@@ -785,6 +790,7 @@ def main():
                     "Test_nums_rate": global_data.esrgan.Test_nums_rate,
                     "train_class_mode": mode,
                     "TRAIN_MODE": global_data.esrgan.validate_train_mode(),
+                    "validate_num_workers": validate_num_workers,
                     "selected_classes": selected_classes if selected_classes is not None else "ALL_MIXED",
                 },
             )

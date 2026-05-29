@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import math
+import sys
 import time
 import zipfile
 from dataclasses import dataclass
@@ -401,6 +402,14 @@ class AllHandlePipeline:
         # 单独取色可以保证八组/倍率对比的颜色既明显区分，又保持论文常用配色风格。
         return getattr(self.cfg, "EXPERIMENT_HIST_COLORS", {}).get(exp_key, self.experiment_color(exp_key))
 
+    def experiment_hist_alpha(self, exp_key: str) -> float:
+        """误差直方图透明度；顶层绘制顺序和透明度分开控制，便于突出曲线但保留半透明叠加。"""
+
+        highlight_keys = set(getattr(self.cfg, "HIST_HIGHLIGHT_EXPERIMENT_KEYS", ()))
+        if exp_key in highlight_keys:
+            return float(getattr(self.cfg, "HIST_HIGHLIGHT_ALPHA", getattr(self.cfg, "HIST_ALPHA", 0.55)))
+        return float(getattr(self.cfg, "HIST_ALPHA", 0.55))
+
     def darken_color(self, color: str, factor: float | None = None) -> str:
         """把直方图填充色加深，用作柱子边框和图例边框，避免图例只有浅色块而辨识度不足。"""
 
@@ -411,8 +420,16 @@ class AllHandlePipeline:
         dark = tuple(max(0.0, min(1.0, channel * factor)) for channel in rgb)
         return plt.matplotlib.colors.to_hex(dark)
 
-    def apply_hist_legend(self, ax: plt.Axes, series: dict[str, tuple[np.ndarray, np.ndarray]]) -> None:
-        """误差直方图专用 legend：面色半透明，边框使用同一实验的深色粗线。"""
+    def apply_hist_legend(
+        self,
+        ax: plt.Axes,
+        series: dict[str, tuple[np.ndarray, np.ndarray]],
+        *,
+        loc: str | None = None,
+        bbox_to_anchor: tuple[float, float] | None = None,
+        ncol: int | None = None,
+    ) -> None:
+        """误差直方图专用 legend；双子图场景可通过参数把图例移到图外，避免压住柱峰。"""
 
         ensure_matplotlib()
         patch_cls = plt.matplotlib.patches.Patch
@@ -428,12 +445,20 @@ class AllHandlePipeline:
                     facecolor=color,
                     edgecolor="none" if edge_width <= 0 else self.darken_color(color),
                     linewidth=edge_width,
-                    alpha=self.cfg.HIST_ALPHA,
+                    alpha=self.experiment_hist_alpha(exp_key),
                 )
             )
             labels.append(self.experiment_label(exp_key))
         if handles:
-            ax.legend(handles, labels, frameon=False)
+            legend_kwargs = {
+                "frameon": False,
+                "loc": loc or getattr(self.cfg, "HIST_LEGEND_LOC", "best"),
+                "ncol": ncol or int(getattr(self.cfg, "HIST_LEGEND_NCOL", 1)),
+            }
+            if bbox_to_anchor is not None:
+                legend_kwargs["bbox_to_anchor"] = bbox_to_anchor
+                legend_kwargs["borderaxespad"] = 0.0
+            ax.legend(handles, labels, **legend_kwargs)
 
     def particle_stats_bar_color(self, exp_key: str | None) -> str:
         """颗粒统计条形图颜色：GT 与每个实验固定颜色，图例和柱子保持一致。"""
@@ -455,6 +480,14 @@ class AllHandlePipeline:
             return str(int(round(value)))
         text = f"{value:.{decimals}f}"
         return text.rstrip("0").rstrip(".")
+
+    def format_csv_float(self, value) -> str:
+        """CSV 专用浮点格式：缺失值留空，有效值用普通小数，避免出现难读的科学计数法。"""
+
+        number = self.to_float(value)
+        if number is None or not math.isfinite(number):
+            return ""
+        return f"{float(number):.10g}"
 
     def legend_order_keys(self) -> tuple[str, ...]:
         """读取固定 legend 顺序；没有单独配置时回退到实验顺序。"""
@@ -500,6 +533,275 @@ class AllHandlePipeline:
             frame.set_facecolor(getattr(self.cfg, "ENERGY_LEGEND_FACE_COLOR", "#E6E6E6"))
             frame.set_edgecolor(getattr(self.cfg, "ENERGY_LEGEND_EDGE_COLOR", "#808080"))
             frame.set_alpha(float(getattr(self.cfg, "ENERGY_LEGEND_ALPHA", 0.58)))
+
+    def downsample_curve(self, x: np.ndarray, y: np.ndarray, max_points: int | None = None) -> tuple[np.ndarray, np.ndarray]:
+        """按固定步长抽稀 3D 瀑布图曲线，避免高分辨率直方图/能谱在 SVG 中生成过大的路径。"""
+
+        x_arr = np.asarray(x, dtype=np.float64)
+        y_arr = np.asarray(y, dtype=np.float64)
+        if max_points is None:
+            max_points = int(getattr(self.cfg, "WATERFALL_3D_MAX_POINTS", 700))
+        if max_points <= 0 or x_arr.size <= max_points:
+            return x_arr, y_arr
+        indices = np.linspace(0, x_arr.size - 1, max_points).astype(int)
+        return x_arr[indices], y_arr[indices]
+
+    def prepare_waterfall_curve(
+        self,
+        x: np.ndarray,
+        y: np.ndarray,
+        *,
+        log_x: bool = False,
+        log_z: bool = False,
+        log_z_plus_one: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        """把二维曲线转换成 3D 瀑布图使用的 x/z；能谱可 log10，直方图可保留原始 Count。"""
+
+        x_arr = np.asarray(x, dtype=np.float64)
+        z_arr = np.asarray(y, dtype=np.float64)
+        mask = np.isfinite(x_arr) & np.isfinite(z_arr)
+        if log_x:
+            mask &= x_arr > 0
+        if log_z:
+            mask &= z_arr > 0
+        if not np.any(mask):
+            return None
+        x_arr = x_arr[mask]
+        z_arr = z_arr[mask]
+        if log_x:
+            x_arr = np.log10(x_arr)
+        if log_z:
+            z_arr = np.log10(z_arr)
+        elif log_z_plus_one:
+            z_arr = np.log10(np.maximum(z_arr, 0.0) + 1.0)
+        return self.downsample_curve(x_arr, z_arr)
+
+    def set_waterfall_white_planes(self, ax: plt.Axes) -> None:
+        """把 3D 坐标平面的 pane 统一设为纯白，符合用户要求的白色坐标平面。"""
+
+        ax.set_facecolor("white")
+        for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+            axis.pane.set_facecolor((1.0, 1.0, 1.0, 1.0))
+            axis.pane.set_edgecolor((1.0, 1.0, 1.0, 1.0))
+        # 3D 网格线保留很浅的灰色，既能看出空间层次，又不会污染白色平面。
+        grid_color = (0.75, 0.75, 0.75, float(getattr(self.cfg, "WATERFALL_3D_GRID_ALPHA", 0.18)))
+        for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+            axis._axinfo["grid"]["color"] = grid_color
+            axis._axinfo["grid"]["linewidth"] = 0.5
+        if bool(getattr(self.cfg, "WATERFALL_3D_FORCE_Z_AXIS_LEFT", True)):
+            # Matplotlib 没有公开 API 指定 3D z 轴左右侧；juggled 是常用私有配置。
+            # 这里仅影响新增瀑布图，失败时静默跳过，保证不同 Matplotlib 版本都能继续出图。
+            try:
+                ax.zaxis._axinfo["juggled"] = (1, 2, 0)
+            except Exception:
+                pass
+
+    def draw_waterfall_3d_axes(
+        self,
+        ax: plt.Axes,
+        series: dict[str, tuple[np.ndarray, np.ndarray]],
+        *,
+        x_label: str,
+        z_label: str,
+        use_hist_color: bool = False,
+        gt_series: tuple[np.ndarray, np.ndarray] | None = None,
+        log_x: bool = False,
+        log_z: bool = False,
+        log_z_plus_one: bool = False,
+        add_legend: bool = True,
+        left_z_label_x: float | None = None,
+    ) -> bool:
+        """
+        在已有 3D 坐标轴上绘制瀑布图。
+        这个 helper 同时服务单独的 *_waterfall_3d 图和新增的 2D+3D 大图；
+        大图中 add_legend=False，避免右侧 3D 图例和左侧二维图例重复。
+        """
+
+        curve_items: list[tuple[str, str, str, str, np.ndarray, np.ndarray]] = []
+        if gt_series is not None:
+            prepared_gt = self.prepare_waterfall_curve(
+                gt_series[0],
+                gt_series[1],
+                log_x=log_x,
+                log_z=log_z,
+                log_z_plus_one=log_z_plus_one,
+            )
+            if prepared_gt is not None:
+                gt_x, gt_z = prepared_gt
+                curve_items.append(
+                    (
+                        "__gt__",
+                        self.cfg.GT_ENERGY_LABEL,
+                        self.cfg.GT_ENERGY_COLOR,
+                        self.cfg.GT_ENERGY_LINESTYLE,
+                        gt_x,
+                        gt_z,
+                    )
+                )
+        for exp_key in self.legend_order_keys():
+            if exp_key not in series:
+                continue
+            prepared = self.prepare_waterfall_curve(
+                series[exp_key][0],
+                series[exp_key][1],
+                log_x=log_x,
+                log_z=log_z,
+                log_z_plus_one=log_z_plus_one,
+            )
+            if prepared is None:
+                continue
+            x_arr, z_arr = prepared
+            color = self.experiment_hist_color(exp_key) if use_hist_color else self.experiment_color(exp_key)
+            curve_items.append((exp_key, self.experiment_label(exp_key), color, "-", x_arr, z_arr))
+        if not curve_items:
+            return False
+
+        self.set_waterfall_white_planes(ax)
+        # 正交投影能减少透视造成的 z 轴倾斜观感；box_aspect 用来让合图里的 3D 图
+        # 和左侧 2D 图视觉尺寸更接近。两个参数都放在 global_class.py 里便于后续微调。
+        projection_type = getattr(self.cfg, "WATERFALL_3D_PROJECTION", None)
+        if projection_type:
+            try:
+                ax.set_proj_type(str(projection_type))
+            except Exception:
+                pass
+        box_aspect = getattr(self.cfg, "WATERFALL_3D_BOX_ASPECT", None)
+        if box_aspect:
+            try:
+                ax.set_box_aspect(
+                    tuple(float(value) for value in box_aspect),
+                    zoom=float(getattr(self.cfg, "WATERFALL_3D_BOX_ZOOM", 1.0)),
+                )
+            except Exception:
+                try:
+                    ax.set_box_aspect(tuple(float(value) for value in box_aspect))
+                except Exception:
+                    pass
+        for y_offset, (_key, label, color, linestyle, x_arr, z_arr) in enumerate(curve_items):
+            y_arr = np.full_like(x_arr, float(y_offset), dtype=np.float64)
+            ax.plot(
+                x_arr,
+                y_arr,
+                z_arr,
+                color=color,
+                linestyle=linestyle,
+                linewidth=float(getattr(self.cfg, "WATERFALL_3D_LINE_WIDTH", 1.45)),
+                label=label,
+            )
+        ax.set_xlabel(x_label, labelpad=8)
+        # y 方向只用来错开不同实验曲线；实验名已经在 legend 中说明，
+        # 默认不再显示 y 轴 label 和 y tick label，避免画面像旧版一样文字堆叠。
+        show_y_label = bool(getattr(self.cfg, "WATERFALL_3D_SHOW_Y_LABEL", False))
+        ax.set_ylabel(getattr(self.cfg, "WATERFALL_3D_Y_LABEL", "Experiment") if show_y_label else "", labelpad=10)
+        if bool(getattr(self.cfg, "WATERFALL_3D_USE_LEFT_Z_LABEL_TEXT", True)):
+            # z 轴被挪到左侧后，Matplotlib 原生 zlabel 容易被 3D 投影挤出画布；
+            # 用 2D 文字固定在左侧，既保留 z 轴含义，也不会和右侧 legend 挤在一起。
+            ax.set_zlabel("")
+            # 普通 3D 图和 2D+3D 合图的可用空间不同，因此允许调用方单独传入
+            # left_z_label_x；这样图例位置、合图间距和 z-label 位置可以互不牵连。
+            z_label_x = (
+                float(left_z_label_x)
+                if left_z_label_x is not None
+                else float(getattr(self.cfg, "WATERFALL_3D_LEFT_Z_LABEL_X", 0.045))
+            )
+            ax.text2D(
+                z_label_x,
+                float(getattr(self.cfg, "WATERFALL_3D_LEFT_Z_LABEL_Y", 0.55)),
+                z_label,
+                transform=ax.transAxes,
+                rotation=90,
+                va="center",
+                ha="center",
+                clip_on=False,
+            )
+        else:
+            ax.set_zlabel(z_label, labelpad=8)
+        # z-label 已经被单独移到左侧，z 轴 tick 数字只需要贴近轴线；
+        # 减小 tick pad 可以进一步避免 Count 和大数值刻度挤成一团。
+        ax.tick_params(axis="z", pad=float(getattr(self.cfg, "WATERFALL_3D_Z_TICK_PAD", 2)))
+        if bool(getattr(self.cfg, "WATERFALL_3D_SHOW_Y_TICK_LABELS", False)):
+            ax.set_yticks(np.arange(len(curve_items), dtype=np.float64))
+            ax.set_yticklabels([item[1] for item in curve_items], fontsize=max(6, self.cfg.TICK_LABEL_SIZE - 2))
+        else:
+            # 红线标注的位置不要再出现实验名；直接清空 y ticks，比只清空 tick label 更彻底。
+            ax.set_yticks([])
+            ax.set_yticklabels([])
+            ax.tick_params(axis="y", length=0, pad=0)
+        if bool(getattr(self.cfg, "WATERFALL_3D_HIDE_Y_AXIS_LINE", True)):
+            # y 轴只是曲线错开的深度方向，有图例后不需要轴线/刻度线，隐藏后画面更接近参考瀑布图。
+            try:
+                ax.yaxis.line.set_color((1.0, 1.0, 1.0, 0.0))
+                ax.yaxis._axinfo["tick"]["inward_factor"] = 0.0
+                ax.yaxis._axinfo["tick"]["outward_factor"] = 0.0
+            except Exception:
+                pass
+        ax.view_init(
+            elev=float(getattr(self.cfg, "WATERFALL_3D_ELEV", 24)),
+            azim=float(getattr(self.cfg, "WATERFALL_3D_AZIM", -58)),
+        )
+        if add_legend:
+            line_cls = plt.matplotlib.lines.Line2D
+            handles = [
+                line_cls([0], [0], color=color, linestyle=linestyle, linewidth=2.0)
+                for _key, _label, color, linestyle, _x_arr, _z_arr in curve_items
+            ]
+            labels = [label for _key, label, _color, _linestyle, _x_arr, _z_arr in curve_items]
+            ax.legend(
+                handles,
+                labels,
+                loc=getattr(self.cfg, "WATERFALL_3D_LEGEND_LOC", "upper left"),
+                bbox_to_anchor=getattr(self.cfg, "WATERFALL_3D_LEGEND_BBOX", (1.02, 1.0)),
+                frameon=True,
+                fontsize=float(getattr(self.cfg, "WATERFALL_3D_LEGEND_FONT_SIZE", 8)),
+                labelspacing=float(getattr(self.cfg, "WATERFALL_3D_LEGEND_LABEL_SPACING", 0.35)),
+                handlelength=float(getattr(self.cfg, "WATERFALL_3D_LEGEND_HANDLE_LENGTH", 2.0)),
+                borderaxespad=0.0,
+            )
+        return True
+
+    def plot_waterfall_3d(
+        self,
+        series: dict[str, tuple[np.ndarray, np.ndarray]],
+        out_base: Path,
+        *,
+        x_label: str,
+        z_label: str,
+        use_hist_color: bool = False,
+        gt_series: tuple[np.ndarray, np.ndarray] | None = None,
+        log_x: bool = False,
+        log_z: bool = False,
+        log_z_plus_one: bool = False,
+    ) -> None:
+        """保存单张 3D 瀑布图；每条曲线沿 y 方向错开，并在右侧保留图例。"""
+
+        if not getattr(self.cfg, "WATERFALL_3D_ENABLED", True):
+            return
+        ensure_matplotlib()
+        fig = plt.figure(figsize=tuple(getattr(self.cfg, "WATERFALL_3D_FIG_SIZE", (7.2, 4.8))))
+        fig.patch.set_facecolor("white")
+        ax = fig.add_subplot(111, projection="3d")
+        drawn = self.draw_waterfall_3d_axes(
+            ax,
+            series,
+            x_label=x_label,
+            z_label=z_label,
+            use_hist_color=use_hist_color,
+            gt_series=gt_series,
+            log_x=log_x,
+            log_z=log_z,
+            log_z_plus_one=log_z_plus_one,
+            add_legend=True,
+        )
+        if not drawn:
+            plt.close(fig)
+            return
+        # 单独 3D 图的 x-label 在 azim=-60 时会压到画布底部；
+        # 这里按全局参数把 3D 坐标轴整体上移，给 "[px]" 这类单位文本留出底部空间。
+        try:
+            fig.subplots_adjust(bottom=float(getattr(self.cfg, "WATERFALL_3D_SUBPLOT_BOTTOM", 0.12)))
+        except Exception:
+            pass
+        self.save_figure(fig, out_base)
 
     def experiment_root(self, exp_key: str, class_name: str, split_name: str) -> Path:
         """根据全局映射拼出某个实验、某个 class、某个 split 的结果根目录。"""
@@ -1378,39 +1680,14 @@ class AllHandlePipeline:
     # =========================
     # (1) 能量谱
     # =========================
-    def plot_energy_spectrum(self, group: GroupContext) -> None:
-        """把八个实验的 ENERGY_SPECTRUM 曲线叠加到一张图。"""
+    def draw_energy_spectrum_2d(
+        self,
+        ax: plt.Axes,
+        series: dict[str, tuple[np.ndarray, np.ndarray]],
+        gt_series: tuple[np.ndarray, np.ndarray] | None,
+    ) -> None:
+        """绘制二维 ENERGY_SPECTRUM；普通图和 2D+3D 大图共用，避免两处样式不一致。"""
 
-        series: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-        gt_series: tuple[np.ndarray, np.ndarray] | None = None
-        for exp_key, directory in group.experiment_dirs.items():
-            # GT 能量谱在不同实验中理论一致，这里只读取第一条可用 GT 曲线并画成单独的 GT 图例。
-            if gt_series is None:
-                gt_path = first_existing(directory, self.cfg.ENERGY_SPECTRUM_GT_FILE_CANDIDATES)
-                if gt_path is not None:
-                    gt_xy = array_to_xy(load_npy(gt_path))
-                    if gt_xy is not None:
-                        gt_x, gt_y = gt_xy
-                        gt_mask = np.isfinite(gt_x) & np.isfinite(gt_y) & (gt_x > 0) & (gt_y > 0)
-                        if np.any(gt_mask):
-                            gt_series = (gt_x[gt_mask], gt_y[gt_mask])
-
-            path = first_existing(directory, self.cfg.ENERGY_SPECTRUM_FILE_CANDIDATES)
-            if path is None:
-                continue
-            xy = array_to_xy(load_npy(path))
-            if xy is None:
-                self.warn(f"skip energy spectrum, cannot parse: {path}")
-                continue
-            x, y = xy
-            mask = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0)
-            if np.any(mask):
-                series[exp_key] = (x[mask], y[mask])
-
-        if not series and gt_series is None:
-            return
-
-        fig, ax = plt.subplots(figsize=(5.4, 3.6))
         if gt_series is not None:
             gt_x, gt_y = gt_series
             ax.loglog(
@@ -1444,10 +1721,107 @@ class AllHandlePipeline:
             self.cfg.ENERGY_SPECTRUM_Y_MAX,
         )
 
+    def plot_energy_spectrum_2d_3d_composite(
+        self,
+        series: dict[str, tuple[np.ndarray, np.ndarray]],
+        gt_series: tuple[np.ndarray, np.ndarray] | None,
+        out_base: Path,
+    ) -> None:
+        """
+        生成能量谱大图：左侧是原二维 log-log 图，右侧是 3D 瀑布图。
+        大图只使用左侧二维图的图例，右侧 3D 图不重复放 legend，避免图例挤压画布。
+        """
+
+        if not getattr(self.cfg, "WATERFALL_3D_ENABLED", True):
+            return
+        ensure_matplotlib()
+        energy_log = bool(getattr(self.cfg, "ENERGY_WATERFALL_USE_LOG10", True))
+        fig = plt.figure(figsize=tuple(getattr(self.cfg, "WATERFALL_3D_COMPOSITE_FIG_SIZE", (11.8, 4.4))))
+        fig.patch.set_facecolor("white")
+        gs = fig.add_gridspec(
+            1,
+            2,
+            width_ratios=tuple(getattr(self.cfg, "WATERFALL_3D_COMPOSITE_WIDTH_RATIOS", (1.0, 1.08))),
+            wspace=float(getattr(self.cfg, "WATERFALL_3D_COMPOSITE_WSPACE", 0.18)),
+        )
+        ax_2d = fig.add_subplot(gs[0, 0])
+        ax_3d = fig.add_subplot(gs[0, 1], projection="3d")
+        self.draw_energy_spectrum_2d(ax_2d, series, gt_series)
+        drawn = self.draw_waterfall_3d_axes(
+            ax_3d,
+            series,
+            x_label=self.cfg.ENERGY_WATERFALL_X_LABEL if energy_log else self.cfg.ENERGY_X_LABEL,
+            z_label=self.cfg.ENERGY_WATERFALL_Z_LABEL if energy_log else self.cfg.ENERGY_Y_LABEL,
+            use_hist_color=False,
+            gt_series=gt_series,
+            log_x=energy_log,
+            log_z=energy_log,
+            add_legend=False,
+            left_z_label_x=float(
+                getattr(
+                    self.cfg,
+                    "WATERFALL_3D_COMPOSITE_LEFT_Z_LABEL_X",
+                    getattr(self.cfg, "WATERFALL_3D_LEFT_Z_LABEL_X", -0.16),
+                )
+            ),
+        )
+        if not drawn:
+            plt.close(fig)
+            return
+        self.save_figure(fig, out_base.with_name(f"{out_base.name}_2d_3d_composite"))
+
+    def plot_energy_spectrum(self, group: GroupContext) -> None:
+        """把八个实验的 ENERGY_SPECTRUM 曲线叠加到一张图。"""
+
+        series: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        gt_series: tuple[np.ndarray, np.ndarray] | None = None
+        for exp_key, directory in group.experiment_dirs.items():
+            # GT 能量谱在不同实验中理论一致，这里只读取第一条可用 GT 曲线并画成单独的 GT 图例。
+            if gt_series is None:
+                gt_path = first_existing(directory, self.cfg.ENERGY_SPECTRUM_GT_FILE_CANDIDATES)
+                if gt_path is not None:
+                    gt_xy = array_to_xy(load_npy(gt_path))
+                    if gt_xy is not None:
+                        gt_x, gt_y = gt_xy
+                        gt_mask = np.isfinite(gt_x) & np.isfinite(gt_y) & (gt_x > 0) & (gt_y > 0)
+                        if np.any(gt_mask):
+                            gt_series = (gt_x[gt_mask], gt_y[gt_mask])
+
+            path = first_existing(directory, self.cfg.ENERGY_SPECTRUM_FILE_CANDIDATES)
+            if path is None:
+                continue
+            xy = array_to_xy(load_npy(path))
+            if xy is None:
+                self.warn(f"skip energy spectrum, cannot parse: {path}")
+                continue
+            x, y = xy
+            mask = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0)
+            if np.any(mask):
+                series[exp_key] = (x[mask], y[mask])
+
+        if not series and gt_series is None:
+            return
+
+        fig, ax = plt.subplots(figsize=(5.4, 3.6))
+        self.draw_energy_spectrum_2d(ax, series, gt_series)
+
         out_dir = self.output_dir(self.cfg.ENERGY_OUTPUT_DIR_NAME, group.class_name, group.split_name)
         out_base = out_dir / f"{safe_name(group.category_name)}_energy_spectrum"
         self.save_npy(out_base.with_suffix(".npy"), {"gt": gt_series, "experiments": series})
         self.save_figure(fig, out_base)
+        # 新增 3D 瀑布图：沿 y 方向按 GT 和各实验错开曲线，坐标平面保持白色，便于论文中展示谱线层次。
+        energy_log = bool(getattr(self.cfg, "ENERGY_WATERFALL_USE_LOG10", True))
+        self.plot_waterfall_3d(
+            series,
+            out_base.with_name(f"{out_base.name}_waterfall_3d"),
+            x_label=self.cfg.ENERGY_WATERFALL_X_LABEL if energy_log else self.cfg.ENERGY_X_LABEL,
+            z_label=self.cfg.ENERGY_WATERFALL_Z_LABEL if energy_log else self.cfg.ENERGY_Y_LABEL,
+            use_hist_color=False,
+            gt_series=gt_series,
+            log_x=energy_log,
+            log_z=energy_log,
+        )
+        self.plot_energy_spectrum_2d_3d_composite(series, gt_series, out_base)
 
     # =========================
     # (3)(4)(5) 直方图叠加
@@ -1504,21 +1878,19 @@ class AllHandlePipeline:
                 series[exp_key] = (x[mask], y[mask])
         return series
 
-    def plot_overlay_histogram(
+    def draw_overlay_histogram_2d(
         self,
+        ax: plt.Axes,
         group: GroupContext,
-        file_candidates: tuple[str, ...],
-        out_name: str,
+        series: dict[str, tuple[np.ndarray, np.ndarray]],
+        *,
         x_label: str,
         y_label: str,
         axis_kind: str,
-        save_npy: bool,
+        add_legend: bool = True,
     ) -> None:
-        series = self.load_hist_series(group, file_candidates)
-        if not series:
-            return
+        """绘制单张二维误差直方图叠加图；普通图和 2D+3D 大图共用同一套遮挡顺序。"""
 
-        fig, ax = plt.subplots(figsize=(5.2, 3.4))
         for draw_idx, (exp_key, (x, y)) in enumerate(self.sorted_hist_series(series)):
             width = self.estimate_bar_width(x)
             hist_color = self.experiment_hist_color(exp_key)
@@ -1530,7 +1902,7 @@ class AllHandlePipeline:
                 y,
                 width=width,
                 color=hist_color,
-                alpha=self.cfg.HIST_ALPHA,
+                alpha=self.experiment_hist_alpha(exp_key),
                 edgecolor=edge_color,
                 linewidth=edge_width,
                 label=self.experiment_label(exp_key),
@@ -1547,33 +1919,142 @@ class AllHandlePipeline:
                 )
         ax.set_xlabel(x_label)
         ax.set_ylabel(y_label)
-        self.apply_hist_legend(ax, series)
+        if add_legend:
+            self.apply_hist_legend(ax, series)
         ax.grid(True, alpha=0.18, linewidth=0.5)
         self.apply_hist_axis(ax, group.category_name, axis_kind)
 
+    def plot_overlay_histogram_2d_3d_composite(
+        self,
+        group: GroupContext,
+        series: dict[str, tuple[np.ndarray, np.ndarray]],
+        out_base: Path,
+        *,
+        x_label: str,
+        y_label: str,
+        axis_kind: str,
+    ) -> None:
+        """
+        生成误差直方图大图：左侧为原二维叠加直方图，右侧为 3D 瀑布图。
+        图例只保留左侧二维图的版本，右侧 3D 图用于展示分布层次，不额外重复 legend。
+        """
+
+        if not getattr(self.cfg, "WATERFALL_3D_ENABLED", True):
+            return
+        ensure_matplotlib()
+        hist_log_count = bool(getattr(self.cfg, "HIST_WATERFALL_USE_LOG10_COUNT", False))
+        fig = plt.figure(figsize=tuple(getattr(self.cfg, "WATERFALL_3D_COMPOSITE_FIG_SIZE", (11.8, 4.4))))
+        fig.patch.set_facecolor("white")
+        gs = fig.add_gridspec(
+            1,
+            2,
+            width_ratios=tuple(getattr(self.cfg, "WATERFALL_3D_COMPOSITE_WIDTH_RATIOS", (1.0, 1.08))),
+            wspace=float(getattr(self.cfg, "WATERFALL_3D_COMPOSITE_WSPACE", 0.18)),
+        )
+        ax_2d = fig.add_subplot(gs[0, 0])
+        ax_3d = fig.add_subplot(gs[0, 1], projection="3d")
+        self.draw_overlay_histogram_2d(
+            ax_2d,
+            group,
+            series,
+            x_label=x_label,
+            y_label=y_label,
+            axis_kind=axis_kind,
+            add_legend=True,
+        )
+        drawn = self.draw_waterfall_3d_axes(
+            ax_3d,
+            series,
+            x_label=x_label,
+            z_label=self.cfg.HIST_WATERFALL_LOG_Z_LABEL if hist_log_count else self.cfg.HIST_WATERFALL_Z_LABEL,
+            use_hist_color=True,
+            log_z_plus_one=hist_log_count,
+            add_legend=False,
+            left_z_label_x=float(
+                getattr(
+                    self.cfg,
+                    "WATERFALL_3D_COMPOSITE_LEFT_Z_LABEL_X",
+                    getattr(self.cfg, "WATERFALL_3D_LEFT_Z_LABEL_X", -0.16),
+                )
+            ),
+        )
+        if not drawn:
+            plt.close(fig)
+            return
+        self.save_figure(fig, out_base.with_name(f"{out_base.name}_2d_3d_composite"))
+
+    def plot_overlay_histogram(
+        self,
+        group: GroupContext,
+        file_candidates: tuple[str, ...],
+        out_name: str,
+        x_label: str,
+        y_label: str,
+        axis_kind: str,
+        save_npy: bool,
+    ) -> None:
+        series = self.load_hist_series(group, file_candidates)
+        if not series:
+            return
+
+        fig, ax = plt.subplots(figsize=(5.2, 3.4))
+        self.draw_overlay_histogram_2d(
+            ax,
+            group,
+            series,
+            x_label=x_label,
+            y_label=y_label,
+            axis_kind=axis_kind,
+            add_legend=True,
+        )
+
         out_dir = self.output_dir(self.cfg.HIST_OUTPUT_DIR_NAME, group.class_name, group.split_name)
         out_base = out_dir / f"{safe_name(group.category_name)}_{out_name}"
+        self.write_histogram_diagnostics_csv(
+            out_base.with_name(f"{out_base.name}_stats.csv"),
+            group,
+            series,
+            hist_name=out_name,
+            compute_symmetry=True,
+        )
         if save_npy:
             self.save_npy(out_base.with_suffix(".npy"), series)
         self.save_figure(fig, out_base)
-
-    def plot_flow_u_epe_histogram(self, group: GroupContext) -> None:
-        """左侧叠加 Δu 误差直方图，右侧叠加 EPE 直方图。"""
-
-        u_series = self.load_hist_series(group, ("delta_u_hist_all.npy", "delta_u_hist.npy"))
-        epe_series = self.load_hist_series(group, ("epe_hist_all.npy", "epe_hist.npy"))
-        if not u_series and not epe_series:
-            return
-
-        fig, axes = plt.subplots(
-            1,
-            2,
-            figsize=(8.4, 3.4),
-            gridspec_kw={"wspace": float(getattr(self.cfg, "FLOW_U_EPE_HIST_WSPACE", 0.32))},
+        # 新增 3D 瀑布图：直方图仍使用原来的科研配色，按实验顺序沿 y 方向展开，并保留图例。
+        hist_log_count = bool(getattr(self.cfg, "HIST_WATERFALL_USE_LOG10_COUNT", False))
+        self.plot_waterfall_3d(
+            series,
+            out_base.with_name(f"{out_base.name}_waterfall_3d"),
+            x_label=x_label,
+            z_label=self.cfg.HIST_WATERFALL_LOG_Z_LABEL if hist_log_count else self.cfg.HIST_WATERFALL_Z_LABEL,
+            use_hist_color=True,
+            log_z_plus_one=hist_log_count,
         )
+        self.plot_overlay_histogram_2d_3d_composite(
+            group,
+            series,
+            out_base,
+            x_label=x_label,
+            y_label=y_label,
+            axis_kind=axis_kind,
+        )
+
+    def draw_flow_u_epe_histogram_2d(
+        self,
+        axes: Iterable[plt.Axes],
+        group: GroupContext,
+        u_series: dict[str, tuple[np.ndarray, np.ndarray]],
+        epe_series: dict[str, tuple[np.ndarray, np.ndarray]],
+        *,
+        legend_series: dict[str, tuple[np.ndarray, np.ndarray]],
+        use_outside_legend: bool,
+    ) -> None:
+        """绘制 flow_u_epe 的二维双子图；普通图和新增上下布局大图共用。"""
+
+        axes_list = list(axes)
         for ax, series, x_label, axis_kind in (
-            (axes[0], u_series, self.cfg.FLOW_U_HIST_X_LABEL, "flow_u"),
-            (axes[1], epe_series, self.cfg.EPE_HIST_X_LABEL, "epe"),
+            (axes_list[0], u_series, self.cfg.FLOW_U_HIST_X_LABEL, "flow_u"),
+            (axes_list[1], epe_series, self.cfg.EPE_HIST_X_LABEL, "epe"),
         ):
             for draw_idx, (exp_key, (x, y)) in enumerate(self.sorted_hist_series(series)):
                 hist_color = self.experiment_hist_color(exp_key)
@@ -1584,7 +2065,7 @@ class AllHandlePipeline:
                     y,
                     width=self.estimate_bar_width(x),
                     color=hist_color,
-                    alpha=self.cfg.HIST_ALPHA,
+                    alpha=self.experiment_hist_alpha(exp_key),
                     edgecolor=edge_color,
                     linewidth=edge_width,
                     label=self.experiment_label(exp_key),
@@ -1602,11 +2083,253 @@ class AllHandlePipeline:
             ax.set_ylabel(self.cfg.HIST_Y_LABEL)
             ax.grid(True, alpha=0.18, linewidth=0.5)
             self.apply_hist_axis(ax, group.category_name, axis_kind)
-        self.apply_hist_legend(axes[1], epe_series or u_series)
+        if use_outside_legend:
+            # 八组实验的 legend 过高，放在右侧 EPE 子图内部会压住 EPE 直方图主峰；
+            # 因此把 legend 锚到右图外侧，并给整张图加宽，保存时 tight bbox 会把 legend 一起保留。
+            self.apply_hist_legend(
+                axes_list[1],
+                legend_series,
+                loc=getattr(self.cfg, "FLOW_U_EPE_HIST_LEGEND_OUTSIDE_LOC", "upper left"),
+                bbox_to_anchor=getattr(self.cfg, "FLOW_U_EPE_HIST_LEGEND_OUTSIDE_BBOX", (1.02, 1.0)),
+                ncol=int(getattr(self.cfg, "FLOW_U_EPE_HIST_LEGEND_OUTSIDE_NCOL", 1)),
+            )
+        else:
+            self.apply_hist_legend(axes_list[1], legend_series)
+
+    def plot_flow_u_epe_histogram_2d_3d_composite(
+        self,
+        group: GroupContext,
+        u_series: dict[str, tuple[np.ndarray, np.ndarray]],
+        epe_series: dict[str, tuple[np.ndarray, np.ndarray]],
+        out_base: Path,
+    ) -> None:
+        """
+        生成 flow_u_epe 大图：第一行保留原二维双子图，第二行放两个对应的 3D 瀑布图。
+        这个特殊排版避免把四个子图挤到一行，同时只保留第一行二维图的 legend。
+        """
+
+        if not getattr(self.cfg, "WATERFALL_3D_ENABLED", True):
+            return
+        ensure_matplotlib()
+        legend_series = epe_series or u_series
+        use_outside_legend = bool(getattr(self.cfg, "FLOW_U_EPE_HIST_LEGEND_OUTSIDE", True)) and len(
+            legend_series
+        ) >= int(getattr(self.cfg, "FLOW_U_EPE_HIST_LEGEND_OUTSIDE_MIN_SERIES", 7))
+        fig = plt.figure(
+            figsize=tuple(getattr(self.cfg, "WATERFALL_3D_FLOW_U_EPE_COMPOSITE_FIG_SIZE", (11.8, 7.2)))
+        )
+        fig.patch.set_facecolor("white")
+        gs = fig.add_gridspec(
+            2,
+            2,
+            wspace=float(getattr(self.cfg, "WATERFALL_3D_FLOW_U_EPE_COMPOSITE_WSPACE", 0.28)),
+            hspace=float(getattr(self.cfg, "WATERFALL_3D_FLOW_U_EPE_COMPOSITE_HSPACE", 0.36)),
+        )
+        axes_2d = (fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[0, 1]))
+        self.draw_flow_u_epe_histogram_2d(
+            axes_2d,
+            group,
+            u_series,
+            epe_series,
+            legend_series=legend_series,
+            use_outside_legend=use_outside_legend,
+        )
+        hist_log_count = bool(getattr(self.cfg, "HIST_WATERFALL_USE_LOG10_COUNT", False))
+        z_label = self.cfg.HIST_WATERFALL_LOG_Z_LABEL if hist_log_count else self.cfg.HIST_WATERFALL_Z_LABEL
+        ax_u_3d = fig.add_subplot(gs[1, 0], projection="3d")
+        ax_epe_3d = fig.add_subplot(gs[1, 1], projection="3d")
+        drawn_u = self.draw_waterfall_3d_axes(
+            ax_u_3d,
+            u_series,
+            x_label=self.cfg.FLOW_U_HIST_X_LABEL,
+            z_label=z_label,
+            use_hist_color=True,
+            log_z_plus_one=hist_log_count,
+            add_legend=False,
+            left_z_label_x=float(
+                getattr(
+                    self.cfg,
+                    "WATERFALL_3D_COMPOSITE_LEFT_Z_LABEL_X",
+                    getattr(self.cfg, "WATERFALL_3D_LEFT_Z_LABEL_X", -0.16),
+                )
+            ),
+        )
+        drawn_epe = self.draw_waterfall_3d_axes(
+            ax_epe_3d,
+            epe_series,
+            x_label=self.cfg.EPE_HIST_X_LABEL,
+            z_label=z_label,
+            use_hist_color=True,
+            log_z_plus_one=hist_log_count,
+            add_legend=False,
+            left_z_label_x=float(
+                getattr(
+                    self.cfg,
+                    "WATERFALL_3D_COMPOSITE_LEFT_Z_LABEL_X",
+                    getattr(self.cfg, "WATERFALL_3D_LEFT_Z_LABEL_X", -0.16),
+                )
+            ),
+        )
+        if not (drawn_u or drawn_epe):
+            plt.close(fig)
+            return
+        self.save_figure(fig, out_base.with_name(f"{out_base.name}_2d_3d_composite"))
+
+    def plot_flow_u_epe_histogram(self, group: GroupContext) -> None:
+        """左侧叠加 Δu 误差直方图，右侧叠加 EPE 直方图。"""
+
+        u_series = self.load_hist_series(group, ("delta_u_hist_all.npy", "delta_u_hist.npy"))
+        epe_series = self.load_hist_series(group, ("epe_hist_all.npy", "epe_hist.npy"))
+        if not u_series and not epe_series:
+            return
+
+        legend_series = epe_series or u_series
+        use_outside_legend = bool(getattr(self.cfg, "FLOW_U_EPE_HIST_LEGEND_OUTSIDE", True)) and len(
+            legend_series
+        ) >= int(getattr(self.cfg, "FLOW_U_EPE_HIST_LEGEND_OUTSIDE_MIN_SERIES", 7))
+        fig_width = float(getattr(self.cfg, "FLOW_U_EPE_HIST_OUTSIDE_LEGEND_FIG_WIDTH", 10.2)) if use_outside_legend else 8.4
+        fig, axes = plt.subplots(
+            1,
+            2,
+            figsize=(fig_width, 3.4),
+            gridspec_kw={"wspace": float(getattr(self.cfg, "FLOW_U_EPE_HIST_WSPACE", 0.32))},
+        )
+        self.draw_flow_u_epe_histogram_2d(
+            axes,
+            group,
+            u_series,
+            epe_series,
+            legend_series=legend_series,
+            use_outside_legend=use_outside_legend,
+        )
 
         out_dir = self.output_dir(self.cfg.HIST_OUTPUT_DIR_NAME, group.class_name, group.split_name)
         out_base = out_dir / f"{safe_name(group.category_name)}_flow_u_epe_hist_overlay"
+        rows: list[dict[str, str]] = []
+        rows.extend(self.histogram_diagnostic_rows(group, u_series, hist_name="flow_u_hist", compute_symmetry=True))
+        # EPE 本身是非负端点误差，不以 0 为对称中心，因此只保存坐标范围，不计算对称度。
+        rows.extend(self.histogram_diagnostic_rows(group, epe_series, hist_name="epe_hist", compute_symmetry=False))
+        self.write_histogram_diagnostics_csv(out_base.with_name(f"{out_base.name}_stats.csv"), group, None, rows=rows)
         self.save_figure(fig, out_base)
+        # flow_u_epe 原图是左右双子图，这里分别补充 Delta u 与 EPE 的 3D 瀑布图，避免一个 3D 双面板过挤。
+        hist_log_count = bool(getattr(self.cfg, "HIST_WATERFALL_USE_LOG10_COUNT", False))
+        z_label = self.cfg.HIST_WATERFALL_LOG_Z_LABEL if hist_log_count else self.cfg.HIST_WATERFALL_Z_LABEL
+        self.plot_waterfall_3d(
+            u_series,
+            out_base.with_name(f"{safe_name(group.category_name)}_flow_u_hist_waterfall_3d"),
+            x_label=self.cfg.FLOW_U_HIST_X_LABEL,
+            z_label=z_label,
+            use_hist_color=True,
+            log_z_plus_one=hist_log_count,
+        )
+        self.plot_waterfall_3d(
+            epe_series,
+            out_base.with_name(f"{safe_name(group.category_name)}_epe_hist_waterfall_3d"),
+            x_label=self.cfg.EPE_HIST_X_LABEL,
+            z_label=z_label,
+            use_hist_color=True,
+            log_z_plus_one=hist_log_count,
+        )
+        self.plot_flow_u_epe_histogram_2d_3d_composite(group, u_series, epe_series, out_base)
+
+    def histogram_diagnostic_rows(
+        self,
+        group: GroupContext,
+        series: dict[str, tuple[np.ndarray, np.ndarray]],
+        hist_name: str,
+        compute_symmetry: bool,
+    ) -> list[dict[str, str]]:
+        """把每个实验的直方图范围和对称度整理成 CSV 行；EPE 等非零对称直方图可关闭对称度。"""
+
+        rows: list[dict[str, str]] = []
+        for exp_key in self.legend_order_keys():
+            if exp_key not in series:
+                continue
+            x, y = series[exp_key]
+            x_arr = np.asarray(x, dtype=np.float64)
+            y_arr = np.asarray(y, dtype=np.float64)
+            mask = np.isfinite(x_arr) & np.isfinite(y_arr)
+            if not np.any(mask):
+                continue
+            x_valid = x_arr[mask]
+            y_valid = y_arr[mask]
+            symmetry = self.histogram_symmetry_metrics(x_valid, y_valid) if compute_symmetry else {}
+            row = {
+                "comparison": self.active_comparison_name,
+                "class": group.class_name,
+                "split": group.split_name,
+                "category": group.category_name,
+                "histogram": hist_name,
+                "experiment": self.experiment_label(exp_key),
+                "experiment_key": exp_key,
+                "x_min": self.format_csv_float(float(np.nanmin(x_valid))),
+                "x_max": self.format_csv_float(float(np.nanmax(x_valid))),
+                "y_min": self.format_csv_float(float(np.nanmin(y_valid))),
+                "y_max": self.format_csv_float(float(np.nanmax(y_valid))),
+                "symmetry_score": self.format_csv_float(symmetry.get("symmetry_score")),
+                "symmetry_asymmetry_l1": self.format_csv_float(symmetry.get("asymmetry_l1")),
+                "symmetry_pair_count": str(int(symmetry.get("pair_count", 0))) if symmetry else "",
+            }
+            rows.append(row)
+        return rows
+
+    def write_histogram_diagnostics_csv(
+        self,
+        path: Path,
+        group: GroupContext,
+        series: dict[str, tuple[np.ndarray, np.ndarray]] | None,
+        hist_name: str | None = None,
+        compute_symmetry: bool = True,
+        rows: list[dict[str, str]] | None = None,
+    ) -> None:
+        """保存 03_error_histograms 的诊断 CSV：直方图对称度、x 范围、y 范围。"""
+
+        output_rows = rows if rows is not None else self.histogram_diagnostic_rows(group, series or {}, hist_name or "", compute_symmetry)
+        if not output_rows:
+            return
+        columns = (
+            "comparison",
+            "class",
+            "split",
+            "category",
+            "histogram",
+            "experiment",
+            "experiment_key",
+            "x_min",
+            "x_max",
+            "y_min",
+            "y_max",
+            "symmetry_score",
+            "symmetry_asymmetry_l1",
+            "symmetry_pair_count",
+        )
+        self.write_csv_rows(path, output_rows, columns)
+
+    def histogram_symmetry_metrics(self, x: np.ndarray, y: np.ndarray) -> dict[str, float]:
+        """以 0 为中心计算直方图左右对称度；1 表示完全对称，0 附近表示差异很大。"""
+
+        order = np.argsort(x)
+        x_sorted = np.asarray(x, dtype=np.float64)[order]
+        y_sorted = np.asarray(y, dtype=np.float64)[order]
+        positive_abs = np.unique(np.abs(x_sorted[np.abs(x_sorted) > 0]))
+        if positive_abs.size == 0:
+            return {"symmetry_score": float("nan"), "asymmetry_l1": float("nan"), "pair_count": 0.0}
+        min_x = float(np.nanmin(x_sorted))
+        max_x = float(np.nanmax(x_sorted))
+        pair_abs = positive_abs[(positive_abs <= max_x) & (-positive_abs >= min_x)]
+        if pair_abs.size == 0:
+            return {"symmetry_score": float("nan"), "asymmetry_l1": float("nan"), "pair_count": 0.0}
+        y_pos = np.interp(pair_abs, x_sorted, y_sorted)
+        y_neg = np.interp(-pair_abs, x_sorted, y_sorted)
+        denom = float(np.sum(y_pos + y_neg))
+        if denom <= 0:
+            return {"symmetry_score": float("nan"), "asymmetry_l1": float("nan"), "pair_count": float(pair_abs.size)}
+        asymmetry = float(np.sum(np.abs(y_pos - y_neg)) / denom)
+        return {
+            "symmetry_score": max(0.0, 1.0 - asymmetry),
+            "asymmetry_l1": asymmetry,
+            "pair_count": float(pair_abs.size),
+        }
 
     def sorted_hist_series(
         self, series: dict[str, tuple[np.ndarray, np.ndarray]]
@@ -1711,20 +2434,21 @@ class AllHandlePipeline:
         """为每个样本生成 u/v/s 光流误差图，并按指定参考实验统一色条。"""
 
         for bundle in self.bundle_samples(group, "flow"):
+            is_tbl = normalize_name(group.category_name) == "tbl"
             for component in ("u", "v", "s"):
                 maps: dict[str, np.ndarray] = {}
                 for exp_key, sample_dir in bundle.sample_dirs.items():
                     error_maps = self.load_flow_error_maps(sample_dir)
                     if component in error_maps:
-                        maps[exp_key] = error_maps[component]
+                        err_map = error_maps[component]
+                        if is_tbl:
+                            err_map = self.trim_tbl_flow_error_bottom(err_map, sample_dir)
+                        maps[exp_key] = err_map
                 if not maps:
                     continue
                 # 光流误差图必须让 0 位于色条中心且显示为白色，因此范围强制关于 0 对称。
-                vmin, vmax = self.resolve_color_limit(
-                    self.error_colorbar_reference_arrays(maps),
-                    self.cfg.FLOW_ERROR_COLORBAR_LIMIT,
-                    center_zero=True,
-                )
+                reference_arrays = self.error_colorbar_reference_arrays(maps)
+                vmin, vmax = self.flow_error_color_limit_for_category(group.category_name, reference_arrays)
                 out_dir = self.output_dir(
                     self.cfg.ERROR_MAP_OUTPUT_DIR_NAME,
                     group.class_name,
@@ -1971,6 +2695,22 @@ class AllHandlePipeline:
         if not values:
             return -1.0, 1.0
         merged = np.concatenate(values)
+        percentile = getattr(self.cfg, "COLORBAR_AUTO_PERCENTILE", None)
+        if percentile is not None:
+            pct = max(0.0, min(100.0, float(percentile)))
+            if center_zero:
+                # 所有误差类色条仍保持 0 居中，白色对应 0；这里只用分位数抑制极少数离群尖峰。
+                max_abs = float(np.nanpercentile(np.abs(merged), pct)) if merged.size else 1.0
+                max_abs = max(max_abs, 1e-6)
+                return -max_abs, max_abs
+            lower = (100.0 - pct) / 2.0
+            upper = 100.0 - lower
+            vmin = float(np.nanpercentile(merged, lower))
+            vmax = float(np.nanpercentile(merged, upper))
+            if math.isclose(vmin, vmax):
+                pad = abs(vmin) * 0.05 + 1e-6
+                return vmin - pad, vmax + pad
+            return vmin, vmax
         if center_zero:
             max_abs = float(np.max(np.abs(merged))) if merged.size else 1.0
             max_abs = max(max_abs, 1e-6)
@@ -1980,6 +2720,48 @@ class AllHandlePipeline:
             pad = abs(vmin) * 0.05 + 1e-6
             return vmin - pad, vmax + pad
         return vmin, vmax
+
+    def resolve_percentile_color_limit(
+        self,
+        arrays: Iterable[np.ndarray | None],
+        percentile: float,
+        center_zero: bool = False,
+    ) -> tuple[float, float]:
+        """按分位数解析色条范围，用于 TBL 光流误差这类极少数离群点明显的长条图。"""
+
+        values = []
+        for array in arrays:
+            if array is None:
+                continue
+            finite = finite_values(np.asarray(array))
+            if finite.size:
+                values.append(finite)
+        if not values:
+            return -1.0, 1.0
+        merged = np.concatenate(values)
+        pct = max(0.0, min(100.0, float(percentile)))
+        if center_zero:
+            max_abs = float(np.nanpercentile(np.abs(merged), pct)) if merged.size else 1.0
+            max_abs = max(max_abs, 1e-6)
+            return -max_abs, max_abs
+        lower = (100.0 - pct) / 2.0
+        upper = 100.0 - lower
+        vmin = float(np.nanpercentile(merged, lower))
+        vmax = float(np.nanpercentile(merged, upper))
+        if math.isclose(vmin, vmax):
+            pad = abs(vmin) * 0.05 + 1e-6
+            return vmin - pad, vmax + pad
+        return vmin, vmax
+
+    def flow_error_color_limit_for_category(
+        self, category_name: str, reference_arrays: Iterable[np.ndarray | None]
+    ) -> tuple[float, float]:
+        """光流误差色条范围；TBL 用分位数抑制极少数离群点，仍只基于参考实验计算。"""
+
+        percentile = getattr(self.cfg, "TBL_FLOW_ERROR_COLORBAR_PERCENTILE", None)
+        if normalize_name(category_name) == "tbl" and percentile is not None:
+            return self.resolve_percentile_color_limit(reference_arrays, float(percentile), center_zero=True)
+        return self.resolve_color_limit(reference_arrays, self.cfg.FLOW_ERROR_COLORBAR_LIMIT, center_zero=True)
 
     # =========================
     # 数据读取：光流 / 颗粒 / 涡度
@@ -2647,6 +3429,19 @@ class AllHandlePipeline:
             return [items]
         return [items[idx : idx + chunk_size] for idx in range(0, len(items), chunk_size)]
 
+    def particle_binary_wrap_method_count(self) -> int | None:
+        """读取颗粒阈值对比图的分块数量；没有配置时保持单行。"""
+
+        mapping = getattr(self.cfg, "COMPARISON_GROUP_PARTICLE_BINARY_WRAP_METHOD_COUNT", {})
+        value = mapping.get(self.active_comparison_name)
+        if value is None:
+            return None
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
     def tbl_profile_valid_height(self, sample_dir: Path) -> int | None:
         """读取 TBL profile_analysis 中保存的有效 y 高度，用于裁掉误差图底部无效壁面区。"""
 
@@ -2804,8 +3599,71 @@ class AllHandlePipeline:
     def plot_particle_sr_error_composites_horizontal(self, group: GroupContext, crop: bool = False) -> None:
         """previous/next 的 LR、GT、八个 SR 与对应误差图；crop=True 时使用 TBL crop 数据但保持横向布局。"""
 
+        is_experiment = normalize_name(group.category_name) == "experiment"
         for bundle in self.limited_bundles(group, "particle"):
-            rows = []
+            exp_keys = [key for key in group.experiment_keys if key in bundle.sample_dirs]
+            exp_chunks = self.chunk_items(exp_keys, self.composite_wrap_method_count())
+            fixed_count = 1 if is_experiment else 2
+            method_cols = max((len(chunk) for chunk in exp_chunks), default=0)
+            n_cols = fixed_count + method_cols
+
+            if is_experiment:
+                # experiment 的 particle_sr_error_composite 保留原文件名，但不再画误差行。
+                # 每个时刻只展示 GT(插值参考) 和各方法 SR；后续分块空出 GT 列，让后半实验与前半实验列对齐。
+                row_specs = []
+                for time_name in ("previous", "next"):
+                    gt = self.first_available_particle(bundle, time_name, "gt", crop=crop)
+                    sr_maps = {
+                        exp_key: self.load_particle_array_mode(sample_dir, time_name, "sr", crop=crop)
+                        for exp_key, sample_dir in bundle.sample_dirs.items()
+                    }
+                    for chunk_idx, chunk in enumerate(exp_chunks):
+                        row_specs.append((time_name, [gt], sr_maps, chunk_idx, chunk))
+                fig = plt.figure(figsize=(2.0 * n_cols + 0.5, max(2.2, 0.72 * len(row_specs))))
+                gs = fig.add_gridspec(
+                    len(row_specs),
+                    n_cols,
+                    width_ratios=[1] * n_cols,
+                    hspace=0.04,
+                    wspace=0.04,
+                )
+                for row_idx, (time_name, fixed_maps, exp_maps, chunk_idx, chunk) in enumerate(row_specs):
+                    show_fixed = chunk_idx == 0
+                    row_arrays = (fixed_maps if show_fixed else [None] * fixed_count) + [
+                        exp_maps.get(exp_key) for exp_key in chunk
+                    ]
+                    row_arrays += [None] * (n_cols - len(row_arrays))
+                    all_row_arrays = fixed_maps + [exp_maps.get(exp_key) for exp_key in exp_keys]
+                    vmin, vmax = self.row_limit(all_row_arrays, self.cfg.PARTICLE_VALUE_COLORBAR_LIMIT)
+                    labels = ([self.cfg.GT_PANEL_LABEL] if show_fixed else [""] * fixed_count) + [
+                        self.experiment_label(exp_key) for exp_key in chunk
+                    ]
+                    labels += [""] * (n_cols - len(labels))
+                    for col_idx, array in enumerate(row_arrays):
+                        ax = fig.add_subplot(gs[row_idx, col_idx])
+                        self.draw_map(ax, array, self.cfg.IMAGE_CMAP, vmin, vmax, labels[col_idx])
+                        if col_idx == 0 and show_fixed:
+                            ax.text(
+                                -0.08,
+                                0.5,
+                                self.cfg.PREVIOUS_ROW_LABEL if time_name == "previous" else self.cfg.NEXT_ROW_LABEL,
+                                transform=ax.transAxes,
+                                ha="right",
+                                va="center",
+                                rotation=90,
+                                fontsize=self.cfg.PANEL_LABEL_SIZE,
+                            )
+                out_dir = self.output_dir(
+                    self.cfg.COMPOSITE_OUTPUT_DIR_NAME,
+                    group.class_name,
+                    group.split_name,
+                    group.category_name,
+                    bundle.sample_name,
+                )
+                suffix = getattr(self.cfg, "TBL_PARTICLE_CROP_OUTPUT_SUFFIX", "_crop") if crop else ""
+                self.save_figure(fig, out_dir / f"particle_sr_error_composite{suffix}")
+                continue
+
             for time_name in ("previous", "next"):
                 lr = self.first_available_particle(bundle, time_name, "lr", crop=crop)
                 gt = self.first_available_particle(bundle, time_name, "gt", crop=crop)
@@ -2817,120 +3675,122 @@ class AllHandlePipeline:
                     exp_key: self.load_particle_array_mode(sample_dir, time_name, "error", crop=crop)
                     for exp_key, sample_dir in bundle.sample_dirs.items()
                 }
-                rows.append((time_name, "image", [lr, gt], sr_maps))
-                rows.append((time_name, "error", [None, None], err_maps))
+                if is_experiment:
+                    # experiment 的 GT 是 LR 插值得到的伪参考，误差图是 SR-伪 GT。
+                    # 论文对比图中只保留 GT 和各方法 SR，避免把伪误差当成真实 HR 误差解读。
+                    rows = [(time_name, "image", [gt], sr_maps)]
+                else:
+                    rows = [
+                        (time_name, "image", [lr, gt], sr_maps),
+                        (time_name, "error", [None, None], err_maps),
+                    ]
 
-            exp_keys = [key for key in group.experiment_keys if key in bundle.sample_dirs]
-            exp_chunks = self.chunk_items(exp_keys, self.composite_wrap_method_count())
-            fixed_count = 2
-            method_cols = max((len(chunk) for chunk in exp_chunks), default=0)
-            n_cols = fixed_count + method_cols
-            row_specs = []
-            for time_name in ("previous", "next"):
-                time_rows = [row for row in rows if row[0] == time_name]
-                # eight_experiments 分成 4+4 两块时，每一块都按“颗粒图一行、误差图一行”排列；
-                # 不再先连续画两行颗粒图再画两行误差图，避免 SR 图和对应误差图上下关系被打散。
+                row_specs = []
+                # previous 和 next 拆成两张独立图；非 experiment 保持“颗粒图一行、误差图一行”，
+                # experiment 则只保留颗粒图行。
                 for chunk_idx, chunk in enumerate(exp_chunks):
-                    for row_time_name, row_kind, fixed_maps, exp_maps in time_rows:
+                    for row_time_name, row_kind, fixed_maps, exp_maps in rows:
                         row_specs.append((row_time_name, row_kind, fixed_maps, exp_maps, chunk_idx, chunk))
-            fig = plt.figure(figsize=(2.0 * n_cols + 0.5, max(4.2, 2.05 * len(row_specs))))
-            gs = fig.add_gridspec(
-                len(row_specs),
-                n_cols + 1,
-                width_ratios=[1] * n_cols + [0.06],
-                hspace=0.08,
-                wspace=0.04,
-            )
-            for row_idx, (time_name, row_kind, fixed_maps, exp_maps, chunk_idx, chunk) in enumerate(row_specs):
-                show_fixed = chunk_idx == 0
-                # 颗粒图第一块保留 LR/GT；eight_experiments 的第二块也空出 LR 和 GT 两列，
-                # 让后 4 个实验与第一行的实验列对齐，而不是落到 GT 那一列下面。
-                current_fixed_maps = fixed_maps if show_fixed else [None] * fixed_count
-                row_arrays = current_fixed_maps + [exp_maps.get(exp_key) for exp_key in chunk]
-                row_arrays += [None] * (n_cols - len(row_arrays))
-                # 颗粒 SR 对比图的 LR 面板使用原始低分辨率尺寸；
-                # 参考画布取 GT 和各个 SR 的最大尺寸，确保 LR 顶部与旁边图像上边缘对齐。
-                lr_reference_shape = None
-                if row_kind == "image":
-                    lr_reference_shape = self.reference_hw([fixed_maps[1]] + [exp_maps.get(exp_key) for exp_key in exp_keys])
-                if row_kind == "image":
-                    all_row_arrays = fixed_maps + [exp_maps.get(exp_key) for exp_key in exp_keys]
-                    vmin, vmax = self.row_limit(all_row_arrays, self.cfg.PARTICLE_VALUE_COLORBAR_LIMIT)
-                    cmap = self.cfg.IMAGE_CMAP
-                    colorbar_label = self.cfg.PARTICLE_VALUE_COLORBAR_LABEL
-                    labels = ([self.cfg.LR_PANEL_LABEL, self.cfg.GT_PANEL_LABEL] if show_fixed else [""] * fixed_count) + [
-                        self.experiment_label(exp_key) for exp_key in chunk
-                    ]
-                else:
-                    # 组合图中的颗粒误差行也使用 0 居中的白色发散色条。
-                    vmin, vmax = self.row_limit(
-                        self.error_colorbar_reference_arrays(exp_maps),
-                        self.cfg.PARTICLE_ERROR_COLORBAR_LIMIT,
-                        center_zero=True,
-                    )
-                    cmap = self.cfg.ERROR_CMAP
-                    colorbar_label = self.cfg.PARTICLE_ERROR_COLORBAR_LABEL
-                    labels = (
-                        [self.cfg.BLANK_PANEL_LABEL, self.cfg.BLANK_PANEL_LABEL] if show_fixed else [""] * fixed_count
-                    ) + [
-                        self.experiment_label(exp_key) for exp_key in chunk
-                    ]
-                labels += [""] * (n_cols - len(labels))
-                image_handle = None
-                row_axes: list[plt.Axes] = []
-                for col_idx, array in enumerate(row_arrays):
-                    ax = fig.add_subplot(gs[row_idx, col_idx])
-                    row_axes.append(ax)
-                    if row_kind == "image" and col_idx == 0:
-                        handle = self.draw_map_original_size(
-                            ax,
-                            array,
-                            cmap,
-                            vmin,
-                            vmax,
-                            labels[col_idx],
-                            lr_reference_shape,
-                        )
+                row_height = 0.72 if is_experiment else 2.05
+                min_height = 2.2 if is_experiment else 4.2
+                fig = plt.figure(figsize=(2.0 * n_cols + 0.5, max(min_height, row_height * len(row_specs))))
+                gs = fig.add_gridspec(
+                    len(row_specs),
+                    n_cols + 1,
+                    width_ratios=[1] * n_cols + [0.06],
+                    hspace=0.04 if is_experiment else 0.08,
+                    wspace=0.04,
+                )
+                for row_idx, (row_time_name, row_kind, fixed_maps, exp_maps, chunk_idx, chunk) in enumerate(row_specs):
+                    show_fixed = chunk_idx == 0
+                    # 非 experiment 第一块保留 LR/GT；experiment 第一块只保留 GT。
+                    current_fixed_maps = fixed_maps if show_fixed else [None] * fixed_count
+                    row_arrays = current_fixed_maps + [exp_maps.get(exp_key) for exp_key in chunk]
+                    row_arrays += [None] * (n_cols - len(row_arrays))
+                    lr_reference_shape = None
+                    if row_kind == "image" and not is_experiment:
+                        lr_reference_shape = self.reference_hw([fixed_maps[1]] + [exp_maps.get(exp_key) for exp_key in exp_keys])
+                    if row_kind == "image":
+                        all_row_arrays = fixed_maps + [exp_maps.get(exp_key) for exp_key in exp_keys]
+                        vmin, vmax = self.row_limit(all_row_arrays, self.cfg.PARTICLE_VALUE_COLORBAR_LIMIT)
+                        cmap = self.cfg.IMAGE_CMAP
+                        colorbar_label = self.cfg.PARTICLE_VALUE_COLORBAR_LABEL
+                        fixed_labels = [self.cfg.GT_PANEL_LABEL] if is_experiment else [
+                            self.cfg.LR_PANEL_LABEL,
+                            self.cfg.GT_PANEL_LABEL,
+                        ]
+                        labels = (fixed_labels if show_fixed else [""] * fixed_count) + [
+                            self.experiment_label(exp_key) for exp_key in chunk
+                        ]
                     else:
-                        fill_panel = (
-                            normalize_name(group.category_name) == "tbl"
-                            and not crop
-                            and row_kind == "error"
-                            and bool(getattr(self.cfg, "TBL_FULL_FRAME_ERROR_FILL_PANEL", True))
+                        # 组合图中的颗粒误差行也使用 0 居中的白色发散色条。
+                        vmin, vmax = self.row_limit(
+                            self.error_colorbar_reference_arrays(exp_maps),
+                            self.cfg.PARTICLE_ERROR_COLORBAR_LIMIT,
+                            center_zero=True,
                         )
-                        handle = self.draw_map(ax, array, cmap, vmin, vmax, labels[col_idx], fill_panel=fill_panel)
-                    image_handle = handle or image_handle
-                    if col_idx == 0 and show_fixed:
-                        ax.text(
-                            -0.08,
-                            0.5,
-                            self.cfg.PREVIOUS_ROW_LABEL if time_name == "previous" else self.cfg.NEXT_ROW_LABEL,
-                            transform=ax.transAxes,
-                            ha="right",
-                            va="center",
-                            rotation=90,
-                            fontsize=self.cfg.PANEL_LABEL_SIZE,
-                        )
-                cax = fig.add_subplot(gs[row_idx, n_cols])
-                if image_handle is not None and vmin is not None and vmax is not None:
-                    cb = self.add_colorbar(fig, image_handle, cax=cax)
-                    cb.set_label(colorbar_label, fontsize=self.cfg.COLORBAR_LABEL_SIZE)
-                    # eight_experiments 的颗粒图/误差图是等比例方图，GridSpec 行高通常大于图片实际高度；
-                    # 如果色条直接占满整行，就会出现上下边界和误差图不齐。这里取当前行有效图片轴的实际位置，
-                    # 把色条轴高度裁到同样的 y0/y1，保证每条色条上下都和对应图片对齐。
-                    self.align_colorbar_to_axes(cax, row_axes)
-                else:
-                    cax.axis("off")
+                        cmap = self.cfg.ERROR_CMAP
+                        colorbar_label = self.cfg.PARTICLE_ERROR_COLORBAR_LABEL
+                        labels = (
+                            [self.cfg.BLANK_PANEL_LABEL, self.cfg.BLANK_PANEL_LABEL] if show_fixed else [""] * fixed_count
+                        ) + [
+                            self.experiment_label(exp_key) for exp_key in chunk
+                        ]
+                    labels += [""] * (n_cols - len(labels))
+                    image_handle = None
+                    row_axes: list[plt.Axes] = []
+                    for col_idx, array in enumerate(row_arrays):
+                        ax = fig.add_subplot(gs[row_idx, col_idx])
+                        row_axes.append(ax)
+                        if row_kind == "image" and col_idx == 0 and not is_experiment:
+                            handle = self.draw_map_original_size(
+                                ax,
+                                array,
+                                cmap,
+                                vmin,
+                                vmax,
+                                labels[col_idx],
+                                lr_reference_shape,
+                            )
+                        else:
+                            fill_panel = (
+                                normalize_name(group.category_name) == "tbl"
+                                and not crop
+                                and row_kind == "error"
+                                and bool(getattr(self.cfg, "TBL_FULL_FRAME_ERROR_FILL_PANEL", True))
+                            )
+                            handle = self.draw_map(ax, array, cmap, vmin, vmax, labels[col_idx], fill_panel=fill_panel)
+                        image_handle = handle or image_handle
+                        if col_idx == 0 and show_fixed:
+                            ax.text(
+                                -0.08,
+                                0.5,
+                                self.cfg.PREVIOUS_ROW_LABEL if row_time_name == "previous" else self.cfg.NEXT_ROW_LABEL,
+                                transform=ax.transAxes,
+                                ha="right",
+                                va="center",
+                                rotation=90,
+                                fontsize=self.cfg.PANEL_LABEL_SIZE,
+                            )
+                    cax = fig.add_subplot(gs[row_idx, n_cols])
+                    if image_handle is not None and vmin is not None and vmax is not None:
+                        cb = self.add_colorbar(fig, image_handle, cax=cax)
+                        cb.set_label(colorbar_label, fontsize=self.cfg.COLORBAR_LABEL_SIZE)
+                        # 取当前行有效图片轴的实际位置，把色条轴高度裁到同样的 y0/y1。
+                        self.align_colorbar_to_axes(cax, row_axes)
+                    else:
+                        cax.axis("off")
 
-            out_dir = self.output_dir(
-                self.cfg.COMPOSITE_OUTPUT_DIR_NAME,
-                group.class_name,
-                group.split_name,
-                group.category_name,
-                bundle.sample_name,
-            )
-            suffix = getattr(self.cfg, "TBL_PARTICLE_CROP_OUTPUT_SUFFIX", "_crop") if crop else ""
-            self.save_figure(fig, out_dir / f"particle_sr_error_composite{suffix}")
+                out_dir = self.output_dir(
+                    self.cfg.COMPOSITE_OUTPUT_DIR_NAME,
+                    group.class_name,
+                    group.split_name,
+                    group.category_name,
+                    bundle.sample_name,
+                )
+                suffix = getattr(self.cfg, "TBL_PARTICLE_CROP_OUTPUT_SUFFIX", "_crop") if crop else ""
+                # 文件名显式带 previous/next，避免重新生成时仍把两个时刻堆到同一张长图里。
+                self.save_figure(fig, out_dir / f"particle_sr_error_composite_{time_name}{suffix}")
 
     def plot_particle_sr_error_composites_vertical(self, group: GroupContext) -> None:
         """TBL full-frame 颗粒图专用竖排版：每行一个实验/参考图，左列图像，右列误差。"""
@@ -3091,6 +3951,10 @@ class AllHandlePipeline:
                         err_maps[exp_key] = err_map
                 if not pred_maps and not err_maps:
                     continue
+                bottom_reference_arrays = self.error_colorbar_reference_arrays(err_maps)
+                bottom_limit = self.cfg.FLOW_ERROR_COLORBAR_LIMIT
+                if is_tbl and getattr(self.cfg, "TBL_FLOW_ERROR_COLORBAR_PERCENTILE", None) is not None:
+                    bottom_limit = self.flow_error_color_limit_for_category(group.category_name, bottom_reference_arrays)
                 self.plot_two_row_method_composite(
                     fixed_top=[gt_map],
                     method_top=pred_maps,
@@ -3107,7 +3971,7 @@ class AllHandlePipeline:
                     top_cmap=self.cfg.IMAGE_CMAP,
                     bottom_cmap=self.cfg.ERROR_CMAP,
                     top_limit=self.cfg.FLOW_VALUE_COLORBAR_LIMIT,
-                    bottom_limit=self.cfg.FLOW_ERROR_COLORBAR_LIMIT,
+                    bottom_limit=bottom_limit,
                     top_fallback_limit=self.flow_value_component_fallback_limit(group.category_name, component),
                     top_colorbar_label=self.cfg.FLOW_VALUE_COLORBAR_LABEL,
                     bottom_colorbar_label=self.cfg.FLOW_ERROR_COLORBAR_LABEL,
@@ -3115,7 +3979,7 @@ class AllHandlePipeline:
                     fixed_bottom_labels=[self.cfg.BLANK_PANEL_LABEL],
                     method_labels={k: self.experiment_label(k) for k in pred_maps.keys() | err_maps.keys()},
                     bottom_center_zero=True,
-                    bottom_reference_arrays=self.error_colorbar_reference_arrays(err_maps),
+                    bottom_reference_arrays=bottom_reference_arrays,
                     bottom_fill_panel=is_tbl,
                 )
 
@@ -3880,130 +4744,177 @@ class AllHandlePipeline:
                 bundle.sample_name,
             )
             is_tbl = normalize_name(group.category_name) == "tbl"
+            # experiment 的 LR 就是原始实验图，HR 又是 LR 插值得到的伪参考；
+            # 颗粒阈值对比和 count/pixels 条形图里再放 LR 会重复且容易误读。
+            # 因此只有非 experiment 类别保留 “GT 后面一列 LR” 的对比方式。
+            include_lr = normalize_name(group.category_name) != "experiment"
             if not metrics_only:
-                self.plot_particle_stats_image_composite(bundle, exp_keys, out_dir, crop=False, is_tbl=is_tbl)
-            self.plot_particle_stats_metric_composite(bundle, exp_keys, out_dir, crop=False)
+                self.plot_particle_stats_image_composite(
+                    bundle,
+                    exp_keys,
+                    out_dir,
+                    crop=False,
+                    is_tbl=is_tbl,
+                    include_lr=include_lr,
+                )
+            self.plot_particle_stats_metric_composite(bundle, exp_keys, out_dir, crop=False, include_lr=include_lr)
             # TBL 的 crop 颗粒统计与原图统计都要保留：
             # full-frame 用原始 npy/csv，crop 版优先读取 *_crop*.npy，SR/GT 图没有 crop npy 时再按同一 crop 框裁。
             if is_tbl and getattr(self.cfg, "TBL_PARTICLE_CROP_ENABLED", True):
                 if not metrics_only:
-                    self.plot_particle_stats_image_composite(bundle, exp_keys, out_dir, crop=True, is_tbl=is_tbl)
-                self.plot_particle_stats_metric_composite(bundle, exp_keys, out_dir, crop=True)
+                    self.plot_particle_stats_image_composite(
+                        bundle,
+                        exp_keys,
+                        out_dir,
+                        crop=True,
+                        is_tbl=is_tbl,
+                        include_lr=include_lr,
+                    )
+                self.plot_particle_stats_metric_composite(bundle, exp_keys, out_dir, crop=True, include_lr=include_lr)
 
     def particle_stats_metric_config(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
         """集中返回颗粒统计条形图的指标 key 和图上显示 label。"""
 
-        # 按用户要求，颗粒统计拆分后的条形统计图只保留 count 和 particle pixels；
+        # 按用户要求，颗粒统计拆分后的条形统计图只保留 count、particle pixels 和 mean area；
         # IoU/precision/recall/F1 不再画入这张图，避免产生多余空行和过密子图。
-        metrics = ("count", "pixels")
+        metrics = ("count", "pixels", "mean_area")
         metric_labels = (
             self.cfg.PARTICLE_STAT_COUNT_LABEL,
             self.cfg.PARTICLE_STAT_PIXEL_LABEL,
+            self.cfg.PARTICLE_STAT_MEAN_AREA_LABEL,
         )
         return metrics, metric_labels
 
     def plot_particle_stats_image_composite(
-        self, bundle: SampleBundle, exp_keys: list[str], out_dir: Path, crop: bool = False, is_tbl: bool = False
+        self,
+        bundle: SampleBundle,
+        exp_keys: list[str],
+        out_dir: Path,
+        crop: bool = False,
+        is_tbl: bool = False,
+        include_lr: bool = True,
     ) -> None:
-        """只绘制 previous/next 的 GT、各实验 SR 图和阈值图；crop=True 时读取 TBL crop 数据。"""
+        """只绘制 previous/next 的 GT、LR 和各实验阈值图；crop=True 时读取 TBL crop 数据。"""
 
         if is_tbl and not crop and getattr(self.cfg, "TBL_PARTICLE_STATS_IMAGE_VERTICAL_LAYOUT", True):
             self.plot_particle_stats_image_composite_vertical(bundle, exp_keys, out_dir)
             return
 
-        n_cols = 2 + len(exp_keys)
+        fixed_count = 2 if include_lr else 1
+        compact_experiment_layout = not include_lr and not is_tbl
+        exp_chunks = self.chunk_items(exp_keys, self.particle_binary_wrap_method_count())
+        method_cols = max((len(chunk) for chunk in exp_chunks), default=0)
+        n_cols = fixed_count + method_cols
+        rows_per_time = max(1, len(exp_chunks))
+        gap_row = rows_per_time if not compact_experiment_layout else None
+        total_rows = rows_per_time * 2 + (0 if compact_experiment_layout else 1)
+        # 颗粒阈值对比图与普通组合图的换行规则不同：GT/LR 是固定参考列，
+        # eight_experiments 后半 4 个实验、without_widim_hs 后半 3 个实验都要从第三列开始，
+        # 因此每个后续分块都在前面补空白列，只让实验图与上方实验列对齐。
+        row_ratio = self.cfg.PARTICLE_STATS_IMAGE_ROW_RATIO
+        time_row_ratios: list[float] = []
+        for _ in exp_chunks:
+            time_row_ratios.append(row_ratio)
+        if compact_experiment_layout:
+            # experiment 颗粒阈值图只看 GT 和各实验二值图，不需要 previous/next 中间额外空白行；
+            # 去掉 gap 后，图像上下间隔由 hspace 控制，和左右 wspace 使用同一个数值。
+            height_ratios = time_row_ratios + time_row_ratios
+        else:
+            height_ratios = (
+                time_row_ratios
+                + [float(getattr(self.cfg, "PARTICLE_STATS_IMAGE_COMPACT_BLOCK_GAP_RATIO", self.cfg.PARTICLE_STATS_BLOCK_GAP_RATIO))]
+                + time_row_ratios
+            )
         # 颗粒图/阈值图只需要展示图像本身，不能复用条形统计图的宽列参数；
-        # 这里使用单独的紧凑画布，避免 crop 阈值图在横向多列时被大片空白隔开。
+        # 分块后列数变少、行数变多，所以按行数同步放大高度，避免标题和图像互相挤压。
         fig_width = max(7.5, float(getattr(self.cfg, "PARTICLE_STATS_IMAGE_WIDTH_PER_COL", 1.35)) * n_cols)
-        fig_height = float(getattr(self.cfg, "PARTICLE_STATS_IMAGE_COMPACT_FIG_HEIGHT", self.cfg.PARTICLE_STATS_IMAGE_FIG_HEIGHT))
+        base_height = float(
+            getattr(self.cfg, "PARTICLE_STATS_IMAGE_COMPACT_FIG_HEIGHT", self.cfg.PARTICLE_STATS_IMAGE_FIG_HEIGHT)
+        )
+        if compact_experiment_layout:
+            # 现在只保留阈值图行，按行数重新估算高度，避免上下方向留下大片空白。
+            # 按行数重新估算高度，让等比例显示后的竖向空白接近横向间隔。
+            fig_height = max(2.2, 0.55 * total_rows)
+        else:
+            fig_height = max(base_height * 0.55, base_height * rows_per_time / 2.0)
         fig = plt.figure(figsize=(fig_width, fig_height))
-        height_ratios = [
-            self.cfg.PARTICLE_STATS_IMAGE_ROW_RATIO,
-            self.cfg.PARTICLE_STATS_IMAGE_ROW_RATIO,
-            float(getattr(self.cfg, "PARTICLE_STATS_IMAGE_COMPACT_BLOCK_GAP_RATIO", self.cfg.PARTICLE_STATS_BLOCK_GAP_RATIO)),
-            self.cfg.PARTICLE_STATS_IMAGE_ROW_RATIO,
-            self.cfg.PARTICLE_STATS_IMAGE_ROW_RATIO,
-        ]
+        grid_space = float(getattr(self.cfg, "PARTICLE_STATS_IMAGE_COMPACT_WSPACE", self.cfg.PARTICLE_STATS_WSPACE))
         gs = fig.add_gridspec(
-            5,
+            total_rows,
             n_cols,
             height_ratios=height_ratios,
-            hspace=float(getattr(self.cfg, "PARTICLE_STATS_IMAGE_COMPACT_HSPACE", self.cfg.PARTICLE_STATS_HSPACE)),
-            wspace=float(getattr(self.cfg, "PARTICLE_STATS_IMAGE_COMPACT_WSPACE", self.cfg.PARTICLE_STATS_WSPACE)),
+            hspace=grid_space
+            if compact_experiment_layout
+            else float(getattr(self.cfg, "PARTICLE_STATS_IMAGE_COMPACT_HSPACE", self.cfg.PARTICLE_STATS_HSPACE)),
+            wspace=grid_space,
         )
-        gap_ax = fig.add_subplot(gs[2, :])
-        gap_ax.axis("off")
+        if gap_row is not None:
+            gap_ax = fig.add_subplot(gs[gap_row, :])
+            gap_ax.axis("off")
 
         for block_idx, time_name in enumerate(("previous", "next")):
-            row0 = 0 if block_idx == 0 else 3
+            row0 = 0 if block_idx == 0 else (rows_per_time if compact_experiment_layout else gap_row + 1)
             gt = self.first_available_particle(bundle, time_name, "gt", crop=crop)
-            lr = self.first_available_particle(bundle, time_name, "lr", crop=crop)
+            lr = self.first_available_particle(bundle, time_name, "lr", crop=crop) if include_lr else None
             gt_binary = self.first_available_particle(bundle, time_name, "gt_binary", crop=crop)
-            lr_payload = self.compute_lr_particle_binary_stats_payload(bundle, time_name, crop=crop)
+            lr_payload = self.compute_lr_particle_binary_stats_payload(bundle, time_name, crop=crop) if include_lr else None
             lr_binary = lr_payload.get("pred_binary") if lr_payload else None
-            sr_maps = {
-                exp_key: self.load_particle_array_mode(sample_dir, time_name, "sr", crop=crop)
-                for exp_key, sample_dir in bundle.sample_dirs.items()
-            }
             sr_binary_maps = {
                 exp_key: self.load_particle_array_mode(sample_dir, time_name, "sr_binary", crop=crop)
                 for exp_key, sample_dir in bundle.sample_dirs.items()
             }
-            image_vmin, image_vmax = self.row_limit([gt, lr] + list(sr_maps.values()), self.cfg.PARTICLE_VALUE_COLORBAR_LIMIT)
             binary_vmin, binary_vmax = 0.0, 1.0
 
-            # 颗粒阈值对比图在 GT 后面加入 LR：第一行是 GT/LR/SR，第二行是对应二值图。
-            # LR 通常没有单独保存 binary npy，因此使用当前样本阈值 T 即时生成 LR binary。
-            first_row_arrays = [gt, lr] + [sr_maps.get(exp_key) for exp_key in exp_keys]
-            first_row_labels = [self.cfg.GT_PANEL_LABEL, self.cfg.LR_PANEL_LABEL] + [
-                self.experiment_label(exp_key) for exp_key in exp_keys
-            ]
-            second_row_arrays = [gt_binary, lr_binary] + [sr_binary_maps.get(exp_key) for exp_key in exp_keys]
-            second_row_labels = [self.cfg.GT_PANEL_LABEL, self.cfg.LR_PANEL_LABEL] + [
-                self.experiment_label(exp_key) for exp_key in exp_keys
-            ]
+            # 按用户要求，颗粒阈值对比图不再绘制超分辨率灰度图，只保留阈值/二值图。
+            # 第一个分块显示 GT/LR 阈值图；后续分块把 GT/LR 两列留空，使后半实验从第三列开始对齐。
             label_size = float(getattr(self.cfg, "PARTICLE_BINARY_PANEL_LABEL_SIZE", self.cfg.PANEL_LABEL_SIZE))
-            for col_idx in range(n_cols):
-                ax = fig.add_subplot(gs[row0, col_idx])
-                self.draw_map(
-                    ax,
-                    first_row_arrays[col_idx] if col_idx < len(first_row_arrays) else None,
-                    self.cfg.IMAGE_CMAP,
-                    image_vmin,
-                    image_vmax,
-                    first_row_labels[col_idx] if col_idx < len(first_row_labels) else "",
-                    label_fontsize=label_size,
-                )
-                if col_idx == 0:
-                    ax.text(
-                        -0.08,
-                        0.5,
-                        self.cfg.PREVIOUS_ROW_LABEL if time_name == "previous" else self.cfg.NEXT_ROW_LABEL,
-                        transform=ax.transAxes,
-                        ha="right",
-                        va="center",
-                        rotation=90,
-                        fontsize=self.cfg.PANEL_LABEL_SIZE,
+            for chunk_idx, exp_chunk in enumerate(exp_chunks):
+                binary_row = row0 + chunk_idx
+                show_fixed = chunk_idx == 0
+
+                if show_fixed:
+                    binary_arrays = [gt_binary] + ([lr_binary] if include_lr else [])
+                    binary_labels = [self.cfg.GT_PANEL_LABEL] + ([self.cfg.LR_PANEL_LABEL] if include_lr else [])
+                else:
+                    binary_arrays = [None] * fixed_count
+                    binary_labels = [""] * fixed_count
+
+                binary_arrays += [sr_binary_maps.get(exp_key) for exp_key in exp_chunk]
+                binary_labels += [self.experiment_label(exp_key) for exp_key in exp_chunk]
+                binary_arrays += [None] * (n_cols - len(binary_arrays))
+                binary_labels += [""] * (n_cols - len(binary_labels))
+
+                for col_idx in range(n_cols):
+                    ax = fig.add_subplot(gs[binary_row, col_idx])
+                    self.draw_map(
+                        ax,
+                        binary_arrays[col_idx],
+                        self.cfg.BINARY_CMAP,
+                        binary_vmin,
+                        binary_vmax,
+                        binary_labels[col_idx],
+                        label_fontsize=label_size,
                     )
-                ax = fig.add_subplot(gs[row0 + 1, col_idx])
-                self.draw_map(
-                    ax,
-                    second_row_arrays[col_idx] if col_idx < len(second_row_arrays) else None,
-                    self.cfg.BINARY_CMAP,
-                    binary_vmin,
-                    binary_vmax,
-                    second_row_labels[col_idx] if col_idx < len(second_row_labels) else "",
-                    label_fontsize=label_size,
-                )
+                    if col_idx == 0 and show_fixed:
+                        ax.text(
+                            -0.08,
+                            0.5,
+                            self.cfg.PREVIOUS_ROW_LABEL if time_name == "previous" else self.cfg.NEXT_ROW_LABEL,
+                            transform=ax.transAxes,
+                            ha="right",
+                            va="center",
+                            rotation=90,
+                            fontsize=self.cfg.PANEL_LABEL_SIZE,
+                        )
 
         suffix = getattr(self.cfg, "TBL_PARTICLE_CROP_OUTPUT_SUFFIX", "_crop") if crop else ""
-        # 保留原文件名，但内容改为纯图像/阈值对比；统计行已拆到 particle_binary_stats_metrics_composite。
+        # 保留原文件名，但内容改为纯阈值图对比；统计行已拆到 particle_binary_stats_metrics_composite。
         self.save_figure(fig, out_dir / f"particle_binary_stats_composite{suffix}")
 
     def plot_particle_stats_image_composite_vertical(
         self, bundle: SampleBundle, exp_keys: list[str], out_dir: Path
     ) -> None:
-        """TBL full-frame 颗粒图/阈值图纵向两列排版：左颗粒图，右阈值图。"""
+        """TBL full-frame 颗粒阈值图纵向排版：去掉超分辨率灰度图，只保留阈值图。"""
 
         rows: list[tuple[str, str, np.ndarray | None, np.ndarray | None]] = []
         for time_name in ("previous", "next"):
@@ -4027,32 +4938,31 @@ class AllHandlePipeline:
                 rows.append(("gap", "", None, None))
 
         row_count = len(rows)
-        fig_width = float(getattr(self.cfg, "TBL_STATS_IMAGE_VERTICAL_FIG_WIDTH", 8.6))
+        fig_width = max(6.5, float(getattr(self.cfg, "TBL_STATS_IMAGE_VERTICAL_FIG_WIDTH", 8.6)) * 0.55)
         row_height = float(getattr(self.cfg, "TBL_STATS_IMAGE_VERTICAL_ROW_HEIGHT", 1.15))
         fig = plt.figure(figsize=(fig_width, max(3.0, row_height * row_count)))
         height_ratios = [0.22 if time_name == "gap" else 1.0 for time_name, _, _, _ in rows]
         gs = fig.add_gridspec(
             row_count,
-            2,
+            1,
             height_ratios=height_ratios,
             hspace=float(getattr(self.cfg, "TBL_STATS_IMAGE_VERTICAL_HSPACE", 0.06)),
-            wspace=float(getattr(self.cfg, "TBL_STATS_IMAGE_VERTICAL_WSPACE", 0.05)),
         )
-        image_arrays = [array for time_name, _, array, _ in rows if time_name != "gap"]
-        image_vmin, image_vmax = self.row_limit(image_arrays, self.cfg.PARTICLE_VALUE_COLORBAR_LIMIT)
         label_size = float(getattr(self.cfg, "PARTICLE_BINARY_PANEL_LABEL_SIZE", self.cfg.PANEL_LABEL_SIZE))
         for row_idx, (time_name, label, image_array, binary_array) in enumerate(rows):
             if time_name == "gap":
-                ax = fig.add_subplot(gs[row_idx, :])
+                ax = fig.add_subplot(gs[row_idx, 0])
                 ax.axis("off")
                 continue
             ax = fig.add_subplot(gs[row_idx, 0])
+            # 按用户要求，这张颗粒阈值对比图只保留 threshold/binary 图；
+            # 原来的 SR/GT/LR 灰度颗粒图列不再绘制，避免与阈值结果重复占用版面。
             self.draw_map(
                 ax,
-                image_array,
-                self.cfg.IMAGE_CMAP,
-                image_vmin,
-                image_vmax,
+                binary_array,
+                self.cfg.BINARY_CMAP,
+                0.0,
+                1.0,
                 label,
                 fill_panel=True,
                 label_fontsize=label_size,
@@ -4068,49 +4978,32 @@ class AllHandlePipeline:
                     rotation=90,
                     fontsize=self.cfg.PANEL_LABEL_SIZE,
                 )
-            ax = fig.add_subplot(gs[row_idx, 1])
-            self.draw_map(
-                ax,
-                binary_array,
-                self.cfg.BINARY_CMAP,
-                0.0,
-                1.0,
-                f"{label} binary",
-                fill_panel=True,
-                label_fontsize=label_size,
-            )
 
         self.save_figure(fig, out_dir / "particle_binary_stats_composite")
 
     def plot_particle_stats_metric_composite(
-        self, bundle: SampleBundle, exp_keys: list[str], out_dir: Path, crop: bool = False
+        self, bundle: SampleBundle, exp_keys: list[str], out_dir: Path, crop: bool = False, include_lr: bool = True
     ) -> None:
-        """单独绘制 GT 灰度直方图和统计条形图；crop=True 时使用 TBL 已保存 crop stats/hist。"""
+        """把 GT 灰度直方图、count、pixels、mean_area 拆成独立图片。"""
 
         metrics, metric_labels = self.particle_stats_metric_config()
-        # 现在只保留灰度直方图、count 和 particle pixels，previous/next 各占一行；
-        # 去掉原来为 IoU/precision/recall/F1 预留的第二行和中间空行。
-        n_cols = 1 + len(metrics)
-        fig_width = max(12.0, self.cfg.PARTICLE_STATS_FIG_WIDTH_PER_COL * n_cols * 1.45)
-        fig_height = max(5.6, float(self.cfg.PARTICLE_STATS_METRIC_FIG_HEIGHT) * 0.55)
-        fig = plt.figure(figsize=(fig_width, fig_height))
-        gs = fig.add_gridspec(
-            2,
-            n_cols,
-            height_ratios=[self.cfg.PARTICLE_STATS_CHART_ROW_RATIO, self.cfg.PARTICLE_STATS_CHART_ROW_RATIO],
-            hspace=self.cfg.PARTICLE_STATS_HSPACE,
-            wspace=self.cfg.PARTICLE_STATS_WSPACE,
-        )
         patch_cls = ensure_matplotlib().matplotlib.patches.Patch
+        legend_keys = [None] + (["__lr__"] if include_lr else []) + exp_keys
         legend_handles = [
             patch_cls(facecolor=self.particle_stats_bar_color(key), edgecolor=self.cfg.PARTICLE_STATS_BAR_EDGE_COLOR)
-            for key in ([None, "__lr__"] + exp_keys)
+            for key in legend_keys
         ]
-        legend_labels = [self.cfg.GT_PANEL_LABEL, self.cfg.LR_PANEL_LABEL] + [self.experiment_label(k) for k in exp_keys]
+        legend_labels = [self.cfg.GT_PANEL_LABEL] + ([self.cfg.LR_PANEL_LABEL] if include_lr else []) + [
+            self.experiment_label(k) for k in exp_keys
+        ]
 
         for block_idx, time_name in enumerate(("previous", "next")):
-            row_start = block_idx
-            hist_ax = fig.add_subplot(gs[row_start, 0])
+            # 原先的 particle_binary_stats_metrics_composite 把 previous/next 的多个子图塞在同一张大图里；
+            # 现在按用户要求拆开保存，每个时间、每个指标各一张图，便于论文排版时自由组合。
+            hist_fig, hist_ax = plt.subplots(figsize=(
+                float(getattr(self.cfg, "PARTICLE_STATS_SINGLE_HIST_FIG_WIDTH", 5.2)),
+                float(getattr(self.cfg, "PARTICLE_STATS_SINGLE_HIST_FIG_HEIGHT", 3.4)),
+            ))
             self.draw_particle_gray_hist(hist_ax, bundle, time_name, crop=crop)
             hist_ax.text(
                 float(getattr(self.cfg, "PARTICLE_STATS_ROW_LABEL_X", -0.23)),
@@ -4122,24 +5015,46 @@ class AllHandlePipeline:
                 rotation=90,
                 fontsize=self.cfg.PANEL_LABEL_SIZE,
             )
+            suffix = getattr(self.cfg, "TBL_PARTICLE_CROP_OUTPUT_SUFFIX", "_crop") if crop else ""
+            self.save_figure(hist_fig, out_dir / f"particle_binary_stats_gray_hist_{time_name}{suffix}")
+
             stats = {
                 exp_key: self.load_particle_stats(sample_dir, time_name, crop=crop)
                 for exp_key, sample_dir in bundle.sample_dirs.items()
             }
             gt_stats = self.load_particle_gt_stats(bundle, time_name, crop=crop)
-            lr_stats = self.load_particle_lr_stats(bundle, time_name, crop=crop)
-            bar_labels = [self.cfg.GT_PANEL_LABEL, self.cfg.LR_PANEL_LABEL] + [self.experiment_label(k) for k in exp_keys]
-            bar_exp_keys = [None, "__lr__"] + exp_keys
+            lr_stats = self.load_particle_lr_stats(bundle, time_name, crop=crop) if include_lr else {}
+            bar_labels = [self.cfg.GT_PANEL_LABEL] + ([self.cfg.LR_PANEL_LABEL] if include_lr else []) + [
+                self.experiment_label(k) for k in exp_keys
+            ]
+            bar_exp_keys = [None] + (["__lr__"] if include_lr else []) + exp_keys
             bar_colors = [self.particle_stats_bar_color(key) for key in bar_exp_keys]
+            # 与拆出来的每张条形图配套保存数值诊断表：accuracy_vs_gt 衡量接近 GT 的程度，
+            # improvement_vs_lr 衡量相对 LR 的误差降低比例，方便后续直接做表格或二次统计。
+            self.write_particle_stats_accuracy_csv(
+                out_dir / f"particle_binary_stats_accuracy_{time_name}{suffix}.csv",
+                bundle,
+                exp_keys,
+                metrics,
+                metric_labels,
+                gt_stats,
+                lr_stats,
+                stats,
+                include_lr=include_lr,
+                time_name=time_name,
+                crop=crop,
+            )
 
             for metric_idx, (metric, label) in enumerate(zip(metrics, metric_labels)):
-                # count 和 particle pixels 与灰度直方图同行显示，不再保留其它指标的空行。
-                plot_row = row_start
-                plot_col = metric_idx + 1
-                ax = fig.add_subplot(gs[plot_row, plot_col])
+                fig, ax = plt.subplots(figsize=(
+                    float(getattr(self.cfg, "PARTICLE_STATS_SINGLE_BAR_FIG_WIDTH", 5.8)),
+                    float(getattr(self.cfg, "PARTICLE_STATS_SINGLE_BAR_FIG_HEIGHT", 3.6)),
+                ))
+                base_values = [gt_stats.get(metric, np.nan)]
+                if include_lr:
+                    base_values.append(lr_stats.get(metric, np.nan))
                 values = np.asarray(
-                    [gt_stats.get(metric, np.nan), lr_stats.get(metric, np.nan)]
-                    + [stats.get(exp_key, {}).get(metric, np.nan) for exp_key in exp_keys],
+                    base_values + [stats.get(exp_key, {}).get(metric, np.nan) for exp_key in exp_keys],
                     dtype=np.float64,
                 )
                 x_pos = np.arange(len(bar_labels))
@@ -4179,10 +5094,10 @@ class AllHandlePipeline:
                 except Exception:
                     pass
                 ax.tick_params(axis="x", pad=1)
-                ax.set_ylabel(self.cfg.PARTICLE_METRIC_Y_LABEL if metric not in ("count", "pixels") else self.cfg.PARTICLE_COUNT_Y_LABEL)
+                ax.set_ylabel(self.cfg.PARTICLE_COUNT_Y_LABEL if metric in ("count", "pixels") else self.cfg.PARTICLE_METRIC_Y_LABEL)
                 self.panel_text(ax, label)
                 ax.grid(True, alpha=0.18, linewidth=0.5)
-                # 按用户要求，每张条形统计图内部都放图例；固定到右上角，避免自动布局把图例放到左上，
+                # 按用户要求，每张独立条形统计图内部都放图例；固定到右上角，避免自动布局把图例放到左上，
                 # 从而和 count / particle pixels 的面板 label 挤在一起。
                 legend_kwargs = {
                     "loc": getattr(self.cfg, "PARTICLE_STATS_LEGEND_LOC", "upper right"),
@@ -4199,9 +5114,103 @@ class AllHandlePipeline:
                     legend_labels,
                     **legend_kwargs,
                 )
+                self.save_figure(fig, out_dir / f"particle_binary_stats_{metric}_{time_name}{suffix}")
 
-        suffix = getattr(self.cfg, "TBL_PARTICLE_CROP_OUTPUT_SUFFIX", "_crop") if crop else ""
-        self.save_figure(fig, out_dir / f"particle_binary_stats_metrics_composite{suffix}")
+    def write_particle_stats_accuracy_csv(
+        self,
+        path: Path,
+        bundle: SampleBundle,
+        exp_keys: list[str],
+        metrics: tuple[str, ...],
+        metric_labels: tuple[str, ...],
+        gt_stats: dict[str, float],
+        lr_stats: dict[str, float],
+        stats: dict[str, dict[str, float]],
+        include_lr: bool,
+        time_name: str,
+        crop: bool = False,
+    ) -> None:
+        """保存颗粒统计条形图的数值表：相对 GT 的准确度，以及相对 LR 的提升度。"""
+
+        rows: list[dict[str, str]] = []
+        methods: list[tuple[str, str, dict[str, float]]] = [(self.cfg.GT_PANEL_LABEL, "__gt__", gt_stats)]
+        if include_lr:
+            methods.append((self.cfg.LR_PANEL_LABEL, "__lr__", lr_stats))
+        methods.extend((self.experiment_label(exp_key), exp_key, stats.get(exp_key, {})) for exp_key in exp_keys)
+
+        for metric, metric_label in zip(metrics, metric_labels):
+            gt_value = self.to_float(gt_stats.get(metric))
+            lr_value = self.to_float(lr_stats.get(metric)) if include_lr else None
+            lr_error = self.absolute_error(lr_value, gt_value)
+            for method_label, method_key, method_stats in methods:
+                value = self.to_float(method_stats.get(metric))
+                error = self.absolute_error(value, gt_value)
+                accuracy = self.accuracy_vs_reference(value, gt_value)
+                improvement = self.improvement_vs_lr(error, lr_error)
+                rows.append(
+                    {
+                        "sample": bundle.sample_name,
+                        "time": time_name,
+                        "crop": "1" if crop else "0",
+                        "metric": metric,
+                        "metric_label": metric_label,
+                        "method": method_label,
+                        "method_key": method_key,
+                        "value": self.format_csv_float(value),
+                        "gt_value": self.format_csv_float(gt_value),
+                        "lr_value": self.format_csv_float(lr_value),
+                        "abs_error_vs_gt": self.format_csv_float(error),
+                        "accuracy_vs_gt": self.format_csv_float(accuracy),
+                        "accuracy_vs_gt_percent": self.format_csv_float(None if accuracy is None else accuracy * 100.0),
+                        "improvement_vs_lr": self.format_csv_float(improvement),
+                        "improvement_vs_lr_percent": self.format_csv_float(None if improvement is None else improvement * 100.0),
+                    }
+                )
+
+        columns = (
+            "sample",
+            "time",
+            "crop",
+            "metric",
+            "metric_label",
+            "method",
+            "method_key",
+            "value",
+            "gt_value",
+            "lr_value",
+            "abs_error_vs_gt",
+            "accuracy_vs_gt",
+            "accuracy_vs_gt_percent",
+            "improvement_vs_lr",
+            "improvement_vs_lr_percent",
+        )
+        self.write_csv_rows(path, rows, columns)
+
+    def absolute_error(self, value: float | None, reference: float | None) -> float | None:
+        """返回 |value-reference|；任一值缺失时返回 None。"""
+
+        if value is None or reference is None:
+            return None
+        if not math.isfinite(float(value)) or not math.isfinite(float(reference)):
+            return None
+        return abs(float(value) - float(reference))
+
+    def accuracy_vs_reference(self, value: float | None, reference: float | None) -> float | None:
+        """相对 GT 的准确度：1-|value-GT|/|GT|，越接近 1 表示越准确。"""
+
+        error = self.absolute_error(value, reference)
+        if error is None or reference is None or not math.isfinite(float(reference)) or math.isclose(float(reference), 0.0):
+            return None
+        return 1.0 - error / abs(float(reference))
+
+    def improvement_vs_lr(self, method_error: float | None, lr_error: float | None) -> float | None:
+        """相对 LR 的提升度：(LR_error-method_error)/LR_error，正值表示比 LR 更接近 GT。"""
+
+        if method_error is None or lr_error is None:
+            return None
+        if not math.isfinite(float(method_error)) or not math.isfinite(float(lr_error)) or math.isclose(float(lr_error), 0.0):
+            return None
+        return (float(lr_error) - float(method_error)) / float(lr_error)
 
     def draw_particle_gray_hist(self, ax: plt.Axes, bundle: SampleBundle, time_name: str, crop: bool = False) -> None:
         """绘制 GT 灰度直方图，并标注阈值 T；TBL crop 版优先读取已保存的 crop hist。"""
@@ -4317,6 +5326,10 @@ class AllHandlePipeline:
         return {
             "count": float(stats["pred_particle_count"]) if "pred_particle_count" in stats else float("nan"),
             "pixels": float(stats["pred_particle_pixels"]) if "pred_particle_pixels" in stats else float("nan"),
+            "mean_area": self.safe_divide(
+                float(stats["pred_particle_pixels"]) if "pred_particle_pixels" in stats else float("nan"),
+                float(stats["pred_particle_count"]) if "pred_particle_count" in stats else float("nan"),
+            ),
             "iou": float(stats["binary_iou"]) if "binary_iou" in stats else float("nan"),
             "precision": float(stats["binary_precision"]) if "binary_precision" in stats else float("nan"),
             "recall": float(stats["binary_recall"]) if "binary_recall" in stats else float("nan"),
@@ -4336,11 +5349,115 @@ class AllHandlePipeline:
             compute_stats = self.import_compute_particle_binary_stats()
             return compute_stats(ensure_2d_image(lr), ensure_2d_image(gt))
         except Exception as exc:
-            self.warn(f"failed to compute LR particle stats via compute_particle_binary_stats: {bundle.sample_name}/{time_name}: {exc}")
+            self.warn(
+                f"failed to compute LR particle stats via compute_particle_binary_stats, use local fallback: "
+                f"{bundle.sample_name}/{time_name}: {exc}"
+            )
+            return self.compute_particle_binary_stats_fallback(lr, gt)
+
+    def compute_particle_binary_stats_fallback(self, pred_image: np.ndarray, gt_image: np.ndarray) -> dict:
+        """轻量 fallback：不依赖训练/日志模块，按 HR Otsu 阈值计算 pred/GT 颗粒二值统计。"""
+
+        pred_gray = ensure_2d_image(pred_image)
+        gt_gray = ensure_2d_image(gt_image)
+        common_h = min(int(pred_gray.shape[-2]), int(gt_gray.shape[-2]))
+        common_w = min(int(pred_gray.shape[-1]), int(gt_gray.shape[-1]))
+        if common_h <= 0 or common_w <= 0:
             return {}
+        pred_gray = np.asarray(pred_gray[:common_h, :common_w], dtype=np.float32)
+        gt_gray = np.asarray(gt_gray[:common_h, :common_w], dtype=np.float32)
+        threshold = self.otsu_threshold_from_gray(gt_gray)
+        foreground_rule = self.particle_foreground_rule(gt_gray, threshold)
+        gt_binary = self.binary_from_threshold(gt_gray, threshold, foreground_rule)
+        pred_binary = self.binary_from_threshold(pred_gray, threshold, foreground_rule)
+
+        gt_count = self.count_binary_components(gt_binary)
+        pred_count = self.count_binary_components(pred_binary)
+        gt_pixels = int(np.count_nonzero(gt_binary))
+        pred_pixels = int(np.count_nonzero(pred_binary))
+        intersection = int(np.count_nonzero(gt_binary & pred_binary))
+        union = int(np.count_nonzero(gt_binary | pred_binary))
+        precision = float(intersection / pred_pixels) if pred_pixels > 0 else float("nan")
+        recall = float(intersection / gt_pixels) if gt_pixels > 0 else float("nan")
+        f1 = float((2.0 * precision * recall) / (precision + recall)) if np.isfinite(precision + recall) and (precision + recall) > 0 else float("nan")
+        stats = {
+            "threshold_method": "otsu_from_hr_only_all_handle_fallback",
+            "threshold": float(threshold),
+            "foreground_rule": foreground_rule,
+            "gt_particle_count": int(gt_count),
+            "pred_particle_count": int(pred_count),
+            "gt_particle_pixels": int(gt_pixels),
+            "pred_particle_pixels": int(pred_pixels),
+            "gt_area_mean": self.safe_divide(float(gt_pixels), float(gt_count)),
+            "pred_area_mean": self.safe_divide(float(pred_pixels), float(pred_count)),
+            "binary_iou": float(intersection / union) if union > 0 else float("nan"),
+            "binary_precision": precision,
+            "binary_recall": recall,
+            "binary_f1": f1,
+        }
+        return {"stats": stats, "pred_binary": pred_binary.astype(np.uint8), "gt_binary": gt_binary.astype(np.uint8)}
+
+    def otsu_threshold_from_gray(self, gray: np.ndarray, bins: int = 256) -> float:
+        """只基于 GT 灰度图计算 Otsu 阈值；用于本地 fallback 的 LR 颗粒统计。"""
+
+        finite = np.asarray(gray, dtype=np.float32).reshape(-1)
+        finite = finite[np.isfinite(finite)]
+        if finite.size == 0:
+            return float("nan")
+        min_value = float(np.min(finite))
+        max_value = float(np.max(finite))
+        if not np.isfinite(min_value) or not np.isfinite(max_value) or max_value <= min_value:
+            return min_value
+        counts, edges = np.histogram(finite, bins=int(bins), range=(min_value, max_value))
+        counts = counts.astype(np.float64)
+        centers = ((edges[:-1] + edges[1:]) * 0.5).astype(np.float64)
+        total = float(np.sum(counts))
+        if total <= 0:
+            return float("nan")
+        probability = counts / total
+        omega = np.cumsum(probability)
+        mu = np.cumsum(probability * centers)
+        mu_total = float(mu[-1])
+        denominator = omega * (1.0 - omega)
+        score = np.full_like(denominator, -np.inf, dtype=np.float64)
+        valid = denominator > 1e-12
+        score[valid] = ((mu_total * omega[valid] - mu[valid]) ** 2) / denominator[valid]
+        return float(centers[int(np.nanargmax(score))])
+
+    def particle_foreground_rule(self, gt_gray: np.ndarray, threshold: float) -> str:
+        """根据 GT 阈值两侧像素占比选择颗粒前景方向，兼容白点黑底和反相图。"""
+
+        finite = np.isfinite(gt_gray)
+        if not np.any(finite) or not np.isfinite(threshold):
+            return "greater"
+        high_ratio = float(np.mean(gt_gray[finite] > threshold))
+        low_ratio = float(np.mean(gt_gray[finite] < threshold))
+        return "greater" if high_ratio <= low_ratio else "less"
+
+    def binary_from_threshold(self, gray: np.ndarray, threshold: float, foreground_rule: str) -> np.ndarray:
+        """按同一个 GT 阈值把 pred/GT 转成二值图；无效像素固定为背景。"""
+
+        arr = np.asarray(gray, dtype=np.float32)
+        finite = np.isfinite(arr)
+        if not np.isfinite(threshold):
+            return np.zeros(arr.shape, dtype=bool)
+        if str(foreground_rule).lower() == "less":
+            return (arr < threshold) & finite
+        return (arr > threshold) & finite
 
     def import_compute_particle_binary_stats(self):
         """优先从 tfrecord_test_common.py 导入公共统计函数，失败时回退到实际定义模块。"""
+
+        # 从 SRGAN 根目录直接执行 all_handle/pipeline.py 时，sys.path 只有 SRGAN，
+        # 而 evaluate_image_compare_common.py 内部使用 study.SRGAN 绝对导入；
+        # 这里补上项目根目录，保证公共颗粒统计函数在脚本/IDE/命令行三种入口都能导入。
+        current_file = Path(__file__).resolve()
+        # parents[3] 是包含 study/ 的项目根目录；parents[2] 是 study/ 本身。
+        # 两个路径都加入后，可同时兼容 study.SRGAN.* 与 SRGAN.* 两种历史导入写法。
+        for import_root in (current_file.parents[3], current_file.parents[2]):
+            import_root_text = str(import_root)
+            if import_root_text not in sys.path:
+                sys.path.insert(0, import_root_text)
 
         try:
             from study.SRGAN.model.tfrecord_test_common import compute_particle_binary_stats
@@ -4500,8 +5617,12 @@ class AllHandlePipeline:
             numeric = numpy.asarray(numeric_values, dtype=numpy.float64)
         else:
             numeric = numpy.asarray(arr, dtype=numpy.float64).reshape(-1)
+        # 纯数值数组的历史顺序是 count/pixels/IoU/precision/recall/F1；
+        # 不能把第三列直接解释成 mean_area，否则旧 npy 会把 IoU 误当成平均面积。
+        # mean_area 在没有字段名时统一由 pixels/count 派生。
         keys = ("count", "pixels", "iou", "precision", "recall", "f1")
-        return {key: float(numeric[idx]) for idx, key in enumerate(keys) if idx < numeric.size}
+        mapped = {key: float(numeric[idx]) for idx, key in enumerate(keys) if idx < numeric.size}
+        return self.add_particle_mean_area(mapped)
 
     def parse_particle_raw_stats_array(self, array: np.ndarray) -> dict:
         """从 npy 中提取原始 key-value 统计字段，避免 GT 字段被预测字段映射规则覆盖。"""
@@ -4543,7 +5664,7 @@ class AllHandlePipeline:
                 if number is not None:
                     mapped[canonical] = number
                     break
-        return mapped
+        return self.add_particle_mean_area(mapped)
 
     def map_gt_particle_stats_fields(self, row: dict) -> dict[str, float]:
         """把原始统计字段映射成 GT 条形图指标；GT 自身二值重叠指标固定为 1。"""
@@ -4561,7 +5682,27 @@ class AllHandlePipeline:
                     break
         self_metric = float(self.cfg.PARTICLE_GT_SELF_METRIC_VALUE)
         mapped.update({"iou": self_metric, "precision": self_metric, "recall": self_metric, "f1": self_metric})
-        return mapped
+        return self.add_particle_mean_area(mapped)
+
+    def safe_divide(self, numerator: float, denominator: float) -> float:
+        """安全相除：用于 mean_area=pixels/count，count 缺失或为 0 时返回 NaN。"""
+
+        try:
+            if not math.isfinite(numerator) or not math.isfinite(denominator) or math.isclose(denominator, 0.0):
+                return float("nan")
+            return float(numerator) / float(denominator)
+        except Exception:
+            return float("nan")
+
+    def add_particle_mean_area(self, stats: dict[str, float]) -> dict[str, float]:
+        """补充颗粒平均面积；若文件没有 mean_area 字段，则用 particle pixels / count 自动计算。"""
+
+        if "mean_area" not in stats or not math.isfinite(float(stats.get("mean_area", float("nan")))):
+            count = self.to_float(stats.get("count"))
+            pixels = self.to_float(stats.get("pixels"))
+            if count is not None and pixels is not None:
+                stats["mean_area"] = self.safe_divide(float(pixels), float(count))
+        return stats
 
     def to_float(self, value) -> float | None:
         """把 numpy 标量、单元素数组或字符串数值转成 float；非数值字段返回 None。"""
