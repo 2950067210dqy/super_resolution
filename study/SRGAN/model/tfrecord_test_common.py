@@ -764,6 +764,68 @@ def _prepare_uvw_display_stacks(pred_uvw, gt_uvw, dataset_name=None, mask_2d=Non
     return display_pred, display_gt, display_delta
 
 
+def _save_single_uvw_component_compare(
+    out_path,
+    component_index,
+    component_label,
+    display_pred_uvw,
+    display_gt_uvw,
+    display_delta_uvw,
+    *,
+    dataset_name=None,
+    cmap_name="jet",
+    flow_error_colorbar_limit=0.5,
+    metric_text=None,
+):
+    """
+    保存单个 U/V/S 分量的 Pred / GT / Error 对比图。
+
+    实验图尺寸较大，原来的 uvs_compare.png 把 U/V/S 三行全部塞进一张图，阅读和写盘都比较重。
+    这里把每个分量拆成独立 PNG：u_compare.png、v_compare.png、s_compare.png。
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    vmin, vmax = _flow_component_limits_like_overview(dataset_name, component_index)
+    err_min, err_max = _flow_error_limits_like_overview(
+        dataset_name,
+        component_index,
+        display_delta_uvw[component_index],
+        flow_error_colorbar_limit=flow_error_colorbar_limit,
+    )
+    fig, axes = plt.subplots(1, 3, figsize=(15, 3.7), dpi=140, facecolor="w")
+    _plot_field_with_colorbar(
+        axes[0],
+        display_pred_uvw[component_index],
+        f"Pred {component_label}",
+        cmap_name,
+        vmin,
+        vmax,
+        f"{component_label} displacement [px]",
+    )
+    _plot_field_with_colorbar(
+        axes[1],
+        display_gt_uvw[component_index],
+        f"GT {component_label}",
+        cmap_name,
+        vmin,
+        vmax,
+        f"{component_label} displacement [px]",
+    )
+    _plot_field_with_colorbar(
+        axes[2],
+        display_delta_uvw[component_index],
+        f"Error {component_label} (Pred-GT)",
+        "bwr",
+        err_min,
+        err_max,
+        f"{component_label} error [px]",
+        metric_text=metric_text,
+    )
+    fig.tight_layout()
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+
+
 def _save_uvw_compare_artifacts(
     sample_dir,
     pred_chw,
@@ -815,6 +877,30 @@ def _save_uvw_compare_artifacts(
     # AEE 是流场误差图的核心标量指标：等价于所有有效像素 EPE 的平均值。
     # 这里使用原始 pred_chw/gt_chw 计算，不受 TBL/TWCF 绘图裁剪和填充逻辑影响。
     sample_aee_text = _format_metric_annotation("AEE", _compute_aee_from_chw(pred_chw, gt_chw))
+
+    if str(dataset_name or "").lower() == "experiment":
+        # 实验结果单独拆成 U/V/S 三张图；如果旧版本留下了 uvs_compare.png，
+        # 这里删掉它，避免目录里同时出现旧总图和新拆分图造成误读。
+        stale_compare = sample_dir / "uvs_compare.png"
+        if stale_compare.exists():
+            try:
+                stale_compare.unlink()
+            except OSError:
+                pass
+        for component_index, component_name in enumerate(component_names):
+            _save_single_uvw_component_compare(
+                sample_dir / f"{component_name}_compare.png",
+                component_index,
+                component_name.upper(),
+                display_pred_uvw,
+                display_gt_uvw,
+                display_delta_uvw,
+                dataset_name=dataset_name,
+                cmap_name=cmap_name,
+                flow_error_colorbar_limit=flow_error_colorbar_limit,
+                metric_text=sample_aee_text,
+            )
+        return pred_uvw, gt_uvw, delta_uvw
 
     fig, axes = plt.subplots(3, 3, figsize=(15, 11), dpi=140, facecolor="w")
     for row_idx, label in enumerate(("U", "V", "S")):

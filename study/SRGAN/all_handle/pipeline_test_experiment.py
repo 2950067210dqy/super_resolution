@@ -91,7 +91,7 @@ EXPERIMENT_SAMPLES = (
     ("peak_1", "exp_0152"),
     ("peak_2", "exp_0153"),
     ("end_1", "exp_0802"),
-    ("end_2", "exp_0803"),
+    ("end_2", "exp_0801"),
 )
 
 # ESRuRAFT_PIV_Ground 里的这两个实验不是神经网络 checkpoint baseline：

@@ -62,7 +62,8 @@ class global_data:
         # 如果只想处理颗粒统计条形图，设置 OUTPUT_STAGE_FILTER = "particle_stats_metrics"；
         # 如果只想处理 *_flow_u_epe_hist_overlay.png，设置 OUTPUT_STAGE_FILTER = "flow_u_epe_hist_overlay"。
         # 如果只想处理 TBL 的 02_error_maps，设置 OUTPUT_STAGE_FILTER = "tbl_02_error_map"。
-        OUTPUT_STAGE_FILTER =None
+        # OUTPUT_STAGE_FILTER =None
+        OUTPUT_STAGE_FILTER =("03_error_histograms")
         OUTPUT_STAGE_ALIASES = {
             "01_energy_spectrum": "energy_spectrum",
             "energy_spectrum": "energy_spectrum",
@@ -333,19 +334,36 @@ class global_data:
         HIST_EDGE_LINE_WIDTH = 0.0
         HIST_LEGEND_EDGE_LINE_WIDTH = 0.0
         HIST_DRAW_OUTLINE = False
+        # 误差直方图的 npy 往往已经保存为“中心点 x + count”的直方图，
+        # 不同实验如果各自使用不同 x 范围和 bin 宽度，直接叠加会导致同一张图里 count 峰值不可比。
+        # 开启后，pipeline 会在绘图前把同一张图中的所有方法重分箱到统一公共 bins；
+        # 原始 npy 不会被改动，只统一输出图和诊断 CSV 的统计口径。
+        HIST_USE_SHARED_BINS = True
+        # 公共 bins 的来源。widest_series 表示直接选取“所有对比方法中 x range 最大”的那组直方图作为模板，
+        # 其它方法都重分箱到它的 x centers / bin width / range 上；这和误差图色条取最大范围的思路一致。
+        HIST_SHARED_BIN_TEMPLATE_MODE = "widest_series"
+        # 公共 bin 宽度默认取当前图中“最粗”的原始 bin 宽，例如 backstep 中 bicubic-hs 的
+        # x range=[-7.34, 7.34]、bin width≈0.0734 会成为其它方法共同使用的 bin 宽。
+        # 仅当 HIST_SHARED_BIN_TEMPLATE_MODE 不是 widest_series 时才会使用该模式。
+        HIST_SHARED_BIN_WIDTH_MODE = "coarsest"
+        # 以 0 为中心的误差直方图使用对称 x 范围；EPE 是非负量，不做 0 对称处理。
+        HIST_SHARED_BIN_SYMMETRIC_AXIS_KINDS = ("flow", "flow_u", "particle", "vorticity")
         # 误差直方图里 ESRuRAFT-PIV 必须最后绘制并处在最高层，避免被其它半透明柱子覆盖；
         # 倍率对比图里的 x4/x8 也属于本文方法，因此同样放到顶层。
         HIST_TOP_EXPERIMENT_KEYS = ("PIV_A_Esrgan_v4", "PIV_A_Esrgan_v_SCALE_8")
-        # 顶层实验只负责“最后绘制、最高 zorder”，透明度仍回到 HIST_ALPHA；
-        # 这样 ESRuRAFT-PIV 不会被遮挡，同时也不会变成不透明色块盖住其它方法。
-        HIST_HIGHLIGHT_EXPERIMENT_KEYS = ()
-        HIST_HIGHLIGHT_ALPHA = HIST_ALPHA
+        # 顶层实验不仅最后绘制、最高 zorder，还单独降低“透明感”（提高 alpha），
+        # 这样 ESRuRAFT-PIV 会位于所有误差直方图最上层，并且比其它半透明柱子更突出。
+        # 若后续想恢复所有方法同样透明度，把 HIST_HIGHLIGHT_EXPERIMENT_KEYS 改成 () 即可。
+        HIST_HIGHLIGHT_EXPERIMENT_KEYS = ("PIV_A_Esrgan_v4", "PIV_A_Esrgan_v_SCALE_8")
+        HIST_HIGHLIGHT_ALPHA = 0.78
         # flow_u_epe_hist_overlay 是左右两张子图，右图 y 轴 Count 容易贴到左图；
         # 这里单独控制两个子图之间的横向间隔。
         FLOW_U_EPE_HIST_WSPACE = 0.32
         # 八组实验的 flow_u_epe_hist_overlay 图例如果放在右侧 EPE 子图内部，会和 0 附近的高峰挤在一起；
         # 因此当实验数量达到阈值时，把图例放到右侧子图外部。下面几个参数可单独调图宽、锚点和图例列数。
-        FLOW_U_EPE_HIST_LEGEND_OUTSIDE = True
+        # 普通 *_flow_u_epe_hist_overlay.png 的图例放回右侧 EPE 子图内部；
+        # 如果放到图外，横向空间会被 legend 拉宽，论文排版时右侧空白过多。
+        FLOW_U_EPE_HIST_LEGEND_OUTSIDE = False
         FLOW_U_EPE_HIST_LEGEND_OUTSIDE_MIN_SERIES = 7
         FLOW_U_EPE_HIST_OUTSIDE_LEGEND_FIG_WIDTH = 10.2
         FLOW_U_EPE_HIST_LEGEND_OUTSIDE_LOC = "upper left"
@@ -358,7 +376,7 @@ class global_data:
         WATERFALL_3D_FIG_SIZE = (9.2, 7.2)
         # 单独 3D 图把坐标轴整体往上挪一点，给底部 x-label 的 "[px]" 留出空间；
         # 这个参数只作用于 *_waterfall_3d 单图，不影响 2D+3D 合图。
-        WATERFALL_3D_SUBPLOT_BOTTOM = 0.12
+        WATERFALL_3D_SUBPLOT_BOTTOM = 0.16
         WATERFALL_3D_PAIR_FIG_SIZE = (10.8, 4.6)
         WATERFALL_3D_ELEV = 24
         # 3D 视角默认把 x 轴放到左前侧，避免 y 轴方向的实验名抢占主要视觉位置。
@@ -376,6 +394,9 @@ class global_data:
         WATERFALL_3D_LINE_WIDTH = 1.45
         WATERFALL_3D_GRID_ALPHA = 0.18
         WATERFALL_3D_MAX_POINTS = 700
+        # 3D 轴的 x-label 在倾斜视角下很容易落到画布外；这里把 labelpad 单独做成全局参数，
+        # 既可以把 "Delta u [px]" / "EPE [px]" 往坐标轴内收，也不影响二维图的 label 间距。
+        WATERFALL_3D_X_LABEL_PAD = 2
         WATERFALL_3D_LEGEND_FONT_SIZE = 7
         WATERFALL_3D_LEGEND_LOC = "upper left"
         # 单独 3D 瀑布图的图例位置；第二个值控制上下，第一个值越小图例越靠近图体。
@@ -394,9 +415,30 @@ class global_data:
         WATERFALL_3D_COMPOSITE_WSPACE = 0.18
         # flow_u_epe_hist_overlay 的大图比较特殊：第一行是原来的左右二维图，
         # 第二行是对应的两个 3D 瀑布图，因此单独给更高的画布和行列间距。
-        WATERFALL_3D_FLOW_U_EPE_COMPOSITE_FIG_SIZE = (11.8, 7.2)
-        WATERFALL_3D_FLOW_U_EPE_COMPOSITE_WSPACE = 0.28
-        WATERFALL_3D_FLOW_U_EPE_COMPOSITE_HSPACE = 0.36
+        # flow_u_epe 的 2D+3D 合图是两行布局：第一行二维图，第二行 3D 图。
+        # 第二行如果和第一行等高，3D 盒体会显得明显偏小，x-label 也容易被挤到画布外；
+        # 因此这里单独加高画布，并让第二行拿到更多高度。
+        WATERFALL_3D_FLOW_U_EPE_COMPOSITE_FIG_SIZE = (12.8, 10.8)
+        WATERFALL_3D_FLOW_U_EPE_COMPOSITE_WSPACE = 0.26
+        # 控制第一行 2D 与第二行 3D 的上下空白；0.08 在紧凑排布和 3D x-label 显示空间之间较均衡。
+        WATERFALL_3D_FLOW_U_EPE_COMPOSITE_HSPACE = 0.08
+        WATERFALL_3D_FLOW_U_EPE_COMPOSITE_HEIGHT_RATIOS = (1.0, 1.55)
+        # flow_u_epe 的 2D+3D 合图需要更大的底部边距，否则第二行 3D 图旋转后的 x-label 会被裁掉。
+        # right 留到 0.98 是因为这张合图的图例改为放回右上二维子图内部，不再需要额外的图外 legend 空间。
+        WATERFALL_3D_FLOW_U_EPE_COMPOSITE_LEFT = 0.06
+        WATERFALL_3D_FLOW_U_EPE_COMPOSITE_RIGHT = 0.98
+        WATERFALL_3D_FLOW_U_EPE_COMPOSITE_TOP = 0.98
+        WATERFALL_3D_FLOW_U_EPE_COMPOSITE_BOTTOM = 0.12
+        # 普通 flow_u_epe_hist_overlay 仍可使用图外 legend；但 2D+3D 合图已有两行，
+        # 外置 legend 会显得像跑到画布外，所以这里单独控制合图版本把图例放回图内。
+        FLOW_U_EPE_HIST_COMPOSITE_LEGEND_OUTSIDE = False
+        # flow_u_epe 的 2D+3D 合图第二行是 3D 坐标轴，z 轴 Count 用 text2D 手动绘制。
+        # 这里单独控制第二行 3D Count 的横向位置，让它和第一行二维图的 Count label 上下对齐；
+        # 只影响 *_flow_u_epe_hist_overlay_2d_3d_composite，不影响其它 3D 瀑布图。
+        WATERFALL_3D_FLOW_U_EPE_LEFT_Z_LABEL_X = -0.10
+        # 下排 3D Count label 改用 figure 坐标与上排 2D Count label 对齐；
+        # 这个偏移量用于最后细调，0 表示完全使用上排 2D y-label 的横坐标。
+        WATERFALL_3D_FLOW_U_EPE_Z_LABEL_FIG_X_OFFSET = 0.0
         # y 方向已经由图例说明实验顺序，因此默认隐藏 y 轴刻度文字和 y 轴 label，避免和图例重复且挤在一起。
         WATERFALL_3D_SHOW_Y_TICK_LABELS = False
         WATERFALL_3D_SHOW_Y_LABEL = False
@@ -835,17 +877,21 @@ class global_data:
         # NPY 文件名约定
         # =========================
         # 不同阶段保存的文件名略有差异，pipeline.py 会按这些候选名依次尝试。
+        # ENERGY_SPECTRUM 默认用于比较“超分辨率图像”的频谱，所以必须优先读取 image_pair_*。
+        # 之前把 flow_energy_spectrum_* 放在最前，会导致 bicubic-widim / bicubic-hs / bicubic-raft /
+        # bicubic-searaft 读取到不同光流算法输出的频谱；这些实验虽然 SR 图像同为 bicubic，
+        # 但后续光流算法不同，flow 频谱自然不一致。若后续确实需要光流频谱，可把 flow_* 候选移回最前。
         ENERGY_SPECTRUM_FILE_CANDIDATES = (
-            "flow_energy_spectrum_pred_mean.npy",
             "image_pair_energy_spectrum_pred_mean.npy",
             "energy_spectrum_pred.npy",
+            "flow_energy_spectrum_pred_mean.npy",
             "flow_energy_spectrum_pred.npy",
         )
-        # GT 真实图像/真实光流的 ENERGY_SPECTRUM 候选文件；只画一条 GT 曲线，避免八个实验重复覆盖。
+        # GT 也优先读取真实图像对频谱，保证 GT 与 SR 曲线属于同一种物理量/数据来源。
         ENERGY_SPECTRUM_GT_FILE_CANDIDATES = (
-            "flow_energy_spectrum_gt_mean.npy",
             "image_pair_energy_spectrum_gt_mean.npy",
             "energy_spectrum_gt.npy",
+            "flow_energy_spectrum_gt_mean.npy",
             "flow_energy_spectrum_gt.npy",
         )
         FLOW_HIST_FILE_NAMES = {

@@ -688,7 +688,13 @@ class AllHandlePipeline:
                 linewidth=float(getattr(self.cfg, "WATERFALL_3D_LINE_WIDTH", 1.45)),
                 label=label,
             )
-        ax.set_xlabel(x_label, labelpad=8)
+        # 3D 图的 x-label 在 azim=-60 这类视角下会向画布底部倾斜；
+        # labelpad 放到全局变量里，便于把带单位的 "[px]" 往坐标轴内收，避免保存时被裁切。
+        ax.set_xlabel(x_label, labelpad=float(getattr(self.cfg, "WATERFALL_3D_X_LABEL_PAD", 2)))
+        try:
+            ax.xaxis.label.set_clip_on(False)
+        except Exception:
+            pass
         # y 方向只用来错开不同实验曲线；实验名已经在 legend 中说明，
         # 默认不再显示 y 轴 label 和 y tick label，避免画面像旧版一样文字堆叠。
         show_y_label = bool(getattr(self.cfg, "WATERFALL_3D_SHOW_Y_LABEL", False))
@@ -713,6 +719,9 @@ class AllHandlePipeline:
                 va="center",
                 ha="center",
                 clip_on=False,
+                # 3D 图的 z-label 是手动 text2D 绘制，默认字号会比二维 axes label 小；
+                # 这里统一绑定到 AXIS_LABEL_SIZE，保证 2D+3D 合图里的 Count 字体大小一致。
+                fontsize=float(getattr(self.cfg, "AXIS_LABEL_SIZE", 12)),
             )
         else:
             ax.set_zlabel(z_label, labelpad=8)
@@ -1878,6 +1887,140 @@ class AllHandlePipeline:
                 series[exp_key] = (x[mask], y[mask])
         return series
 
+    def centers_to_edges(self, centers: np.ndarray) -> np.ndarray | None:
+        """由直方图中心点推回 bin 边界；用于把不同实验的 count 重分配到公共 bins。"""
+
+        x = np.asarray(centers, dtype=np.float64)
+        x = x[np.isfinite(x)]
+        if x.size == 0:
+            return None
+        x = np.sort(x)
+        if x.size == 1:
+            width = 1.0
+            return np.asarray([x[0] - width * 0.5, x[0] + width * 0.5], dtype=np.float64)
+        mid = (x[:-1] + x[1:]) * 0.5
+        first_width = x[1] - x[0]
+        last_width = x[-1] - x[-2]
+        return np.concatenate(([x[0] - first_width * 0.5], mid, [x[-1] + last_width * 0.5])).astype(np.float64)
+
+    def choose_shared_hist_bin_width(self, series: dict[str, tuple[np.ndarray, np.ndarray]]) -> float | None:
+        """选择公共 bin 宽；默认使用最粗 bin，保证不同方法的 count 可在同一 bin 宽下比较。"""
+
+        widths = []
+        for x, _ in series.values():
+            width = self.estimate_bar_width(x)
+            if np.isfinite(width) and width > 0:
+                widths.append(float(width))
+        if not widths:
+            return None
+        mode = str(getattr(self.cfg, "HIST_SHARED_BIN_WIDTH_MODE", "coarsest")).lower()
+        if mode in {"finest", "min"}:
+            return float(np.nanmin(widths))
+        if mode in {"median"}:
+            return float(np.nanmedian(widths))
+        return float(np.nanmax(widths))
+
+    def choose_widest_hist_template_centers(
+        self, series: dict[str, tuple[np.ndarray, np.ndarray]]
+    ) -> np.ndarray | None:
+        """选择 x range 最大的实验作为公共直方图模板，直接复用它的中心点作为统一 bins。"""
+
+        best_centers: np.ndarray | None = None
+        best_score = -np.inf
+        for _, (x, y) in series.items():
+            x_arr = np.asarray(x, dtype=np.float64)
+            y_arr = np.asarray(y, dtype=np.float64)
+            mask = np.isfinite(x_arr) & np.isfinite(y_arr)
+            if not np.any(mask):
+                continue
+            x_valid = np.sort(x_arr[mask])
+            if x_valid.size < 2:
+                continue
+            # range 越大越优先；range 相同时用 bin 宽更大的作为次级排序，避免极细 bins 让图过密。
+            x_range = float(np.nanmax(x_valid) - np.nanmin(x_valid))
+            score = (x_range, self.estimate_bar_width(x_valid))
+            numeric_score = score[0] * 1_000_000.0 + score[1]
+            if numeric_score > best_score:
+                best_score = numeric_score
+                best_centers = x_valid
+        return None if best_centers is None else best_centers.copy()
+
+    def rebin_hist_to_edges(self, x: np.ndarray, y: np.ndarray, new_edges: np.ndarray) -> np.ndarray:
+        """把旧直方图按区间重叠比例重分配到新 bins，尽量保持每个方法的总 count 不变。"""
+
+        x_arr = np.asarray(x, dtype=np.float64)
+        y_arr = np.asarray(y, dtype=np.float64)
+        order = np.argsort(x_arr)
+        x_sorted = x_arr[order]
+        y_sorted = y_arr[order]
+        old_edges = self.centers_to_edges(x_sorted)
+        new_counts = np.zeros(max(0, len(new_edges) - 1), dtype=np.float64)
+        if old_edges is None or new_counts.size == 0:
+            return new_counts
+        for old_idx, count in enumerate(y_sorted):
+            if not np.isfinite(count) or count == 0:
+                continue
+            left = old_edges[old_idx]
+            right = old_edges[old_idx + 1]
+            width = right - left
+            if not np.isfinite(width) or width <= 0:
+                continue
+            start = max(0, int(np.searchsorted(new_edges, left, side="right") - 1))
+            stop = min(new_counts.size - 1, int(np.searchsorted(new_edges, right, side="left")))
+            for new_idx in range(start, stop + 1):
+                overlap = min(right, new_edges[new_idx + 1]) - max(left, new_edges[new_idx])
+                if overlap > 0:
+                    new_counts[new_idx] += count * (overlap / width)
+        return new_counts
+
+    def standardize_hist_series_bins(
+        self, series: dict[str, tuple[np.ndarray, np.ndarray]], axis_kind: str
+    ) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+        """统一同一张误差直方图中所有实验的 x range 与 bin width。"""
+
+        if not series or not bool(getattr(self.cfg, "HIST_USE_SHARED_BINS", True)):
+            return series
+
+        template_mode = str(getattr(self.cfg, "HIST_SHARED_BIN_TEMPLATE_MODE", "widest_series")).lower()
+        if template_mode == "widest_series":
+            # 和误差图色条取最大范围一致：先找所有对比方法中 x range 最大的那组直方图，
+            # 直接使用它的 x centers 作为公共 bins。这样公共 range、bin width、bin 个数都来自同一参考方法。
+            centers = self.choose_widest_hist_template_centers(series)
+            if centers is None:
+                return series
+        else:
+            width = self.choose_shared_hist_bin_width(series)
+            if width is None or not np.isfinite(width) or width <= 0:
+                return series
+            all_x = np.concatenate([np.asarray(x, dtype=np.float64) for x, _ in series.values()])
+            all_x = all_x[np.isfinite(all_x)]
+            if all_x.size == 0:
+                return series
+            x_min = float(np.nanmin(all_x))
+            x_max = float(np.nanmax(all_x))
+            symmetric_kinds = set(getattr(self.cfg, "HIST_SHARED_BIN_SYMMETRIC_AXIS_KINDS", ()))
+            if axis_kind in symmetric_kinds:
+                max_abs = max(abs(x_min), abs(x_max))
+                x_min, x_max = -max_abs, max_abs
+
+            # 用中心点定义公共 x range；这样输出图里的 x 数据范围与用户看到的范围一致。
+            count = int(np.floor((x_max - x_min) / width + 0.5)) + 1
+            if count < 2:
+                return series
+            centers = x_min + np.arange(count, dtype=np.float64) * width
+            if centers[-1] < x_max - width * 0.25:
+                centers = np.append(centers, centers[-1] + width)
+        edges = self.centers_to_edges(centers)
+        if edges is None:
+            return series
+
+        rebinned: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        for exp_key, (x, y) in series.items():
+            # 这里不改原始 npy，只在内存里把各实验的 count 映射到公共 bins，
+            # 保证绘图、3D 瀑布图和诊断 CSV 使用一致的 x range / bin width。
+            rebinned[exp_key] = (centers.copy(), self.rebin_hist_to_edges(x, y, edges))
+        return rebinned
+
     def draw_overlay_histogram_2d(
         self,
         ax: plt.Axes,
@@ -1993,9 +2136,13 @@ class AllHandlePipeline:
         axis_kind: str,
         save_npy: bool,
     ) -> None:
-        series = self.load_hist_series(group, file_candidates)
-        if not series:
+        raw_series = self.load_hist_series(group, file_candidates)
+        if not raw_series:
             return
+        # 绘图使用统一 bins，保证不同方法的柱高/3D 曲线可比；
+        # 但 *_stats.csv 需要反映每个方法原始 npy 自己的 x range/bin width，
+        # 因此下面单独保留 raw_series 写诊断表，不使用统一后的公共范围。
+        series = self.standardize_hist_series_bins(raw_series, axis_kind)
 
         fig, ax = plt.subplots(figsize=(5.2, 3.4))
         self.draw_overlay_histogram_2d(
@@ -2013,7 +2160,7 @@ class AllHandlePipeline:
         self.write_histogram_diagnostics_csv(
             out_base.with_name(f"{out_base.name}_stats.csv"),
             group,
-            series,
+            raw_series,
             hist_name=out_name,
             compute_symmetry=True,
         )
@@ -2112,9 +2259,16 @@ class AllHandlePipeline:
             return
         ensure_matplotlib()
         legend_series = epe_series or u_series
-        use_outside_legend = bool(getattr(self.cfg, "FLOW_U_EPE_HIST_LEGEND_OUTSIDE", True)) and len(
-            legend_series
-        ) >= int(getattr(self.cfg, "FLOW_U_EPE_HIST_LEGEND_OUTSIDE_MIN_SERIES", 7))
+        # 这张 2D+3D 合图和普通 flow_u_epe_hist_overlay 不同：右侧还有第二行 3D 图，
+        # 如果继续使用普通图的外置 legend，保存后会显得图例跑到画布外侧。
+        # 因此合图版本优先读取 FLOW_U_EPE_HIST_COMPOSITE_LEGEND_OUTSIDE，默认放回右上二维子图内部。
+        use_outside_legend = bool(
+            getattr(
+                self.cfg,
+                "FLOW_U_EPE_HIST_COMPOSITE_LEGEND_OUTSIDE",
+                getattr(self.cfg, "FLOW_U_EPE_HIST_LEGEND_OUTSIDE", True),
+            )
+        ) and len(legend_series) >= int(getattr(self.cfg, "FLOW_U_EPE_HIST_LEGEND_OUTSIDE_MIN_SERIES", 7))
         fig = plt.figure(
             figsize=tuple(getattr(self.cfg, "WATERFALL_3D_FLOW_U_EPE_COMPOSITE_FIG_SIZE", (11.8, 7.2)))
         )
@@ -2124,6 +2278,13 @@ class AllHandlePipeline:
             2,
             wspace=float(getattr(self.cfg, "WATERFALL_3D_FLOW_U_EPE_COMPOSITE_WSPACE", 0.28)),
             hspace=float(getattr(self.cfg, "WATERFALL_3D_FLOW_U_EPE_COMPOSITE_HSPACE", 0.36)),
+            left=float(getattr(self.cfg, "WATERFALL_3D_FLOW_U_EPE_COMPOSITE_LEFT", 0.06)),
+            right=float(getattr(self.cfg, "WATERFALL_3D_FLOW_U_EPE_COMPOSITE_RIGHT", 0.98)),
+            top=float(getattr(self.cfg, "WATERFALL_3D_FLOW_U_EPE_COMPOSITE_TOP", 0.98)),
+            bottom=float(getattr(self.cfg, "WATERFALL_3D_FLOW_U_EPE_COMPOSITE_BOTTOM", 0.12)),
+            height_ratios=tuple(
+                getattr(self.cfg, "WATERFALL_3D_FLOW_U_EPE_COMPOSITE_HEIGHT_RATIOS", (1.0, 1.0))
+            ),
         )
         axes_2d = (fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[0, 1]))
         self.draw_flow_u_epe_histogram_2d(
@@ -2142,15 +2303,21 @@ class AllHandlePipeline:
             ax_u_3d,
             u_series,
             x_label=self.cfg.FLOW_U_HIST_X_LABEL,
-            z_label=z_label,
+            # flow_u_epe 合图的下排 3D Count label 需要和上排 2D Count label 精确上下对齐；
+            # 因此这里先不让 3D axes 自己画 z-label，后面再用 figure 坐标统一补上。
+            z_label="",
             use_hist_color=True,
             log_z_plus_one=hist_log_count,
             add_legend=False,
             left_z_label_x=float(
                 getattr(
                     self.cfg,
-                    "WATERFALL_3D_COMPOSITE_LEFT_Z_LABEL_X",
-                    getattr(self.cfg, "WATERFALL_3D_LEFT_Z_LABEL_X", -0.16),
+                    "WATERFALL_3D_FLOW_U_EPE_LEFT_Z_LABEL_X",
+                    getattr(
+                        self.cfg,
+                        "WATERFALL_3D_COMPOSITE_LEFT_Z_LABEL_X",
+                        getattr(self.cfg, "WATERFALL_3D_LEFT_Z_LABEL_X", -0.16),
+                    ),
                 )
             ),
         )
@@ -2158,30 +2325,68 @@ class AllHandlePipeline:
             ax_epe_3d,
             epe_series,
             x_label=self.cfg.EPE_HIST_X_LABEL,
-            z_label=z_label,
+            # 同左侧 Delta u 的 3D 子图，EPE 的 Count 也由 figure 级文本绘制，
+            # 保证它和右上 2D 子图的 Count label 在同一竖直线上。
+            z_label="",
             use_hist_color=True,
             log_z_plus_one=hist_log_count,
             add_legend=False,
             left_z_label_x=float(
                 getattr(
                     self.cfg,
-                    "WATERFALL_3D_COMPOSITE_LEFT_Z_LABEL_X",
-                    getattr(self.cfg, "WATERFALL_3D_LEFT_Z_LABEL_X", -0.16),
+                    "WATERFALL_3D_FLOW_U_EPE_LEFT_Z_LABEL_X",
+                    getattr(
+                        self.cfg,
+                        "WATERFALL_3D_COMPOSITE_LEFT_Z_LABEL_X",
+                        getattr(self.cfg, "WATERFALL_3D_LEFT_Z_LABEL_X", -0.16),
+                    ),
                 )
             ),
         )
         if not (drawn_u or drawn_epe):
             plt.close(fig)
             return
+        # 3D 轴的 z-label 如果直接放在 axes 相对坐标里，会因 3D 投影和 z tick 数字位置变化而挤在一起。
+        # 这里先触发布局计算，再读取上排 2D y-label 的 figure 坐标，把下排 3D 的 Count 放到同一 x 位置。
+        # 这样不同 class/category 的数据范围变化时，Count 仍能和上面的二维图严格上下对齐。
+        try:
+            fig.canvas.draw()
+            renderer = fig.canvas.get_renderer()
+            inv_fig = fig.transFigure.inverted()
+            x_offset = float(getattr(self.cfg, "WATERFALL_3D_FLOW_U_EPE_Z_LABEL_FIG_X_OFFSET", 0.0))
+            for top_ax, bottom_ax in ((axes_2d[0], ax_u_3d), (axes_2d[1], ax_epe_3d)):
+                top_label_box = top_ax.yaxis.label.get_window_extent(renderer=renderer)
+                top_label_center = inv_fig.transform(top_label_box.get_points()).mean(axis=0)
+                bottom_box = bottom_ax.get_position()
+                # 下排 Count 是 figure 级文本，默认字号可能与上排 axes ylabel 不一致；
+                # 这里直接复用上排 Count 的字号/字体粗细，保证四个 Count 标签视觉大小完全一致。
+                top_label_font_size = top_ax.yaxis.label.get_size()
+                top_label_font_weight = top_ax.yaxis.label.get_fontweight()
+                fig.text(
+                    float(top_label_center[0]) + x_offset,
+                    float((bottom_box.y0 + bottom_box.y1) * 0.5),
+                    z_label,
+                    rotation=90,
+                    va="center",
+                    ha="center",
+                    fontsize=top_label_font_size,
+                    fontweight=top_label_font_weight,
+                )
+        except Exception:
+            # 如果某些 Matplotlib 后端无法返回文字 bbox，则保留无下排 label 的图，而不是中断批量绘图。
+            pass
         self.save_figure(fig, out_base.with_name(f"{out_base.name}_2d_3d_composite"))
 
     def plot_flow_u_epe_histogram(self, group: GroupContext) -> None:
         """左侧叠加 Δu 误差直方图，右侧叠加 EPE 直方图。"""
 
-        u_series = self.load_hist_series(group, ("delta_u_hist_all.npy", "delta_u_hist.npy"))
-        epe_series = self.load_hist_series(group, ("epe_hist_all.npy", "epe_hist.npy"))
-        if not u_series and not epe_series:
+        raw_u_series = self.load_hist_series(group, ("delta_u_hist_all.npy", "delta_u_hist.npy"))
+        raw_epe_series = self.load_hist_series(group, ("epe_hist_all.npy", "epe_hist.npy"))
+        if not raw_u_series and not raw_epe_series:
             return
+        # 图使用统一 bins；CSV 继续使用 raw_*_series，避免 x_min/x_max 被公共模板覆盖。
+        u_series = self.standardize_hist_series_bins(raw_u_series, "flow_u")
+        epe_series = self.standardize_hist_series_bins(raw_epe_series, "epe")
 
         legend_series = epe_series or u_series
         use_outside_legend = bool(getattr(self.cfg, "FLOW_U_EPE_HIST_LEGEND_OUTSIDE", True)) and len(
@@ -2206,9 +2411,9 @@ class AllHandlePipeline:
         out_dir = self.output_dir(self.cfg.HIST_OUTPUT_DIR_NAME, group.class_name, group.split_name)
         out_base = out_dir / f"{safe_name(group.category_name)}_flow_u_epe_hist_overlay"
         rows: list[dict[str, str]] = []
-        rows.extend(self.histogram_diagnostic_rows(group, u_series, hist_name="flow_u_hist", compute_symmetry=True))
+        rows.extend(self.histogram_diagnostic_rows(group, raw_u_series, hist_name="flow_u_hist", compute_symmetry=True))
         # EPE 本身是非负端点误差，不以 0 为对称中心，因此只保存坐标范围，不计算对称度。
-        rows.extend(self.histogram_diagnostic_rows(group, epe_series, hist_name="epe_hist", compute_symmetry=False))
+        rows.extend(self.histogram_diagnostic_rows(group, raw_epe_series, hist_name="epe_hist", compute_symmetry=False))
         self.write_histogram_diagnostics_csv(out_base.with_name(f"{out_base.name}_stats.csv"), group, None, rows=rows)
         self.save_figure(fig, out_base)
         # flow_u_epe 原图是左右双子图，这里分别补充 Delta u 与 EPE 的 3D 瀑布图，避免一个 3D 双面板过挤。
@@ -2254,6 +2459,7 @@ class AllHandlePipeline:
             x_valid = x_arr[mask]
             y_valid = y_arr[mask]
             symmetry = self.histogram_symmetry_metrics(x_valid, y_valid) if compute_symmetry else {}
+            zero_error_count = self.histogram_zero_error_count(x_valid, y_valid)
             row = {
                 "comparison": self.active_comparison_name,
                 "class": group.class_name,
@@ -2268,7 +2474,11 @@ class AllHandlePipeline:
                 "y_max": self.format_csv_float(float(np.nanmax(y_valid))),
                 "symmetry_score": self.format_csv_float(symmetry.get("symmetry_score")),
                 "symmetry_asymmetry_l1": self.format_csv_float(symmetry.get("asymmetry_l1")),
-                "symmetry_pair_count": str(int(symmetry.get("pair_count", 0))) if symmetry else "",
+                # symmetry_pair_count 不再记录“100 个左右配对 bin”这种 bin 数量，
+                # 而是记录参与对称性计算的样本 count 总数，便于和整张直方图的像素/样本规模对应。
+                "symmetry_pair_count": self.format_csv_float(symmetry.get("pair_count")) if symmetry else "",
+                # 单独记录误差为 0（或最接近 0 的中心 bin）的 count，方便判断主峰集中程度。
+                "zero_error_count": self.format_csv_float(zero_error_count),
             }
             rows.append(row)
         return rows
@@ -2302,8 +2512,22 @@ class AllHandlePipeline:
             "symmetry_score",
             "symmetry_asymmetry_l1",
             "symmetry_pair_count",
+            "zero_error_count",
         )
         self.write_csv_rows(path, output_rows, columns)
+
+    def histogram_zero_error_count(self, x: np.ndarray, y: np.ndarray) -> float:
+        """返回误差为 0 的 bin count；若中心点没有精确 0，则取覆盖 0 的最近中心 bin。"""
+
+        x_arr = np.asarray(x, dtype=np.float64)
+        y_arr = np.asarray(y, dtype=np.float64)
+        mask = np.isfinite(x_arr) & np.isfinite(y_arr)
+        if not np.any(mask):
+            return float("nan")
+        x_valid = x_arr[mask]
+        y_valid = y_arr[mask]
+        zero_idx = int(np.nanargmin(np.abs(x_valid)))
+        return float(y_valid[zero_idx])
 
     def histogram_symmetry_metrics(self, x: np.ndarray, y: np.ndarray) -> dict[str, float]:
         """以 0 为中心计算直方图左右对称度；1 表示完全对称，0 附近表示差异很大。"""
@@ -2311,24 +2535,27 @@ class AllHandlePipeline:
         order = np.argsort(x)
         x_sorted = np.asarray(x, dtype=np.float64)[order]
         y_sorted = np.asarray(y, dtype=np.float64)[order]
+        zero_count = self.histogram_zero_error_count(x_sorted, y_sorted)
+        zero_count = 0.0 if not np.isfinite(zero_count) else float(zero_count)
         positive_abs = np.unique(np.abs(x_sorted[np.abs(x_sorted) > 0]))
         if positive_abs.size == 0:
-            return {"symmetry_score": float("nan"), "asymmetry_l1": float("nan"), "pair_count": 0.0}
+            return {"symmetry_score": float("nan"), "asymmetry_l1": float("nan"), "pair_count": zero_count}
         min_x = float(np.nanmin(x_sorted))
         max_x = float(np.nanmax(x_sorted))
         pair_abs = positive_abs[(positive_abs <= max_x) & (-positive_abs >= min_x)]
         if pair_abs.size == 0:
-            return {"symmetry_score": float("nan"), "asymmetry_l1": float("nan"), "pair_count": 0.0}
+            return {"symmetry_score": float("nan"), "asymmetry_l1": float("nan"), "pair_count": zero_count}
         y_pos = np.interp(pair_abs, x_sorted, y_sorted)
         y_neg = np.interp(-pair_abs, x_sorted, y_sorted)
         denom = float(np.sum(y_pos + y_neg))
         if denom <= 0:
-            return {"symmetry_score": float("nan"), "asymmetry_l1": float("nan"), "pair_count": float(pair_abs.size)}
+            return {"symmetry_score": float("nan"), "asymmetry_l1": float("nan"), "pair_count": zero_count}
         asymmetry = float(np.sum(np.abs(y_pos - y_neg)) / denom)
         return {
             "symmetry_score": max(0.0, 1.0 - asymmetry),
             "asymmetry_l1": asymmetry,
-            "pair_count": float(pair_abs.size),
+            # 这里记录 count 总数，而不是左右配对 bin 的数量；包含 0 误差 bin，尽量覆盖整张直方图。
+            "pair_count": float(denom + zero_count),
         }
 
     def sorted_hist_series(
