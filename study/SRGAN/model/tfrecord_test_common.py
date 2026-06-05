@@ -2931,6 +2931,23 @@ def _save_gray_image(path, arr):
     plt.imsave(str(path), _clip_image_for_display(arr), cmap="gray", vmin=0.0, vmax=1.0)
 
 
+def _save_gray_image_low_memory(path, arr):
+    """
+    用 PIL 直接保存单通道 PNG，避免 matplotlib 为大幅实验图创建 RGBA figure 缓冲。
+
+    scale_8 实验图可能达到数千万像素；plt.imsave/figure 组合很容易把内存峰值推到
+    OOM killer 阈值。这里只生成一个 uint8 灰度数组并立刻写盘，适合实验大图的基础输出。
+    """
+    from PIL import Image
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    image = np.squeeze(arr).astype(np.float32, copy=False)
+    image = np.nan_to_num(image, nan=0.0, posinf=1.0, neginf=0.0)
+    image = np.clip(image, 0.0, 1.0)
+    Image.fromarray((image * 255.0).astype(np.uint8), mode="L").save(path)
+
+
 def _plot_image_comparison(out_path, sample_images, particle_error_colorbar_limit=1.0, show_particle_error_metric=True):
     """
     保存 prev/next 的 LR、原图 HR、生成 SR、SR-HR 误差合并对比图。
@@ -3174,6 +3191,10 @@ def _save_image_outputs(dataset_name, dataset_dir, image_payload, start_index, p
         1.0,
     )
     show_particle_error_metric = bool(plot_args.get("particle_error_show_metric", True))
+    experiment_low_memory_outputs = (
+        str(dataset_name or "").lower() == "experiment"
+        and bool(plot_args.get("experiment_low_memory_image_outputs", False))
+    )
     payload_np = {
         "prev_lr": _as_numpy_batch(image_payload["prev_lr"]),
         "next_lr": _as_numpy_batch(image_payload["next_lr"]),
@@ -3195,6 +3216,27 @@ def _save_image_outputs(dataset_name, dataset_dir, image_payload, start_index, p
             "pred_prev": payload_np["pred_prev"][local_idx, 0],
             "pred_next": payload_np["pred_next"][local_idx, 0],
         }
+        if experiment_low_memory_outputs:
+            # 实验 scale_8 图很大。通用 image_outputs 会继续计算全幅 SR-HR error、FFT/ESMSE、
+            # error hist、连通域统计和大 matplotlib comparison，这些在单张样本上就可能触发 OOM。
+            # 低内存模式只保存 all_handle 和人工检查最需要的基础颗粒图；flow 图在后续步骤单独保存。
+            sample_dir.mkdir(parents=True, exist_ok=True)
+            _save_gray_image_low_memory(sample_dir / "prev_lr.png", sample_images["prev_lr"])
+            _save_gray_image_low_memory(sample_dir / "prev_hr.png", sample_images["prev_hr"])
+            _save_gray_image_low_memory(sample_dir / "prev_sr.png", sample_images["pred_prev"])
+            _save_gray_image_low_memory(sample_dir / "next_lr.png", sample_images["next_lr"])
+            _save_gray_image_low_memory(sample_dir / "next_hr.png", sample_images["next_hr"])
+            _save_gray_image_low_memory(sample_dir / "next_sr.png", sample_images["pred_next"])
+            (sample_dir / "image_outputs_low_memory_note.txt").write_text(
+                "\n".join([
+                    "experiment_low_memory_image_outputs=True",
+                    "Skipped full-frame particle error, ESMSE FFT, error hist, binary connected-component stats, and comparison.png.",
+                    "Reason: experiment scale_8 full-frame images can exceed available RAM during matplotlib/FFT/stat plotting.",
+                ])
+                + "\n",
+                encoding="utf-8",
+            )
+            continue
         # 颗粒图像误差图：Generated SR - Original HR。
         # prev/next_sr_error*.npy 属于误差 NPY，按需求不受 IS_SAVE_NPY 影响，始终保存；
         # 这样可视化和后处理数据完全一致。

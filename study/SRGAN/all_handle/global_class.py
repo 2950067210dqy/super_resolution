@@ -59,11 +59,14 @@ class global_data:
         # flow_u_epe_hist_overlay 属于 03_error_histograms，tbl_02_error_map 属于 02_error_maps。
         # 支持目录名和短名混用：energy_spectrum / error_maps / error_histograms / composite_panels。
         # 如果只想直接处理 TBL 剖面图，设置 OUTPUT_STAGE_FILTER = "tbl_profile_overlay"；
+        # 如果只想重跑 TBL 的 v 方向且去掉 bicubic-hs 的剖面图，
+        # 设置 OUTPUT_STAGE_FILTER = "tbl_v_profile_overlay_without_bicubic_hs"；
+        # 如果只想重跑 TBL/TWCF 的能量谱图，设置 OUTPUT_STAGE_FILTER = "tbl_twcf_energy_spectrum"；
         # 如果只想处理颗粒统计条形图，设置 OUTPUT_STAGE_FILTER = "particle_stats_metrics"；
         # 如果只想处理 *_flow_u_epe_hist_overlay.png，设置 OUTPUT_STAGE_FILTER = "flow_u_epe_hist_overlay"。
         # 如果只想处理 TBL 的 02_error_maps，设置 OUTPUT_STAGE_FILTER = "tbl_02_error_map"。
         # OUTPUT_STAGE_FILTER =None
-        OUTPUT_STAGE_FILTER =("03_error_histograms")
+        OUTPUT_STAGE_FILTER =("tbl_v_profile_overlay_without_bicubic_hs")
         OUTPUT_STAGE_ALIASES = {
             "01_energy_spectrum": "energy_spectrum",
             "energy_spectrum": "energy_spectrum",
@@ -87,6 +90,13 @@ class global_data:
             "profile_overlay": "tbl_profile_overlay",
             "tbl_profile": "tbl_profile_overlay",
             "profile": "tbl_profile_overlay",
+            "tbl_v_profile_overlay_without_bicubic_hs": "tbl_v_profile_overlay_without_bicubic_hs",
+            "tbl_v_profile_without_bicubic_hs": "tbl_v_profile_overlay_without_bicubic_hs",
+            "tbl_v_without_bicubic_hs": "tbl_v_profile_overlay_without_bicubic_hs",
+            "tbl_twcf_energy_spectrum": "tbl_twcf_energy_spectrum",
+            "tbl_twcf_energy": "tbl_twcf_energy_spectrum",
+            "tbl_energy_spectrum": "tbl_twcf_energy_spectrum",
+            "twcf_energy_spectrum": "tbl_twcf_energy_spectrum",
             "particle_stats_metrics": "particle_stats_metrics",
             "particle_metrics": "particle_stats_metrics",
             "particle_bar": "particle_stats_metrics",
@@ -348,6 +358,21 @@ class global_data:
         HIST_SHARED_BIN_WIDTH_MODE = "coarsest"
         # 以 0 为中心的误差直方图使用对称 x 范围；EPE 是非负量，不做 0 对称处理。
         HIST_SHARED_BIN_SYMMETRIC_AXIS_KINDS = ("flow", "flow_u", "particle", "vorticity")
+        # 统一 bins 后，公共模板两端可能有大量 0 count 的空白 bin，导致图中主峰被挤得很小。
+        # 开启后，绘图的 x 轴显示范围只根据实际有 count 的 bin 自动缩小；
+        # flow/particle/vorticity/Delta u 按 0 对称，EPE 只从 0 到最大值。
+        HIST_USE_DYNAMIC_X_LIMITS = True
+        HIST_DYNAMIC_X_LIMIT_MIN_COUNT = 0.0
+        HIST_DYNAMIC_X_LIMIT_MARGIN_RATIO = 0.0
+        # 新增“2D + 局部 3D”合图：2D 子图仍显示完整/当前二维范围，
+        # 3D 子图只显示直方图 count 变化明显的 x 区域，避免长尾把 3D 主峰挤得太窄。
+        # 明显区域按“所有实验 count 叠加后超过峰值比例”的 bin 自动确定；
+        # 例如峰值附近为主要变化区时，会自动得到类似 [-5, 5] 这样的局部范围。
+        WATERFALL_3D_FOCUS_COMPOSITE_ENABLED = True
+        HIST_FOCUS_X_LIMIT_THRESHOLD_RATIO = 0.005
+        HIST_FOCUS_X_LIMIT_MARGIN_RATIO = 0.08
+        # 为避免噪声造成过窄范围，局部 3D 至少保留当前动态显示范围的一定比例。
+        HIST_FOCUS_X_LIMIT_MIN_SPAN_RATIO = 0.18
         # 误差直方图里 ESRuRAFT-PIV 必须最后绘制并处在最高层，避免被其它半透明柱子覆盖；
         # 倍率对比图里的 x4/x8 也属于本文方法，因此同样放到顶层。
         HIST_TOP_EXPERIMENT_KEYS = ("PIV_A_Esrgan_v4", "PIV_A_Esrgan_v_SCALE_8")
@@ -585,6 +610,12 @@ class global_data:
         TBL_PROFILE_X_MAX = None
         TBL_PROFILE_Y_MIN = None
         TBL_PROFILE_Y_MAX = None
+        # TBL v 方向位移幅值较小，普通自动范围会被个别方法拉得过宽，导致主体曲线挤在中间。
+        # 因此按分量提供专属横坐标范围；这里把 v 方向固定为 [-2, 2]，
+        # 会作用于 tbl_v_profile_overlay_without_bicubic_hs.png 等 v 方向剖面图。
+        TBL_PROFILE_COMPONENT_X_LIMITS = {
+            "v": (-4.0, 4.0),
+        }
         PARTICLE_STAT_COUNT_LABEL = "count"
         PARTICLE_STAT_PIXEL_LABEL = "particle pixels"
         PARTICLE_STAT_MEAN_AREA_LABEL = "mean area"
@@ -775,6 +806,16 @@ class global_data:
         ENERGY_SPECTRUM_Y_MAX = None
         ENERGY_SPECTRUM_X_TICK_INTERVAL = None
         ENERGY_SPECTRUM_Y_TICK_INTERVAL = None
+        # TBL/TWCF 的能量谱横坐标比普通方形样本更长；如果继续套用全局 X_MAX=200，
+        # 右侧高波数区域会在二维图和 2D+3D 合图左侧二维图中被截断。
+        # 因此仅对这些类别按当前可用数据自动扩展横轴，其他类别仍使用上方全局范围。
+        ENERGY_SPECTRUM_DYNAMIC_X_LIMIT_CATEGORIES = ("tbl", "twcf")
+        ENERGY_SPECTRUM_DYNAMIC_X_MARGIN_RATIO = 0.02
+        # 能量谱的“2D + 局部 3D”合图中，3D 子图按各实验 log10(energy) 曲线差异自动取 x 范围。
+        # 阈值越大，3D 越聚焦在差异最明显的波数段；阈值越小，保留范围越宽。
+        ENERGY_FOCUS_X_LIMIT_SPREAD_RATIO = 0.18
+        ENERGY_FOCUS_X_LIMIT_MARGIN_RATIO = 0.08
+        ENERGY_FOCUS_X_LIMIT_MIN_SPAN_RATIO = 0.18
 
         # FLOW_ERROR_COLORBAR_LIMIT / PARTICLE_ERROR_COLORBAR_LIMIT 支持两种模式：
         # - "auto": pipeline.py 会按 ERROR_COLORBAR_REFERENCE_EXPERIMENT_KEYS 指定的实验求 min/max；

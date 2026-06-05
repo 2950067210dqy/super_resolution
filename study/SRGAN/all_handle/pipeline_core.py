@@ -351,9 +351,13 @@ class AllHandlePipeline:
         # - particle_binary_count 用于单独重跑颗粒阈值图 + count/pixels 条形图；
         # - flow_u_epe_hist_overlay 已包含在 error_histograms 里；
         # - tbl_02_error_map 已包含在 error_maps 的 TBL 流程里。
+        # - tbl_v_profile_overlay_without_bicubic_hs 只重跑 TBL v 方向去掉 bicubic-hs 的剖面图；
+        # - tbl_twcf_energy_spectrum 只重跑 TBL/TWCF 的能量谱图，便于修正长条流场的横轴显示。
         # 因此 OUTPUT_STAGE_FILTER=None 时不再默认跑它们，只有显式指定时才运行。
         standalone_stages = {
             "tbl_profile_overlay",
+            "tbl_v_profile_overlay_without_bicubic_hs",
+            "tbl_twcf_energy_spectrum",
             "particle_stats_metrics",
             "particle_binary_count",
             "flow_u_epe_hist_overlay",
@@ -576,6 +580,31 @@ class AllHandlePipeline:
             z_arr = np.log10(np.maximum(z_arr, 0.0) + 1.0)
         return self.downsample_curve(x_arr, z_arr)
 
+    def crop_waterfall_curve_to_x_limits(
+        self,
+        x_arr: np.ndarray,
+        z_arr: np.ndarray,
+        x_limits: tuple[float | None, float | None] | None,
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        """
+        按 3D 图的 x 轴显示范围裁剪曲线数据。
+        仅设置 ax.set_xlim 会隐藏范围外曲线，但 z 轴自动缩放仍可能被范围外尖峰影响；
+        这里在绘制前直接裁剪 x/z，使局部 3D 合图的高度也聚焦在可见区域。
+        """
+
+        if x_limits is None:
+            return x_arr, z_arr
+        x_min, x_max = x_limits
+        mask = np.ones_like(x_arr, dtype=bool)
+        if x_min is not None:
+            mask &= x_arr >= float(x_min)
+        if x_max is not None:
+            mask &= x_arr <= float(x_max)
+        mask &= np.isfinite(x_arr) & np.isfinite(z_arr)
+        if not np.any(mask):
+            return None
+        return x_arr[mask], z_arr[mask]
+
     def set_waterfall_white_planes(self, ax: plt.Axes) -> None:
         """把 3D 坐标平面的 pane 统一设为纯白，符合用户要求的白色坐标平面。"""
 
@@ -610,6 +639,7 @@ class AllHandlePipeline:
         log_z_plus_one: bool = False,
         add_legend: bool = True,
         left_z_label_x: float | None = None,
+        x_limits: tuple[float | None, float | None] | None = None,
     ) -> bool:
         """
         在已有 3D 坐标轴上绘制瀑布图。
@@ -628,16 +658,22 @@ class AllHandlePipeline:
             )
             if prepared_gt is not None:
                 gt_x, gt_z = prepared_gt
-                curve_items.append(
-                    (
-                        "__gt__",
-                        self.cfg.GT_ENERGY_LABEL,
-                        self.cfg.GT_ENERGY_COLOR,
-                        self.cfg.GT_ENERGY_LINESTYLE,
-                        gt_x,
-                        gt_z,
+                cropped_gt = self.crop_waterfall_curve_to_x_limits(gt_x, gt_z, x_limits)
+                if cropped_gt is None:
+                    gt_x, gt_z = np.asarray([], dtype=np.float64), np.asarray([], dtype=np.float64)
+                else:
+                    gt_x, gt_z = cropped_gt
+                if gt_x.size:
+                    curve_items.append(
+                        (
+                            "__gt__",
+                            self.cfg.GT_ENERGY_LABEL,
+                            self.cfg.GT_ENERGY_COLOR,
+                            self.cfg.GT_ENERGY_LINESTYLE,
+                            gt_x,
+                            gt_z,
+                        )
                     )
-                )
         for exp_key in self.legend_order_keys():
             if exp_key not in series:
                 continue
@@ -651,6 +687,10 @@ class AllHandlePipeline:
             if prepared is None:
                 continue
             x_arr, z_arr = prepared
+            cropped = self.crop_waterfall_curve_to_x_limits(x_arr, z_arr, x_limits)
+            if cropped is None:
+                continue
+            x_arr, z_arr = cropped
             color = self.experiment_hist_color(exp_key) if use_hist_color else self.experiment_color(exp_key)
             curve_items.append((exp_key, self.experiment_label(exp_key), color, "-", x_arr, z_arr))
         if not curve_items:
@@ -688,6 +728,10 @@ class AllHandlePipeline:
                 linewidth=float(getattr(self.cfg, "WATERFALL_3D_LINE_WIDTH", 1.45)),
                 label=label,
             )
+        if x_limits is not None:
+            x_min, x_max = x_limits
+            if x_min is not None or x_max is not None:
+                ax.set_xlim(left=x_min, right=x_max)
         # 3D 图的 x-label 在 azim=-60 这类视角下会向画布底部倾斜；
         # labelpad 放到全局变量里，便于把带单位的 "[px]" 往坐标轴内收，避免保存时被裁切。
         ax.set_xlabel(x_label, labelpad=float(getattr(self.cfg, "WATERFALL_3D_X_LABEL_PAD", 2)))
@@ -780,6 +824,7 @@ class AllHandlePipeline:
         log_x: bool = False,
         log_z: bool = False,
         log_z_plus_one: bool = False,
+        x_limits: tuple[float | None, float | None] | None = None,
     ) -> None:
         """保存单张 3D 瀑布图；每条曲线沿 y 方向错开，并在右侧保留图例。"""
 
@@ -800,6 +845,7 @@ class AllHandlePipeline:
             log_z=log_z,
             log_z_plus_one=log_z_plus_one,
             add_legend=True,
+            x_limits=x_limits,
         )
         if not drawn:
             plt.close(fig)
@@ -1126,7 +1172,10 @@ class AllHandlePipeline:
                 self.active_comparison_name = group.comparison_name
                 self.progress(f"group {group_index}/{total_groups}: {self.group_progress_label(group)}")
                 steps = []
-                if "energy_spectrum" in enabled_stages:
+                if "energy_spectrum" in enabled_stages or (
+                    "tbl_twcf_energy_spectrum" in enabled_stages
+                    and normalize_name(group.category_name) in ("tbl", "twcf")
+                ):
                     steps.append(("energy_spectrum", self.plot_energy_spectrum))
                 if "error_histograms" in enabled_stages:
                     steps.append(("histograms", self.plot_histogram_bundle))
@@ -1150,6 +1199,16 @@ class AllHandlePipeline:
                         and normalize_name(group.category_name) == "tbl"
                     ):
                         steps.append(("tbl_profile_overlay", self.plot_tbl_profile_overlays))
+                    if (
+                        "tbl_v_profile_overlay_without_bicubic_hs" in enabled_stages
+                        and normalize_name(group.category_name) == "tbl"
+                    ):
+                        steps.append(
+                            (
+                                "tbl_v_profile_overlay_without_bicubic_hs",
+                                self.plot_tbl_v_profile_overlay_without_bicubic_hs,
+                            )
+                        )
                 step_total = len(steps)
                 if step_total == 0:
                     self.progress(f"group {group_index}/{total_groups} has no enabled steps: {self.group_progress_label(group)}")
@@ -1689,11 +1748,131 @@ class AllHandlePipeline:
     # =========================
     # (1) 能量谱
     # =========================
+    def energy_spectrum_dynamic_x_limits(
+        self,
+        series: dict[str, tuple[np.ndarray, np.ndarray]],
+        gt_series: tuple[np.ndarray, np.ndarray] | None,
+        category_name: str | None,
+    ) -> tuple[float, float] | None:
+        """
+        仅对配置中指定的长条流场类别自动扩展能量谱横轴。
+        TBL/TWCF 的波数范围常常超过普通方形样本；如果继续用全局 ENERGY_SPECTRUM_X_MAX，
+        二维图右侧高波数会被裁掉。这里从 GT 和所有实验曲线中取有限且大于 0 的 x，
+        再加少量比例边距，保证普通 2D 图和 2D+3D 合图里的 2D 子图都显示完整。
+        """
+
+        dynamic_categories = {
+            normalize_name(name)
+            for name in getattr(self.cfg, "ENERGY_SPECTRUM_DYNAMIC_X_LIMIT_CATEGORIES", ())
+        }
+        if normalize_name(category_name or "") not in dynamic_categories:
+            return None
+
+        x_values: list[np.ndarray] = []
+        if gt_series is not None:
+            gt_x = np.asarray(gt_series[0], dtype=np.float64).reshape(-1)
+            gt_x = gt_x[np.isfinite(gt_x) & (gt_x > 0)]
+            if gt_x.size:
+                x_values.append(gt_x)
+        for x, _y in series.values():
+            arr = np.asarray(x, dtype=np.float64).reshape(-1)
+            arr = arr[np.isfinite(arr) & (arr > 0)]
+            if arr.size:
+                x_values.append(arr)
+        if not x_values:
+            return None
+
+        merged = np.concatenate(x_values)
+        x_min = float(np.nanmin(merged))
+        x_max = float(np.nanmax(merged))
+        if not math.isfinite(x_min) or not math.isfinite(x_max) or x_min <= 0 or x_max <= x_min:
+            return None
+
+        margin_ratio = max(0.0, float(getattr(self.cfg, "ENERGY_SPECTRUM_DYNAMIC_X_MARGIN_RATIO", 0.0)))
+        return (x_min / (1.0 + margin_ratio), x_max * (1.0 + margin_ratio))
+
+    def energy_spectrum_focus_x_limits(
+        self,
+        series: dict[str, tuple[np.ndarray, np.ndarray]],
+        gt_series: tuple[np.ndarray, np.ndarray] | None,
+        *,
+        log_x: bool,
+    ) -> tuple[float | None, float | None]:
+        """
+        为能量谱局部 3D 图自动计算“曲线差异明显”的 x 范围。
+        做法：把 GT 和各实验的 log10(energy) 插值到共同的 log10(wavenumber) 网格，
+        用每个波数处的最大-最小差异作为显著性；只保留超过最大差异一定比例的区域。
+        返回值与 3D 绘图坐标一致：log_x=True 时返回 log10(wavenumber) 范围。
+        """
+
+        curves: list[tuple[np.ndarray, np.ndarray]] = []
+        if gt_series is not None:
+            curves.append(gt_series)
+        curves.extend(series.values())
+
+        prepared: list[tuple[np.ndarray, np.ndarray]] = []
+        for x, y in curves:
+            x_arr = np.asarray(x, dtype=np.float64).reshape(-1)
+            y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
+            mask = np.isfinite(x_arr) & np.isfinite(y_arr) & (x_arr > 0) & (y_arr > 0)
+            if np.count_nonzero(mask) < 3:
+                continue
+            x_log = np.log10(x_arr[mask])
+            y_log = np.log10(y_arr[mask])
+            order = np.argsort(x_log)
+            x_log = x_log[order]
+            y_log = y_log[order]
+            unique_x, unique_indices = np.unique(x_log, return_index=True)
+            if unique_x.size >= 3:
+                prepared.append((unique_x, y_log[unique_indices]))
+        if len(prepared) < 2:
+            return None, None
+
+        left = max(float(np.nanmin(x)) for x, _y in prepared)
+        right = min(float(np.nanmax(x)) for x, _y in prepared)
+        if not math.isfinite(left) or not math.isfinite(right) or right <= left:
+            return None, None
+
+        sample_count = int(getattr(self.cfg, "WATERFALL_3D_MAX_POINTS", 700))
+        grid = np.linspace(left, right, max(80, sample_count))
+        values = []
+        for x_log, y_log in prepared:
+            values.append(np.interp(grid, x_log, y_log))
+        matrix = np.vstack(values)
+        spread = np.nanmax(matrix, axis=0) - np.nanmin(matrix, axis=0)
+        spread = np.where(np.isfinite(spread), spread, 0.0)
+        max_spread = float(np.nanmax(spread)) if spread.size else 0.0
+        if max_spread <= 0:
+            return None, None
+
+        threshold = max_spread * float(getattr(self.cfg, "ENERGY_FOCUS_X_LIMIT_SPREAD_RATIO", 0.18))
+        focus_grid = grid[spread >= threshold]
+        if focus_grid.size == 0:
+            return None, None
+
+        focus_left = float(np.nanmin(focus_grid))
+        focus_right = float(np.nanmax(focus_grid))
+        full_span = right - left
+        min_span = full_span * max(0.0, float(getattr(self.cfg, "ENERGY_FOCUS_X_LIMIT_MIN_SPAN_RATIO", 0.18)))
+        if focus_right - focus_left < min_span:
+            center = 0.5 * (focus_left + focus_right)
+            focus_left = center - 0.5 * min_span
+            focus_right = center + 0.5 * min_span
+        margin = (focus_right - focus_left) * max(
+            0.0, float(getattr(self.cfg, "ENERGY_FOCUS_X_LIMIT_MARGIN_RATIO", 0.08))
+        )
+        focus_left = max(left, focus_left - margin)
+        focus_right = min(right, focus_right + margin)
+        if log_x:
+            return focus_left, focus_right
+        return 10.0 ** focus_left, 10.0 ** focus_right
+
     def draw_energy_spectrum_2d(
         self,
         ax: plt.Axes,
         series: dict[str, tuple[np.ndarray, np.ndarray]],
         gt_series: tuple[np.ndarray, np.ndarray] | None,
+        category_name: str | None = None,
     ) -> None:
         """绘制二维 ENERGY_SPECTRUM；普通图和 2D+3D 大图共用，避免两处样式不一致。"""
 
@@ -1729,12 +1908,18 @@ class AllHandlePipeline:
             self.cfg.ENERGY_SPECTRUM_Y_MIN,
             self.cfg.ENERGY_SPECTRUM_Y_MAX,
         )
+        dynamic_x_limits = self.energy_spectrum_dynamic_x_limits(series, gt_series, category_name)
+        if dynamic_x_limits is not None:
+            ax.set_xlim(*dynamic_x_limits)
 
     def plot_energy_spectrum_2d_3d_composite(
         self,
         series: dict[str, tuple[np.ndarray, np.ndarray]],
         gt_series: tuple[np.ndarray, np.ndarray] | None,
         out_base: Path,
+        category_name: str | None = None,
+        waterfall_x_limits: tuple[float | None, float | None] | None = None,
+        suffix: str = "_2d_3d_composite",
     ) -> None:
         """
         生成能量谱大图：左侧是原二维 log-log 图，右侧是 3D 瀑布图。
@@ -1755,7 +1940,7 @@ class AllHandlePipeline:
         )
         ax_2d = fig.add_subplot(gs[0, 0])
         ax_3d = fig.add_subplot(gs[0, 1], projection="3d")
-        self.draw_energy_spectrum_2d(ax_2d, series, gt_series)
+        self.draw_energy_spectrum_2d(ax_2d, series, gt_series, category_name=category_name)
         drawn = self.draw_waterfall_3d_axes(
             ax_3d,
             series,
@@ -1766,6 +1951,7 @@ class AllHandlePipeline:
             log_x=energy_log,
             log_z=energy_log,
             add_legend=False,
+            x_limits=waterfall_x_limits,
             left_z_label_x=float(
                 getattr(
                     self.cfg,
@@ -1777,7 +1963,7 @@ class AllHandlePipeline:
         if not drawn:
             plt.close(fig)
             return
-        self.save_figure(fig, out_base.with_name(f"{out_base.name}_2d_3d_composite"))
+        self.save_figure(fig, out_base.with_name(f"{out_base.name}{suffix}"))
 
     def plot_energy_spectrum(self, group: GroupContext) -> None:
         """把八个实验的 ENERGY_SPECTRUM 曲线叠加到一张图。"""
@@ -1812,7 +1998,7 @@ class AllHandlePipeline:
             return
 
         fig, ax = plt.subplots(figsize=(5.4, 3.6))
-        self.draw_energy_spectrum_2d(ax, series, gt_series)
+        self.draw_energy_spectrum_2d(ax, series, gt_series, category_name=group.category_name)
 
         out_dir = self.output_dir(self.cfg.ENERGY_OUTPUT_DIR_NAME, group.class_name, group.split_name)
         out_base = out_dir / f"{safe_name(group.category_name)}_energy_spectrum"
@@ -1830,7 +2016,20 @@ class AllHandlePipeline:
             log_x=energy_log,
             log_z=energy_log,
         )
-        self.plot_energy_spectrum_2d_3d_composite(series, gt_series, out_base)
+        self.plot_energy_spectrum_2d_3d_composite(series, gt_series, out_base, category_name=group.category_name)
+        if bool(getattr(self.cfg, "WATERFALL_3D_FOCUS_COMPOSITE_ENABLED", True)):
+            # 额外保存一张局部 3D 合图：二维能量谱仍显示完整横轴，
+            # 右侧 3D 只展示各实验谱线差异最明显的波数段，便于观察局部差异。
+            focus_x_limits = self.energy_spectrum_focus_x_limits(series, gt_series, log_x=energy_log)
+            if focus_x_limits != (None, None):
+                self.plot_energy_spectrum_2d_3d_composite(
+                    series,
+                    gt_series,
+                    out_base,
+                    category_name=group.category_name,
+                    waterfall_x_limits=focus_x_limits,
+                    suffix="_2d_3d_focus_composite",
+                )
 
     # =========================
     # (3)(4)(5) 直方图叠加
@@ -2065,7 +2264,7 @@ class AllHandlePipeline:
         if add_legend:
             self.apply_hist_legend(ax, series)
         ax.grid(True, alpha=0.18, linewidth=0.5)
-        self.apply_hist_axis(ax, group.category_name, axis_kind)
+        self.apply_hist_axis(ax, group.category_name, axis_kind, series=series)
 
     def plot_overlay_histogram_2d_3d_composite(
         self,
@@ -2076,6 +2275,8 @@ class AllHandlePipeline:
         x_label: str,
         y_label: str,
         axis_kind: str,
+        waterfall_x_limits: tuple[float | None, float | None] | None = None,
+        suffix: str = "_2d_3d_composite",
     ) -> None:
         """
         生成误差直方图大图：左侧为原二维叠加直方图，右侧为 3D 瀑布图。
@@ -2113,6 +2314,7 @@ class AllHandlePipeline:
             use_hist_color=True,
             log_z_plus_one=hist_log_count,
             add_legend=False,
+            x_limits=waterfall_x_limits if waterfall_x_limits is not None else self.hist_dynamic_x_limits(series, axis_kind),
             left_z_label_x=float(
                 getattr(
                     self.cfg,
@@ -2124,7 +2326,7 @@ class AllHandlePipeline:
         if not drawn:
             plt.close(fig)
             return
-        self.save_figure(fig, out_base.with_name(f"{out_base.name}_2d_3d_composite"))
+        self.save_figure(fig, out_base.with_name(f"{out_base.name}{suffix}"))
 
     def plot_overlay_histogram(
         self,
@@ -2169,6 +2371,7 @@ class AllHandlePipeline:
         self.save_figure(fig, out_base)
         # 新增 3D 瀑布图：直方图仍使用原来的科研配色，按实验顺序沿 y 方向展开，并保留图例。
         hist_log_count = bool(getattr(self.cfg, "HIST_WATERFALL_USE_LOG10_COUNT", False))
+        x_limits = self.hist_dynamic_x_limits(series, axis_kind)
         self.plot_waterfall_3d(
             series,
             out_base.with_name(f"{out_base.name}_waterfall_3d"),
@@ -2176,6 +2379,7 @@ class AllHandlePipeline:
             z_label=self.cfg.HIST_WATERFALL_LOG_Z_LABEL if hist_log_count else self.cfg.HIST_WATERFALL_Z_LABEL,
             use_hist_color=True,
             log_z_plus_one=hist_log_count,
+            x_limits=x_limits,
         )
         self.plot_overlay_histogram_2d_3d_composite(
             group,
@@ -2185,6 +2389,21 @@ class AllHandlePipeline:
             y_label=y_label,
             axis_kind=axis_kind,
         )
+        if bool(getattr(self.cfg, "WATERFALL_3D_FOCUS_COMPOSITE_ENABLED", True)):
+            # 额外保存局部 3D 合图：二维直方图保持原来的完整显示范围，
+            # 右侧 3D 只展示 count 变化明显的 x 区域，避免长尾区域压缩主峰细节。
+            focus_x_limits = self.hist_focus_x_limits(series, axis_kind)
+            if focus_x_limits != (None, None):
+                self.plot_overlay_histogram_2d_3d_composite(
+                    group,
+                    series,
+                    out_base,
+                    x_label=x_label,
+                    y_label=y_label,
+                    axis_kind=axis_kind,
+                    waterfall_x_limits=focus_x_limits,
+                    suffix="_2d_3d_focus_composite",
+                )
 
     def draw_flow_u_epe_histogram_2d(
         self,
@@ -2229,7 +2448,7 @@ class AllHandlePipeline:
             ax.set_xlabel(x_label)
             ax.set_ylabel(self.cfg.HIST_Y_LABEL)
             ax.grid(True, alpha=0.18, linewidth=0.5)
-            self.apply_hist_axis(ax, group.category_name, axis_kind)
+            self.apply_hist_axis(ax, group.category_name, axis_kind, series=series)
         if use_outside_legend:
             # 八组实验的 legend 过高，放在右侧 EPE 子图内部会压住 EPE 直方图主峰；
             # 因此把 legend 锚到右图外侧，并给整张图加宽，保存时 tight bbox 会把 legend 一起保留。
@@ -2249,6 +2468,10 @@ class AllHandlePipeline:
         u_series: dict[str, tuple[np.ndarray, np.ndarray]],
         epe_series: dict[str, tuple[np.ndarray, np.ndarray]],
         out_base: Path,
+        *,
+        u_waterfall_x_limits: tuple[float | None, float | None] | None = None,
+        epe_waterfall_x_limits: tuple[float | None, float | None] | None = None,
+        suffix: str = "_2d_3d_composite",
     ) -> None:
         """
         生成 flow_u_epe 大图：第一行保留原二维双子图，第二行放两个对应的 3D 瀑布图。
@@ -2297,6 +2520,16 @@ class AllHandlePipeline:
         )
         hist_log_count = bool(getattr(self.cfg, "HIST_WATERFALL_USE_LOG10_COUNT", False))
         z_label = self.cfg.HIST_WATERFALL_LOG_Z_LABEL if hist_log_count else self.cfg.HIST_WATERFALL_Z_LABEL
+        u_x_limits = (
+            u_waterfall_x_limits
+            if u_waterfall_x_limits is not None
+            else self.hist_dynamic_x_limits(u_series, "flow_u")
+        )
+        epe_x_limits = (
+            epe_waterfall_x_limits
+            if epe_waterfall_x_limits is not None
+            else self.hist_dynamic_x_limits(epe_series, "epe")
+        )
         ax_u_3d = fig.add_subplot(gs[1, 0], projection="3d")
         ax_epe_3d = fig.add_subplot(gs[1, 1], projection="3d")
         drawn_u = self.draw_waterfall_3d_axes(
@@ -2309,6 +2542,7 @@ class AllHandlePipeline:
             use_hist_color=True,
             log_z_plus_one=hist_log_count,
             add_legend=False,
+            x_limits=u_x_limits,
             left_z_label_x=float(
                 getattr(
                     self.cfg,
@@ -2331,6 +2565,7 @@ class AllHandlePipeline:
             use_hist_color=True,
             log_z_plus_one=hist_log_count,
             add_legend=False,
+            x_limits=epe_x_limits,
             left_z_label_x=float(
                 getattr(
                     self.cfg,
@@ -2375,7 +2610,7 @@ class AllHandlePipeline:
         except Exception:
             # 如果某些 Matplotlib 后端无法返回文字 bbox，则保留无下排 label 的图，而不是中断批量绘图。
             pass
-        self.save_figure(fig, out_base.with_name(f"{out_base.name}_2d_3d_composite"))
+        self.save_figure(fig, out_base.with_name(f"{out_base.name}{suffix}"))
 
     def plot_flow_u_epe_histogram(self, group: GroupContext) -> None:
         """左侧叠加 Δu 误差直方图，右侧叠加 EPE 直方图。"""
@@ -2419,6 +2654,8 @@ class AllHandlePipeline:
         # flow_u_epe 原图是左右双子图，这里分别补充 Delta u 与 EPE 的 3D 瀑布图，避免一个 3D 双面板过挤。
         hist_log_count = bool(getattr(self.cfg, "HIST_WATERFALL_USE_LOG10_COUNT", False))
         z_label = self.cfg.HIST_WATERFALL_LOG_Z_LABEL if hist_log_count else self.cfg.HIST_WATERFALL_Z_LABEL
+        u_x_limits = self.hist_dynamic_x_limits(u_series, "flow_u")
+        epe_x_limits = self.hist_dynamic_x_limits(epe_series, "epe")
         self.plot_waterfall_3d(
             u_series,
             out_base.with_name(f"{safe_name(group.category_name)}_flow_u_hist_waterfall_3d"),
@@ -2426,6 +2663,7 @@ class AllHandlePipeline:
             z_label=z_label,
             use_hist_color=True,
             log_z_plus_one=hist_log_count,
+            x_limits=u_x_limits,
         )
         self.plot_waterfall_3d(
             epe_series,
@@ -2434,8 +2672,24 @@ class AllHandlePipeline:
             z_label=z_label,
             use_hist_color=True,
             log_z_plus_one=hist_log_count,
+            x_limits=epe_x_limits,
         )
         self.plot_flow_u_epe_histogram_2d_3d_composite(group, u_series, epe_series, out_base)
+        if bool(getattr(self.cfg, "WATERFALL_3D_FOCUS_COMPOSITE_ENABLED", True)):
+            # flow_u_epe 是一张图里同时比较 Delta u 和 EPE；
+            # 局部 3D 版本分别为左下 Delta u 和右下 EPE 计算显著区域，二维第一行仍保持完整视图。
+            u_focus_x_limits = self.hist_focus_x_limits(u_series, "flow_u")
+            epe_focus_x_limits = self.hist_focus_x_limits(epe_series, "epe")
+            if u_focus_x_limits != (None, None) or epe_focus_x_limits != (None, None):
+                self.plot_flow_u_epe_histogram_2d_3d_composite(
+                    group,
+                    u_series,
+                    epe_series,
+                    out_base,
+                    u_waterfall_x_limits=u_focus_x_limits,
+                    epe_waterfall_x_limits=epe_focus_x_limits,
+                    suffix="_2d_3d_focus_composite",
+                )
 
     def histogram_diagnostic_rows(
         self,
@@ -2594,6 +2848,122 @@ class AllHandlePipeline:
         diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
         return float(np.median(diffs)) if diffs.size else 0.8
 
+    def hist_dynamic_x_limits(
+        self, series: dict[str, tuple[np.ndarray, np.ndarray]], axis_kind: str
+    ) -> tuple[float | None, float | None]:
+        """根据实际有 count 的 bin 自动缩小误差直方图 x 轴显示范围。"""
+
+        if not series or not bool(getattr(self.cfg, "HIST_USE_DYNAMIC_X_LIMITS", True)):
+            return None, None
+        min_count = float(getattr(self.cfg, "HIST_DYNAMIC_X_LIMIT_MIN_COUNT", 0.0))
+        x_values: list[np.ndarray] = []
+        for x, y in series.values():
+            x_arr = np.asarray(x, dtype=np.float64)
+            y_arr = np.asarray(y, dtype=np.float64)
+            mask = np.isfinite(x_arr) & np.isfinite(y_arr) & (y_arr > min_count)
+            if np.any(mask):
+                x_values.append(x_arr[mask])
+        if not x_values:
+            return None, None
+        all_x = np.concatenate(x_values)
+        x_min = float(np.nanmin(all_x))
+        x_max = float(np.nanmax(all_x))
+        if not np.isfinite(x_min) or not np.isfinite(x_max):
+            return None, None
+
+        if axis_kind == "epe":
+            # EPE 是非负误差，不需要以 0 对称，但横轴左边界固定为 0，避免出现 0.03 这类不直观起点。
+            left = 0.0
+            right = max(left, x_max)
+        else:
+            max_abs = max(abs(x_min), abs(x_max))
+            left, right = -max_abs, max_abs
+
+        margin_ratio = float(getattr(self.cfg, "HIST_DYNAMIC_X_LIMIT_MARGIN_RATIO", 0.0))
+        if margin_ratio > 0 and right > left:
+            margin = (right - left) * margin_ratio
+            left -= margin
+            right += margin
+            if axis_kind == "epe":
+                left = max(0.0, left)
+            else:
+                max_abs = max(abs(left), abs(right))
+                left, right = -max_abs, max_abs
+        return left, right
+
+    def hist_focus_x_limits(
+        self, series: dict[str, tuple[np.ndarray, np.ndarray]], axis_kind: str
+    ) -> tuple[float | None, float | None]:
+        """
+        为误差直方图局部 3D 自动计算“变化明显区域”。
+        先把各实验 count 插值/累加到同一 x 网格，再找出总 count 超过峰值比例的 bin；
+        对 flow/particle/vorticity/Delta u 等正负误差，最终范围强制以 0 对称，EPE 则保持非负范围。
+        """
+
+        if not series:
+            return None, None
+        # 统一 bins 后各实验通常共用同一 x 网格；这里仍做插值兜底，兼容旧 npy 或单独传入的曲线。
+        base_x: np.ndarray | None = None
+        for x, _y in series.values():
+            arr = np.asarray(x, dtype=np.float64).reshape(-1)
+            arr = arr[np.isfinite(arr)]
+            if arr.size:
+                base_x = np.sort(arr)
+                break
+        if base_x is None or base_x.size < 2:
+            return None, None
+
+        total = np.zeros_like(base_x, dtype=np.float64)
+        for x, y in series.values():
+            x_arr = np.asarray(x, dtype=np.float64).reshape(-1)
+            y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
+            mask = np.isfinite(x_arr) & np.isfinite(y_arr)
+            if np.count_nonzero(mask) < 2:
+                continue
+            order = np.argsort(x_arr[mask])
+            total += np.interp(base_x, x_arr[mask][order], y_arr[mask][order], left=0.0, right=0.0)
+        max_count = float(np.nanmax(total)) if total.size else 0.0
+        if max_count <= 0:
+            return self.hist_dynamic_x_limits(series, axis_kind)
+
+        threshold = max_count * float(getattr(self.cfg, "HIST_FOCUS_X_LIMIT_THRESHOLD_RATIO", 0.005))
+        focus_x = base_x[total >= threshold]
+        if focus_x.size == 0:
+            return self.hist_dynamic_x_limits(series, axis_kind)
+
+        full_left, full_right = self.hist_dynamic_x_limits(series, axis_kind)
+        if full_left is None:
+            full_left = float(np.nanmin(base_x))
+        if full_right is None:
+            full_right = float(np.nanmax(base_x))
+        if not math.isfinite(full_left) or not math.isfinite(full_right) or full_right <= full_left:
+            return None, None
+
+        focus_left = float(np.nanmin(focus_x))
+        focus_right = float(np.nanmax(focus_x))
+        full_span = full_right - full_left
+        min_span = full_span * max(0.0, float(getattr(self.cfg, "HIST_FOCUS_X_LIMIT_MIN_SPAN_RATIO", 0.18)))
+        margin_ratio = max(0.0, float(getattr(self.cfg, "HIST_FOCUS_X_LIMIT_MARGIN_RATIO", 0.08)))
+
+        if axis_kind == "epe":
+            if focus_right - focus_left < min_span:
+                focus_right = focus_left + min_span
+            margin = (focus_right - focus_left) * margin_ratio
+            left = max(0.0, full_left, focus_left - margin)
+            right = min(full_right, focus_right + margin)
+            if right <= left:
+                return self.hist_dynamic_x_limits(series, axis_kind)
+            return left, right
+
+        max_abs = max(abs(focus_left), abs(focus_right), min_span * 0.5)
+        max_abs *= 1.0 + margin_ratio
+        full_abs = max(abs(full_left), abs(full_right))
+        if full_abs > 0:
+            max_abs = min(max_abs, full_abs)
+        if max_abs <= 0:
+            return self.hist_dynamic_x_limits(series, axis_kind)
+        return -max_abs, max_abs
+
     def apply_axis_limits(
         self,
         ax: plt.Axes,
@@ -2607,7 +2977,13 @@ class AllHandlePipeline:
         if y_min is not None or y_max is not None:
             ax.set_ylim(bottom=y_min, top=y_max)
 
-    def apply_hist_axis(self, ax: plt.Axes, category_name: str, axis_kind: str) -> None:
+    def apply_hist_axis(
+        self,
+        ax: plt.Axes,
+        category_name: str,
+        axis_kind: str,
+        series: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
+    ) -> None:
         """按普通类别或 TBL/TWCF 专用配置设置直方图坐标轴。"""
 
         category_norm = normalize_name(category_name)
@@ -2635,6 +3011,12 @@ class AllHandlePipeline:
             x_max = limits.get("x_max", x_max)
             y_min = limits.get("y_min", y_min)
             y_max = limits.get("y_max", y_max)
+        if series:
+            # 统一 bins 只保证不同方法的柱宽/统计口径一致；显示范围再按有 count 的最小/最大 x 缩小。
+            # 除 EPE 外，误差直方图的 x 轴强制以 0 为中心对称，便于比较正负误差。
+            dynamic_x_min, dynamic_x_max = self.hist_dynamic_x_limits(series, axis_kind)
+            if dynamic_x_min is not None or dynamic_x_max is not None:
+                x_min, x_max = dynamic_x_min, dynamic_x_max
         self.apply_axis_limits(ax, x_min, x_max, y_min, y_max)
 
     # =========================
@@ -4687,11 +5069,21 @@ class AllHandlePipeline:
         reference_width = max(float(np.nanmax(columns)) / 0.83, float(np.nanmax(columns)) + 1.0)
         return np.clip(columns / reference_width * float(top_width - 1), 0, top_width - 1)
 
-    def plot_tbl_profile_overlays(self, group: GroupContext) -> None:
+    def plot_tbl_profile_overlays(
+        self,
+        group: GroupContext,
+        component_filter: tuple[str, ...] | None = None,
+        extra_only: bool = False,
+    ) -> None:
         """TBL 补充图：按图三样式绘制顶部 GT 场和下方三段剖面对比曲线。"""
 
+        # component_filter/extra_only 主要服务于 OUTPUT_STAGE_FILTER 的精确重跑：
+        # 例如只重跑 tbl_v_profile_overlay_without_bicubic_hs.png 时，不需要顺带生成 u 方向或含 bicubic-hs 的版本。
+        selected_components = tuple(component_filter) if component_filter else tuple(
+            getattr(self.cfg, "TBL_PROFILE_COMPONENTS", ("u", "v"))
+        )
         for bundle in self.bundle_tbl_profile_samples(group):
-            for component in getattr(self.cfg, "TBL_PROFILE_COMPONENTS", ("u", "v")):
+            for component in selected_components:
                 pred_profiles: dict[str, np.ndarray] = {}
                 gt_profile: np.ndarray | None = None
                 y_positions: np.ndarray | None = None
@@ -4724,18 +5116,19 @@ class AllHandlePipeline:
                     point_count = gt_profile.shape[1] if gt_profile is not None else next(iter(pred_profiles.values())).shape[1]
                     y_positions = np.arange(point_count, dtype=np.float64)
 
-                self.plot_tbl_profile_overlay_figure(
-                    group,
-                    bundle.sample_name,
-                    component,
-                    pred_profiles,
-                    gt_profile,
-                    y_positions,
-                    profile_columns,
-                    top_gt_map,
-                    exclude_keys=(),
-                    suffix="",
-                )
+                if not extra_only:
+                    self.plot_tbl_profile_overlay_figure(
+                        group,
+                        bundle.sample_name,
+                        component,
+                        pred_profiles,
+                        gt_profile,
+                        y_positions,
+                        profile_columns,
+                        top_gt_map,
+                        exclude_keys=(),
+                        suffix="",
+                    )
                 extra_exclude = tuple(getattr(self.cfg, "TBL_PROFILE_EXTRA_EXCLUDE_EXPERIMENT_KEYS", ()))
                 if extra_exclude:
                     self.plot_tbl_profile_overlay_figure(
@@ -4750,6 +5143,11 @@ class AllHandlePipeline:
                         exclude_keys=extra_exclude,
                         suffix=str(getattr(self.cfg, "TBL_PROFILE_EXTRA_SUFFIX", "_filtered")),
                     )
+
+    def plot_tbl_v_profile_overlay_without_bicubic_hs(self, group: GroupContext) -> None:
+        """只生成 TBL v 方向且排除 bicubic-hs 的剖面图，用于单独修 tbl_v_profile_overlay_without_bicubic_hs.png。"""
+
+        self.plot_tbl_profile_overlays(group, component_filter=("v",), extra_only=True)
 
     def plot_tbl_profile_overlay_figure(
         self,
@@ -4904,10 +5302,18 @@ class AllHandlePipeline:
             if region_idx == 0:
                 ax.set_ylabel(getattr(self.cfg, "TBL_PROFILE_Y_LABEL", "y [px]"))
             ax.grid(True, alpha=float(getattr(self.cfg, "TBL_PROFILE_GRID_ALPHA", 0.25)), linewidth=0.5)
+            component_x_limits = getattr(self.cfg, "TBL_PROFILE_COMPONENT_X_LIMITS", {}).get(normalize_name(component), None)
+            if component_x_limits is not None and len(component_x_limits) >= 2:
+                # 分量级范围优先于通用 TBL_PROFILE_X_MIN/MAX。
+                # 这样可以单独把 v 方向固定为 [-2, 2]，同时不影响 u 方向剖面的自动/全局范围。
+                x_min, x_max = component_x_limits[0], component_x_limits[1]
+            else:
+                x_min = getattr(self.cfg, "TBL_PROFILE_X_MIN", None)
+                x_max = getattr(self.cfg, "TBL_PROFILE_X_MAX", None)
             self.apply_axis_limits(
                 ax,
-                getattr(self.cfg, "TBL_PROFILE_X_MIN", None),
-                getattr(self.cfg, "TBL_PROFILE_X_MAX", None),
+                x_min,
+                x_max,
                 getattr(self.cfg, "TBL_PROFILE_Y_MIN", None),
                 getattr(self.cfg, "TBL_PROFILE_Y_MAX", None),
             )

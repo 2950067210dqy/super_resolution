@@ -567,6 +567,10 @@ def _apply_experiment_patch_geometry(test_args: dict, job: ModelJob) -> dict:
     # 实验数据没有真实 HR，comparison.png 里的 HR 是 LR 插值得到的参考图。
     # 因此颗粒误差面板只展示 SR-HR 误差本身，不再叠加 ESMSE 文本，避免把伪参考指标误读为真实精度。
     patched_args["particle_error_show_metric"] = False
+    # 只有 scale_8 的实验大图会在 image_outputs 的全幅 FFT/统计/matplotlib 绘图阶段触发 OOM；
+    # 其他倍率仍保留完整 test_all 图像输出，避免为了 scale_8 的内存问题改变正常倍率的产物结构。
+    patched_args["experiment_low_memory_image_outputs"] = str(job.scale_dir_name) == "scale_8"
+    patched_args["experiment_low_memory_particle_zoom"] = str(job.scale_dir_name) == "scale_8"
     return patched_args
 
 
@@ -1126,6 +1130,7 @@ def _save_single_experiment_particle_zoom(
     lr_img: np.ndarray,
     hr_img: np.ndarray,
     sr_img: np.ndarray,
+    low_memory: bool = False,
 ) -> None:
     """
     保存单模型实验颗粒局部放大对比图。
@@ -1137,42 +1142,128 @@ def _save_single_experiment_particle_zoom(
 
     if hr_img is None or sr_img is None:
         return
-    import matplotlib.pyplot as plt
-    import matplotlib.patches as patches
 
     h, w = hr_img.shape
     regions = [_region_to_bounds(region, h, w) for region in EXPERIMENT_PARTICLE_ZOOM_REGIONS]
-    n_regions = len(regions)
-    fig = plt.figure(figsize=(11, 3.0 + 3.1 * n_regions), dpi=150, facecolor="w")
-    gs = fig.add_gridspec(n_regions + 1, 2, height_ratios=[1.0] + [1.25] * n_regions, hspace=0.16, wspace=0.04)
+    if not low_memory:
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as patches
 
-    for col, (title, arr) in enumerate((("HR with regions", hr_img), ("SR with regions", sr_img))):
-        ax = fig.add_subplot(gs[0, col])
-        ax.imshow(arr, cmap="gray", vmin=0.0, vmax=1.0)
-        for idx, (y0, y1, x0, x1) in enumerate(regions, start=1):
-            ax.add_patch(patches.Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False, edgecolor="red", linewidth=1.2))
-            ax.text(x0, y0, str(idx), color="white", fontsize=8, bbox={"facecolor": "red", "edgecolor": "none", "pad": 1})
-        ax.set_title(title)
-        ax.axis("off")
+        n_regions = len(regions)
+        fig = plt.figure(figsize=(11, 3.0 + 3.1 * n_regions), dpi=150, facecolor="w")
+        gs = fig.add_gridspec(n_regions + 1, 2, height_ratios=[1.0] + [1.25] * n_regions, hspace=0.16, wspace=0.04)
 
-    for row, bounds in enumerate(regions, start=1):
-        y0, y1, x0, x1 = bounds
-        panels = (
-            (f"Region {row} HR", hr_img[y0:y1, x0:x1], "gray", 0.0, 1.0),
-            (f"Region {row} SR", sr_img[y0:y1, x0:x1], "gray", 0.0, 1.0),
-        )
-        for col, (title, arr, cmap, vmin, vmax) in enumerate(panels):
-            ax = fig.add_subplot(gs[row, col])
-            ax.imshow(arr, cmap=cmap, vmin=vmin, vmax=vmax)
+        for col, (title, arr) in enumerate((("HR with regions", hr_img), ("SR with regions", sr_img))):
+            ax = fig.add_subplot(gs[0, col])
+            ax.imshow(arr, cmap="gray", vmin=0.0, vmax=1.0)
+            for idx, (y0, y1, x0, x1) in enumerate(regions, start=1):
+                ax.add_patch(patches.Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False, edgecolor="red", linewidth=1.2))
+                ax.text(x0, y0, str(idx), color="white", fontsize=8, bbox={"facecolor": "red", "edgecolor": "none", "pad": 1})
             ax.set_title(title)
             ax.axis("off")
 
+        for row, bounds in enumerate(regions, start=1):
+            y0, y1, x0, x1 = bounds
+            panels = (
+                (f"Region {row} HR", hr_img[y0:y1, x0:x1], "gray", 0.0, 1.0),
+                (f"Region {row} SR", sr_img[y0:y1, x0:x1], "gray", 0.0, 1.0),
+            )
+            for col, (title, arr, cmap, vmin, vmax) in enumerate(panels):
+                ax = fig.add_subplot(gs[row, col])
+                ax.imshow(arr, cmap=cmap, vmin=vmin, vmax=vmax)
+                ax.set_title(title)
+                ax.axis("off")
+
+        sample_image_dir.mkdir(parents=True, exist_ok=True)
+        fig.savefig(sample_image_dir / f"{time_name}_particle_zoom_comparison.png", bbox_inches="tight", pad_inches=0.03)
+        plt.close(fig)
+        return
+
     sample_image_dir.mkdir(parents=True, exist_ok=True)
-    fig.savefig(sample_image_dir / f"{time_name}_particle_zoom_comparison.png", bbox_inches="tight", pad_inches=0.03)
-    plt.close(fig)
+    from PIL import Image, ImageDraw
+
+    def to_gray_image(arr: np.ndarray) -> Image.Image:
+        """用 PIL 直接构造灰度图，避免 matplotlib 为超大实验图生成 RGBA 画布。"""
+
+        gray = np.clip(np.squeeze(arr).astype(np.float32, copy=False), 0.0, 1.0)
+        return Image.fromarray((gray * 255.0).astype(np.uint8), mode="L")
+
+    def add_label(image: Image.Image, text: str) -> Image.Image:
+        """给拼图小块加灰底文字，保持和原有可视化的标签风格接近。"""
+
+        image = image.convert("RGB")
+        draw = ImageDraw.Draw(image)
+        bbox = draw.textbbox((0, 0), text)
+        draw.rectangle((0, 0, bbox[2] + 8, bbox[3] + 6), fill=(220, 220, 220))
+        draw.text((4, 3), text, fill=(0, 0, 0))
+        return image
+
+    def overview_with_regions(arr: np.ndarray, title: str, max_width: int = 720) -> Image.Image:
+        """先用 numpy 步进抽样生成小预览，再画红框，避免整张 scale_8 大图进入 PIL resize。"""
+
+        source = np.squeeze(arr)
+        step = max(1, int(math.ceil(source.shape[1] / max_width)))
+        preview = to_gray_image(source[::step, ::step]).convert("RGB")
+        scale_x = preview.width / max(1, source.shape[1])
+        scale_y = preview.height / max(1, source.shape[0])
+        draw = ImageDraw.Draw(preview)
+        for idx, (y0, y1, x0, x1) in enumerate(regions, start=1):
+            rect = (
+                int(round(x0 * scale_x)),
+                int(round(y0 * scale_y)),
+                int(round(x1 * scale_x)),
+                int(round(y1 * scale_y)),
+            )
+            draw.rectangle(rect, outline=(255, 0, 0), width=2)
+            draw.rectangle((rect[0], rect[1], rect[0] + 16, rect[1] + 14), fill=(255, 0, 0))
+            draw.text((rect[0] + 3, rect[1] + 1), str(idx), fill=(255, 255, 255))
+        return add_label(preview, title)
+
+    def crop_region(arr: np.ndarray, bounds: tuple[int, int, int, int], title: str, max_width: int = 720) -> Image.Image:
+        """裁出局部颗粒区域并放大到固定预览宽度，便于直接比较 HR/SR 颗粒形态。"""
+
+        y0, y1, x0, x1 = bounds
+        crop = to_gray_image(arr[y0:y1, x0:x1]).convert("RGB")
+        scale = max_width / max(1, crop.width)
+        crop = crop.resize(
+            (max_width, max(1, int(round(crop.height * scale)))),
+            Image.Resampling.NEAREST,
+        )
+        return add_label(crop, title)
+
+    panels: list[tuple[Image.Image, Image.Image]] = [
+        (overview_with_regions(hr_img, "HR with regions"), overview_with_regions(sr_img, "SR with regions"))
+    ]
+    for idx, bounds in enumerate(regions, start=1):
+        panels.append(
+            (
+                crop_region(hr_img, bounds, f"Region {idx} HR"),
+                crop_region(sr_img, bounds, f"Region {idx} SR"),
+            )
+        )
+
+    margin, gap_x, gap_y = 20, 14, 12
+    col_w = max(max(left.width, right.width) for left, right in panels)
+    row_heights = [max(left.height, right.height) for left, right in panels]
+    canvas = Image.new(
+        "RGB",
+        (margin * 2 + col_w * 2 + gap_x, margin * 2 + sum(row_heights) + gap_y * (len(panels) - 1)),
+        "white",
+    )
+    y = margin
+    for row_h, (left, right) in zip(row_heights, panels):
+        canvas.paste(left, (margin, y))
+        canvas.paste(right, (margin + col_w + gap_x, y))
+        y += row_h + gap_y
+    canvas.save(sample_image_dir / f"{time_name}_particle_zoom_comparison.png")
 
 
-def _save_experiment_particle_zoom_comparisons(dataset_dir: Path, sample_index: int, image_payload_sample: dict) -> None:
+def _save_experiment_particle_zoom_comparisons(
+    dataset_dir: Path,
+    sample_index: int,
+    image_payload_sample: dict,
+    low_memory: bool = False,
+) -> None:
     """为 previous/next 分别保存局部放大颗粒对比图。"""
 
     sample_image_dir = dataset_dir / "images" / f"sample_{sample_index:04d}"
@@ -1187,6 +1278,7 @@ def _save_experiment_particle_zoom_comparisons(dataset_dir: Path, sample_index: 
             _tensor_or_array_to_2d_unit(image_payload_sample.get(lr_key)),
             _tensor_or_array_to_2d_unit(image_payload_sample.get(hr_key)),
             _tensor_or_array_to_2d_unit(image_payload_sample.get(sr_key)),
+            low_memory=low_memory,
         )
 
 
@@ -1232,7 +1324,12 @@ def _save_experiment_sample_plot_artifacts_one_by_one(
     )
     _save_image_outputs(dataset_name, dataset_dir, image_payload_sample, sample_index, plot_args=test_args)
     logger.info("[experiment_test] sample plot step: particle zoom comparisons -> sample_{:04d}", sample_index)
-    _save_experiment_particle_zoom_comparisons(dataset_dir, sample_index, image_payload_sample)
+    _save_experiment_particle_zoom_comparisons(
+        dataset_dir,
+        sample_index,
+        image_payload_sample,
+        low_memory=bool(test_args.get("experiment_low_memory_particle_zoom", False)),
+    )
     gc.collect()
 
     logger.info("[experiment_test] sample plot step: flow artifacts -> sample_{:04d}", sample_index)
