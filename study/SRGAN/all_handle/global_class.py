@@ -65,9 +65,15 @@ class global_data:
         # 如果只想处理颗粒统计条形图，设置 OUTPUT_STAGE_FILTER = "particle_stats_metrics"；
         # 如果只想处理 *_flow_u_epe_hist_overlay.png，设置 OUTPUT_STAGE_FILTER = "flow_u_epe_hist_overlay"。
         # 如果只想处理 TBL 的 02_error_maps，设置 OUTPUT_STAGE_FILTER = "tbl_02_error_map"。
+        # 如果只想生成论文精选图，设置 OUTPUT_STAGE_FILTER = "thesis"：
+        # 01/03 只跑 backstep、sqg、tbl、twcf；
+        # 02/04 只跑下面 THESIS_SAMPLE_FILTER_BY_CATEGORY 中指定的代表样本。
         # OUTPUT_STAGE_FILTER =None
-        OUTPUT_STAGE_FILTER =("tbl_v_profile_overlay_without_bicubic_hs")
+        OUTPUT_STAGE_FILTER = "thesis"
         OUTPUT_STAGE_ALIASES = {
+            "thesis": "thesis",
+            "paper": "thesis",
+            "paper_figures": "thesis",
             "01_energy_spectrum": "energy_spectrum",
             "energy_spectrum": "energy_spectrum",
             "energy": "energy_spectrum",
@@ -132,6 +138,31 @@ class global_data:
         CATEGORY_FILTER = None
         # None 表示不限制样本；生成大拼图时如果只想快速看一两个样本，可改成 ("sample_0000",) 或具体样本名。
         SAMPLE_FILTER = None
+        # thesis 模式的阶段与数据白名单：
+        # - THESIS_OUTPUT_STAGES 展开为标准四阶段，避免用户手动写很长的 OUTPUT_STAGE_FILTER；
+        # - THESIS_COMPARISON_FILTER 控制 thesis 模式只跑指定对比组；
+        # - THESIS_CATEGORY_FILTER 控制 01_energy_spectrum / 03_error_histograms 以及 02/04 的类别范围；
+        # - THESIS_SAMPLE_FILTER_BY_CATEGORY 只作用于需要样本目录的 02_error_maps / 04_composite_panels，
+        #   每个类别只生成论文中选定的代表样本，避免全量组合图耗时过长、输出过多。
+        THESIS_OUTPUT_STAGES = (
+            "energy_spectrum",
+            "error_maps",
+            "error_histograms",
+            "composite_panels",
+        )
+        # thesis 模式只输出主八组实验，不再额外生成 eight_experiments_without_widim_hs 补充图。
+        THESIS_COMPARISON_FILTER = ("eight_experiments",)
+        THESIS_CATEGORY_FILTER = ("backstep", "sqg", "tbl", "twcf")
+        THESIS_SAMPLE_FILTER_BY_CATEGORY = {
+            "backstep": ("000888_backstep_re1000_00328",),
+            "sqg": ("000089_validate_000089",),
+            "tbl": ("sample_0000",),
+            "twcf": ("sample_0009",),
+        }
+        # thesis 模式下，04_composite_panels 里的 particle_binary_stats_*.png
+        # 只保留柱子颜色和数值标注，不再在每张颗粒条形统计图内部重复放图例；
+        # 普通模式仍保留图例，便于单独查看时识别各颜色对应的方法。
+        THESIS_HIDE_PARTICLE_STATS_BAR_LEGEND = True
         # 组合图可能很多，None 表示每个类别所有共同样本都生成；调试时可改为 1 或 3。
         MAX_SAMPLE_COMPOSITES_PER_CATEGORY = None
         # 是否保存后处理过程中的 npy 汇总文件。按用户最新要求默认关闭；
@@ -316,18 +347,49 @@ class global_data:
         # =========================
         # 全局图形样式
         # =========================
-        FIG_DPI = 300
+        # PNG 导出分辨率。论文图经常会被缩小排版，300 dpi 缩小后文字和细线容易发糊；
+        # 提高到 600 dpi，让同一张图在文档里缩放后仍保留足够像素密度。SVG 仍会同步输出，适合优先排版使用。
+        FIG_DPI = 600
         FIG_FORMATS = ("png", "svg")
+        # 字体大小统一管理：
+        # DEFAULT_* 保存本次修改前的默认字号，便于随时回退或对照旧版图；
+        # FONT_SIZE_SCALE 是全局放大倍率，所有轴 label、刻度、图例、面板 label、色条 label 都从这里统一放大。
+        DEFAULT_AXIS_LABEL_SIZE = 13
+        DEFAULT_TICK_LABEL_SIZE = 11
+        DEFAULT_LEGEND_FONT_SIZE = 13
+        DEFAULT_PANEL_LABEL_SIZE = 11
+        DEFAULT_COLORBAR_LABEL_SIZE = 13
+        DEFAULT_WATERFALL_3D_LEGEND_FONT_SIZE = 8
+        DEFAULT_ENERGY_LEGEND_FONT_SIZE = 9
+        DEFAULT_PARTICLE_STATS_XTICK_LABEL_SIZE = 9
+        DEFAULT_PARTICLE_STATS_VALUE_LABEL_SIZE = 8
+        DEFAULT_PARTICLE_STATS_LEGEND_FONT_SIZE = 8.5
+        DEFAULT_PARTICLE_BINARY_PANEL_LABEL_SIZE = 6.5
+        FONT_SIZE_SCALE = 1.68
+        # 图例字体再单独放大一层：坐标轴字号已经由 FONT_SIZE_SCALE 控制，
+        # 但论文图里 legend 往往需要比默认更醒目，因此把 legend 的额外倍率独立出来。
+        # DEFAULT_* 仍保留旧版默认值，LEGEND_FONT_EXTRA_SCALE 只影响实际输出的图例字号。
+        LEGEND_FONT_EXTRA_SCALE = 1.68
+        # 字号放大后，原画布会更容易出现 label、tick、legend 互相挤压；
+        # FIG_SIZE_SCALE 会被 pipeline.py 统一应用到所有 plt.figure/plt.subplots 的 figsize。
+        FIG_SIZE_SCALE = 1.90
         # 论文图默认优先使用 Times New Roman；如果当前系统/服务器没有安装该字体，
         # pipeline.py 会按 FONT_FAMILY_FALLBACKS 自动选择可用衬线字体，避免 Matplotlib 反复输出
         # "Font family 'Times New Roman' not found." 警告。
         FONT_FAMILY = "Times New Roman"
         FONT_FAMILY_FALLBACKS = ("DejaVu Serif", "Liberation Serif", "Nimbus Roman", "serif")
-        AXIS_LABEL_SIZE = 12
-        TICK_LABEL_SIZE = 10
-        LEGEND_FONT_SIZE = 10
-        PANEL_LABEL_SIZE = 12
-        COLORBAR_LABEL_SIZE = 10
+        AXIS_LABEL_SIZE = DEFAULT_AXIS_LABEL_SIZE * FONT_SIZE_SCALE
+        TICK_LABEL_SIZE = DEFAULT_TICK_LABEL_SIZE * FONT_SIZE_SCALE
+        LEGEND_FONT_SIZE = DEFAULT_LEGEND_FONT_SIZE * FONT_SIZE_SCALE * LEGEND_FONT_EXTRA_SCALE
+        PANEL_LABEL_SIZE = DEFAULT_PANEL_LABEL_SIZE * FONT_SIZE_SCALE
+        # 面板左上角 label 会随全局字号一起放大；普通图像面板以 bicubic-searaft 为参考，
+        # 自动把基准字号放大到该字符串刚好铺满当前子图可用宽度。
+        # 后续仍保留真实宽度检测：只有比参考字符串更长、实际越界的 label 才继续缩小。
+        PANEL_LABEL_TARGET_FIT_TEXT = "bicubic-searaft"
+        PANEL_LABEL_TARGET_WIDTH_FRACTION = 1.0
+        PANEL_LABEL_MAX_WIDTH_FRACTION = 1.0
+        PANEL_LABEL_MIN_SIZE = DEFAULT_PANEL_LABEL_SIZE * FONT_SIZE_SCALE * 0.62
+        COLORBAR_LABEL_SIZE = DEFAULT_COLORBAR_LABEL_SIZE * FONT_SIZE_SCALE
         # 所有色条 tick 统一格式：正数和 0 前补空白，让 " 1.0" 与 "-1.0" 这类正负范围对齐。
         COLORBAR_PAD_POSITIVE_TICKS = True
         COLORBAR_TICK_DECIMALS = 1
@@ -344,6 +406,17 @@ class global_data:
         HIST_EDGE_LINE_WIDTH = 0.0
         HIST_LEGEND_EDGE_LINE_WIDTH = 0.0
         HIST_DRAW_OUTLINE = False
+        # 误差直方图图例会经过 apply_hist_legend 显式生成；
+        # 这里单独提供字号/间距变量，确保普通 2D 图、2D+3D 合图、focus 合图都能同步放大图例。
+        HIST_LEGEND_FONT_SIZE = DEFAULT_LEGEND_FONT_SIZE * FONT_SIZE_SCALE * LEGEND_FONT_EXTRA_SCALE
+        HIST_LEGEND_LABEL_SPACING = 0.45
+        HIST_LEGEND_HANDLE_LENGTH = 2.2
+        # 03_error_histograms 的 2D+3D 组合图顶行 legend 需要和 01 一样有边框；
+        # 只作用于 *_2d_3d_composite / *_2d_3d_focus_composite，不改变普通二维直方图 legend。
+        HIST_WATERFALL_3D_COMPOSITE_LEGEND_FRAME = True
+        HIST_WATERFALL_3D_COMPOSITE_LEGEND_FACE_COLOR = "#FFFFFF"
+        HIST_WATERFALL_3D_COMPOSITE_LEGEND_EDGE_COLOR = "#C8C8C8"
+        HIST_WATERFALL_3D_COMPOSITE_LEGEND_ALPHA = 0.92
         # 误差直方图的 npy 往往已经保存为“中心点 x + count”的直方图，
         # 不同实验如果各自使用不同 x 范围和 bin 宽度，直接叠加会导致同一张图里 count 峰值不可比。
         # 开启后，pipeline 会在绘图前把同一张图中的所有方法重分箱到统一公共 bins；
@@ -394,6 +467,11 @@ class global_data:
         FLOW_U_EPE_HIST_LEGEND_OUTSIDE_LOC = "upper left"
         FLOW_U_EPE_HIST_LEGEND_OUTSIDE_BBOX = (1.02, 1.0)
         FLOW_U_EPE_HIST_LEGEND_OUTSIDE_NCOL = 1
+        # flow_u/epe 的 2D+3D 合图中，右上 EPE 子图必须完整包含 legend；
+        # 合图专用 legend 使用 2 列并放在子图右上角，避免八组实验纵向堆叠后越出图框。
+        FLOW_U_EPE_HIST_COMPOSITE_LEGEND_LOC = "upper right"
+        FLOW_U_EPE_HIST_COMPOSITE_LEGEND_BBOX = (0.98, 0.98)
+        FLOW_U_EPE_HIST_COMPOSITE_LEGEND_NCOL = 2
         # 3D 瀑布图开关与统一风格；只控制新增的 *_waterfall_3d.png/svg，
         # 不改变原来的二维能谱图和误差直方图。
         WATERFALL_3D_ENABLED = True
@@ -421,16 +499,49 @@ class global_data:
         WATERFALL_3D_MAX_POINTS = 700
         # 3D 轴的 x-label 在倾斜视角下很容易落到画布外；这里把 labelpad 单独做成全局参数，
         # 既可以把 "Delta u [px]" / "EPE [px]" 往坐标轴内收，也不影响二维图的 label 间距。
-        WATERFALL_3D_X_LABEL_PAD = 2
-        WATERFALL_3D_LEGEND_FONT_SIZE = 7
+        # 普通 3D 单图里 x-label 会沿 3D 视角倾斜，容易和 x 轴刻度数字贴在一起；
+        # 这里单独加大 labelpad，让 log10(Wavenumber)、Delta u [px] 等标签往下离开刻度。
+        WATERFALL_3D_X_LABEL_PAD = 22
+        WATERFALL_3D_X_TICK_PAD = 8
+        # 03_error_histograms 的 2D+3D 组图里，3D x-label 旋转后容易和 tick 数字挤在一起；
+        # 这里给直方图合图单独配置更大的 x-label pad，不影响能谱等其它 3D 图。
+        HIST_WATERFALL_3D_X_LABEL_PAD = 24
+        HIST_WATERFALL_3D_X_TICK_PAD = 10
+        WATERFALL_3D_LEGEND_FONT_SIZE = (
+            DEFAULT_WATERFALL_3D_LEGEND_FONT_SIZE * FONT_SIZE_SCALE * LEGEND_FONT_EXTRA_SCALE
+        )
         WATERFALL_3D_LEGEND_LOC = "upper left"
         # 单独 3D 瀑布图的图例位置；第二个值控制上下，第一个值越小图例越靠近图体。
         # 用户反馈图例离图太远，因此这里从旧版 1.42 收到 1.16。
-        WATERFALL_3D_LEGEND_BBOX = (0.92, 1.0)
-        WATERFALL_3D_LEGEND_LABEL_SPACING = 0.35
-        WATERFALL_3D_LEGEND_HANDLE_LENGTH = 2.0
+        WATERFALL_3D_LEGEND_BBOX = (1.04, 1.0)
+        WATERFALL_3D_LEGEND_LABEL_SPACING = 0.42
+        WATERFALL_3D_LEGEND_HANDLE_LENGTH = 2.25
         # 2D+3D “大图”尺寸与子图间距：左侧复用原二维图，右侧放新增 3D 瀑布图。
-        WATERFALL_3D_COMPOSITE_FIG_SIZE = (12.8, 4.6)
+        WATERFALL_3D_COMPOSITE_FIG_SIZE = (14.4, 6.1)
+        # 01_energy_spectrum 和普通 03_error_histograms 的 2D+3D 组图统一改成：
+        # 第一行整行放 legend，第二行左 2D、右 3D。这样 legend 不再压住 2D 或 3D 主图。
+        WATERFALL_3D_COMPOSITE_TOP_LEGEND_HEIGHT_RATIO = 0.20
+        WATERFALL_3D_COMPOSITE_PLOT_HEIGHT_RATIO = 1.0
+        WATERFALL_3D_COMPOSITE_TOP_LEGEND_HSPACE = 0.03
+        # 01_energy_spectrum 的 2D+3D 合图第一行专门放 legend。
+        # 八组实验加 GT 的 2D+3D 合图 legend 独占第一行并横跨两列；
+        # 这里按用户要求固定为 5 列，让 legend 横向铺开而不压到主图。
+        WATERFALL_3D_COMPOSITE_TOP_LEGEND_NCOL = 5
+        # 03_error_histograms 的 2D+3D 合图不跟 01 共用 5 列，按用户要求单独使用 4 列。
+        HIST_WATERFALL_3D_COMPOSITE_TOP_LEGEND_NCOL = 4
+        WATERFALL_3D_COMPOSITE_TOP_LEGEND_LOC = "center"
+        WATERFALL_3D_COMPOSITE_TOP_LEGEND_FONT_SIZE = DEFAULT_LEGEND_FONT_SIZE * FONT_SIZE_SCALE * 0.98
+        HIST_WATERFALL_3D_COMPOSITE_TOP_LEGEND_FONT_SIZE = (
+            DEFAULT_LEGEND_FONT_SIZE * FONT_SIZE_SCALE * 1.22
+        )
+        HIST_WATERFALL_3D_COMPOSITE_LEGEND_HANDLE_LENGTH = 2.0
+        HIST_WATERFALL_3D_COMPOSITE_LEGEND_HANDLE_HEIGHT = 1.18
+        HIST_WATERFALL_3D_COMPOSITE_LEGEND_HANDLE_TEXT_PAD = 0.78
+        HIST_WATERFALL_3D_COMPOSITE_LEGEND_COLUMN_SPACING = 1.45
+        HIST_WATERFALL_3D_COMPOSITE_LEGEND_BORDER_PAD = 0.44
+        # 01_energy_spectrum 的 2D+3D 合图顶行 legend 使用线段句柄；
+        # 这里单独加粗 legend 中代表各方法颜色的线，不改变图中曲线本身。
+        ENERGY_COMPOSITE_LEGEND_LINE_WIDTH = 3.2
         # 合图右侧 3D 子图给更多宽度，使其视觉面积接近左侧 2D 图，不再显得偏小。
         WATERFALL_3D_COMPOSITE_WIDTH_RATIOS = (1.0, 1.36)
         # 右侧 3D 图的 z 轴 label 会放在 3D 子图左侧；合图中适当加大 wspace，
@@ -443,10 +554,11 @@ class global_data:
         # flow_u_epe 的 2D+3D 合图是两行布局：第一行二维图，第二行 3D 图。
         # 第二行如果和第一行等高，3D 盒体会显得明显偏小，x-label 也容易被挤到画布外；
         # 因此这里单独加高画布，并让第二行拿到更多高度。
-        WATERFALL_3D_FLOW_U_EPE_COMPOSITE_FIG_SIZE = (12.8, 10.8)
+        WATERFALL_3D_FLOW_U_EPE_COMPOSITE_FIG_SIZE = (13.6, 12.2)
         WATERFALL_3D_FLOW_U_EPE_COMPOSITE_WSPACE = 0.26
-        # 控制第一行 2D 与第二行 3D 的上下空白；0.08 在紧凑排布和 3D x-label 显示空间之间较均衡。
-        WATERFALL_3D_FLOW_U_EPE_COMPOSITE_HSPACE = 0.08
+        # 控制第一行 2D 与第二行 3D 的上下空白；字号放大后需要更大间距，
+        # 避免第一行两张 2D 图的 x-label 被第二行 3D 图覆盖。
+        WATERFALL_3D_FLOW_U_EPE_COMPOSITE_HSPACE = 0.22
         WATERFALL_3D_FLOW_U_EPE_COMPOSITE_HEIGHT_RATIOS = (1.0, 1.55)
         # flow_u_epe 的 2D+3D 合图需要更大的底部边距，否则第二行 3D 图旋转后的 x-label 会被裁掉。
         # right 留到 0.98 是因为这张合图的图例改为放回右上二维子图内部，不再需要额外的图外 legend 空间。
@@ -460,7 +572,7 @@ class global_data:
         # flow_u_epe 的 2D+3D 合图第二行是 3D 坐标轴，z 轴 Count 用 text2D 手动绘制。
         # 这里单独控制第二行 3D Count 的横向位置，让它和第一行二维图的 Count label 上下对齐；
         # 只影响 *_flow_u_epe_hist_overlay_2d_3d_composite，不影响其它 3D 瀑布图。
-        WATERFALL_3D_FLOW_U_EPE_LEFT_Z_LABEL_X = -0.10
+        WATERFALL_3D_FLOW_U_EPE_LEFT_Z_LABEL_X = -0.18
         # 下排 3D Count label 改用 figure 坐标与上排 2D Count label 对齐；
         # 这个偏移量用于最后细调，0 表示完全使用上排 2D y-label 的横坐标。
         WATERFALL_3D_FLOW_U_EPE_Z_LABEL_FIG_X_OFFSET = 0.0
@@ -476,9 +588,28 @@ class global_data:
         # 因此合图单独使用更靠左的位置，而不增加两张图之间的间隔。
         WATERFALL_3D_COMPOSITE_LEFT_Z_LABEL_X = -0.24
         WATERFALL_3D_LEFT_Z_LABEL_Y = 0.55
-        WATERFALL_3D_Z_TICK_PAD = 2
+        WATERFALL_3D_Z_TICK_PAD = 14
+        # 03_error_histograms 的 Count 数字贴在 z 轴上时容易重叠，合图单独把 z tick 往外推。
+        HIST_WATERFALL_3D_Z_TICK_PAD = 16
         # 能谱跨度很大，默认把 x/z 都转成 log10 后画 3D 瀑布图，这样不同曲线不会被数量级压扁。
         ENERGY_WATERFALL_USE_LOG10 = True
+        # thesis 模式下，能谱 2D+3D 组图右侧 3D 子图不再显示 log10(...) 坐标含义，
+        # 而是“内部仍用 log10 坐标、外部显示成 10^n tick”，并沿用左侧 2D 能谱图的 label。
+        # 这样既保留二维 log-log 图的数量级范围，又不会显示 log10(Wavenumber) 这类重复说明。
+        # 普通模式仍使用 ENERGY_WATERFALL_USE_LOG10 的旧逻辑。
+        THESIS_ENERGY_COMPOSITE_USE_2D_AXIS = True
+        THESIS_ENERGY_WATERFALL_USE_LOG10 = True
+        THESIS_ENERGY_WATERFALL_POWER_TICKS = True
+        # thesis 能谱合图中 3D x-label 更容易和倾斜 tick 挤在一起，单独加大 labelpad；
+        # z-label 则适当靠近 3D 轴，避免像旧图一样离轴过远。
+        THESIS_ENERGY_WATERFALL_X_LABEL_PAD = 24
+        THESIS_ENERGY_WATERFALL_X_TICK_PAD = 10
+        THESIS_ENERGY_WATERFALL_Z_LABEL_X = -0.15
+        # thesis 能谱 2D+3D 组图把 legend 放到右侧 3D 图右上角，分两列排布，避免左侧 2D 图例压住曲线。
+        THESIS_ENERGY_COMPOSITE_LEGEND_ON_3D = True
+        THESIS_ENERGY_COMPOSITE_LEGEND_LOC = "upper right"
+        THESIS_ENERGY_COMPOSITE_LEGEND_BBOX = (0.98, 0.98)
+        THESIS_ENERGY_COMPOSITE_LEGEND_NCOL = 2
         # 误差直方图默认保留原始 Count 高度；若后续峰值过高，可改成 True 使用 log10(Count + 1)。
         HIST_WATERFALL_USE_LOG10_COUNT = False
         IMAGE_CMAP = "viridis"
@@ -509,7 +640,7 @@ class global_data:
         ENERGY_LEGEND_FACE_COLOR = "#E6E6E6"
         ENERGY_LEGEND_EDGE_COLOR = "#808080"
         ENERGY_LEGEND_ALPHA = 0.58
-        ENERGY_LEGEND_FONT_SIZE = 8
+        ENERGY_LEGEND_FONT_SIZE = DEFAULT_ENERGY_LEGEND_FONT_SIZE * FONT_SIZE_SCALE * LEGEND_FONT_EXTRA_SCALE
         FLOW_VALUE_COLORBAR_LABEL = "Displacement [px]"
         FLOW_ERROR_COLORBAR_LABEL = "Error [px]"
         PARTICLE_VALUE_COLORBAR_LABEL = "Intensity"
@@ -582,7 +713,12 @@ class global_data:
         # 下面三个比例控制“上方 GT 流场 + 中间横向色条 + 下方三张剖面图”的高度分配。
         # 下方剖面图刻意放高一些，贴近用户给出的第三张参考图，曲线和坐标 label 更清楚。
         TBL_PROFILE_TOP_HEIGHT_RATIO = 1.05
-        TBL_PROFILE_COLORBAR_HEIGHT_RATIO = 0.18
+        # TBL 剖面图的中间行同时承载“色条 + 全局图例”。
+        # 全局字体放大后，原来的 0.18 高度会让图例跨行压住上方流场和下方三张剖面图标题；
+        # 因此单独增高中间行，保证论文图例完整落在自己的行内。
+        # 第一行右侧已经放竖向色条，第二行只用于整行图例；
+        # 这里保留旧变量名是为了兼容旧代码路径，但含义已经变成“图例行高度”。
+        TBL_PROFILE_COLORBAR_HEIGHT_RATIO = 0.52
         TBL_PROFILE_CURVE_HEIGHT_RATIO = 3.20
         TBL_PROFILE_GT_COLOR = "#444444"
         TBL_PROFILE_GT_LINESTYLE = "--"
@@ -600,12 +736,35 @@ class global_data:
         # TBL 剖面图色条 label 默认放在色条上方，避免 "Displacement [px]" 和下方剖面子图标题挨在一起。
         TBL_PROFILE_COLORBAR_LABEL_PAD = 3
         TBL_PROFILE_COLORBAR_LABEL_POSITION = "top"
-        # TBL 剖面图中间行改成“左色条 + 右图例”，避免图例压住三张剖面曲线。
-        # 左右宽度比例、间距和图例列数都放到全局变量里，后续可以按论文版面继续微调。
-        TBL_PROFILE_COLORBAR_LEGEND_WIDTH_RATIOS = (1.05, 1.25)
-        TBL_PROFILE_COLORBAR_LEGEND_WSPACE = 0.14
+        # TBL 剖面图第一行改成“左侧 GT 流场 + 右侧竖向色条”，第二行整行只放图例；
+        # 避免旧版横向色条和图例共同挤在第二行。
+        TBL_PROFILE_TOP_COLORBAR_WIDTH_RATIOS = (42.0, 1.0)
+        TBL_PROFILE_TOP_COLORBAR_WSPACE = 0.025
+        TBL_PROFILE_COLORBAR_ORIENTATION = "vertical"
+        TBL_PROFILE_COLORBAR_LABEL_POSITION = "right"
         TBL_PROFILE_LEGEND_LOC = "center"
-        TBL_PROFILE_LEGEND_NCOL = 2
+        # TBL 剖面图第二行由图例独享；这里使用 TBL 专属字号，避免全局 legend 字号过大后挤压列布局。
+        # 右边界按用户要求对齐到第一行竖向色条的右边，因此第二行 legend 横跨完整顶行宽度。
+        TBL_PROFILE_LEGEND_FONT_SIZE = LEGEND_FONT_SIZE * 0.82
+        TBL_PROFILE_LEGEND_NCOL = 5
+        TBL_PROFILE_LEGEND_LABEL_SPACING = 0.34
+        TBL_PROFILE_LEGEND_HANDLE_LENGTH = 1.10
+        # 图例里的线段需要比实际剖面曲线更粗，避免论文缩放后看不清颜色/虚线样式。
+        # 只改变 legend 句柄，不改变下方三张剖面图中的曲线线宽。
+        TBL_PROFILE_LEGEND_LINE_WIDTH = 4.2
+        TBL_PROFILE_LEGEND_HANDLE_TEXT_PAD = 0.42
+        TBL_PROFILE_LEGEND_COLUMN_SPACING = 0.90
+        TBL_PROFILE_LEGEND_BORDER_PAD = 0.35
+        # *_without_bicubic_hs 版本少一个方法，按用户要求改成 4 列；
+        # 同时让 legend 线段更长、更粗，方便和普通五列版本区分并提升可读性。
+        TBL_PROFILE_EXTRA_LEGEND_NCOL = 4
+        TBL_PROFILE_EXTRA_LEGEND_HANDLE_LENGTH = 1.55
+        TBL_PROFILE_EXTRA_LEGEND_LINE_WIDTH = 4.2
+        # 图例框锁在第二行完整宽度内，右边界和第一行色条右边界对齐；
+        # mode="expand" 会让 legend frame 横向铺满该区域，而不是被长标签撑宽或缩窄。
+        TBL_PROFILE_LEGEND_BBOX = (0.0, 0.04, 1.0, 0.92)
+        TBL_PROFILE_LEGEND_MODE = "expand"
+        TBL_PROFILE_LEGEND_BORDER_AXES_PAD = 0.0
         TBL_PROFILE_X_MIN = None
         TBL_PROFILE_X_MAX = None
         TBL_PROFILE_Y_MIN = None
@@ -644,7 +803,7 @@ class global_data:
         PARTICLE_STATS_WSPACE = 0.58
         PARTICLE_STATS_HSPACE = 0.42
         PARTICLE_STATS_XTICK_ROTATION = 50
-        PARTICLE_STATS_XTICK_LABEL_SIZE = 8
+        PARTICLE_STATS_XTICK_LABEL_SIZE = DEFAULT_PARTICLE_STATS_XTICK_LABEL_SIZE * FONT_SIZE_SCALE
         # 颗粒统计条形图用不同颜色区分 GT 与各个实验，并通过图例说明；
         # 横轴不再显示长实验名，避免旋转标签挤占图像空间。
         PARTICLE_STATS_BAR_COLOR = "#4477AA"
@@ -663,12 +822,30 @@ class global_data:
             "PIV_A_Esrgan_v_SCALE_8": "#111111",
         }
         PARTICLE_STATS_BAR_EDGE_COLOR = "#222222"
-        PARTICLE_STATS_VALUE_LABEL_SIZE = 7
+        # 单张颗粒条形统计图用于论文排版时会被缩放查看，字体需要比普通组合图再大一些；
+        # 下面几项只影响 particle_binary_stats_{metric}_{time}.png 这类独立条形图。
+        PARTICLE_STATS_SINGLE_BAR_AXIS_LABEL_SIZE = AXIS_LABEL_SIZE * 1.65
+        PARTICLE_STATS_SINGLE_BAR_TICK_LABEL_SIZE = TICK_LABEL_SIZE * 1.55
+        PARTICLE_STATS_SINGLE_BAR_PANEL_LABEL_SIZE = AXIS_LABEL_SIZE * 1.45
+        PARTICLE_STATS_VALUE_LABEL_SIZE = DEFAULT_PARTICLE_STATS_VALUE_LABEL_SIZE * FONT_SIZE_SCALE * 2.45
         PARTICLE_STATS_VALUE_FORMAT = "plain"
         PARTICLE_STATS_VALUE_DECIMALS = 4
+        # bicubic-widim / bicubic-hs / bicubic-raft / bicubic-searaft 在颗粒统计里经常得到完全相同数值；
+        # 为避免四个柱顶数字重叠，数值一致时只在四根柱子的中间标一次，并用箭头分别指向四根柱子。
+        PARTICLE_STATS_MERGE_BICUBIC_VALUE_LABELS = True
+        PARTICLE_STATS_MERGE_BICUBIC_MIN_COUNT = 4
+        PARTICLE_STATS_MERGE_BICUBIC_RTOL = 1e-8
+        PARTICLE_STATS_MERGE_BICUBIC_ATOL = 1e-10
+        PARTICLE_STATS_MERGED_VALUE_Y_OFFSET_RATIO = 0.11
+        PARTICLE_STATS_MERGED_ARROW_LINE_WIDTH = 1.15
+        PARTICLE_STATS_MERGED_ARROW_COLOR = "#222222"
         PARTICLE_STATS_SHOW_XTICK_LABELS = False
         PARTICLE_STATS_LEGEND_NCOL = 2
-        PARTICLE_STATS_LEGEND_FONT_SIZE = 7.5
+        # 颗粒统计图的 legend 在局部函数里显式传 fontsize，不完全依赖 Matplotlib rcParams；
+        # 因此这里也接入 LEGEND_FONT_EXTRA_SCALE，保证“所有图例字体再大一点”的全局需求一致生效。
+        PARTICLE_STATS_LEGEND_FONT_SIZE = (
+            DEFAULT_PARTICLE_STATS_LEGEND_FONT_SIZE * FONT_SIZE_SCALE * LEGEND_FONT_EXTRA_SCALE
+        )
         # 颗粒统计条形图左侧 previous/next 行标签和 y 轴 label 都需要留出更大空间，
         # 避免二者挤在一起；数值越大，左侧留白越多。
         PARTICLE_STATS_ROW_LABEL_X = -0.23
@@ -681,14 +858,14 @@ class global_data:
         PARTICLE_STATS_LEGEND_LOC = "upper right"
         PARTICLE_STATS_LEGEND_BBOX = (0.985, 0.985)
         # y 轴顶部额外留白稍微加大，让右上角图例和柱顶数值都有空间。
-        PARTICLE_STATS_Y_PAD_RATIO = 0.70
+        PARTICLE_STATS_Y_PAD_RATIO = 0.90
         PARTICLE_STATS_Y_PAD_MIN = 1.0
         # 灰度直方图中 T=... 文字相对阈值竖线的横向偏移，使用 x 轴坐标比例；
         # 默认略向右移动，避免文字贴着虚线。
         PARTICLE_GRAY_HIST_THRESHOLD_TEXT_DX = 0.015
         # 颗粒阈值化图的面板标签通常包含较长实验名，例如 bicubic-widim、ESRuRAFT-PIV；
         # 这些图本身列宽较窄，因此整张颗粒阈值对比图都使用更小字号，避免 label 超过图片本身。
-        PARTICLE_BINARY_PANEL_LABEL_SIZE = 5.5
+        PARTICLE_BINARY_PANEL_LABEL_SIZE = DEFAULT_PARTICLE_BINARY_PANEL_LABEL_SIZE * FONT_SIZE_SCALE
         # TBL 颗粒 full-frame 按用户最新要求使用纵向论文排版：
         # 1）SR/误差对比图每行两列，第一列是颗粒超分辨图，第二列是对应误差图；
         # 2）颗粒统计里的颗粒图/阈值图每行两列，第一列是颗粒超分辨图，第二列是阈值图。

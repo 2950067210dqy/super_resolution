@@ -212,9 +212,77 @@ class AllHandlePipeline:
         pyplot.rcParams["font.family"] = self.select_available_font_family()
         pyplot.rcParams["font.size"] = self.cfg.TICK_LABEL_SIZE
         pyplot.rcParams["axes.labelsize"] = self.cfg.AXIS_LABEL_SIZE
+        pyplot.rcParams["axes.titlesize"] = self.cfg.AXIS_LABEL_SIZE
+        pyplot.rcParams["figure.titlesize"] = self.cfg.AXIS_LABEL_SIZE
+        pyplot.rcParams["xtick.labelsize"] = self.cfg.TICK_LABEL_SIZE
+        pyplot.rcParams["ytick.labelsize"] = self.cfg.TICK_LABEL_SIZE
         pyplot.rcParams["legend.fontsize"] = self.cfg.LEGEND_FONT_SIZE
+        pyplot.rcParams["legend.title_fontsize"] = self.cfg.LEGEND_FONT_SIZE
+        # legend 的文字放大后，默认图例框容易显得过紧；
+        # 这里统一增加图例框内边距、文字间距和句柄长度，让所有带图例的图更适合论文排版。
+        pyplot.rcParams["legend.borderpad"] = float(getattr(self.cfg, "LEGEND_BORDER_PAD", 0.55))
+        pyplot.rcParams["legend.labelspacing"] = float(getattr(self.cfg, "LEGEND_LABEL_SPACING", 0.45))
+        pyplot.rcParams["legend.handlelength"] = float(getattr(self.cfg, "LEGEND_HANDLE_LENGTH", 2.2))
+        pyplot.rcParams["legend.handletextpad"] = float(getattr(self.cfg, "LEGEND_HANDLE_TEXT_PAD", 0.8))
         pyplot.rcParams["svg.fonttype"] = "none"
         pyplot.rcParams["axes.unicode_minus"] = False
+        self.install_scaled_figure_helpers(pyplot)
+
+    def install_scaled_figure_helpers(self, pyplot) -> None:
+        """
+        统一放大所有图的 figsize。
+
+        代码里历史上有大量 plt.figure(figsize=...) / plt.subplots(figsize=...)，
+        如果逐个手动乘倍率很容易漏掉；这里在 Matplotlib 入口处安装一次轻量包装，
+        后续所有显式 figsize 都会自动乘以全局 FIG_SIZE_SCALE。原始默认字号仍保存在
+        global_class.py 的 DEFAULT_* 变量里，实际字号和画布缩放都可以集中修改。
+        """
+
+        try:
+            scale = float(getattr(self.cfg, "FIG_SIZE_SCALE", 1.0))
+        except (TypeError, ValueError):
+            scale = 1.0
+        if scale <= 0:
+            scale = 1.0
+        pyplot._all_handle_figsize_scale = scale
+        if not hasattr(pyplot, "_all_handle_default_rc_figsize"):
+            pyplot._all_handle_default_rc_figsize = tuple(pyplot.rcParams.get("figure.figsize", (6.4, 4.8)))
+        # 没有显式 figsize 的图也使用同一画布放大倍率，保证“所有图”都跟随全局配置。
+        pyplot.rcParams["figure.figsize"] = [
+            float(value) * scale for value in getattr(pyplot, "_all_handle_default_rc_figsize", (6.4, 4.8))
+        ]
+        if getattr(pyplot, "_all_handle_figsize_scale_installed", False):
+            return
+
+        original_figure = pyplot.figure
+        original_subplots = pyplot.subplots
+
+        def scaled_figsize(figsize):
+            current_scale = float(getattr(pyplot, "_all_handle_figsize_scale", 1.0))
+            if current_scale == 1.0 or figsize is None:
+                return figsize
+            try:
+                return tuple(float(value) * current_scale for value in figsize)
+            except (TypeError, ValueError):
+                return figsize
+
+        def figure_wrapper(*args, **kwargs):
+            if "figsize" in kwargs:
+                kwargs = dict(kwargs)
+                kwargs["figsize"] = scaled_figsize(kwargs["figsize"])
+            return original_figure(*args, **kwargs)
+
+        def subplots_wrapper(*args, **kwargs):
+            if "figsize" in kwargs:
+                kwargs = dict(kwargs)
+                kwargs["figsize"] = scaled_figsize(kwargs["figsize"])
+            return original_subplots(*args, **kwargs)
+
+        pyplot._all_handle_original_figure = original_figure
+        pyplot._all_handle_original_subplots = original_subplots
+        pyplot.figure = figure_wrapper
+        pyplot.subplots = subplots_wrapper
+        pyplot._all_handle_figsize_scale_installed = True
 
     def select_available_font_family(self) -> str:
         """按全局字体优先级选择本机已安装字体，避免缺 Times New Roman 时产生大量 warning。"""
@@ -378,6 +446,11 @@ class AllHandlePipeline:
         for item in raw_items:
             key = normalize_name(str(item))
             stage = aliases.get(key, key)
+            if stage == "thesis":
+                # thesis 是论文精选图模式：本身不是一个绘图函数，而是展开成 01/02/03/04 四个标准阶段；
+                # 类别和样本白名单由 effective_category_filter()/effective_sample_filter() 进一步处理。
+                enabled.update(getattr(self.cfg, "THESIS_OUTPUT_STAGES", ()))
+                continue
             if stage == "all":
                 enabled.update(standard_stages)
                 continue
@@ -386,6 +459,98 @@ class AllHandlePipeline:
             else:
                 self.warn(f"unknown output stage ignored: {item}")
         return enabled or set(standard_stages)
+
+    def output_mode_enabled(self, mode_name: str) -> bool:
+        """判断 OUTPUT_STAGE_FILTER 是否包含某个模式名；用于 thesis 这类会影响类别/样本范围的复合模式。"""
+
+        configured = getattr(self.cfg, "OUTPUT_STAGE_FILTER", None)
+        if configured is None:
+            return False
+        if isinstance(configured, str):
+            raw_items = [configured]
+        else:
+            try:
+                raw_items = list(configured)
+            except TypeError:
+                raw_items = [configured]
+        aliases = getattr(self.cfg, "OUTPUT_STAGE_ALIASES", {})
+        target = normalize_name(mode_name)
+        for item in raw_items:
+            key = normalize_name(str(item))
+            if normalize_name(str(aliases.get(key, key))) == target:
+                return True
+        return False
+
+    def thesis_mode_enabled(self) -> bool:
+        """论文精选图模式开关；只由 OUTPUT_STAGE_FILTER 中的 thesis/paper/paper_figures 触发。"""
+
+        return self.output_mode_enabled("thesis")
+
+    def effective_category_filter(self) -> set[str] | None:
+        """
+        合并普通 CATEGORY_FILTER 与 thesis 模式的类别白名单。
+
+        两者同时存在时取交集，避免用户手动追加过滤条件时 thesis 模式失效；
+        返回 None 表示不限制类别。
+        """
+
+        filters: list[set[str]] = []
+        if self.cfg.CATEGORY_FILTER:
+            filters.append({normalize_name(value) for value in self.cfg.CATEGORY_FILTER})
+        if self.thesis_mode_enabled():
+            filters.append({normalize_name(value) for value in getattr(self.cfg, "THESIS_CATEGORY_FILTER", ())})
+        if not filters:
+            return None
+        allowed = filters[0]
+        for current in filters[1:]:
+            allowed &= current
+        return allowed
+
+    def effective_sample_filter(self, group: GroupContext) -> set[str] | None:
+        """
+        合并普通 SAMPLE_FILTER 与 thesis 模式的类别样本白名单。
+
+        thesis 的样本限制只按当前 group.category_name 生效，例如 backstep 只保留
+        000888_backstep_re1000_00328，tbl 只保留 sample_0000；如果再手动设置 SAMPLE_FILTER，
+        两者取交集，保证显式调试范围仍然有效。
+        """
+
+        filters: list[set[str]] = []
+        if self.cfg.SAMPLE_FILTER:
+            filters.append({normalize_name(value) for value in self.cfg.SAMPLE_FILTER})
+        if self.thesis_mode_enabled():
+            category_key = normalize_name(group.category_name)
+            thesis_samples = getattr(self.cfg, "THESIS_SAMPLE_FILTER_BY_CATEGORY", {}).get(category_key)
+            if thesis_samples:
+                filters.append({normalize_name(value) for value in thesis_samples})
+        if not filters:
+            return None
+        allowed = filters[0]
+        for current in filters[1:]:
+            allowed &= current
+        return allowed
+
+    def effective_comparison_filter(self) -> set[str] | None:
+        """
+        合并普通 COMPARISON_FILTER 与 thesis 模式的对比组白名单。
+
+        thesis 模式按用户要求只输出 eight_experiments，避免同时生成
+        eight_experiments_without_widim_hs 这类补充对比图；如果后续仍想单独跑其它组，
+        可以关闭 thesis 或在 global_class.py 中修改 THESIS_COMPARISON_FILTER。
+        """
+
+        filters: list[set[str]] = []
+        comparison_filter = getattr(self.cfg, "COMPARISON_FILTER", None)
+        if comparison_filter:
+            filters.append({normalize_name(value) for value in comparison_filter})
+        if self.thesis_mode_enabled():
+            filters.append({normalize_name(value) for value in getattr(self.cfg, "THESIS_COMPARISON_FILTER", ())})
+        if not filters:
+            return None
+        allowed = filters[0]
+        for current in filters[1:]:
+            allowed &= current
+        return allowed
 
     def group_progress_label(self, group: GroupContext) -> str:
         """把当前分组压缩成一行可读文本，避免进度输出里出现很长的路径。"""
@@ -432,6 +597,17 @@ class AllHandlePipeline:
         loc: str | None = None,
         bbox_to_anchor: tuple[float, float] | None = None,
         ncol: int | None = None,
+        font_size: float | None = None,
+        labelspacing: float | None = None,
+        handlelength: float | None = None,
+        handleheight: float | None = None,
+        handletextpad: float | None = None,
+        columnspacing: float | None = None,
+        borderpad: float | None = None,
+        frameon: bool | None = None,
+        facecolor: str | None = None,
+        edgecolor: str | None = None,
+        framealpha: float | None = None,
     ) -> None:
         """误差直方图专用 legend；双子图场景可通过参数把图例移到图外，避免压住柱峰。"""
 
@@ -455,14 +631,58 @@ class AllHandlePipeline:
             labels.append(self.experiment_label(exp_key))
         if handles:
             legend_kwargs = {
-                "frameon": False,
+                "frameon": bool(frameon) if frameon is not None else False,
                 "loc": loc or getattr(self.cfg, "HIST_LEGEND_LOC", "best"),
                 "ncol": ncol or int(getattr(self.cfg, "HIST_LEGEND_NCOL", 1)),
+                # 误差直方图（包括 flow_u/epe 的 2D+3D focus 合图）统一显式使用全局图例字号，
+                # 避免某些子图没有完全继承 rcParams，导致图例仍然偏小。
+                # 2D+3D 组合图的 legend 位于独立第一行，可通过参数使用更小的合图专用字号；
+                # 普通误差直方图不传 font_size 时仍使用 HIST_LEGEND_FONT_SIZE。
+                "fontsize": float(font_size if font_size is not None else getattr(self.cfg, "HIST_LEGEND_FONT_SIZE", self.cfg.LEGEND_FONT_SIZE)),
+                "labelspacing": float(labelspacing if labelspacing is not None else getattr(self.cfg, "HIST_LEGEND_LABEL_SPACING", 0.45)),
+                "handlelength": float(handlelength if handlelength is not None else getattr(self.cfg, "HIST_LEGEND_HANDLE_LENGTH", 2.2)),
             }
+            if handleheight is not None:
+                legend_kwargs["handleheight"] = float(handleheight)
+            if handletextpad is not None:
+                legend_kwargs["handletextpad"] = float(handletextpad)
+            if columnspacing is not None:
+                legend_kwargs["columnspacing"] = float(columnspacing)
+            if borderpad is not None:
+                legend_kwargs["borderpad"] = float(borderpad)
             if bbox_to_anchor is not None:
                 legend_kwargs["bbox_to_anchor"] = bbox_to_anchor
                 legend_kwargs["borderaxespad"] = 0.0
-            ax.legend(handles, labels, **legend_kwargs)
+            legend = ax.legend(handles, labels, **legend_kwargs)
+            if legend is not None and legend_kwargs["frameon"]:
+                frame = legend.get_frame()
+                if facecolor is not None:
+                    frame.set_facecolor(facecolor)
+                if edgecolor is not None:
+                    frame.set_edgecolor(edgecolor)
+                if framealpha is not None:
+                    frame.set_alpha(float(framealpha))
+
+    def set_legend_line_width(self, legend, linewidth: float | None) -> None:
+        """加粗 legend 中的线段句柄，只影响 legend 显示，不改变图中实际曲线。"""
+
+        if legend is None or linewidth is None:
+            return
+        try:
+            linewidth = float(linewidth)
+        except (TypeError, ValueError):
+            return
+        if linewidth <= 0:
+            return
+        handles = getattr(legend, "legend_handles", None)
+        if handles is None:
+            handles = getattr(legend, "legendHandles", [])
+        for handle in handles:
+            if hasattr(handle, "set_linewidth"):
+                try:
+                    handle.set_linewidth(linewidth)
+                except Exception:
+                    pass
 
     def particle_stats_bar_color(self, exp_key: str | None) -> str:
         """颗粒统计条形图颜色：GT 与每个实验固定颜色，图例和柱子保持一致。"""
@@ -537,6 +757,37 @@ class AllHandlePipeline:
             frame.set_facecolor(getattr(self.cfg, "ENERGY_LEGEND_FACE_COLOR", "#E6E6E6"))
             frame.set_edgecolor(getattr(self.cfg, "ENERGY_LEGEND_EDGE_COLOR", "#808080"))
             frame.set_alpha(float(getattr(self.cfg, "ENERGY_LEGEND_ALPHA", 0.58)))
+
+    def ordered_legend_items_from_axes(
+        self,
+        axes: Iterable[plt.Axes],
+        *,
+        include_gt: bool = False,
+    ) -> tuple[list[object], list[str]]:
+        """
+        从一个或多个 axes 中按全局实验顺序收集 legend 条目。
+
+        2D+3D 组图把 legend 提到第一行以后，不能再依赖某个子图自己 ax.legend()；
+        因此这里复用 apply_ordered_legend 的排序逻辑，生成可放到独立 legend_ax 的 handles/labels。
+        """
+
+        label_to_handle: dict[str, object] = {}
+        for ax in axes:
+            handles, labels = ax.get_legend_handles_labels()
+            for handle, label in zip(handles, labels):
+                if label:
+                    label_to_handle.setdefault(label, handle)
+        ordered_labels = [
+            self.experiment_label(exp_key)
+            for exp_key in self.legend_order_keys()
+            if self.experiment_label(exp_key) in label_to_handle
+        ]
+        if include_gt and self.cfg.GT_ENERGY_LABEL in label_to_handle:
+            ordered_labels.append(self.cfg.GT_ENERGY_LABEL)
+        for label in label_to_handle:
+            if label not in ordered_labels:
+                ordered_labels.append(label)
+        return [label_to_handle[label] for label in ordered_labels], ordered_labels
 
     def downsample_curve(self, x: np.ndarray, y: np.ndarray, max_points: int | None = None) -> tuple[np.ndarray, np.ndarray]:
         """按固定步长抽稀 3D 瀑布图曲线，避免高分辨率直方图/能谱在 SVG 中生成过大的路径。"""
@@ -625,6 +876,139 @@ class AllHandlePipeline:
             except Exception:
                 pass
 
+    def apply_log10_power_ticks_3d(
+        self,
+        ax: plt.Axes,
+        axis_name: str,
+        limits: tuple[float | None, float | None] | None = None,
+    ) -> None:
+        """
+        把 3D 图中已经 log10 变换过的坐标轴显示成 10 的幂。
+
+        能谱 3D 瀑布图内部仍用 log10(wavenumber)/log10(energy) 来避免数量级压扁；
+        但 thesis 图要求和左侧 2D log-log 图一致，因此 tick label 显示为 10^n。
+        """
+
+        getter = {"x": ax.get_xlim, "z": ax.get_zlim}.get(axis_name)
+        setter_ticks = {"x": ax.set_xticks, "z": ax.set_zticks}.get(axis_name)
+        setter_labels = {"x": ax.set_xticklabels, "z": ax.set_zticklabels}.get(axis_name)
+        if getter is None or setter_ticks is None or setter_labels is None:
+            return
+        axis_limits = limits if limits is not None else getter()
+        if axis_limits is None:
+            return
+        low, high = axis_limits
+        if low is None or high is None:
+            low, high = getter()
+        low = float(low)
+        high = float(high)
+        if not math.isfinite(low) or not math.isfinite(high):
+            return
+        if high < low:
+            low, high = high, low
+        start = math.ceil(low)
+        end = math.floor(high)
+        ticks = [float(value) for value in range(start, end + 1)]
+        if not ticks:
+            ticks = [low, high] if high > low else [low]
+        tick_labels = []
+        for value in ticks:
+            if abs(value - round(value)) < 1e-8:
+                tick_labels.append(rf"$10^{{{int(round(value))}}}$")
+            else:
+                tick_labels.append(rf"$10^{{{value:.1f}}}$")
+        setter_ticks(ticks)
+        setter_labels(tick_labels)
+
+    def format_log10_power_label(self, value: float) -> str:
+        """把 log10 后的坐标值格式化成 10 的幂，用于 3D 能谱轴的起点 tick。"""
+
+        if abs(value - round(value)) < 1e-8:
+            return rf"$10^{{{int(round(value))}}}$"
+        return rf"$10^{{{value:.2g}}}$"
+
+    def add_axis_start_ticks_2d(self, ax: plt.Axes, *, mark_x: bool = True, mark_y: bool = True) -> None:
+        """
+        在 2D 图的 x/y 轴显式保留起点 tick。
+
+        Matplotlib 在 log 坐标下有时会自动省略低端 tick，论文图会看不出坐标起点；
+        这里只补当前显示范围的左/下边界，不改变曲线数据和坐标范围。
+        """
+
+        ensure_matplotlib()
+        axis_items = []
+        if mark_x:
+            axis_items.append((ax.get_xlim, ax.get_xticks, ax.set_xticks, ax.get_xscale, ax.xaxis))
+        if mark_y:
+            axis_items.append((ax.get_ylim, ax.get_yticks, ax.set_yticks, ax.get_yscale, ax.yaxis))
+        ticker = plt.matplotlib.ticker
+        for getter_limits, getter_ticks, setter_ticks, getter_scale, axis_obj in axis_items:
+            low, high = getter_limits()
+            if not math.isfinite(low) or not math.isfinite(high):
+                continue
+            start = float(min(low, high))
+            end = float(max(low, high))
+            if getter_scale() == "log" and start <= 0:
+                continue
+            ticks = [float(value) for value in getter_ticks() if math.isfinite(float(value))]
+            ticks = [value for value in ticks if start <= value <= end]
+            if not any(abs(value - start) <= max(abs(start), 1.0) * 1e-8 for value in ticks):
+                ticks.append(start)
+            ticks = sorted(set(round(value, 12) for value in ticks))
+            axis_obj.set_major_locator(ticker.FixedLocator(ticks))
+            if getter_scale() == "log":
+                # LogFormatter 对非整十次幂的边界 tick 仍可能给空 label；
+                # 这里用固定 formatter，确保 2D 合图的坐标起点一定能读出来。
+                axis_obj.set_major_formatter(ticker.FixedFormatter([self.format_log_tick_label_2d(value) for value in ticks]))
+            else:
+                setter_ticks(ticks)
+
+    def format_log_tick_label_2d(self, value: float) -> str:
+        """格式化 2D log 坐标 tick；非整十次幂用紧凑科学计数法显示。"""
+
+        if value <= 0 or not math.isfinite(value):
+            return ""
+        exponent = math.log10(value)
+        rounded_exp = round(exponent)
+        if abs(exponent - rounded_exp) < 1e-8:
+            return rf"$10^{{{int(rounded_exp)}}}$"
+        return f"{value:.2g}"
+
+    def add_axis_start_ticks_3d(
+        self,
+        ax: plt.Axes,
+        *,
+        mark_x: bool = True,
+        mark_z: bool = True,
+        x_log10_power_ticks: bool = False,
+        z_log10_power_ticks: bool = False,
+    ) -> None:
+        """
+        在 3D 瀑布图的 x/z 轴显式保留起点 tick。
+
+        3D 能谱轴内部可能已经转换成 log10 坐标，因此 power tick 的 label 需要同步重建。
+        """
+
+        axis_items = []
+        if mark_x:
+            axis_items.append((ax.get_xlim, ax.get_xticks, ax.set_xticks, ax.set_xticklabels, x_log10_power_ticks))
+        if mark_z:
+            axis_items.append((ax.get_zlim, ax.get_zticks, ax.set_zticks, ax.set_zticklabels, z_log10_power_ticks))
+        for getter_limits, getter_ticks, setter_ticks, setter_labels, use_power_labels in axis_items:
+            low, high = getter_limits()
+            if not math.isfinite(low) or not math.isfinite(high):
+                continue
+            start = float(min(low, high))
+            end = float(max(low, high))
+            ticks = [float(value) for value in getter_ticks() if math.isfinite(float(value))]
+            ticks = [value for value in ticks if start <= value <= end]
+            if not any(abs(value - start) <= max(abs(start), 1.0) * 1e-8 for value in ticks):
+                ticks.append(start)
+            ticks = sorted(set(round(value, 12) for value in ticks))
+            setter_ticks(ticks)
+            if use_power_labels:
+                setter_labels([self.format_log10_power_label(value) for value in ticks])
+
     def draw_waterfall_3d_axes(
         self,
         ax: plt.Axes,
@@ -640,6 +1024,16 @@ class AllHandlePipeline:
         add_legend: bool = True,
         left_z_label_x: float | None = None,
         x_limits: tuple[float | None, float | None] | None = None,
+        z_limits: tuple[float | None, float | None] | None = None,
+        x_label_pad: float | None = None,
+        x_tick_pad: float | None = None,
+        z_tick_pad: float | None = None,
+        x_log10_power_ticks: bool = False,
+        z_log10_power_ticks: bool = False,
+        legend_loc: str | None = None,
+        legend_bbox: tuple[float, float] | None = None,
+        legend_ncol: int | None = None,
+        legend_font_size: float | None = None,
     ) -> bool:
         """
         在已有 3D 坐标轴上绘制瀑布图。
@@ -732,9 +1126,23 @@ class AllHandlePipeline:
             x_min, x_max = x_limits
             if x_min is not None or x_max is not None:
                 ax.set_xlim(left=x_min, right=x_max)
+        if z_limits is not None:
+            z_min, z_max = z_limits
+            if z_min is not None or z_max is not None:
+                ax.set_zlim(bottom=z_min, top=z_max)
+        if x_log10_power_ticks:
+            self.apply_log10_power_ticks_3d(ax, "x", x_limits)
+        if z_log10_power_ticks:
+            self.apply_log10_power_ticks_3d(ax, "z", z_limits)
         # 3D 图的 x-label 在 azim=-60 这类视角下会向画布底部倾斜；
         # labelpad 放到全局变量里，便于把带单位的 "[px]" 往坐标轴内收，避免保存时被裁切。
-        ax.set_xlabel(x_label, labelpad=float(getattr(self.cfg, "WATERFALL_3D_X_LABEL_PAD", 2)))
+        # 能谱 thesis 合图可通过 x_label_pad 单独把 label 往下挪，避免和 x tick label 挤在一起。
+        label_pad = (
+            float(x_label_pad)
+            if x_label_pad is not None
+            else float(getattr(self.cfg, "WATERFALL_3D_X_LABEL_PAD", 2))
+        )
+        ax.set_xlabel(x_label, labelpad=label_pad)
         try:
             ax.xaxis.label.set_clip_on(False)
         except Exception:
@@ -769,9 +1177,23 @@ class AllHandlePipeline:
             )
         else:
             ax.set_zlabel(z_label, labelpad=8)
-        # z-label 已经被单独移到左侧，z 轴 tick 数字只需要贴近轴线；
-        # 减小 tick pad 可以进一步避免 Count 和大数值刻度挤成一团。
-        ax.tick_params(axis="z", pad=float(getattr(self.cfg, "WATERFALL_3D_Z_TICK_PAD", 2)))
+        # 3D 坐标轴不会像 2D 轴那样自动给放大的 tick label 让位；
+        # x/z tick pad 需要独立控制，避免坐标范围数字压到倾斜轴线上。
+        ax.tick_params(
+            axis="x",
+            labelsize=float(getattr(self.cfg, "TICK_LABEL_SIZE", 10)),
+            pad=float(
+                x_tick_pad if x_tick_pad is not None else getattr(self.cfg, "WATERFALL_3D_X_TICK_PAD", 4)
+            ),
+        )
+        ax.tick_params(axis="y", labelsize=float(getattr(self.cfg, "TICK_LABEL_SIZE", 10)))
+        ax.tick_params(
+            axis="z",
+            labelsize=float(getattr(self.cfg, "TICK_LABEL_SIZE", 10)),
+            pad=float(
+                z_tick_pad if z_tick_pad is not None else getattr(self.cfg, "WATERFALL_3D_Z_TICK_PAD", 2)
+            ),
+        )
         if bool(getattr(self.cfg, "WATERFALL_3D_SHOW_Y_TICK_LABELS", False)):
             ax.set_yticks(np.arange(len(curve_items), dtype=np.float64))
             ax.set_yticklabels([item[1] for item in curve_items], fontsize=max(6, self.cfg.TICK_LABEL_SIZE - 2))
@@ -802,12 +1224,19 @@ class AllHandlePipeline:
             ax.legend(
                 handles,
                 labels,
-                loc=getattr(self.cfg, "WATERFALL_3D_LEGEND_LOC", "upper left"),
-                bbox_to_anchor=getattr(self.cfg, "WATERFALL_3D_LEGEND_BBOX", (1.02, 1.0)),
+                loc=legend_loc or getattr(self.cfg, "WATERFALL_3D_LEGEND_LOC", "upper left"),
+                bbox_to_anchor=legend_bbox
+                if legend_bbox is not None
+                else getattr(self.cfg, "WATERFALL_3D_LEGEND_BBOX", (1.02, 1.0)),
                 frameon=True,
-                fontsize=float(getattr(self.cfg, "WATERFALL_3D_LEGEND_FONT_SIZE", 8)),
+                fontsize=float(
+                    legend_font_size
+                    if legend_font_size is not None
+                    else getattr(self.cfg, "WATERFALL_3D_LEGEND_FONT_SIZE", 8)
+                ),
                 labelspacing=float(getattr(self.cfg, "WATERFALL_3D_LEGEND_LABEL_SPACING", 0.35)),
                 handlelength=float(getattr(self.cfg, "WATERFALL_3D_LEGEND_HANDLE_LENGTH", 2.0)),
+                ncol=int(legend_ncol) if legend_ncol is not None else 1,
                 borderaxespad=0.0,
             )
         return True
@@ -846,6 +1275,29 @@ class AllHandlePipeline:
             log_z_plus_one=log_z_plus_one,
             add_legend=True,
             x_limits=x_limits,
+            # 普通 3D 单图也要和 2D+3D 合图一样显式控制 label/tick 间距；
+            # 误差直方图的 Count 刻度更密集，因此 use_hist_color=True 时使用 HIST_* 专属参数。
+            x_label_pad=float(
+                getattr(
+                    self.cfg,
+                    "HIST_WATERFALL_3D_X_LABEL_PAD" if use_hist_color else "WATERFALL_3D_X_LABEL_PAD",
+                    getattr(self.cfg, "WATERFALL_3D_X_LABEL_PAD", 2),
+                )
+            ),
+            x_tick_pad=float(
+                getattr(
+                    self.cfg,
+                    "HIST_WATERFALL_3D_X_TICK_PAD" if use_hist_color else "WATERFALL_3D_X_TICK_PAD",
+                    getattr(self.cfg, "WATERFALL_3D_X_TICK_PAD", 4),
+                )
+            ),
+            z_tick_pad=float(
+                getattr(
+                    self.cfg,
+                    "HIST_WATERFALL_3D_Z_TICK_PAD" if use_hist_color else "WATERFALL_3D_Z_TICK_PAD",
+                    getattr(self.cfg, "WATERFALL_3D_Z_TICK_PAD", 2),
+                )
+            ),
         )
         if not drawn:
             plt.close(fig)
@@ -923,6 +1375,8 @@ class AllHandlePipeline:
         """统一创建色条，并按全局规则格式化 tick label。"""
 
         cb = fig.colorbar(mappable, cax=cax, **kwargs)
+        # 色条 tick label 不完全受普通坐标轴 rcParams 控制，因此这里显式绑定全局刻度字号。
+        cb.ax.tick_params(labelsize=float(getattr(self.cfg, "TICK_LABEL_SIZE", 10)))
         if bool(getattr(self.cfg, "COLORBAR_PAD_POSITIVE_TICKS", True)):
             self.pad_positive_colorbar_tick_labels(
                 cb,
@@ -937,9 +1391,7 @@ class AllHandlePipeline:
         """扫描八个实验已有的 class/split/category 目录，生成后续绘图任务。"""
 
         groups: list[GroupContext] = []
-        category_filter = None
-        if self.cfg.CATEGORY_FILTER:
-            category_filter = {normalize_name(v) for v in self.cfg.CATEGORY_FILTER}
+        category_filter = self.effective_category_filter()
 
         comparison_groups = getattr(
             self.cfg,
@@ -947,8 +1399,12 @@ class AllHandlePipeline:
             {"eight_experiments": tuple(self.cfg.EXPERIMENT_KEYS)},
         )
         min_counts = getattr(self.cfg, "COMPARISON_GROUP_MIN_EXPERIMENTS", {})
+        comparison_filter = self.effective_comparison_filter()
 
         for comparison_name, experiment_keys in comparison_groups.items():
+            if comparison_filter and normalize_name(comparison_name) not in comparison_filter:
+                # thesis 模式下只保留主八组实验，避免把 without_widim_hs 的补充图也跑出来。
+                continue
             experiment_keys = tuple(experiment_keys)
             min_count = int(min_counts.get(comparison_name, 1))
             for class_name in self.cfg.CLASS_NAMES:
@@ -963,16 +1419,19 @@ class AllHandlePipeline:
                     if len(existing_roots) < min_count:
                         continue
 
-                    groups.append(
-                        GroupContext(
-                            comparison_name=comparison_name,
-                            experiment_keys=experiment_keys,
-                            class_name=class_name,
-                            split_name=split_name,
-                            category_name="all",
-                            experiment_dirs=existing_roots,
+                    if not self.thesis_mode_enabled():
+                        # thesis 模式只生成论文指定的四个类别，不再额外生成 category=all 的汇总组；
+                        # 这样 01_energy_spectrum / 03_error_histograms 也会严格限定在 backstep/sqg/tbl/twcf。
+                        groups.append(
+                            GroupContext(
+                                comparison_name=comparison_name,
+                                experiment_keys=experiment_keys,
+                                class_name=class_name,
+                                split_name=split_name,
+                                category_name="all",
+                                experiment_dirs=existing_roots,
+                            )
                         )
-                    )
 
                     category_map: dict[str, str] = {}
                     for root in existing_roots.values():
@@ -1083,8 +1542,8 @@ class AllHandlePipeline:
         for sample_map in per_experiment.values():
             names.update(sample_map.keys())
 
-        if self.cfg.SAMPLE_FILTER:
-            allowed = {normalize_name(v) for v in self.cfg.SAMPLE_FILTER}
+        allowed = self.effective_sample_filter(group)
+        if allowed:
             names = {name for name in names if normalize_name(name) in allowed}
 
         bundles: list[SampleBundle] = []
@@ -1873,6 +2332,7 @@ class AllHandlePipeline:
         series: dict[str, tuple[np.ndarray, np.ndarray]],
         gt_series: tuple[np.ndarray, np.ndarray] | None,
         category_name: str | None = None,
+        add_legend: bool = True,
     ) -> None:
         """绘制二维 ENERGY_SPECTRUM；普通图和 2D+3D 大图共用，避免两处样式不一致。"""
 
@@ -1900,7 +2360,8 @@ class AllHandlePipeline:
         ax.set_xlabel(self.cfg.ENERGY_X_LABEL)
         ax.set_ylabel(self.cfg.ENERGY_Y_LABEL)
         ax.grid(True, which="both", alpha=0.22, linewidth=0.5)
-        self.apply_ordered_legend(ax, include_gt=True, energy_style=True)
+        if add_legend:
+            self.apply_ordered_legend(ax, include_gt=True, energy_style=True)
         self.apply_axis_limits(
             ax,
             self.cfg.ENERGY_SPECTRUM_X_MIN,
@@ -1929,33 +2390,117 @@ class AllHandlePipeline:
         if not getattr(self.cfg, "WATERFALL_3D_ENABLED", True):
             return
         ensure_matplotlib()
-        energy_log = bool(getattr(self.cfg, "ENERGY_WATERFALL_USE_LOG10", True))
+        # thesis 模式用于论文定稿：右侧 3D 子图内部仍使用 log10 坐标，
+        # 但 label 和 tick 显示方式要与左侧 2D log-log 能谱保持一致。
+        thesis_energy_axis = self.thesis_mode_enabled() and bool(
+            getattr(self.cfg, "THESIS_ENERGY_COMPOSITE_USE_2D_AXIS", True)
+        )
+        thesis_legend_on_3d = thesis_energy_axis and bool(
+            getattr(self.cfg, "THESIS_ENERGY_COMPOSITE_LEGEND_ON_3D", True)
+        )
+        energy_log = bool(
+            getattr(
+                self.cfg,
+                "THESIS_ENERGY_WATERFALL_USE_LOG10" if thesis_energy_axis else "ENERGY_WATERFALL_USE_LOG10",
+                False if thesis_energy_axis else True,
+            )
+        )
         fig = plt.figure(figsize=tuple(getattr(self.cfg, "WATERFALL_3D_COMPOSITE_FIG_SIZE", (11.8, 4.4))))
         fig.patch.set_facecolor("white")
         gs = fig.add_gridspec(
-            1,
             2,
+            2,
+            height_ratios=(
+                float(getattr(self.cfg, "WATERFALL_3D_COMPOSITE_TOP_LEGEND_HEIGHT_RATIO", 0.22)),
+                float(getattr(self.cfg, "WATERFALL_3D_COMPOSITE_PLOT_HEIGHT_RATIO", 1.0)),
+            ),
             width_ratios=tuple(getattr(self.cfg, "WATERFALL_3D_COMPOSITE_WIDTH_RATIOS", (1.0, 1.08))),
             wspace=float(getattr(self.cfg, "WATERFALL_3D_COMPOSITE_WSPACE", 0.18)),
+            hspace=float(getattr(self.cfg, "WATERFALL_3D_COMPOSITE_TOP_LEGEND_HSPACE", 0.08)),
         )
-        ax_2d = fig.add_subplot(gs[0, 0])
-        ax_3d = fig.add_subplot(gs[0, 1], projection="3d")
-        self.draw_energy_spectrum_2d(ax_2d, series, gt_series, category_name=category_name)
+        legend_ax = fig.add_subplot(gs[0, :])
+        legend_ax.axis("off")
+        ax_2d = fig.add_subplot(gs[1, 0])
+        ax_3d = fig.add_subplot(gs[1, 1], projection="3d")
+        self.draw_energy_spectrum_2d(
+            ax_2d,
+            series,
+            gt_series,
+            category_name=category_name,
+            add_legend=False,
+        )
+        # 01 的 2D+3D 合图左侧二维图要显式显示 x/y 起点；
+        # 只补 tick，不改坐标范围和曲线数据。
+        self.add_axis_start_ticks_2d(ax_2d, mark_x=True, mark_y=True)
+        # 读取左侧 2D 子图实际使用的范围；普通合图同步完整范围，focus 合图继续沿用“差异明显区域”。
+        # 由于 3D 内部使用 log10 坐标，这里把二维图的原始 x/y 范围转换到 log10 坐标后再传入。
+        energy_x_limits = waterfall_x_limits
+        energy_z_limits = None
+        if thesis_energy_axis and energy_log:
+            raw_x_limits = tuple(float(value) for value in ax_2d.get_xlim())
+            raw_z_limits = tuple(float(value) for value in ax_2d.get_ylim())
+            if energy_x_limits is None:
+                energy_x_limits = tuple(math.log10(max(value, np.finfo(float).tiny)) for value in raw_x_limits)
+            energy_z_limits = tuple(math.log10(max(value, np.finfo(float).tiny)) for value in raw_z_limits)
+        elif thesis_energy_axis:
+            energy_x_limits = tuple(float(value) for value in ax_2d.get_xlim())
+            energy_z_limits = tuple(float(value) for value in ax_2d.get_ylim())
+        energy_x_label = (
+            self.cfg.ENERGY_X_LABEL
+            if thesis_energy_axis or not energy_log
+            else self.cfg.ENERGY_WATERFALL_X_LABEL
+        )
+        energy_z_label = (
+            self.cfg.ENERGY_Y_LABEL
+            if thesis_energy_axis or not energy_log
+            else self.cfg.ENERGY_WATERFALL_Z_LABEL
+        )
+        energy_x_label_pad = (
+            float(getattr(self.cfg, "THESIS_ENERGY_WATERFALL_X_LABEL_PAD", 8))
+            if thesis_energy_axis
+            else None
+        )
+        energy_x_tick_pad = (
+            float(getattr(self.cfg, "THESIS_ENERGY_WATERFALL_X_TICK_PAD", self.cfg.WATERFALL_3D_X_TICK_PAD))
+            if thesis_energy_axis
+            else float(getattr(self.cfg, "WATERFALL_3D_X_TICK_PAD", 4))
+        )
         drawn = self.draw_waterfall_3d_axes(
             ax_3d,
             series,
-            x_label=self.cfg.ENERGY_WATERFALL_X_LABEL if energy_log else self.cfg.ENERGY_X_LABEL,
-            z_label=self.cfg.ENERGY_WATERFALL_Z_LABEL if energy_log else self.cfg.ENERGY_Y_LABEL,
+            x_label=energy_x_label,
+            z_label=energy_z_label,
             use_hist_color=False,
             gt_series=gt_series,
             log_x=energy_log,
             log_z=energy_log,
             add_legend=False,
-            x_limits=waterfall_x_limits,
+            x_limits=energy_x_limits,
+            z_limits=energy_z_limits,
+            x_label_pad=energy_x_label_pad,
+            x_tick_pad=energy_x_tick_pad,
+            x_log10_power_ticks=bool(
+                thesis_energy_axis and energy_log and getattr(self.cfg, "THESIS_ENERGY_WATERFALL_POWER_TICKS", True)
+            ),
+            z_log10_power_ticks=bool(
+                thesis_energy_axis and energy_log and getattr(self.cfg, "THESIS_ENERGY_WATERFALL_POWER_TICKS", True)
+            ),
+            legend_loc=getattr(self.cfg, "THESIS_ENERGY_COMPOSITE_LEGEND_LOC", "upper right")
+            if thesis_legend_on_3d
+            else None,
+            legend_bbox=getattr(self.cfg, "THESIS_ENERGY_COMPOSITE_LEGEND_BBOX", (0.98, 0.98))
+            if thesis_legend_on_3d
+            else None,
+            legend_ncol=int(getattr(self.cfg, "THESIS_ENERGY_COMPOSITE_LEGEND_NCOL", 2))
+            if thesis_legend_on_3d
+            else None,
+            legend_font_size=float(getattr(self.cfg, "ENERGY_LEGEND_FONT_SIZE", self.cfg.LEGEND_FONT_SIZE))
+            if thesis_legend_on_3d
+            else None,
             left_z_label_x=float(
                 getattr(
                     self.cfg,
-                    "WATERFALL_3D_COMPOSITE_LEFT_Z_LABEL_X",
+                    "THESIS_ENERGY_WATERFALL_Z_LABEL_X" if thesis_energy_axis else "WATERFALL_3D_COMPOSITE_LEFT_Z_LABEL_X",
                     getattr(self.cfg, "WATERFALL_3D_LEFT_Z_LABEL_X", -0.16),
                 )
             ),
@@ -1963,6 +2508,45 @@ class AllHandlePipeline:
         if not drawn:
             plt.close(fig)
             return
+        # 01 的 2D+3D 合图右侧 3D 图同样补 x/z 起点；
+        # thesis 能谱使用 10 的幂次 tick 时，这里会同步生成 10^n 格式的起点 label。
+        self.add_axis_start_ticks_3d(
+            ax_3d,
+            mark_x=True,
+            mark_z=True,
+            x_log10_power_ticks=bool(
+                thesis_energy_axis and energy_log and getattr(self.cfg, "THESIS_ENERGY_WATERFALL_POWER_TICKS", True)
+            ),
+            z_log10_power_ticks=bool(
+                thesis_energy_axis and energy_log and getattr(self.cfg, "THESIS_ENERGY_WATERFALL_POWER_TICKS", True)
+            ),
+        )
+        # 01_energy_spectrum 的 2D+3D 组图统一把 legend 放到第一行并横跨两列；
+        # 这样既不遮挡左侧 2D 曲线，也不会压到右侧 3D 坐标轴和曲线。
+        handles, labels = self.ordered_legend_items_from_axes((ax_2d, ax_3d), include_gt=True)
+        if handles:
+            legend = legend_ax.legend(
+                handles,
+                labels,
+                loc=getattr(self.cfg, "WATERFALL_3D_COMPOSITE_TOP_LEGEND_LOC", "center"),
+                ncol=min(len(labels), int(getattr(self.cfg, "WATERFALL_3D_COMPOSITE_TOP_LEGEND_NCOL", 2))),
+                frameon=bool(getattr(self.cfg, "ENERGY_LEGEND_FRAME", True)),
+                # 01 的 2D+3D 合图使用第一行整行 legend；字号单独略小，避免五列 legend 仍然压住主图。
+                fontsize=float(
+                    getattr(
+                        self.cfg,
+                        "WATERFALL_3D_COMPOSITE_TOP_LEGEND_FONT_SIZE",
+                        getattr(self.cfg, "ENERGY_LEGEND_FONT_SIZE", self.cfg.LEGEND_FONT_SIZE),
+                    )
+                ),
+                labelspacing=float(getattr(self.cfg, "LEGEND_LABEL_SPACING", 0.45)),
+                handlelength=float(getattr(self.cfg, "LEGEND_HANDLE_LENGTH", 2.2)),
+                borderpad=float(getattr(self.cfg, "LEGEND_BORDER_PAD", 0.55)),
+            )
+            self.set_legend_line_width(
+                legend,
+                getattr(self.cfg, "ENERGY_COMPOSITE_LEGEND_LINE_WIDTH", None),
+            )
         self.save_figure(fig, out_base.with_name(f"{out_base.name}{suffix}"))
 
     def plot_energy_spectrum(self, group: GroupContext) -> None:
@@ -2279,8 +2863,8 @@ class AllHandlePipeline:
         suffix: str = "_2d_3d_composite",
     ) -> None:
         """
-        生成误差直方图大图：左侧为原二维叠加直方图，右侧为 3D 瀑布图。
-        图例只保留左侧二维图的版本，右侧 3D 图用于展示分布层次，不额外重复 legend。
+        生成误差直方图大图：第一行放全局图例，第二行左侧为二维叠加直方图，右侧为 3D 瀑布图。
+        图例独占一行，避免全局字号放大后压住二维直方图或 3D 坐标轴。
         """
 
         if not getattr(self.cfg, "WATERFALL_3D_ENABLED", True):
@@ -2290,13 +2874,20 @@ class AllHandlePipeline:
         fig = plt.figure(figsize=tuple(getattr(self.cfg, "WATERFALL_3D_COMPOSITE_FIG_SIZE", (11.8, 4.4))))
         fig.patch.set_facecolor("white")
         gs = fig.add_gridspec(
-            1,
             2,
+            2,
+            height_ratios=(
+                float(getattr(self.cfg, "WATERFALL_3D_COMPOSITE_TOP_LEGEND_HEIGHT_RATIO", 0.22)),
+                float(getattr(self.cfg, "WATERFALL_3D_COMPOSITE_PLOT_HEIGHT_RATIO", 1.0)),
+            ),
             width_ratios=tuple(getattr(self.cfg, "WATERFALL_3D_COMPOSITE_WIDTH_RATIOS", (1.0, 1.08))),
             wspace=float(getattr(self.cfg, "WATERFALL_3D_COMPOSITE_WSPACE", 0.18)),
+            hspace=float(getattr(self.cfg, "WATERFALL_3D_COMPOSITE_TOP_LEGEND_HSPACE", 0.08)),
         )
-        ax_2d = fig.add_subplot(gs[0, 0])
-        ax_3d = fig.add_subplot(gs[0, 1], projection="3d")
+        legend_ax = fig.add_subplot(gs[0, :])
+        legend_ax.axis("off")
+        ax_2d = fig.add_subplot(gs[1, 0])
+        ax_3d = fig.add_subplot(gs[1, 1], projection="3d")
         self.draw_overlay_histogram_2d(
             ax_2d,
             group,
@@ -2304,7 +2895,7 @@ class AllHandlePipeline:
             x_label=x_label,
             y_label=y_label,
             axis_kind=axis_kind,
-            add_legend=True,
+            add_legend=False,
         )
         drawn = self.draw_waterfall_3d_axes(
             ax_3d,
@@ -2315,6 +2906,9 @@ class AllHandlePipeline:
             log_z_plus_one=hist_log_count,
             add_legend=False,
             x_limits=waterfall_x_limits if waterfall_x_limits is not None else self.hist_dynamic_x_limits(series, axis_kind),
+            x_label_pad=float(getattr(self.cfg, "HIST_WATERFALL_3D_X_LABEL_PAD", self.cfg.WATERFALL_3D_X_LABEL_PAD)),
+            x_tick_pad=float(getattr(self.cfg, "HIST_WATERFALL_3D_X_TICK_PAD", self.cfg.WATERFALL_3D_X_TICK_PAD)),
+            z_tick_pad=float(getattr(self.cfg, "HIST_WATERFALL_3D_Z_TICK_PAD", self.cfg.WATERFALL_3D_Z_TICK_PAD)),
             left_z_label_x=float(
                 getattr(
                     self.cfg,
@@ -2326,6 +2920,47 @@ class AllHandlePipeline:
         if not drawn:
             plt.close(fig)
             return
+        # 03_error_histograms 的普通 2D+3D 合图统一把 legend 放到第一行；
+        # 这样不管 legend 字体多大，都不会遮住右侧 3D 的 Count 轴和左侧二维分布。
+        self.apply_hist_legend(
+            legend_ax,
+            series,
+            loc=getattr(self.cfg, "WATERFALL_3D_COMPOSITE_TOP_LEGEND_LOC", "center"),
+            ncol=int(
+                getattr(
+                    self.cfg,
+                    "HIST_WATERFALL_3D_COMPOSITE_TOP_LEGEND_NCOL",
+                    getattr(self.cfg, "WATERFALL_3D_COMPOSITE_TOP_LEGEND_NCOL", 2),
+                )
+            ),
+            font_size=float(
+                getattr(
+                    self.cfg,
+                    "HIST_WATERFALL_3D_COMPOSITE_TOP_LEGEND_FONT_SIZE",
+                    getattr(
+                        self.cfg,
+                        "WATERFALL_3D_COMPOSITE_TOP_LEGEND_FONT_SIZE",
+                        getattr(self.cfg, "HIST_LEGEND_FONT_SIZE", self.cfg.LEGEND_FONT_SIZE),
+                    ),
+                )
+            ),
+            labelspacing=float(getattr(self.cfg, "HIST_LEGEND_LABEL_SPACING", 0.45)),
+            handlelength=float(
+                getattr(
+                    self.cfg,
+                    "HIST_WATERFALL_3D_COMPOSITE_LEGEND_HANDLE_LENGTH",
+                    getattr(self.cfg, "HIST_LEGEND_HANDLE_LENGTH", 2.2),
+                )
+            ),
+            handleheight=float(getattr(self.cfg, "HIST_WATERFALL_3D_COMPOSITE_LEGEND_HANDLE_HEIGHT", 1.0)),
+            handletextpad=float(getattr(self.cfg, "HIST_WATERFALL_3D_COMPOSITE_LEGEND_HANDLE_TEXT_PAD", 0.8)),
+            columnspacing=float(getattr(self.cfg, "HIST_WATERFALL_3D_COMPOSITE_LEGEND_COLUMN_SPACING", 1.5)),
+            borderpad=float(getattr(self.cfg, "HIST_WATERFALL_3D_COMPOSITE_LEGEND_BORDER_PAD", 0.45)),
+            frameon=bool(getattr(self.cfg, "HIST_WATERFALL_3D_COMPOSITE_LEGEND_FRAME", True)),
+            facecolor=getattr(self.cfg, "HIST_WATERFALL_3D_COMPOSITE_LEGEND_FACE_COLOR", "#FFFFFF"),
+            edgecolor=getattr(self.cfg, "HIST_WATERFALL_3D_COMPOSITE_LEGEND_EDGE_COLOR", "#C8C8C8"),
+            framealpha=float(getattr(self.cfg, "HIST_WATERFALL_3D_COMPOSITE_LEGEND_ALPHA", 0.92)),
+        )
         self.save_figure(fig, out_base.with_name(f"{out_base.name}{suffix}"))
 
     def plot_overlay_histogram(
@@ -2414,6 +3049,8 @@ class AllHandlePipeline:
         *,
         legend_series: dict[str, tuple[np.ndarray, np.ndarray]],
         use_outside_legend: bool,
+        legend_context: str = "normal",
+        add_legend: bool = True,
     ) -> None:
         """绘制 flow_u_epe 的二维双子图；普通图和新增上下布局大图共用。"""
 
@@ -2449,6 +3086,10 @@ class AllHandlePipeline:
             ax.set_ylabel(self.cfg.HIST_Y_LABEL)
             ax.grid(True, alpha=0.18, linewidth=0.5)
             self.apply_hist_axis(ax, group.category_name, axis_kind, series=series)
+        if not add_legend:
+            # flow_u/epe 的 2D+3D 合图会把 legend 抽到最上方整行；
+            # 普通 2D 图仍走下面的子图内/外置 legend 逻辑。
+            return
         if use_outside_legend:
             # 八组实验的 legend 过高，放在右侧 EPE 子图内部会压住 EPE 直方图主峰；
             # 因此把 legend 锚到右图外侧，并给整张图加宽，保存时 tight bbox 会把 legend 一起保留。
@@ -2460,7 +3101,18 @@ class AllHandlePipeline:
                 ncol=int(getattr(self.cfg, "FLOW_U_EPE_HIST_LEGEND_OUTSIDE_NCOL", 1)),
             )
         else:
-            self.apply_hist_legend(axes_list[1], legend_series)
+            if normalize_name(legend_context) == "composite":
+                # flow_u/epe 的 2D+3D 合图里，右上 EPE 子图需要完整容纳 legend；
+                # 因此合图版本固定使用右上角、两列排列，避免 legend 被画布边界裁掉。
+                self.apply_hist_legend(
+                    axes_list[1],
+                    legend_series,
+                    loc=getattr(self.cfg, "FLOW_U_EPE_HIST_COMPOSITE_LEGEND_LOC", "upper right"),
+                    bbox_to_anchor=getattr(self.cfg, "FLOW_U_EPE_HIST_COMPOSITE_LEGEND_BBOX", (0.98, 0.98)),
+                    ncol=int(getattr(self.cfg, "FLOW_U_EPE_HIST_COMPOSITE_LEGEND_NCOL", 2)),
+                )
+            else:
+                self.apply_hist_legend(axes_list[1], legend_series)
 
     def plot_flow_u_epe_histogram_2d_3d_composite(
         self,
@@ -2496,8 +3148,11 @@ class AllHandlePipeline:
             figsize=tuple(getattr(self.cfg, "WATERFALL_3D_FLOW_U_EPE_COMPOSITE_FIG_SIZE", (11.8, 7.2)))
         )
         fig.patch.set_facecolor("white")
+        flow_plot_height_ratios = tuple(
+            getattr(self.cfg, "WATERFALL_3D_FLOW_U_EPE_COMPOSITE_HEIGHT_RATIOS", (1.0, 1.0))
+        )
         gs = fig.add_gridspec(
-            2,
+            3,
             2,
             wspace=float(getattr(self.cfg, "WATERFALL_3D_FLOW_U_EPE_COMPOSITE_WSPACE", 0.28)),
             hspace=float(getattr(self.cfg, "WATERFALL_3D_FLOW_U_EPE_COMPOSITE_HSPACE", 0.36)),
@@ -2505,11 +3160,15 @@ class AllHandlePipeline:
             right=float(getattr(self.cfg, "WATERFALL_3D_FLOW_U_EPE_COMPOSITE_RIGHT", 0.98)),
             top=float(getattr(self.cfg, "WATERFALL_3D_FLOW_U_EPE_COMPOSITE_TOP", 0.98)),
             bottom=float(getattr(self.cfg, "WATERFALL_3D_FLOW_U_EPE_COMPOSITE_BOTTOM", 0.12)),
-            height_ratios=tuple(
-                getattr(self.cfg, "WATERFALL_3D_FLOW_U_EPE_COMPOSITE_HEIGHT_RATIOS", (1.0, 1.0))
+            height_ratios=(
+                float(getattr(self.cfg, "WATERFALL_3D_COMPOSITE_TOP_LEGEND_HEIGHT_RATIO", 0.22)),
+                float(flow_plot_height_ratios[0] if len(flow_plot_height_ratios) > 0 else 1.0),
+                float(flow_plot_height_ratios[1] if len(flow_plot_height_ratios) > 1 else 1.0),
             ),
         )
-        axes_2d = (fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[0, 1]))
+        legend_ax = fig.add_subplot(gs[0, :])
+        legend_ax.axis("off")
+        axes_2d = (fig.add_subplot(gs[1, 0]), fig.add_subplot(gs[1, 1]))
         self.draw_flow_u_epe_histogram_2d(
             axes_2d,
             group,
@@ -2517,6 +3176,49 @@ class AllHandlePipeline:
             epe_series,
             legend_series=legend_series,
             use_outside_legend=use_outside_legend,
+            legend_context="composite",
+            add_legend=False,
+        )
+        # flow_u/epe 的 2D+3D 合图也把 legend 放在第一行横跨两列；
+        # 避免右上 EPE 子图被八组实验的 legend 压住。
+        self.apply_hist_legend(
+            legend_ax,
+            legend_series,
+            loc=getattr(self.cfg, "WATERFALL_3D_COMPOSITE_TOP_LEGEND_LOC", "center"),
+            ncol=int(
+                getattr(
+                    self.cfg,
+                    "HIST_WATERFALL_3D_COMPOSITE_TOP_LEGEND_NCOL",
+                    getattr(self.cfg, "WATERFALL_3D_COMPOSITE_TOP_LEGEND_NCOL", 2),
+                )
+            ),
+            font_size=float(
+                getattr(
+                    self.cfg,
+                    "HIST_WATERFALL_3D_COMPOSITE_TOP_LEGEND_FONT_SIZE",
+                    getattr(
+                        self.cfg,
+                        "WATERFALL_3D_COMPOSITE_TOP_LEGEND_FONT_SIZE",
+                        getattr(self.cfg, "HIST_LEGEND_FONT_SIZE", self.cfg.LEGEND_FONT_SIZE),
+                    ),
+                )
+            ),
+            labelspacing=float(getattr(self.cfg, "HIST_LEGEND_LABEL_SPACING", 0.45)),
+            handlelength=float(
+                getattr(
+                    self.cfg,
+                    "HIST_WATERFALL_3D_COMPOSITE_LEGEND_HANDLE_LENGTH",
+                    getattr(self.cfg, "HIST_LEGEND_HANDLE_LENGTH", 2.2),
+                )
+            ),
+            handleheight=float(getattr(self.cfg, "HIST_WATERFALL_3D_COMPOSITE_LEGEND_HANDLE_HEIGHT", 1.0)),
+            handletextpad=float(getattr(self.cfg, "HIST_WATERFALL_3D_COMPOSITE_LEGEND_HANDLE_TEXT_PAD", 0.8)),
+            columnspacing=float(getattr(self.cfg, "HIST_WATERFALL_3D_COMPOSITE_LEGEND_COLUMN_SPACING", 1.5)),
+            borderpad=float(getattr(self.cfg, "HIST_WATERFALL_3D_COMPOSITE_LEGEND_BORDER_PAD", 0.45)),
+            frameon=bool(getattr(self.cfg, "HIST_WATERFALL_3D_COMPOSITE_LEGEND_FRAME", True)),
+            facecolor=getattr(self.cfg, "HIST_WATERFALL_3D_COMPOSITE_LEGEND_FACE_COLOR", "#FFFFFF"),
+            edgecolor=getattr(self.cfg, "HIST_WATERFALL_3D_COMPOSITE_LEGEND_EDGE_COLOR", "#C8C8C8"),
+            framealpha=float(getattr(self.cfg, "HIST_WATERFALL_3D_COMPOSITE_LEGEND_ALPHA", 0.92)),
         )
         hist_log_count = bool(getattr(self.cfg, "HIST_WATERFALL_USE_LOG10_COUNT", False))
         z_label = self.cfg.HIST_WATERFALL_LOG_Z_LABEL if hist_log_count else self.cfg.HIST_WATERFALL_Z_LABEL
@@ -2530,8 +3232,8 @@ class AllHandlePipeline:
             if epe_waterfall_x_limits is not None
             else self.hist_dynamic_x_limits(epe_series, "epe")
         )
-        ax_u_3d = fig.add_subplot(gs[1, 0], projection="3d")
-        ax_epe_3d = fig.add_subplot(gs[1, 1], projection="3d")
+        ax_u_3d = fig.add_subplot(gs[2, 0], projection="3d")
+        ax_epe_3d = fig.add_subplot(gs[2, 1], projection="3d")
         drawn_u = self.draw_waterfall_3d_axes(
             ax_u_3d,
             u_series,
@@ -2543,6 +3245,9 @@ class AllHandlePipeline:
             log_z_plus_one=hist_log_count,
             add_legend=False,
             x_limits=u_x_limits,
+            x_label_pad=float(getattr(self.cfg, "HIST_WATERFALL_3D_X_LABEL_PAD", self.cfg.WATERFALL_3D_X_LABEL_PAD)),
+            x_tick_pad=float(getattr(self.cfg, "HIST_WATERFALL_3D_X_TICK_PAD", self.cfg.WATERFALL_3D_X_TICK_PAD)),
+            z_tick_pad=float(getattr(self.cfg, "HIST_WATERFALL_3D_Z_TICK_PAD", self.cfg.WATERFALL_3D_Z_TICK_PAD)),
             left_z_label_x=float(
                 getattr(
                     self.cfg,
@@ -2566,6 +3271,9 @@ class AllHandlePipeline:
             log_z_plus_one=hist_log_count,
             add_legend=False,
             x_limits=epe_x_limits,
+            x_label_pad=float(getattr(self.cfg, "HIST_WATERFALL_3D_X_LABEL_PAD", self.cfg.WATERFALL_3D_X_LABEL_PAD)),
+            x_tick_pad=float(getattr(self.cfg, "HIST_WATERFALL_3D_X_TICK_PAD", self.cfg.WATERFALL_3D_X_TICK_PAD)),
+            z_tick_pad=float(getattr(self.cfg, "HIST_WATERFALL_3D_Z_TICK_PAD", self.cfg.WATERFALL_3D_Z_TICK_PAD)),
             left_z_label_x=float(
                 getattr(
                     self.cfg,
@@ -3739,14 +4447,22 @@ class AllHandlePipeline:
             return bundles[: int(limit)]
         return bundles
 
-    def panel_text(self, ax: plt.Axes, text: str, fontsize: float | None = None, loc: str = "upper_left") -> None:
+    def panel_text(
+        self,
+        ax: plt.Axes,
+        text: str,
+        fontsize: float | None = None,
+        loc: str = "upper_left",
+        shrink_long_text: bool = True,
+        fit_reference_label: bool = False,
+    ) -> None:
         """用轴内文本作为面板 label，避免使用 Matplotlib title。"""
 
         if not text:
             return
-        # 颗粒阈值化图的 label 往往是 “实验名 + binary”，比普通面板标题更长；
-        # 这里允许 draw_map 传入较小字号，防止标题文字超出图像本身。
-        label_size = self.cfg.PANEL_LABEL_SIZE if fontsize is None else fontsize
+        # 先按目标字号绘制；后面用真实渲染宽度判断是否越界。
+        # 这样只在 label 真的超过当前子图宽度时才缩小，不再按字符数预判。
+        label_size = float(self.cfg.PANEL_LABEL_SIZE if fontsize is None else fontsize)
         # 个别 TBL full-frame 图左上角有 crop 红框，label 放左上会遮挡；
         # 因此支持把 label 放到右上，其它图默认仍使用左上角，保持旧版论文图样式。
         loc_key = normalize_name(loc)
@@ -3754,7 +4470,34 @@ class AllHandlePipeline:
             x, ha = 0.98, "right"
         else:
             x, ha = 0.02, "left"
-        ax.text(
+        if shrink_long_text and fit_reference_label:
+            try:
+                reference_text = str(getattr(self.cfg, "PANEL_LABEL_TARGET_FIT_TEXT", "") or "")
+                if reference_text:
+                    fig = ax.figure
+                    probe = ax.text(
+                        x,
+                        0.98,
+                        reference_text,
+                        transform=ax.transAxes,
+                        ha=ha,
+                        va="top",
+                        fontsize=label_size,
+                        alpha=0.0,
+                    )
+                    fig.canvas.draw()
+                    renderer = fig.canvas.get_renderer()
+                    probe_bbox = probe.get_window_extent(renderer=renderer)
+                    axes_bbox = ax.get_window_extent(renderer=renderer)
+                    anchor_x = axes_bbox.x0 + axes_bbox.width * float(x)
+                    available_width = (anchor_x - axes_bbox.x0) if ha == "right" else (axes_bbox.x1 - anchor_x)
+                    target_width = available_width * float(getattr(self.cfg, "PANEL_LABEL_TARGET_WIDTH_FRACTION", 1.0))
+                    if probe_bbox.width > 1 and target_width > probe_bbox.width:
+                        label_size *= target_width / probe_bbox.width
+                    probe.remove()
+            except Exception:
+                pass
+        text_artist = ax.text(
             x,
             0.98,
             text,
@@ -3764,6 +4507,26 @@ class AllHandlePipeline:
             fontsize=label_size,
             bbox={"facecolor": "white", "alpha": 0.78, "edgecolor": "none", "pad": 1.5},
         )
+        if shrink_long_text:
+            try:
+                fig = ax.figure
+                fig.canvas.draw()
+                renderer = fig.canvas.get_renderer()
+                text_bbox = text_artist.get_window_extent(renderer=renderer)
+                axes_bbox = ax.get_window_extent(renderer=renderer)
+                anchor_x = axes_bbox.x0 + axes_bbox.width * float(x)
+                if ha == "right":
+                    available_width = anchor_x - axes_bbox.x0
+                else:
+                    available_width = axes_bbox.x1 - anchor_x
+                available_width *= float(getattr(self.cfg, "PANEL_LABEL_MAX_WIDTH_FRACTION", 0.98))
+                if available_width > 1 and text_bbox.width > available_width:
+                    min_size = float(getattr(self.cfg, "PANEL_LABEL_MIN_SIZE", label_size))
+                    new_size = max(min_size, label_size * available_width / text_bbox.width)
+                    if new_size < label_size:
+                        text_artist.set_fontsize(new_size)
+            except Exception:
+                pass
 
     def draw_map(
         self,
@@ -3776,6 +4539,7 @@ class AllHandlePipeline:
         fill_panel: bool = False,
         label_fontsize: float | None = None,
         label_loc: str = "upper_left",
+        fit_reference_label: bool = True,
     ):
         if array is None:
             ax.axis("off")
@@ -3790,7 +4554,13 @@ class AllHandlePipeline:
         # 未指定时，仍对 binary 阈值图自动使用颗粒阈值专用字号。
         if label_fontsize is None and "binary" in str(label).lower():
             label_fontsize = float(getattr(self.cfg, "PARTICLE_BINARY_PANEL_LABEL_SIZE", self.cfg.PANEL_LABEL_SIZE))
-        self.panel_text(ax, label, fontsize=label_fontsize, loc=label_loc)
+        self.panel_text(
+            ax,
+            label,
+            fontsize=label_fontsize,
+            loc=label_loc,
+            fit_reference_label=fit_reference_label,
+        )
         ax.axis("off")
         return handle
 
@@ -3893,7 +4663,7 @@ class AllHandlePipeline:
         ax.set_xlim(0, ref_w)
         ax.set_ylim(ref_h, 0)
         ax.set_aspect("equal", adjustable="box")
-        self.panel_text(ax, label)
+        self.panel_text(ax, label, fit_reference_label=True)
         ax.axis("off")
         return handle
 
@@ -3978,7 +4748,8 @@ class AllHandlePipeline:
                     y0,
                     str(idx),
                     color="white",
-                    fontsize=8,
+                    # crop 红框编号也属于图内文字，跟随全局刻度字号缩放，避免大图里显得过小。
+                    fontsize=float(getattr(self.cfg, "TICK_LABEL_SIZE", 10)),
                     bbox={"facecolor": "red", "edgecolor": "none", "pad": 1},
                 )
         return handle
@@ -4938,8 +5709,8 @@ class AllHandlePipeline:
         names: set[str] = set()
         for sample_map in per_experiment.values():
             names.update(sample_map.keys())
-        if self.cfg.SAMPLE_FILTER:
-            allowed = {normalize_name(v) for v in self.cfg.SAMPLE_FILTER}
+        allowed = self.effective_sample_filter(group)
+        if allowed:
             names = {name for name in names if normalize_name(name) in allowed}
 
         bundles: list[SampleBundle] = []
@@ -5192,7 +5963,20 @@ class AllHandlePipeline:
             wspace=float(getattr(self.cfg, "TBL_PROFILE_WSPACE", 0.18)),
         )
 
-        top_ax = fig.add_subplot(gs[0, :])
+        # 顶部第一行拆成“GT 流场 + 竖向色条”两列；
+        # 旧版把色条放在第二行横排，会和放大的图例争空间。
+        top_row = gs[0, :].subgridspec(
+            1,
+            2,
+            width_ratios=tuple(getattr(self.cfg, "TBL_PROFILE_TOP_COLORBAR_WIDTH_RATIOS", (42.0, 1.0))),
+            wspace=float(getattr(self.cfg, "TBL_PROFILE_TOP_COLORBAR_WSPACE", 0.025)),
+        )
+        top_ax = fig.add_subplot(top_row[0, 0])
+        cax = fig.add_subplot(top_row[0, 1])
+        # 第二行由 legend 独享，并横跨顶部“GT 流场 + 竖向色条”的完整宽度；
+        # 因此 legend frame 的右边界会和第一行色条右边界对齐。
+        legend_ax = fig.add_subplot(gs[1, :])
+        legend_ax.axis("off")
         gt_map = top_gt_map if top_gt_map is not None else self.load_tbl_profile_gt_map(group, sample_name, component)
         top_handle = None
         top_vmin = None
@@ -5240,21 +6024,18 @@ class AllHandlePipeline:
                         fontsize=self.cfg.TICK_LABEL_SIZE,
                         bbox={"facecolor": "white", "alpha": 0.85, "edgecolor": "none", "pad": 1.5},
                     )
-        # 中间行按用户要求拆成左右两块：左边放顶部 GT 流场色条，右边放整张剖面图图例。
-        # 图例不再放入下方三张剖面子图内，避免遮挡曲线或区域标题。
-        colorbar_row = gs[1, :].subgridspec(
-            1,
-            2,
-            width_ratios=tuple(getattr(self.cfg, "TBL_PROFILE_COLORBAR_LEGEND_WIDTH_RATIOS", (1.15, 0.85))),
-            wspace=float(getattr(self.cfg, "TBL_PROFILE_COLORBAR_LEGEND_WSPACE", 0.18)),
-        )
-        cax = fig.add_subplot(colorbar_row[0, 0])
-        legend_ax = fig.add_subplot(colorbar_row[0, 1])
-        legend_ax.axis("off")
         if top_handle is not None and gt_map is not None and ensure_2d_image(gt_map).ndim == 2:
-            cb = self.add_colorbar(fig, top_handle, cax=cax, orientation="horizontal")
-            # 色条 label 放到上方，避免和下面三张剖面图的区域标题/坐标区域挤在一起。
-            cb.ax.xaxis.set_label_position(getattr(self.cfg, "TBL_PROFILE_COLORBAR_LABEL_POSITION", "top"))
+            cb = self.add_colorbar(
+                fig,
+                top_handle,
+                cax=cax,
+                orientation=getattr(self.cfg, "TBL_PROFILE_COLORBAR_ORIENTATION", "vertical"),
+            )
+            # 色条现在位于顶部 GT 流场最右侧，label 也放到右边，避免和第二行 legend 混在一起。
+            if getattr(self.cfg, "TBL_PROFILE_COLORBAR_ORIENTATION", "vertical") == "vertical":
+                cb.ax.yaxis.set_label_position(getattr(self.cfg, "TBL_PROFILE_COLORBAR_LABEL_POSITION", "right"))
+            else:
+                cb.ax.xaxis.set_label_position(getattr(self.cfg, "TBL_PROFILE_COLORBAR_LABEL_POSITION", "top"))
             cb.set_label(
                 self.cfg.FLOW_VALUE_COLORBAR_LABEL,
                 fontsize=self.cfg.COLORBAR_LABEL_SIZE,
@@ -5329,14 +6110,46 @@ class AllHandlePipeline:
                     legend_labels.append(label)
                     seen_labels.add(label)
         if legend_handles:
-            legend_ax.legend(
+            extra_suffix = str(getattr(self.cfg, "TBL_PROFILE_EXTRA_SUFFIX", "_without_bicubic_hs"))
+            is_extra_profile = bool(suffix) and normalize_name(suffix) == normalize_name(extra_suffix)
+            legend_ncol = int(
+                getattr(
+                    self.cfg,
+                    "TBL_PROFILE_EXTRA_LEGEND_NCOL" if is_extra_profile else "TBL_PROFILE_LEGEND_NCOL",
+                    getattr(self.cfg, "TBL_PROFILE_LEGEND_NCOL", 2),
+                )
+            )
+            legend_handle_length = float(
+                getattr(
+                    self.cfg,
+                    "TBL_PROFILE_EXTRA_LEGEND_HANDLE_LENGTH" if is_extra_profile else "TBL_PROFILE_LEGEND_HANDLE_LENGTH",
+                    getattr(self.cfg, "TBL_PROFILE_LEGEND_HANDLE_LENGTH", 2.0),
+                )
+            )
+            legend_line_width = getattr(
+                self.cfg,
+                "TBL_PROFILE_EXTRA_LEGEND_LINE_WIDTH" if is_extra_profile else "TBL_PROFILE_LEGEND_LINE_WIDTH",
+                getattr(self.cfg, "TBL_PROFILE_LEGEND_LINE_WIDTH", None),
+            )
+            legend = legend_ax.legend(
                 legend_handles,
                 legend_labels,
                 loc=getattr(self.cfg, "TBL_PROFILE_LEGEND_LOC", "center"),
+                bbox_to_anchor=tuple(getattr(self.cfg, "TBL_PROFILE_LEGEND_BBOX", (0.0, 0.0, 1.0, 1.0))),
+                bbox_transform=legend_ax.transAxes,
+                mode=getattr(self.cfg, "TBL_PROFILE_LEGEND_MODE", "expand"),
+                borderaxespad=float(getattr(self.cfg, "TBL_PROFILE_LEGEND_BORDER_AXES_PAD", 0.0)),
                 frameon=True,
-                fontsize=self.cfg.LEGEND_FONT_SIZE,
-                ncol=min(len(legend_labels), int(getattr(self.cfg, "TBL_PROFILE_LEGEND_NCOL", 2))),
+                # TBL 剖面图使用专属 legend 字号；全局字号在 5 列布局下会让长方法名彼此挤压。
+                fontsize=float(getattr(self.cfg, "TBL_PROFILE_LEGEND_FONT_SIZE", self.cfg.LEGEND_FONT_SIZE)),
+                ncol=min(len(legend_labels), legend_ncol),
+                labelspacing=float(getattr(self.cfg, "TBL_PROFILE_LEGEND_LABEL_SPACING", 0.35)),
+                handlelength=legend_handle_length,
+                handletextpad=float(getattr(self.cfg, "TBL_PROFILE_LEGEND_HANDLE_TEXT_PAD", 0.8)),
+                columnspacing=float(getattr(self.cfg, "TBL_PROFILE_LEGEND_COLUMN_SPACING", 1.0)),
+                borderpad=float(getattr(self.cfg, "TBL_PROFILE_LEGEND_BORDER_PAD", 0.4)),
             )
+            self.set_legend_line_width(legend, legend_line_width)
 
         out_dir = self.output_dir(
             self.cfg.COMPOSITE_OUTPUT_DIR_NAME,
@@ -5683,6 +6496,15 @@ class AllHandlePipeline:
                     float(getattr(self.cfg, "PARTICLE_STATS_SINGLE_BAR_FIG_WIDTH", 5.8)),
                     float(getattr(self.cfg, "PARTICLE_STATS_SINGLE_BAR_FIG_HEIGHT", 3.6)),
                 ))
+                axis_label_size = float(
+                    getattr(self.cfg, "PARTICLE_STATS_SINGLE_BAR_AXIS_LABEL_SIZE", self.cfg.AXIS_LABEL_SIZE)
+                )
+                tick_label_size = float(
+                    getattr(self.cfg, "PARTICLE_STATS_SINGLE_BAR_TICK_LABEL_SIZE", self.cfg.TICK_LABEL_SIZE)
+                )
+                panel_label_size = float(
+                    getattr(self.cfg, "PARTICLE_STATS_SINGLE_BAR_PANEL_LABEL_SIZE", self.cfg.PANEL_LABEL_SIZE)
+                )
                 base_values = [gt_stats.get(metric, np.nan)]
                 if include_lr:
                     base_values.append(lr_stats.get(metric, np.nan))
@@ -5700,8 +6522,65 @@ class AllHandlePipeline:
                     linewidth=0.6,
                     width=0.68,
                 )
+                finite_indices = np.where(finite_mask)[0]
+                bar_by_index = {int(idx): bar for idx, bar in zip(finite_indices, bars)}
+                merged_value_indices: set[int] = set()
+                if bool(getattr(self.cfg, "PARTICLE_STATS_MERGE_BICUBIC_VALUE_LABELS", True)):
+                    bicubic_indices = [
+                        int(idx)
+                        for idx, exp_key in enumerate(bar_exp_keys)
+                        if isinstance(exp_key, str)
+                        and normalize_name(exp_key).startswith("bicubic")
+                        and idx in bar_by_index
+                        and np.isfinite(values[idx])
+                    ]
+                    min_merge_count = int(getattr(self.cfg, "PARTICLE_STATS_MERGE_BICUBIC_MIN_COUNT", 4))
+                    if len(bicubic_indices) >= min_merge_count:
+                        bicubic_values = values[bicubic_indices]
+                        if np.allclose(
+                            bicubic_values,
+                            bicubic_values[0],
+                            rtol=float(getattr(self.cfg, "PARTICLE_STATS_MERGE_BICUBIC_RTOL", 1e-8)),
+                            atol=float(getattr(self.cfg, "PARTICLE_STATS_MERGE_BICUBIC_ATOL", 1e-10)),
+                        ):
+                            merged_value_indices.update(bicubic_indices)
+                            bicubic_bars = [bar_by_index[idx] for idx in bicubic_indices]
+                            bar_centers = np.asarray(
+                                [bar.get_x() + bar.get_width() / 2.0 for bar in bicubic_bars],
+                                dtype=np.float64,
+                            )
+                            value = float(bicubic_values[0])
+                            y_span = max(float(np.nanmax(values[finite_mask]) - np.nanmin(values[finite_mask])), 1.0)
+                            text_x = float(np.nanmean(bar_centers))
+                            text_y = value + y_span * float(
+                                getattr(self.cfg, "PARTICLE_STATS_MERGED_VALUE_Y_OFFSET_RATIO", 0.11)
+                            )
+                            ax.text(
+                                text_x,
+                                text_y,
+                                self.format_particle_stats_value(value),
+                                ha="center",
+                                va="bottom",
+                                fontsize=self.cfg.PARTICLE_STATS_VALUE_LABEL_SIZE,
+                            )
+                            arrowprops = {
+                                "arrowstyle": "->",
+                                "color": getattr(self.cfg, "PARTICLE_STATS_MERGED_ARROW_COLOR", "#222222"),
+                                "linewidth": float(getattr(self.cfg, "PARTICLE_STATS_MERGED_ARROW_LINE_WIDTH", 1.15)),
+                                "shrinkA": 2,
+                                "shrinkB": 2,
+                            }
+                            for center, bar in zip(bar_centers, bicubic_bars):
+                                ax.annotate(
+                                    "",
+                                    xy=(float(center), float(bar.get_height())),
+                                    xytext=(text_x, text_y),
+                                    arrowprops=arrowprops,
+                                )
                 # 在柱子顶部显示数值，GT 也参与标注，便于直接比较 GT 与各 SR 统计。
-                for bar, value in zip(bars, values[finite_mask]):
+                for source_idx, bar, value in zip(finite_indices, bars, values[finite_mask]):
+                    if int(source_idx) in merged_value_indices:
+                        continue
                     ax.annotate(
                         self.format_particle_stats_value(float(value)),
                         xy=(bar.get_x() + bar.get_width() / 2.0, bar.get_height()),
@@ -5726,27 +6605,35 @@ class AllHandlePipeline:
                     ax.ticklabel_format(axis="y", style="plain", useOffset=False)
                 except Exception:
                     pass
-                ax.tick_params(axis="x", pad=1)
-                ax.set_ylabel(self.cfg.PARTICLE_COUNT_Y_LABEL if metric in ("count", "pixels") else self.cfg.PARTICLE_METRIC_Y_LABEL)
-                self.panel_text(ax, label)
-                ax.grid(True, alpha=0.18, linewidth=0.5)
-                # 按用户要求，每张独立条形统计图内部都放图例；固定到右上角，避免自动布局把图例放到左上，
-                # 从而和 count / particle pixels 的面板 label 挤在一起。
-                legend_kwargs = {
-                    "loc": getattr(self.cfg, "PARTICLE_STATS_LEGEND_LOC", "upper right"),
-                    "frameon": False,
-                    "fontsize": float(getattr(self.cfg, "PARTICLE_STATS_LEGEND_FONT_SIZE", max(5, self.cfg.LEGEND_FONT_SIZE - 3))),
-                    "ncol": min(len(legend_labels), int(getattr(self.cfg, "PARTICLE_STATS_LEGEND_NCOL", 2))),
-                }
-                legend_bbox = getattr(self.cfg, "PARTICLE_STATS_LEGEND_BBOX", None)
-                if legend_bbox is not None:
-                    legend_kwargs["bbox_to_anchor"] = legend_bbox
-                    legend_kwargs["borderaxespad"] = 0.0
-                ax.legend(
-                    legend_handles,
-                    legend_labels,
-                    **legend_kwargs,
+                ax.tick_params(axis="x", pad=1, labelsize=tick_label_size)
+                ax.tick_params(axis="y", labelsize=tick_label_size)
+                ax.set_ylabel(
+                    self.cfg.PARTICLE_COUNT_Y_LABEL if metric in ("count", "pixels") else self.cfg.PARTICLE_METRIC_Y_LABEL,
+                    fontsize=axis_label_size,
                 )
+                self.panel_text(ax, label, fontsize=panel_label_size, shrink_long_text=False)
+                ax.grid(True, alpha=0.18, linewidth=0.5)
+                hide_thesis_legend = self.thesis_mode_enabled() and bool(
+                    getattr(self.cfg, "THESIS_HIDE_PARTICLE_STATS_BAR_LEGEND", True)
+                )
+                if not hide_thesis_legend:
+                    # 普通模式下，每张独立条形统计图内部仍放图例；thesis 模式下论文版面已经固定，
+                    # 这些 particle_binary_stats_*.png 不再重复放图例，避免图例占据柱顶空白。
+                    legend_kwargs = {
+                        "loc": getattr(self.cfg, "PARTICLE_STATS_LEGEND_LOC", "upper right"),
+                        "frameon": False,
+                        "fontsize": float(getattr(self.cfg, "PARTICLE_STATS_LEGEND_FONT_SIZE", max(5, self.cfg.LEGEND_FONT_SIZE - 3))),
+                        "ncol": min(len(legend_labels), int(getattr(self.cfg, "PARTICLE_STATS_LEGEND_NCOL", 2))),
+                    }
+                    legend_bbox = getattr(self.cfg, "PARTICLE_STATS_LEGEND_BBOX", None)
+                    if legend_bbox is not None:
+                        legend_kwargs["bbox_to_anchor"] = legend_bbox
+                        legend_kwargs["borderaxespad"] = 0.0
+                    ax.legend(
+                        legend_handles,
+                        legend_labels,
+                        **legend_kwargs,
+                    )
                 self.save_figure(fig, out_dir / f"particle_binary_stats_{metric}_{time_name}{suffix}")
 
     def write_particle_stats_accuracy_csv(
