@@ -266,9 +266,9 @@ def _build_piv_raft(batch_size: int) -> nn.Module:
     这个函数只替代原来硬编码的 RAFT256 实例化，不改变 Ground 分支的 TRAIN_MODE 逻辑。
     默认 RAFT_MODEL_TYPE="RAFT256"，因此用户不改配置时，行为与原来完全一致。
     """
-    if global_data.esrgan.validate_train_mode() == "bicubic_searaft":
-        # bicubic_searaft 不再构造本工程内置 RAFT，而是直接接入官方 SEA-RAFT。
-        # 这样论文中该组可以清楚表述为“bicubic + official SEA-RAFT”，不会混入普通 RAFT 主干。
+    if global_data.esrgan.validate_train_mode() in {"bicubic_searaft", "esrgan_searaft"}:
+        # 两个 SEA-RAFT 对比组共享同一个官方包装器，不受 RAFT_MODEL_TYPE / GRU_ITERS 影响。
+        # TRAIN_MODE 只决定图像来源是 bicubic 还是 ESRGAN；光流架构与迭代次数保持相同。
         return OfficialSEARAFTWrapper()
 
     raft_model_type = global_data.esrgan.validate_raft_model_type()
@@ -363,7 +363,7 @@ class OfficialSwinIRGenerator(nn.Module):
 
 class OfficialSEARAFTWrapper(nn.Module):
     """
-    `bicubic_searaft` 使用的官方 SEA-RAFT 包装器。
+    `bicubic_searaft` / `esrgan_searaft` 共用的官方 SEA-RAFT 包装器。
 
     这个类不再提供 lite fallback：如果 `third_party/official/SEA-RAFT` 不存在，或者官方仓库结构
     与预期不一致，会直接报清楚的错误。这样论文实验不会在无意间退回自实现版本。
@@ -383,7 +383,7 @@ class OfficialSEARAFTWrapper(nn.Module):
         searaft_root = _official_repo_root("SEA-RAFT")
         if not searaft_root.exists():
             raise FileNotFoundError(
-                "bicubic_searaft 需要官方 SEA-RAFT 仓库，但当前未找到: "
+                "bicubic_searaft/esrgan_searaft 需要官方 SEA-RAFT 仓库，但当前未找到: "
                 f"{searaft_root}。请先执行: "
                 "git clone --depth 1 https://github.com/princeton-vl/SEA-RAFT.git "
                 "third_party/official/SEA-RAFT"
@@ -421,7 +421,7 @@ class OfficialSEARAFTWrapper(nn.Module):
 
         # 官方 SEA-RAFT 使用 config/*.json 中的 argparse.Namespace 初始化。
         # 这里默认读取官方 eval/sintel-M.json：它是中等规模模型，官方配置 iters=4。
-        # 注意：bicubic_searaft 是“官方 SEA-RAFT 对比组”，因此这里不再用本工程
+        # 注意：bicubic_searaft / esrgan_searaft 都是“官方 SEA-RAFT 对比组”，因此这里不再用本工程
         # global_data.esrgan.GRU_ITERS 覆盖迭代次数，避免把官方 M 配置悄悄改成 12 次迭代。
         config_path = searaft_root / "config" / "eval" / "sintel-M.json"
         if not config_path.exists():
@@ -497,6 +497,7 @@ class ESRuRAFT_PIV(nn.Module):
     8. srgan_raft: 传统 SRGAN 超分后送入 RAFT。
     9. swinir_raft: 官方 SwinIR 超分后送入 RAFT。
     10. bicubic_searaft: bicubic 上采样后送入官方 SEA-RAFT。
+    11. esrgan_searaft: 原始 ESRGAN 超分后送入官方 SEA-RAFT，SR 训练策略与 esrgan_raft 相同。
     """
 
     def __init__(self,inner_chanel,batch_size,sr_scale=None):
@@ -505,7 +506,9 @@ class ESRuRAFT_PIV(nn.Module):
         self.train_mode = global_data.esrgan.validate_train_mode()
         self.generator_pixel_shuffle_scale = _resolve_generator_pixel_shuffle_scale(sr_scale)
         self.generator_total_upscale = self.generator_pixel_shuffle_scale * self.generator_pixel_shuffle_scale
-        if self.train_mode == "esrgan_raft":
+        if self.train_mode in {"esrgan_raft", "esrgan_searaft"}:
+            # esrgan_searaft 复用同一套 ESRGAN G/D 与上采样倍率，不引入新的 SR 结构或参数。
+            # 两个模式仅在下方 _build_piv_raft() 选择的光流模型上不同。
             # esrgan_raft 模式明确要求“超分模块换成最原始的 ESRGAN”。
             # 因此这里使用从 model/esrgan/Module/model.py 复制过来的原始单帧 Generator/Discriminator，
             # 不再使用 ESRuRAFT_PIV 的双帧特征融合生成器。
@@ -541,7 +544,7 @@ class ESRuRAFT_PIV(nn.Module):
             # 仍然保留同名属性，是为了让 pipeline/evaluate 里已有的统一接口不需要大面积分叉。
             self.piv_esrgan_generator = nn.Identity()
             self.piv_esrgan_discriminator = nn.Identity()
-        self.piv_RAFT = _build_piv_raft(batch_size=batch_size)  # 按 RAFT_MODEL_TYPE 选择 RAFT / RAFT128 / RAFT256
+        self.piv_RAFT = _build_piv_raft(batch_size=batch_size)  # SEA-RAFT 模式使用官方网络，其余按 RAFT_MODEL_TYPE 选择
         if self.train_mode == "hr_ground_raft_load_models":
             # 新模式只改变 RAFT 的初始权重来源，不改变 HR ground 输入逻辑。
             # strict=True 时要求 checkpoint 与 RAFT_MODEL_TYPE 完全匹配，例如 ckpt_256.tar 对应 RAFT256。
@@ -565,10 +568,10 @@ class ESRuRAFT_PIV(nn.Module):
         """
         当前模式是否需要 Generator/Discriminator 参与训练。
 
-        esrgan_raft / srgan_raft / swinir_raft 都有可学习的超分模块；
+        esrgan_raft / esrgan_searaft / srgan_raft / swinir_raft 都有可学习的超分模块；
         其中 swinir_raft 只有 Generator，没有判别器。
         """
-        return self.train_mode in {"esrgan_raft", "srgan_raft", "swinir_raft"}
+        return self.train_mode in {"esrgan_raft", "esrgan_searaft", "srgan_raft", "swinir_raft"}
 
     def _uses_adversarial_discriminator(self) -> bool:
         """
@@ -577,7 +580,8 @@ class ESRuRAFT_PIV(nn.Module):
         新增的 swinir_raft 是为了补“官方 SwinIR + RAFT”对比，而不是补一个新的 GAN。
         因此它只训练官方 SwinIR Generator 和 RAFT；判别器相关字段仍输出 0，保证 CSV 列兼容。
         """
-        return self.train_mode in {"esrgan_raft", "srgan_raft"}
+        # esrgan_searaft 仍是 GAN 型 SR 对比组，不能因更换光流模型而跳过判别器更新。
+        return self.train_mode in {"esrgan_raft", "esrgan_searaft", "srgan_raft"}
 
     def _uses_generator_raft_epe_loss(self) -> bool:
         """
@@ -961,11 +965,11 @@ class ESRuRAFT_PIV(nn.Module):
         is_adversarial: bool,
     ) -> dict:
         """
-        计算 esrgan_raft / srgan_raft 的“最初始”生成器损失。
+        计算 esrgan_raft / esrgan_searaft / srgan_raft 的“最初始”生成器损失。
 
         这里刻意只保留最初始 SRGAN/ESRGAN 中真正使用的项：
         - srgan_raft: 使用 basic_srgan 最初始 VGG content + BCELoss 形式对抗项；
-        - esrgan_raft: 使用 esrgan 最初始 VGG content + RaGAN 形式对抗项；
+        - esrgan_raft / esrgan_searaft: 使用 esrgan 最初始 VGG content + RaGAN 形式对抗项；
         - 对抗项不再使用原始 loss 模块内部的固定系数，而是乘当前 epoch 的 global_data.esrgan.LAMBDA_ADVERSARIAL；
         - pixel loss: 使用固定权重 L1 + MSE，并按粒子前景/背景均衡平均；
         - 不使用 Ground 后来加上的 SSIM/FFT/flow-warp，也不使用 RAFT EPE 约束 Generator。
@@ -1002,7 +1006,8 @@ class ESRuRAFT_PIV(nn.Module):
                     adversarial_weighted_loss = self._zero_like_loss(content_loss)
                     perceptual_total = content_loss
 
-            elif self.train_mode == "esrgan_raft":
+            elif self.train_mode in {"esrgan_raft", "esrgan_searaft"}:
+                # 更换为 SEA-RAFT 不改变 ESRGAN 的 VGG、RaGAN 或固定像素损失定义。
                 if is_adversarial:
                     # ESRGAN 原始 G 对抗损失是 relativistic average GAN。
                     # D(real) 只作为相对判别参照，不需要给 real 或 D 参数保留梯度。
@@ -1026,7 +1031,7 @@ class ESRuRAFT_PIV(nn.Module):
                     perceptual_total = content_loss
 
             else:
-                raise ValueError(f"Original SR loss only supports esrgan_raft/srgan_raft, got {self.train_mode}")
+                raise ValueError(f"Original SR loss only supports esrgan_raft/esrgan_searaft/srgan_raft, got {self.train_mode}")
 
             # 最初始 SRGAN/ESRGAN 训练里也会计算像素重建项。
             # 这里不用 Ground 后来的 SmoothL1/SSIM/FFT/flow-warp 组合，而是固定为 L1 + MSE：
@@ -1157,7 +1162,8 @@ class ESRuRAFT_PIV(nn.Module):
                 d_loss = real_loss + fake_loss
                 return d_loss, fake_loss, real_loss
 
-            if self.train_mode == "esrgan_raft":
+            if self.train_mode in {"esrgan_raft", "esrgan_searaft"}:
+                # 两个 ESRGAN 模式的判别器都输出 logits，必须共享 RaGAN 判别损失。
                 # 原始 ESRGAN 判别器没有 Sigmoid，pred_real_d/pred_fake_d 是 logits。
                 # 因此这里必须使用最初始 ESRGAN 的 RaGAN 判别器损失；其内部 GANLoss 是 BCEWithLogitsLoss。
                 # RaGAN 的 mean 只来自当前时间帧 batch，不再让 previous/next 互相影响相对判别基准。
@@ -1323,7 +1329,8 @@ class ESRuRAFT_PIV(nn.Module):
             )
             return pred_prev, pred_next, pred_prev, pred_next, sr_outputs
 
-        # esrgan_raft / srgan_raft 模式：使用最初始 ESRGAN/SRGAN 的单帧生成器分别超分 previous/next。
+        # esrgan_raft / esrgan_searaft / srgan_raft：使用同一套单帧 SR 分支分别超分 previous/next。
+        # esrgan_searaft 的两帧 SR 输出会进入统一 detach 的光流分支，再交给官方 SEA-RAFT。
         # 这里不使用 ESRuRAFT_PIV 的双帧特征交互，也不在 SR loss 中加入后续扩展的
         # SSIM/FFT/flow-warp/EPE；这些模式的 Generator loss 回到原始 perceptual + L1/MSE。
         pred_prev = self.piv_esrgan_generator(input_lr_prev)

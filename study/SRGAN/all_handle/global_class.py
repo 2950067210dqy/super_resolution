@@ -68,12 +68,21 @@ class global_data:
         # 如果只想生成论文精选图，设置 OUTPUT_STAGE_FILTER = "thesis"：
         # 01/03 只跑 backstep、sqg、tbl、twcf；
         # 02/04 只跑下面 THESIS_SAMPLE_FILTER_BY_CATEGORY 中指定的代表样本。
+        # 如果只想在 thesis 白名单下重跑 01 和 03，设置 OUTPUT_STAGE_FILTER = "thesis_01_03"。
+        # 如果只想在 thesis 白名单下只跑阈值化对比图 + 颗粒统计条形图，
+        # 设置 OUTPUT_STAGE_FILTER = "thesis_binary"。
         # OUTPUT_STAGE_FILTER =None
-        OUTPUT_STAGE_FILTER = "thesis"
+        OUTPUT_STAGE_FILTER = "thesis_binary"
         OUTPUT_STAGE_ALIASES = {
             "thesis": "thesis",
             "paper": "thesis",
             "paper_figures": "thesis",
+            "thesis_01_03": "thesis_01_03",
+            "paper_01_03": "thesis_01_03",
+            "paper_figures_01_03": "thesis_01_03",
+            "thesis_binary": "thesis_binary",
+            "paper_binary": "thesis_binary",
+            "paper_figures_binary": "thesis_binary",
             "01_energy_spectrum": "energy_spectrum",
             "energy_spectrum": "energy_spectrum",
             "energy": "energy_spectrum",
@@ -112,6 +121,10 @@ class global_data:
             "particle_binary_counts": "particle_binary_count",
             "binary_count": "particle_binary_count",
             "binary_counts": "particle_binary_count",
+            "particle_binary_composite": "particle_binary_composite",
+            "particle_binary_composites": "particle_binary_composite",
+            "binary_composite": "particle_binary_composite",
+            "binary_composites": "particle_binary_composite",
             "flow_u_epe_hist_overlay": "flow_u_epe_hist_overlay",
             "flow_u_epe": "flow_u_epe_hist_overlay",
             "u_epe_hist": "flow_u_epe_hist_overlay",
@@ -149,6 +162,13 @@ class global_data:
             "error_maps",
             "error_histograms",
             "composite_panels",
+        )
+        THESIS_01_03_OUTPUT_STAGES = (
+            "energy_spectrum",
+            "error_histograms",
+        )
+        THESIS_BINARY_OUTPUT_STAGES = (
+            "particle_binary_count",
         )
         # thesis 模式只输出主八组实验，不再额外生成 eight_experiments_without_widim_hs 补充图。
         THESIS_COMPARISON_FILTER = ("eight_experiments",)
@@ -505,8 +525,8 @@ class global_data:
         WATERFALL_3D_X_TICK_PAD = 8
         # 03_error_histograms 的 2D+3D 组图里，3D x-label 旋转后容易和 tick 数字挤在一起；
         # 这里给直方图合图单独配置更大的 x-label pad，不影响能谱等其它 3D 图。
-        HIST_WATERFALL_3D_X_LABEL_PAD = 24
-        HIST_WATERFALL_3D_X_TICK_PAD = 10
+        HIST_WATERFALL_3D_X_LABEL_PAD = 38
+        HIST_WATERFALL_3D_X_TICK_PAD = 18
         WATERFALL_3D_LEGEND_FONT_SIZE = (
             DEFAULT_WATERFALL_3D_LEGEND_FONT_SIZE * FONT_SIZE_SCALE * LEGEND_FONT_EXTRA_SCALE
         )
@@ -517,10 +537,18 @@ class global_data:
         WATERFALL_3D_LEGEND_LABEL_SPACING = 0.42
         WATERFALL_3D_LEGEND_HANDLE_LENGTH = 2.25
         # 2D+3D “大图”尺寸与子图间距：左侧复用原二维图，右侧放新增 3D 瀑布图。
-        WATERFALL_3D_COMPOSITE_FIG_SIZE = (14.4, 6.1)
+        WATERFALL_3D_COMPOSITE_FIG_SIZE = (18.6, 8.2)
+        # 01/03 的 2D+3D 合图单独放大图内轴文字；图例字号仍走 legend 专用配置。
+        WATERFALL_3D_COMPOSITE_AXIS_LABEL_SIZE = AXIS_LABEL_SIZE * 1.55
+        WATERFALL_3D_COMPOSITE_TICK_LABEL_SIZE = TICK_LABEL_SIZE * 1.55
+        # 3D 坐标轴布局不会主动避让放大的 tick/label，因此 3D 再稍微加大字号并配合更大的 pad。
+        WATERFALL_3D_COMPOSITE_3D_AXIS_LABEL_SIZE = WATERFALL_3D_COMPOSITE_AXIS_LABEL_SIZE * 1.05
+        WATERFALL_3D_COMPOSITE_3D_TICK_LABEL_SIZE = WATERFALL_3D_COMPOSITE_TICK_LABEL_SIZE * 1.05
+        WATERFALL_3D_COMPOSITE_X_LABEL_PAD = 36
+        WATERFALL_3D_COMPOSITE_X_TICK_PAD = 16
         # 01_energy_spectrum 和普通 03_error_histograms 的 2D+3D 组图统一改成：
         # 第一行整行放 legend，第二行左 2D、右 3D。这样 legend 不再压住 2D 或 3D 主图。
-        WATERFALL_3D_COMPOSITE_TOP_LEGEND_HEIGHT_RATIO = 0.20
+        WATERFALL_3D_COMPOSITE_TOP_LEGEND_HEIGHT_RATIO = 0.15
         WATERFALL_3D_COMPOSITE_PLOT_HEIGHT_RATIO = 1.0
         WATERFALL_3D_COMPOSITE_TOP_LEGEND_HSPACE = 0.03
         # 01_energy_spectrum 的 2D+3D 合图第一行专门放 legend。
@@ -542,30 +570,33 @@ class global_data:
         # 01_energy_spectrum 的 2D+3D 合图顶行 legend 使用线段句柄；
         # 这里单独加粗 legend 中代表各方法颜色的线，不改变图中曲线本身。
         ENERGY_COMPOSITE_LEGEND_LINE_WIDTH = 3.2
+        ENERGY_COMPOSITE_GT_LINE_WIDTH = 2.45
+        ENERGY_COMPOSITE_PRED_LINE_WIDTH = 2.25
+        WATERFALL_3D_COMPOSITE_LINE_WIDTH = 2.3
         # 合图右侧 3D 子图给更多宽度，使其视觉面积接近左侧 2D 图，不再显得偏小。
         WATERFALL_3D_COMPOSITE_WIDTH_RATIOS = (1.0, 1.36)
         # 右侧 3D 图的 z 轴 label 会放在 3D 子图左侧；合图中适当加大 wspace，
         # 避免 Count / log10(...) 这类 z-label 与左侧二维图或 z 轴刻度挤在一起。
         # 合图左右两张图的间距只控制 2D/3D 子图距离，不再用它解决 z-label 重叠问题；
         # z-label 位置由 WATERFALL_3D_COMPOSITE_LEFT_Z_LABEL_X 单独控制。
-        WATERFALL_3D_COMPOSITE_WSPACE = 0.18
+        WATERFALL_3D_COMPOSITE_WSPACE = 0.24
         # flow_u_epe_hist_overlay 的大图比较特殊：第一行是原来的左右二维图，
         # 第二行是对应的两个 3D 瀑布图，因此单独给更高的画布和行列间距。
         # flow_u_epe 的 2D+3D 合图是两行布局：第一行二维图，第二行 3D 图。
         # 第二行如果和第一行等高，3D 盒体会显得明显偏小，x-label 也容易被挤到画布外；
         # 因此这里单独加高画布，并让第二行拿到更多高度。
-        WATERFALL_3D_FLOW_U_EPE_COMPOSITE_FIG_SIZE = (13.6, 12.2)
-        WATERFALL_3D_FLOW_U_EPE_COMPOSITE_WSPACE = 0.26
+        WATERFALL_3D_FLOW_U_EPE_COMPOSITE_FIG_SIZE = (18.4, 15.8)
+        WATERFALL_3D_FLOW_U_EPE_COMPOSITE_WSPACE = 0.32
         # 控制第一行 2D 与第二行 3D 的上下空白；字号放大后需要更大间距，
         # 避免第一行两张 2D 图的 x-label 被第二行 3D 图覆盖。
-        WATERFALL_3D_FLOW_U_EPE_COMPOSITE_HSPACE = 0.22
+        WATERFALL_3D_FLOW_U_EPE_COMPOSITE_HSPACE = 0.30
         WATERFALL_3D_FLOW_U_EPE_COMPOSITE_HEIGHT_RATIOS = (1.0, 1.55)
         # flow_u_epe 的 2D+3D 合图需要更大的底部边距，否则第二行 3D 图旋转后的 x-label 会被裁掉。
         # right 留到 0.98 是因为这张合图的图例改为放回右上二维子图内部，不再需要额外的图外 legend 空间。
         WATERFALL_3D_FLOW_U_EPE_COMPOSITE_LEFT = 0.06
         WATERFALL_3D_FLOW_U_EPE_COMPOSITE_RIGHT = 0.98
         WATERFALL_3D_FLOW_U_EPE_COMPOSITE_TOP = 0.98
-        WATERFALL_3D_FLOW_U_EPE_COMPOSITE_BOTTOM = 0.12
+        WATERFALL_3D_FLOW_U_EPE_COMPOSITE_BOTTOM = 0.14
         # 普通 flow_u_epe_hist_overlay 仍可使用图外 legend；但 2D+3D 合图已有两行，
         # 外置 legend 会显得像跑到画布外，所以这里单独控制合图版本把图例放回图内。
         FLOW_U_EPE_HIST_COMPOSITE_LEGEND_OUTSIDE = False
@@ -586,11 +617,13 @@ class global_data:
         WATERFALL_3D_LEFT_Z_LABEL_X = -0.16
         # 2D+3D 合图里右侧 3D 子图更窄，z-label 更容易和 z 轴刻度挤在一起；
         # 因此合图单独使用更靠左的位置，而不增加两张图之间的间隔。
-        WATERFALL_3D_COMPOSITE_LEFT_Z_LABEL_X = -0.24
+        WATERFALL_3D_COMPOSITE_LEFT_Z_LABEL_X = -0.30
+        WATERFALL_3D_FLOW_U_EPE_LEFT_Z_LABEL_X = -0.24
         WATERFALL_3D_LEFT_Z_LABEL_Y = 0.55
         WATERFALL_3D_Z_TICK_PAD = 14
         # 03_error_histograms 的 Count 数字贴在 z 轴上时容易重叠，合图单独把 z tick 往外推。
-        HIST_WATERFALL_3D_Z_TICK_PAD = 16
+        WATERFALL_3D_COMPOSITE_Z_TICK_PAD = 26
+        HIST_WATERFALL_3D_Z_TICK_PAD = 28
         # 能谱跨度很大，默认把 x/z 都转成 log10 后画 3D 瀑布图，这样不同曲线不会被数量级压扁。
         ENERGY_WATERFALL_USE_LOG10 = True
         # thesis 模式下，能谱 2D+3D 组图右侧 3D 子图不再显示 log10(...) 坐标含义，
@@ -602,9 +635,9 @@ class global_data:
         THESIS_ENERGY_WATERFALL_POWER_TICKS = True
         # thesis 能谱合图中 3D x-label 更容易和倾斜 tick 挤在一起，单独加大 labelpad；
         # z-label 则适当靠近 3D 轴，避免像旧图一样离轴过远。
-        THESIS_ENERGY_WATERFALL_X_LABEL_PAD = 24
-        THESIS_ENERGY_WATERFALL_X_TICK_PAD = 10
-        THESIS_ENERGY_WATERFALL_Z_LABEL_X = -0.15
+        THESIS_ENERGY_WATERFALL_X_LABEL_PAD = 38
+        THESIS_ENERGY_WATERFALL_X_TICK_PAD = 18
+        THESIS_ENERGY_WATERFALL_Z_LABEL_X = -0.22
         # thesis 能谱 2D+3D 组图把 legend 放到右侧 3D 图右上角，分两列排布，避免左侧 2D 图例压住曲线。
         THESIS_ENERGY_COMPOSITE_LEGEND_ON_3D = True
         THESIS_ENERGY_COMPOSITE_LEGEND_LOC = "upper right"

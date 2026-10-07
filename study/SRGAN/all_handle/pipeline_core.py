@@ -416,7 +416,8 @@ class AllHandlePipeline:
         # 下面这些是“单独重跑某张图”的快捷阶段：
         # - tbl_profile_overlay 已包含在 composite_panels 的 TBL 流程里；
         # - particle_stats_metrics 已包含在 composite_panels 的颗粒统计流程里；
-        # - particle_binary_count 用于单独重跑颗粒阈值图 + count/pixels 条形图；
+        # - particle_binary_count 用于单独重跑颗粒阈值图 + count/pixels/mean_area 条形图；
+        # - particle_binary_composite 只重跑 particle_binary_stats_composite 阈值化对比图；
         # - flow_u_epe_hist_overlay 已包含在 error_histograms 里；
         # - tbl_02_error_map 已包含在 error_maps 的 TBL 流程里。
         # - tbl_v_profile_overlay_without_bicubic_hs 只重跑 TBL v 方向去掉 bicubic-hs 的剖面图；
@@ -428,6 +429,7 @@ class AllHandlePipeline:
             "tbl_twcf_energy_spectrum",
             "particle_stats_metrics",
             "particle_binary_count",
+            "particle_binary_composite",
             "flow_u_epe_hist_overlay",
             "tbl_02_error_map",
         }
@@ -450,6 +452,14 @@ class AllHandlePipeline:
                 # thesis 是论文精选图模式：本身不是一个绘图函数，而是展开成 01/02/03/04 四个标准阶段；
                 # 类别和样本白名单由 effective_category_filter()/effective_sample_filter() 进一步处理。
                 enabled.update(getattr(self.cfg, "THESIS_OUTPUT_STAGES", ()))
+                continue
+            if stage == "thesis_01_03":
+                # thesis_01_03 仍使用 thesis 的类别/对比组白名单，但只重跑 01 能谱和 03 直方图。
+                enabled.update(getattr(self.cfg, "THESIS_01_03_OUTPUT_STAGES", ("energy_spectrum", "error_histograms")))
+                continue
+            if stage == "thesis_binary":
+                # thesis_binary 仍使用 thesis 的类别/对比组/样本白名单，但只重跑阈值化对比图。
+                enabled.update(getattr(self.cfg, "THESIS_BINARY_OUTPUT_STAGES", ("particle_binary_composite",)))
                 continue
             if stage == "all":
                 enabled.update(standard_stages)
@@ -477,12 +487,15 @@ class AllHandlePipeline:
         target = normalize_name(mode_name)
         for item in raw_items:
             key = normalize_name(str(item))
-            if normalize_name(str(aliases.get(key, key))) == target:
+            stage = normalize_name(str(aliases.get(key, key)))
+            if stage == target:
+                return True
+            if target == "thesis" and stage in {"thesis_01_03", "thesis_binary"}:
                 return True
         return False
 
     def thesis_mode_enabled(self) -> bool:
-        """论文精选图模式开关；只由 OUTPUT_STAGE_FILTER 中的 thesis/paper/paper_figures 触发。"""
+        """论文精选图模式开关；thesis 及其子模式都会启用 thesis 白名单。"""
 
         return self.output_mode_enabled("thesis")
 
@@ -1009,6 +1022,19 @@ class AllHandlePipeline:
             if use_power_labels:
                 setter_labels([self.format_log10_power_label(value) for value in ticks])
 
+    def apply_composite_axis_text_sizes(self, ax: plt.Axes) -> None:
+        """放大 2D+3D 合图里的主图轴文字，不影响图例字号。"""
+
+        axis_label_size = float(
+            getattr(self.cfg, "WATERFALL_3D_COMPOSITE_AXIS_LABEL_SIZE", getattr(self.cfg, "AXIS_LABEL_SIZE", 12))
+        )
+        tick_label_size = float(
+            getattr(self.cfg, "WATERFALL_3D_COMPOSITE_TICK_LABEL_SIZE", getattr(self.cfg, "TICK_LABEL_SIZE", 10))
+        )
+        ax.xaxis.label.set_size(axis_label_size)
+        ax.yaxis.label.set_size(axis_label_size)
+        ax.tick_params(axis="both", which="both", labelsize=tick_label_size)
+
     def draw_waterfall_3d_axes(
         self,
         ax: plt.Axes,
@@ -1034,6 +1060,9 @@ class AllHandlePipeline:
         legend_bbox: tuple[float, float] | None = None,
         legend_ncol: int | None = None,
         legend_font_size: float | None = None,
+        axis_label_size: float | None = None,
+        tick_label_size: float | None = None,
+        line_width: float | None = None,
     ) -> bool:
         """
         在已有 3D 坐标轴上绘制瀑布图。
@@ -1111,6 +1140,9 @@ class AllHandlePipeline:
                     ax.set_box_aspect(tuple(float(value) for value in box_aspect))
                 except Exception:
                     pass
+        curve_line_width = float(
+            line_width if line_width is not None else getattr(self.cfg, "WATERFALL_3D_LINE_WIDTH", 1.45)
+        )
         for y_offset, (_key, label, color, linestyle, x_arr, z_arr) in enumerate(curve_items):
             y_arr = np.full_like(x_arr, float(y_offset), dtype=np.float64)
             ax.plot(
@@ -1119,7 +1151,7 @@ class AllHandlePipeline:
                 z_arr,
                 color=color,
                 linestyle=linestyle,
-                linewidth=float(getattr(self.cfg, "WATERFALL_3D_LINE_WIDTH", 1.45)),
+                linewidth=curve_line_width,
                 label=label,
             )
         if x_limits is not None:
@@ -1142,7 +1174,13 @@ class AllHandlePipeline:
             if x_label_pad is not None
             else float(getattr(self.cfg, "WATERFALL_3D_X_LABEL_PAD", 2))
         )
-        ax.set_xlabel(x_label, labelpad=label_pad)
+        label_font_size = float(
+            axis_label_size if axis_label_size is not None else getattr(self.cfg, "AXIS_LABEL_SIZE", 12)
+        )
+        tick_font_size = float(
+            tick_label_size if tick_label_size is not None else getattr(self.cfg, "TICK_LABEL_SIZE", 10)
+        )
+        ax.set_xlabel(x_label, labelpad=label_pad, fontsize=label_font_size)
         try:
             ax.xaxis.label.set_clip_on(False)
         except Exception:
@@ -1150,7 +1188,11 @@ class AllHandlePipeline:
         # y 方向只用来错开不同实验曲线；实验名已经在 legend 中说明，
         # 默认不再显示 y 轴 label 和 y tick label，避免画面像旧版一样文字堆叠。
         show_y_label = bool(getattr(self.cfg, "WATERFALL_3D_SHOW_Y_LABEL", False))
-        ax.set_ylabel(getattr(self.cfg, "WATERFALL_3D_Y_LABEL", "Experiment") if show_y_label else "", labelpad=10)
+        ax.set_ylabel(
+            getattr(self.cfg, "WATERFALL_3D_Y_LABEL", "Experiment") if show_y_label else "",
+            labelpad=10,
+            fontsize=label_font_size,
+        )
         if bool(getattr(self.cfg, "WATERFALL_3D_USE_LEFT_Z_LABEL_TEXT", True)):
             # z 轴被挪到左侧后，Matplotlib 原生 zlabel 容易被 3D 投影挤出画布；
             # 用 2D 文字固定在左侧，既保留 z 轴含义，也不会和右侧 legend 挤在一起。
@@ -1171,32 +1213,30 @@ class AllHandlePipeline:
                 va="center",
                 ha="center",
                 clip_on=False,
-                # 3D 图的 z-label 是手动 text2D 绘制，默认字号会比二维 axes label 小；
-                # 这里统一绑定到 AXIS_LABEL_SIZE，保证 2D+3D 合图里的 Count 字体大小一致。
-                fontsize=float(getattr(self.cfg, "AXIS_LABEL_SIZE", 12)),
+                fontsize=label_font_size,
             )
         else:
-            ax.set_zlabel(z_label, labelpad=8)
+            ax.set_zlabel(z_label, labelpad=8, fontsize=label_font_size)
         # 3D 坐标轴不会像 2D 轴那样自动给放大的 tick label 让位；
         # x/z tick pad 需要独立控制，避免坐标范围数字压到倾斜轴线上。
         ax.tick_params(
             axis="x",
-            labelsize=float(getattr(self.cfg, "TICK_LABEL_SIZE", 10)),
+            labelsize=tick_font_size,
             pad=float(
                 x_tick_pad if x_tick_pad is not None else getattr(self.cfg, "WATERFALL_3D_X_TICK_PAD", 4)
             ),
         )
-        ax.tick_params(axis="y", labelsize=float(getattr(self.cfg, "TICK_LABEL_SIZE", 10)))
+        ax.tick_params(axis="y", labelsize=tick_font_size)
         ax.tick_params(
             axis="z",
-            labelsize=float(getattr(self.cfg, "TICK_LABEL_SIZE", 10)),
+            labelsize=tick_font_size,
             pad=float(
                 z_tick_pad if z_tick_pad is not None else getattr(self.cfg, "WATERFALL_3D_Z_TICK_PAD", 2)
             ),
         )
         if bool(getattr(self.cfg, "WATERFALL_3D_SHOW_Y_TICK_LABELS", False)):
             ax.set_yticks(np.arange(len(curve_items), dtype=np.float64))
-            ax.set_yticklabels([item[1] for item in curve_items], fontsize=max(6, self.cfg.TICK_LABEL_SIZE - 2))
+            ax.set_yticklabels([item[1] for item in curve_items], fontsize=max(6, tick_font_size - 2))
         else:
             # 红线标注的位置不要再出现实验名；直接清空 y ticks，比只清空 tick label 更彻底。
             ax.set_yticks([])
@@ -1651,6 +1691,8 @@ class AllHandlePipeline:
                         steps.append(("particle_stats_metrics", self.plot_particle_stats_metric_only))
                     if "particle_binary_count" in enabled_stages:
                         steps.append(("particle_binary_count", self.plot_particle_binary_count_only))
+                    if "particle_binary_composite" in enabled_stages:
+                        steps.append(("particle_binary_composite", self.plot_particle_binary_composite_only))
                     if "composite_panels" in enabled_stages and normalize_name(group.category_name) in ("tbl", "twcf"):
                         steps.append(("tbl_twcf_flow_uv", self.plot_tbl_twcf_flow_uv))
                     if (
@@ -2333,6 +2375,8 @@ class AllHandlePipeline:
         gt_series: tuple[np.ndarray, np.ndarray] | None,
         category_name: str | None = None,
         add_legend: bool = True,
+        gt_line_width: float | None = None,
+        pred_line_width: float | None = None,
     ) -> None:
         """绘制二维 ENERGY_SPECTRUM；普通图和 2D+3D 大图共用，避免两处样式不一致。"""
 
@@ -2344,7 +2388,7 @@ class AllHandlePipeline:
                 label=self.cfg.GT_ENERGY_LABEL,
                 color=self.cfg.GT_ENERGY_COLOR,
                 linestyle=self.cfg.GT_ENERGY_LINESTYLE,
-                linewidth=1.7,
+                linewidth=float(gt_line_width if gt_line_width is not None else 1.7),
             )
         for exp_key in self.legend_order_keys():
             if exp_key not in series:
@@ -2355,7 +2399,7 @@ class AllHandlePipeline:
                 y,
                 label=self.experiment_label(exp_key),
                 color=self.experiment_color(exp_key),
-                linewidth=1.6,
+                linewidth=float(pred_line_width if pred_line_width is not None else 1.6),
             )
         ax.set_xlabel(self.cfg.ENERGY_X_LABEL)
         ax.set_ylabel(self.cfg.ENERGY_Y_LABEL)
@@ -2428,10 +2472,13 @@ class AllHandlePipeline:
             gt_series,
             category_name=category_name,
             add_legend=False,
+            gt_line_width=float(getattr(self.cfg, "ENERGY_COMPOSITE_GT_LINE_WIDTH", 1.7)),
+            pred_line_width=float(getattr(self.cfg, "ENERGY_COMPOSITE_PRED_LINE_WIDTH", 1.6)),
         )
         # 01 的 2D+3D 合图左侧二维图要显式显示 x/y 起点；
         # 只补 tick，不改坐标范围和曲线数据。
         self.add_axis_start_ticks_2d(ax_2d, mark_x=True, mark_y=True)
+        self.apply_composite_axis_text_sizes(ax_2d)
         # 读取左侧 2D 子图实际使用的范围；普通合图同步完整范围，focus 合图继续沿用“差异明显区域”。
         # 由于 3D 内部使用 log10 坐标，这里把二维图的原始 x/y 范围转换到 log10 坐标后再传入。
         energy_x_limits = waterfall_x_limits
@@ -2458,12 +2505,26 @@ class AllHandlePipeline:
         energy_x_label_pad = (
             float(getattr(self.cfg, "THESIS_ENERGY_WATERFALL_X_LABEL_PAD", 8))
             if thesis_energy_axis
-            else None
+            else float(getattr(self.cfg, "WATERFALL_3D_COMPOSITE_X_LABEL_PAD", self.cfg.WATERFALL_3D_X_LABEL_PAD))
         )
         energy_x_tick_pad = (
             float(getattr(self.cfg, "THESIS_ENERGY_WATERFALL_X_TICK_PAD", self.cfg.WATERFALL_3D_X_TICK_PAD))
             if thesis_energy_axis
-            else float(getattr(self.cfg, "WATERFALL_3D_X_TICK_PAD", 4))
+            else float(getattr(self.cfg, "WATERFALL_3D_COMPOSITE_X_TICK_PAD", self.cfg.WATERFALL_3D_X_TICK_PAD))
+        )
+        composite_3d_axis_label_size = float(
+            getattr(
+                self.cfg,
+                "WATERFALL_3D_COMPOSITE_3D_AXIS_LABEL_SIZE",
+                getattr(self.cfg, "WATERFALL_3D_COMPOSITE_AXIS_LABEL_SIZE", self.cfg.AXIS_LABEL_SIZE),
+            )
+        )
+        composite_3d_tick_label_size = float(
+            getattr(
+                self.cfg,
+                "WATERFALL_3D_COMPOSITE_3D_TICK_LABEL_SIZE",
+                getattr(self.cfg, "WATERFALL_3D_COMPOSITE_TICK_LABEL_SIZE", self.cfg.TICK_LABEL_SIZE),
+            )
         )
         drawn = self.draw_waterfall_3d_axes(
             ax_3d,
@@ -2479,6 +2540,7 @@ class AllHandlePipeline:
             z_limits=energy_z_limits,
             x_label_pad=energy_x_label_pad,
             x_tick_pad=energy_x_tick_pad,
+            z_tick_pad=float(getattr(self.cfg, "WATERFALL_3D_COMPOSITE_Z_TICK_PAD", self.cfg.WATERFALL_3D_Z_TICK_PAD)),
             x_log10_power_ticks=bool(
                 thesis_energy_axis and energy_log and getattr(self.cfg, "THESIS_ENERGY_WATERFALL_POWER_TICKS", True)
             ),
@@ -2504,6 +2566,9 @@ class AllHandlePipeline:
                     getattr(self.cfg, "WATERFALL_3D_LEFT_Z_LABEL_X", -0.16),
                 )
             ),
+            axis_label_size=composite_3d_axis_label_size,
+            tick_label_size=composite_3d_tick_label_size,
+            line_width=float(getattr(self.cfg, "WATERFALL_3D_COMPOSITE_LINE_WIDTH", self.cfg.WATERFALL_3D_LINE_WIDTH)),
         )
         if not drawn:
             plt.close(fig)
@@ -2520,6 +2585,12 @@ class AllHandlePipeline:
             z_log10_power_ticks=bool(
                 thesis_energy_axis and energy_log and getattr(self.cfg, "THESIS_ENERGY_WATERFALL_POWER_TICKS", True)
             ),
+        )
+        ax_3d.tick_params(axis="x", labelsize=composite_3d_tick_label_size, pad=energy_x_tick_pad)
+        ax_3d.tick_params(
+            axis="z",
+            labelsize=composite_3d_tick_label_size,
+            pad=float(getattr(self.cfg, "WATERFALL_3D_COMPOSITE_Z_TICK_PAD", self.cfg.WATERFALL_3D_Z_TICK_PAD)),
         )
         # 01_energy_spectrum 的 2D+3D 组图统一把 legend 放到第一行并横跨两列；
         # 这样既不遮挡左侧 2D 曲线，也不会压到右侧 3D 坐标轴和曲线。
@@ -2814,6 +2885,9 @@ class AllHandlePipeline:
         y_label: str,
         axis_kind: str,
         add_legend: bool = True,
+        edge_width: float | None = None,
+        draw_outline: bool | None = None,
+        outline_width: float | None = None,
     ) -> None:
         """绘制单张二维误差直方图叠加图；普通图和 2D+3D 大图共用同一套遮挡顺序。"""
 
@@ -2821,8 +2895,10 @@ class AllHandlePipeline:
             width = self.estimate_bar_width(x)
             hist_color = self.experiment_hist_color(exp_key)
             # 误差直方图按参考图只使用半透明填充，不再加粗柱边框；如需恢复轮廓线可在 global_class.py 开启。
-            edge_width = float(getattr(self.cfg, "HIST_EDGE_LINE_WIDTH", 0.0))
-            edge_color = "none" if edge_width <= 0 else self.darken_color(hist_color)
+            current_edge_width = float(
+                edge_width if edge_width is not None else getattr(self.cfg, "HIST_EDGE_LINE_WIDTH", 0.0)
+            )
+            edge_color = "none" if current_edge_width <= 0 else self.darken_color(hist_color)
             ax.bar(
                 x,
                 y,
@@ -2830,16 +2906,22 @@ class AllHandlePipeline:
                 color=hist_color,
                 alpha=self.experiment_hist_alpha(exp_key),
                 edgecolor=edge_color,
-                linewidth=edge_width,
+                linewidth=current_edge_width,
                 label=self.experiment_label(exp_key),
                 zorder=self.hist_zorder(exp_key, draw_idx),
             )
-            if getattr(self.cfg, "HIST_DRAW_OUTLINE", False) and float(getattr(self.cfg, "HIST_LINE_WIDTH", 0.0)) > 0:
+            current_draw_outline = (
+                bool(draw_outline) if draw_outline is not None else bool(getattr(self.cfg, "HIST_DRAW_OUTLINE", False))
+            )
+            current_outline_width = float(
+                outline_width if outline_width is not None else getattr(self.cfg, "HIST_LINE_WIDTH", 0.0)
+            )
+            if current_draw_outline and current_outline_width > 0:
                 ax.plot(
                     x,
                     y,
                     color=self.darken_color(hist_color),
-                    linewidth=self.cfg.HIST_LINE_WIDTH,
+                    linewidth=current_outline_width,
                     alpha=0.95,
                     zorder=self.hist_zorder(exp_key, draw_idx) + 0.1,
                 )
@@ -2897,6 +2979,21 @@ class AllHandlePipeline:
             axis_kind=axis_kind,
             add_legend=False,
         )
+        self.apply_composite_axis_text_sizes(ax_2d)
+        composite_3d_axis_label_size = float(
+            getattr(
+                self.cfg,
+                "WATERFALL_3D_COMPOSITE_3D_AXIS_LABEL_SIZE",
+                getattr(self.cfg, "WATERFALL_3D_COMPOSITE_AXIS_LABEL_SIZE", self.cfg.AXIS_LABEL_SIZE),
+            )
+        )
+        composite_3d_tick_label_size = float(
+            getattr(
+                self.cfg,
+                "WATERFALL_3D_COMPOSITE_3D_TICK_LABEL_SIZE",
+                getattr(self.cfg, "WATERFALL_3D_COMPOSITE_TICK_LABEL_SIZE", self.cfg.TICK_LABEL_SIZE),
+            )
+        )
         drawn = self.draw_waterfall_3d_axes(
             ax_3d,
             series,
@@ -2916,6 +3013,9 @@ class AllHandlePipeline:
                     getattr(self.cfg, "WATERFALL_3D_LEFT_Z_LABEL_X", -0.16),
                 )
             ),
+            axis_label_size=composite_3d_axis_label_size,
+            tick_label_size=composite_3d_tick_label_size,
+            line_width=float(getattr(self.cfg, "WATERFALL_3D_COMPOSITE_LINE_WIDTH", self.cfg.WATERFALL_3D_LINE_WIDTH)),
         )
         if not drawn:
             plt.close(fig)
@@ -3051,6 +3151,9 @@ class AllHandlePipeline:
         use_outside_legend: bool,
         legend_context: str = "normal",
         add_legend: bool = True,
+        edge_width: float | None = None,
+        draw_outline: bool | None = None,
+        outline_width: float | None = None,
     ) -> None:
         """绘制 flow_u_epe 的二维双子图；普通图和新增上下布局大图共用。"""
 
@@ -3061,8 +3164,10 @@ class AllHandlePipeline:
         ):
             for draw_idx, (exp_key, (x, y)) in enumerate(self.sorted_hist_series(series)):
                 hist_color = self.experiment_hist_color(exp_key)
-                edge_width = float(getattr(self.cfg, "HIST_EDGE_LINE_WIDTH", 0.0))
-                edge_color = "none" if edge_width <= 0 else self.darken_color(hist_color)
+                current_edge_width = float(
+                    edge_width if edge_width is not None else getattr(self.cfg, "HIST_EDGE_LINE_WIDTH", 0.0)
+                )
+                edge_color = "none" if current_edge_width <= 0 else self.darken_color(hist_color)
                 ax.bar(
                     x,
                     y,
@@ -3070,16 +3175,22 @@ class AllHandlePipeline:
                     color=hist_color,
                     alpha=self.experiment_hist_alpha(exp_key),
                     edgecolor=edge_color,
-                    linewidth=edge_width,
+                    linewidth=current_edge_width,
                     label=self.experiment_label(exp_key),
                     zorder=self.hist_zorder(exp_key, draw_idx),
                 )
-                if getattr(self.cfg, "HIST_DRAW_OUTLINE", False) and float(getattr(self.cfg, "HIST_LINE_WIDTH", 0.0)) > 0:
+                current_draw_outline = (
+                    bool(draw_outline) if draw_outline is not None else bool(getattr(self.cfg, "HIST_DRAW_OUTLINE", False))
+                )
+                current_outline_width = float(
+                    outline_width if outline_width is not None else getattr(self.cfg, "HIST_LINE_WIDTH", 0.0)
+                )
+                if current_draw_outline and current_outline_width > 0:
                     ax.plot(
                         x,
                         y,
                         color=self.darken_color(hist_color),
-                        linewidth=self.cfg.HIST_LINE_WIDTH,
+                        linewidth=current_outline_width,
                         zorder=self.hist_zorder(exp_key, draw_idx) + 0.1,
                     )
             ax.set_xlabel(x_label)
@@ -3179,6 +3290,8 @@ class AllHandlePipeline:
             legend_context="composite",
             add_legend=False,
         )
+        for ax in axes_2d:
+            self.apply_composite_axis_text_sizes(ax)
         # flow_u/epe 的 2D+3D 合图也把 legend 放在第一行横跨两列；
         # 避免右上 EPE 子图被八组实验的 legend 压住。
         self.apply_hist_legend(
@@ -3234,6 +3347,20 @@ class AllHandlePipeline:
         )
         ax_u_3d = fig.add_subplot(gs[2, 0], projection="3d")
         ax_epe_3d = fig.add_subplot(gs[2, 1], projection="3d")
+        composite_3d_axis_label_size = float(
+            getattr(
+                self.cfg,
+                "WATERFALL_3D_COMPOSITE_3D_AXIS_LABEL_SIZE",
+                getattr(self.cfg, "WATERFALL_3D_COMPOSITE_AXIS_LABEL_SIZE", self.cfg.AXIS_LABEL_SIZE),
+            )
+        )
+        composite_3d_tick_label_size = float(
+            getattr(
+                self.cfg,
+                "WATERFALL_3D_COMPOSITE_3D_TICK_LABEL_SIZE",
+                getattr(self.cfg, "WATERFALL_3D_COMPOSITE_TICK_LABEL_SIZE", self.cfg.TICK_LABEL_SIZE),
+            )
+        )
         drawn_u = self.draw_waterfall_3d_axes(
             ax_u_3d,
             u_series,
@@ -3259,6 +3386,9 @@ class AllHandlePipeline:
                     ),
                 )
             ),
+            axis_label_size=composite_3d_axis_label_size,
+            tick_label_size=composite_3d_tick_label_size,
+            line_width=float(getattr(self.cfg, "WATERFALL_3D_COMPOSITE_LINE_WIDTH", self.cfg.WATERFALL_3D_LINE_WIDTH)),
         )
         drawn_epe = self.draw_waterfall_3d_axes(
             ax_epe_3d,
@@ -3285,6 +3415,9 @@ class AllHandlePipeline:
                     ),
                 )
             ),
+            axis_label_size=composite_3d_axis_label_size,
+            tick_label_size=composite_3d_tick_label_size,
+            line_width=float(getattr(self.cfg, "WATERFALL_3D_COMPOSITE_LINE_WIDTH", self.cfg.WATERFALL_3D_LINE_WIDTH)),
         )
         if not (drawn_u or drawn_epe):
             plt.close(fig)
@@ -4436,9 +4569,14 @@ class AllHandlePipeline:
         self.plot_particle_stats_composites(group, metrics_only=True)
 
     def plot_particle_binary_count_only(self, group: GroupContext) -> None:
-        """只生成颗粒阈值对比图和 count/pixels 条形统计图，便于单独修这两张论文图。"""
+        """只生成颗粒阈值对比图和 count/pixels/mean_area 条形统计图。"""
 
         self.plot_particle_stats_composites(group, metrics_only=False)
+
+    def plot_particle_binary_composite_only(self, group: GroupContext) -> None:
+        """只生成 particle_binary_stats_composite 阈值化对比图，不生成颗粒统计条形图。"""
+
+        self.plot_particle_stats_binary_image_only(group)
 
     def limited_bundles(self, group: GroupContext, kind: str) -> list[SampleBundle]:
         bundles = self.bundle_samples(group, kind)
@@ -4664,6 +4802,66 @@ class AllHandlePipeline:
         ax.set_ylim(ref_h, 0)
         ax.set_aspect("equal", adjustable="box")
         self.panel_text(ax, label, fit_reference_label=True)
+        ax.axis("off")
+        return handle
+
+    def draw_map_to_reference_shape(
+        self,
+        ax: plt.Axes,
+        array: np.ndarray | None,
+        cmap: str,
+        vmin: float | None,
+        vmax: float | None,
+        label: str,
+        reference_shape: tuple[int, int] | None,
+        *,
+        label_fontsize: float | None = None,
+        label_loc: str = "upper_left",
+        fit_reference_label: bool = True,
+    ):
+        """
+        按参考高宽把图像铺满当前面板。
+
+        主要用于 particle_binary_stats_composite 里的 LR 二值图显示：
+        LR 统计仍保持原始低分辨率口径，但展示时用最近邻映射到 GT/SR 参考画布，
+        避免由于原始 LR 宽高比例过小而在面板里显示成细条。
+        """
+
+        if array is None:
+            ax.axis("off")
+            return None
+        arr = ensure_2d_image(array)
+        own_shape = self.image_hw(arr)
+        if own_shape is None:
+            ax.axis("off")
+            return None
+        ref_h, ref_w = reference_shape or own_shape
+        if arr.ndim == 2:
+            handle = ax.imshow(
+                arr,
+                cmap=cmap,
+                vmin=vmin,
+                vmax=vmax,
+                extent=(0, float(ref_w), float(ref_h), 0),
+                interpolation="nearest",
+                aspect="equal",
+            )
+        else:
+            handle = ax.imshow(
+                arr,
+                extent=(0, float(ref_w), float(ref_h), 0),
+                interpolation="nearest",
+                aspect="equal",
+            )
+        self.panel_text(
+            ax,
+            label,
+            fontsize=label_fontsize,
+            loc=label_loc,
+            fit_reference_label=fit_reference_label,
+        )
+        ax.set_xlim(0, ref_w)
+        ax.set_ylim(ref_h, 0)
         ax.axis("off")
         return handle
 
@@ -6175,6 +6373,40 @@ class AllHandlePipeline:
     # =========================
     # (10) 颗粒统计组合图
     # =========================
+    def plot_particle_stats_binary_image_only(self, group: GroupContext) -> None:
+        """只绘制颗粒阈值对比图；供 thesis_binary / particle_binary_composite 单独重跑。"""
+
+        for bundle in self.limited_bundles(group, "particle_stats"):
+            exp_keys = [key for key in group.experiment_keys if key in bundle.sample_dirs]
+            if not exp_keys:
+                continue
+            out_dir = self.output_dir(
+                self.cfg.COMPOSITE_OUTPUT_DIR_NAME,
+                group.class_name,
+                group.split_name,
+                group.category_name,
+                bundle.sample_name,
+            )
+            is_tbl = normalize_name(group.category_name) == "tbl"
+            include_lr = normalize_name(group.category_name) != "experiment"
+            self.plot_particle_stats_image_composite(
+                bundle,
+                exp_keys,
+                out_dir,
+                crop=False,
+                is_tbl=is_tbl,
+                include_lr=include_lr,
+            )
+            if is_tbl and getattr(self.cfg, "TBL_PARTICLE_CROP_ENABLED", True):
+                self.plot_particle_stats_image_composite(
+                    bundle,
+                    exp_keys,
+                    out_dir,
+                    crop=True,
+                    is_tbl=is_tbl,
+                    include_lr=include_lr,
+                )
+
     def plot_particle_stats_composites(self, group: GroupContext, metrics_only: bool = False) -> None:
         """图十：颗粒统计图拆成图像对比图和更大的指标统计图。"""
 
@@ -6310,6 +6542,7 @@ class AllHandlePipeline:
                 for exp_key, sample_dir in bundle.sample_dirs.items()
             }
             binary_vmin, binary_vmax = 0.0, 1.0
+            binary_reference_shape = self.reference_hw([gt_binary] + [sr_binary_maps.get(exp_key) for exp_key in exp_keys])
 
             # 按用户要求，颗粒阈值对比图不再绘制超分辨率灰度图，只保留阈值/二值图。
             # 第一个分块显示 GT/LR 阈值图；后续分块把 GT/LR 两列留空，使后半实验从第三列开始对齐。
@@ -6332,15 +6565,28 @@ class AllHandlePipeline:
 
                 for col_idx in range(n_cols):
                     ax = fig.add_subplot(gs[binary_row, col_idx])
-                    self.draw_map(
-                        ax,
-                        binary_arrays[col_idx],
-                        self.cfg.BINARY_CMAP,
-                        binary_vmin,
-                        binary_vmax,
-                        binary_labels[col_idx],
-                        label_fontsize=label_size,
-                    )
+                    is_lr_panel = show_fixed and include_lr and col_idx == 1
+                    if is_lr_panel:
+                        self.draw_map_to_reference_shape(
+                            ax,
+                            binary_arrays[col_idx],
+                            self.cfg.BINARY_CMAP,
+                            binary_vmin,
+                            binary_vmax,
+                            binary_labels[col_idx],
+                            binary_reference_shape,
+                            label_fontsize=label_size,
+                        )
+                    else:
+                        self.draw_map(
+                            ax,
+                            binary_arrays[col_idx],
+                            self.cfg.BINARY_CMAP,
+                            binary_vmin,
+                            binary_vmax,
+                            binary_labels[col_idx],
+                            label_fontsize=label_size,
+                        )
                     if col_idx == 0 and show_fixed:
                         ax.text(
                             -0.08,
@@ -6362,32 +6608,39 @@ class AllHandlePipeline:
     ) -> None:
         """TBL full-frame 颗粒阈值图纵向排版：去掉超分辨率灰度图，只保留阈值图。"""
 
-        rows: list[tuple[str, str, np.ndarray | None, np.ndarray | None]] = []
+        rows: list[tuple[str, str, np.ndarray | None, np.ndarray | None, tuple[int, int] | None]] = []
         for time_name in ("previous", "next"):
             gt = self.first_available_particle(bundle, time_name, "gt", crop=False)
             lr = self.first_available_particle(bundle, time_name, "lr", crop=False)
             gt_binary = self.first_available_particle(bundle, time_name, "gt_binary", crop=False)
             lr_payload = self.compute_lr_particle_binary_stats_payload(bundle, time_name, crop=False)
             lr_binary = lr_payload.get("pred_binary") if lr_payload else None
-            rows.append((time_name, self.cfg.GT_PANEL_LABEL, gt, gt_binary))
-            rows.append((time_name, self.cfg.LR_PANEL_LABEL, lr, lr_binary))
-            for exp_key in exp_keys:
-                sample_dir = bundle.sample_dirs.get(exp_key)
-                sr = self.load_particle_array_mode(sample_dir, time_name, "sr", crop=False) if sample_dir is not None else None
-                sr_binary = (
+            sr_binary_maps = {
+                exp_key: (
                     self.load_particle_array_mode(sample_dir, time_name, "sr_binary", crop=False)
                     if sample_dir is not None
                     else None
                 )
-                rows.append((time_name, self.experiment_label(exp_key), sr, sr_binary))
+                for exp_key, sample_dir in bundle.sample_dirs.items()
+            }
+            binary_reference_shape = self.reference_hw([gt_binary] + [sr_binary_maps.get(exp_key) for exp_key in exp_keys])
+            rows.append((time_name, self.cfg.GT_PANEL_LABEL, gt, gt_binary, None))
+            rows.append((time_name, self.cfg.LR_PANEL_LABEL, lr, lr_binary, binary_reference_shape))
+            for exp_key in exp_keys:
+                sample_dir = bundle.sample_dirs.get(exp_key)
+                sr = self.load_particle_array_mode(sample_dir, time_name, "sr", crop=False) if sample_dir is not None else None
+                sr_binary = (
+                    sr_binary_maps.get(exp_key) if sample_dir is not None else None
+                )
+                rows.append((time_name, self.experiment_label(exp_key), sr, sr_binary, None))
             if time_name == "previous":
-                rows.append(("gap", "", None, None))
+                rows.append(("gap", "", None, None, None))
 
         row_count = len(rows)
         fig_width = max(6.5, float(getattr(self.cfg, "TBL_STATS_IMAGE_VERTICAL_FIG_WIDTH", 8.6)) * 0.55)
         row_height = float(getattr(self.cfg, "TBL_STATS_IMAGE_VERTICAL_ROW_HEIGHT", 1.15))
         fig = plt.figure(figsize=(fig_width, max(3.0, row_height * row_count)))
-        height_ratios = [0.22 if time_name == "gap" else 1.0 for time_name, _, _, _ in rows]
+        height_ratios = [0.22 if time_name == "gap" else 1.0 for time_name, _, _, _, _ in rows]
         gs = fig.add_gridspec(
             row_count,
             1,
@@ -6395,7 +6648,7 @@ class AllHandlePipeline:
             hspace=float(getattr(self.cfg, "TBL_STATS_IMAGE_VERTICAL_HSPACE", 0.06)),
         )
         label_size = float(getattr(self.cfg, "PARTICLE_BINARY_PANEL_LABEL_SIZE", self.cfg.PANEL_LABEL_SIZE))
-        for row_idx, (time_name, label, image_array, binary_array) in enumerate(rows):
+        for row_idx, (time_name, label, image_array, binary_array, binary_reference_shape) in enumerate(rows):
             if time_name == "gap":
                 ax = fig.add_subplot(gs[row_idx, 0])
                 ax.axis("off")
@@ -6403,16 +6656,28 @@ class AllHandlePipeline:
             ax = fig.add_subplot(gs[row_idx, 0])
             # 按用户要求，这张颗粒阈值对比图只保留 threshold/binary 图；
             # 原来的 SR/GT/LR 灰度颗粒图列不再绘制，避免与阈值结果重复占用版面。
-            self.draw_map(
-                ax,
-                binary_array,
-                self.cfg.BINARY_CMAP,
-                0.0,
-                1.0,
-                label,
-                fill_panel=True,
-                label_fontsize=label_size,
-            )
+            if label == self.cfg.LR_PANEL_LABEL:
+                self.draw_map_to_reference_shape(
+                    ax,
+                    binary_array,
+                    self.cfg.BINARY_CMAP,
+                    0.0,
+                    1.0,
+                    label,
+                    binary_reference_shape,
+                    label_fontsize=label_size,
+                )
+            else:
+                self.draw_map(
+                    ax,
+                    binary_array,
+                    self.cfg.BINARY_CMAP,
+                    0.0,
+                    1.0,
+                    label,
+                    fill_panel=True,
+                    label_fontsize=label_size,
+                )
             if label == self.cfg.GT_PANEL_LABEL:
                 ax.text(
                     -0.02,

@@ -66,23 +66,28 @@ class global_data:
         # 消融实验总开关
         # =========================
         # PIV_A_Esrgan_Ablation 是 PIV_A_Esrgan 的独立消融分支，下面用一个全局参数选择
-        # 当前要运行的消融方案。只改这里即可切换 5 组实验，模型构建、RAFT 结构、迁移开关、
+        # 当前要运行的消融方案。只改这里即可切换 7 组实验，模型构建、RAFT 结构、迁移开关、
         # Generator 是否吃 EPE、图像一致性损失是否启用都会在 apply_ablation_config() 中同步。
         #
-        # 5 个模式含义：
+        # 7 个模式含义：
         # 1: PIV_A 生成器 + 基础 ESRGAN 判别器 + RAFT256；不做 RAFT256->RAFT128 迁移；EPE 不限制 G。
         # 2: PIV_A 生成器 + PIV_A 判别器 + RAFT256；不做 RAFT256->RAFT128 迁移；EPE 不限制 G。
         # 3: PIV_A 生成器 + PIV_A 判别器 + 原配置 RAFT；EPE 不限制 G。
         # 4: PIV_A 生成器 + 基础 ESRGAN 判别器 + 原配置 RAFT；EPE 不限制 G。
         # 5: 基础 ESRGAN 生成器 + 基础 ESRGAN 判别器 + 原配置 RAFT；去掉图像一致性损失；EPE 限制 G。
-        ABLATION_MODE = 3
-        ABLATION_MODES = (1, 2, 3, 4, 5)
+        # 6: G+D+R+L_warp：PIV_A 生成器 + PIV_A 判别器 + 原配置 RAFT；仅启用 GT-flow warp，关闭 G 的 EPE。
+        # 7: G+D+R+EPE：与模式 6 使用相同 G/D/R；仅启用 RAFT EPE 对 G 的反馈，关闭 GT-flow warp。
+        # 模式 6 与历史模式 3 的训练配置等价，单列编号用于审稿要求的 U 内部机制对照；模式 1~5 保持原语义。
+        ABLATION_MODE = 7
+        ABLATION_MODES = (1, 2, 3, 4, 5, 6, 7)
         ABLATION_MODE_DESCRIPTIONS = {
             1: "piv_generator_basic_esrgan_discriminator_raft256_no_g_epe",
             2: "piv_generator_piv_discriminator_raft256_no_g_epe",
             3: "piv_generator_piv_discriminator_original_raft_no_g_epe",
             4: "piv_generator_basic_esrgan_discriminator_original_raft_no_g_epe",
             5: "basic_esrgan_generator_basic_esrgan_discriminator_original_raft_with_g_epe_no_flow_warp",
+            6: "piv_generator_piv_discriminator_original_raft_with_flow_warp_no_g_epe",
+            7: "piv_generator_piv_discriminator_original_raft_with_g_epe_no_flow_warp",
         }
         # 消融实验默认从头训练，避免架构切换后误加载旧结构 checkpoint，也避免“迁移学习”
         # 污染各组对照。如果确实要续训，可手动改成 False。
@@ -901,7 +906,7 @@ class global_data:
                 mode = int(raw_mode)
             except ValueError as exc:
                 raise ValueError(
-                    f"ABLATION_MODE 仅支持 {cls.ABLATION_MODES} 或 ablation_1~ablation_5，当前为: {cls.ABLATION_MODE}"
+                    f"ABLATION_MODE 仅支持 {cls.ABLATION_MODES} 或对应的 ablation_N/modeN，当前为: {cls.ABLATION_MODE}"
                 ) from exc
             if mode not in cls.ABLATION_MODES:
                 raise ValueError(
@@ -915,8 +920,8 @@ class global_data:
             根据当前消融模式重建 Generator 侧 FAMO 任务列表。
 
             FAMO 默认关闭，但这里仍然同步任务列表，原因是：
-            - 模式 1~4 中 EPE 不允许限制 Generator，因此即使用户打开 FAMO，也不能把 epe 放进去；
-            - 模式 5 去掉图像一致性损失，因此 flow_consistency 也不能作为 FAMO 任务；
+            - 模式 1~4、6 中 EPE 不允许限制 Generator，因此即使用户打开 FAMO，也不能把 epe 放进去；
+            - 模式 5、7 去掉图像一致性损失，因此 flow_consistency 也不能作为 FAMO 任务；
             - 任务名与初始权重长度必须完全一致，否则 FAMO 初始化会出现隐性错位。
             """
             task_names = ["vgg", "l1", "mse", "ssim", "fft"]
@@ -974,6 +979,14 @@ class global_data:
             elif mode == 5:
                 cls.SR_GENERATOR_TYPE = "basic_esrgan"
                 cls.SR_DISCRIMINATOR_TYPE = "basic_esrgan"
+                cls.FLOW_WARP_CONSISTENCY_ENABLED = False
+                cls.GENERATOR_RAFT_EPE_LOSS = True
+            elif mode == 6:
+                # G+D+R+L_warp：保留原 G/D/R 及 warp 权重调度，只移除 EPE 对 G 的反馈。
+                cls.FLOW_WARP_CONSISTENCY_ENABLED = True
+                cls.GENERATOR_RAFT_EPE_LOSS = False
+            elif mode == 7:
+                # G+D+R+EPE：同一套 G/D/R 及 EPE 权重调度，只移除 GT-flow warp。
                 cls.FLOW_WARP_CONSISTENCY_ENABLED = False
                 cls.GENERATOR_RAFT_EPE_LOSS = True
 
@@ -1164,7 +1177,7 @@ class global_data:
             因此这里更新后，本 epoch 内所有 batch 都会使用同一组固定权重，日志和复现实验也更清晰。
             """
             cls.LAMBDA_ADVERSARIAL = cls.get_adversarial_weight(epoch)
-            # 模式 5 明确去掉图像一致性损失，因此这里不再进入动态增长，始终保持 0。
+            # 模式 5、7 明确去掉图像一致性损失，因此这里不再进入动态增长，始终保持 0。
             cls.LAMBDA_FLOW_WARP_CONSISTENCY = (
                 cls.get_flow_warp_consistency_weight(epoch)
                 if cls.use_flow_warp_consistency()

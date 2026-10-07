@@ -119,7 +119,8 @@ def esrgan_union_RAFT_train(
     flow_hr = batch['flo']["gr_data"].to(device, non_blocking=True)
     flow_hr_uv = flow_hr[:, :2, :, :]
     train_mode = global_data.esrgan.validate_train_mode()
-    if train_mode in {"esrgan_raft", "srgan_raft"}:
+    if train_mode in {"esrgan_raft", "esrgan_searaft", "srgan_raft"}:
+        # esrgan_searaft 沿用 esrgan_raft 的 GAN 预热起点，不因替换光流网络而改变 SR 训练阶段。
         # 原始 SRGAN/ESRGAN 分支从头训练判别器和生成器。
         # 第一轮直接启用 GAN 项时，D 的随机判别会给 G 一个很强且不稳定的纹理梯度，
         # 粒子图像容易出现规则网格伪影；所以这些原始 SR 模式使用独立的预热轮次。

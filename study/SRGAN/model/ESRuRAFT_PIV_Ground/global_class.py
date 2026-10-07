@@ -65,7 +65,8 @@ class global_data:
            """
         #运行环境是否是autoDL
         IS_AUTO_DL = True
-        AUTODL_DATA_PATH = rf"/root/autodl-tmp" if IS_AUTO_DL else r""
+        # AUTODL_DATA_PATH = rf"/root/autodl-tmp" if IS_AUTO_DL else r""
+        AUTODL_DATA_PATH = rf"/" if IS_AUTO_DL else r""
 
         #整体项目注释
         # =========================
@@ -86,6 +87,9 @@ class global_data:
         #    不启用判别器，也不把 RAFT EPE 反传给 Generator，避免它变成新的任务定制方法。
         # 10. "bicubic_searaft": LR 经 bicubic 上采样到 HR 后，送入官方 SEA-RAFT 估计器。
         #     该模式用于补充“官方更现代/更强光流估计器”对比，图像来源仍是固定 bicubic。
+        # 11. "esrgan_searaft": 使用与 esrgan_raft 完全相同的 ESRGAN 生成器、判别器和 SR 损失，
+        #     只把光流估计器换成官方 SEA-RAFT；沿用 sintel-M.json 的 M 架构与 iters=4。
+        #     SR 输出仍在光流入口 detach，因此 SEA-RAFT 的 EPE 只更新光流网络，不更新 Generator。
         TRAIN_MODES = (
             "lr_ground_raft",
             "hr_ground_raft",
@@ -96,8 +100,8 @@ class global_data:
             "bicubic_hs",
             "srgan_raft",
             "swinir_raft",
-            "bicubic_searaft"
-            "",
+            "bicubic_searaft",
+            "esrgan_searaft",
         )
         # 兼容旧实验配置：外部仍写旧名字时会被 normalized_train_mode 映射成新名字。
         TRAIN_MODE_ALIASES = {
@@ -113,7 +117,7 @@ class global_data:
             "searaft": "bicubic_searaft",
             "bicubic_SEA_RAFT": "bicubic_searaft",
         }
-        TRAIN_MODE = "swinir_raft"
+        TRAIN_MODE = "esrgan_searaft"
         # =========================
         # 训练任务标识
         # =========================
@@ -135,8 +139,10 @@ class global_data:
         # - esrgan_raft / srgan_raft 重新启用“对抗损失”的动态权重；
         # - ESRuRAFT_PIV_Ground 是对比实验外壳，所有 TRAIN_MODE 都不让 RAFT EPE 反传到 Generator；
         # - Generator 只吃自身图像/GAN损失，RAFT 只吃 RAFT loss，避免光流误差直接拉动超分图像生成方向。
-        SR_RAFT_FIXED_LOSS_WEIGHT_MODES = ("esrgan_raft", "srgan_raft", "swinir_raft")
-        SR_RAFT_DYNAMIC_ADVERSARIAL_MODES = ("esrgan_raft", "srgan_raft")
+        # esrgan_searaft 的 SR 训练策略与 esrgan_raft 相同：固定非对抗项，动态调度 RaGAN 权重。
+        # 这些策略只作用于 SR 损失，不允许 SEA-RAFT 的监督反传进入 Generator。
+        SR_RAFT_FIXED_LOSS_WEIGHT_MODES = ("esrgan_raft", "esrgan_searaft", "srgan_raft", "swinir_raft")
+        SR_RAFT_DYNAMIC_ADVERSARIAL_MODES = ("esrgan_raft", "esrgan_searaft", "srgan_raft")
 
         # 类别训练模式:
         # - "all":    每个类别单独训练一次；
@@ -987,10 +993,10 @@ class global_data:
             """
             当前模式是否需要训练/调用超分辨率生成器。
 
-            esrgan_raft / srgan_raft / swinir_raft 需要训练或调用可学习超分辨率生成器；
+            esrgan_raft / esrgan_searaft / srgan_raft / swinir_raft 需要训练或调用可学习超分辨率生成器；
             其他模式都是固定图像来源或传统 PIV/光流 baseline。
             """
-            return cls.validate_train_mode() in {"esrgan_raft", "srgan_raft", "swinir_raft"}
+            return cls.validate_train_mode() in {"esrgan_raft", "esrgan_searaft", "srgan_raft", "swinir_raft"}
 
         @classmethod
         def use_fixed_initial_loss_weights_for_current_mode(cls) -> bool:
@@ -1034,7 +1040,8 @@ class global_data:
             esrgan_raft / srgan_raft 按你的要求使用更保守的专属终点。
             """
             mode = cls.validate_train_mode()
-            if mode == "esrgan_raft":
+            # 两个 ESRGAN 对比组共享对抗权重终点，只更换光流网络，不额外调优 SR 分支。
+            if mode in {"esrgan_raft", "esrgan_searaft"}:
                 return float(cls.ESRGAN_RAFT_ADVERSARIAL_WEIGHT_END)
             if mode == "srgan_raft":
                 return float(cls.SRGAN_RAFT_ADVERSARIAL_WEIGHT_END)

@@ -141,7 +141,7 @@ def _build_sr_generator(inner_chanel: int) -> nn.Module:
     """
     根据 ABLATION_MODE 创建 SR 生成器。
 
-    - 默认 / 模式 1~4：使用 PIV_A_Esrgan 的双帧感知生成器，保留 previous/next 特征交互；
+    - 默认 / 模式 1~4、6、7：使用 PIV_A_Esrgan 的双帧感知生成器，保留 previous/next 特征交互；
     - 模式 5：使用最基础 ESRGAN 单帧生成器，去掉双帧融合，配合关闭图像一致性损失做干净消融。
     """
     if global_data.esrgan.use_basic_esrgan_generator():
@@ -387,14 +387,14 @@ class ESRuRAFT_PIV(nn.Module):
         )
 
         if global_data.esrgan.use_flow_warp_consistency():
-            # 模式 1~4 保留 PIV_A_Esrgan 原有的 GT-flow warp 图像对一致性损失。
+            # 模式 1~4、6 保留 PIV_A_Esrgan 原有的 GT-flow warp 图像对一致性损失。
             # 它只约束 SR previous / next 的运动一致性，不等同于 RAFT EPE。
             _, flow_warp_dict = flow_warp_consistency_loss(pred_prev, pred_next, flowl0)
             flow_warp_consistency = flow_warp_dict["flow_warp_consistency_loss"]
             flow_warp_weighted_loss = float(global_data.esrgan.LAMBDA_FLOW_WARP_CONSISTENCY) * flow_warp_consistency
         else:
-            # 模式 5 要观察“基础 ESRGAN 生成器 + 基础 ESRGAN 判别器 + RAFT EPE”的效果，
-            # 因此图像一致性项彻底置 0，既不参与反传，也不污染日志里的 sr_loss。
+            # 模式 5、7 关闭 GT-flow warp，保留各自 G/D/R 架构下的 EPE 反馈。
+            # 图像一致性项彻底置 0，既不参与反传，也不污染日志里的 sr_loss。
             flow_warp_consistency = vgg_loss.new_zeros(())
             flow_warp_weighted_loss = vgg_loss.new_zeros(())
 
@@ -475,7 +475,7 @@ class ESRuRAFT_PIV(nn.Module):
         if global_data.esrgan.use_flow_warp_consistency():
             task_losses.append(sr_outputs["flow_warp_consistency_loss"])
         # 只在联合训练且当前消融模式允许 EPE 限制 Generator 时，才把可反传 EPE 放进 FAMO。
-        # 模式 1~4 即使训练 RAFT，也不能让 epe 影响 Generator；模式 5 才允许这一项。
+        # 模式 1~4、6 即使训练 RAFT，也不能让 epe 影响 Generator；模式 5、7 允许这一项。
         if global_data.esrgan.generator_uses_raft_epe() and raft_outputs is not None:
             task_losses.append(raft_outputs["raft_epe_tensor"])
         return task_losses
@@ -524,8 +524,8 @@ class ESRuRAFT_PIV(nn.Module):
             return generator_loss, logs
 
         if self.generator_famo is None:
-            # 模式 1~4：RAFT 本身仍训练，但 Generator 不再吃 EPE 的梯度；
-            # 模式 5：保留 RAFT_EPE_WEIGHT * EPE，观察 EPE 反作用对基础 ESRGAN 的影响。
+            # 模式 1~4、6：RAFT 本身仍训练，但 Generator 不再吃 EPE 的梯度；
+            # 模式 5、7：保留 RAFT_EPE_WEIGHT * EPE，观察 EPE 反馈对各自 Generator 的影响。
             if global_data.esrgan.generator_uses_raft_epe():
                 epe_weighted_loss = float(global_data.esrgan.RAFT_EPE_WEIGHT) * raft_outputs["raft_epe_tensor"]
             else:
