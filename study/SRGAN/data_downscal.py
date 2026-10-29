@@ -46,7 +46,8 @@ INPUT_DIRS = [
 ]
 
 #下采样倍数
-FACTORS = [4, 8, 16]
+# FACTORS = [4, 8, 16]
+FACTORS = [2]
 
 # "maxpool" 或 "interpolate"
 DOWNSAMPLE_METHOD = "interpolate"

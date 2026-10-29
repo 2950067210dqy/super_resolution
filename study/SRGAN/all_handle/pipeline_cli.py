@@ -18,6 +18,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="Generate all_handle comparison figures from existing npy/png experiment outputs."
     )
     parser.add_argument("--class-name", action="append", help="Only process the given class name, e.g. class_1.")
+    parser.add_argument("--mode", choices=("nine_experiments", "thesis", "thesis_01_03", "thesis_binary", "thesis_graph", "all"))
+    parser.add_argument("--data-root", type=str, help="Root directory containing experiment result folders.")
+    parser.add_argument("--output-root", type=str, help="Destination directory for comparison figures.")
     parser.add_argument("--split", action="append", help="Only process predict_all or test_all.")
     parser.add_argument("--category", action="append", help="Only process the given category name.")
     parser.add_argument("--sample", action="append", help="Only process the given sample name.")
@@ -30,6 +33,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def apply_cli_overrides(cfg: type[global_data.all_handle], args: argparse.Namespace) -> None:
     """命令行参数只覆盖本次运行，不改变 global_class.py 文件内容。"""
 
+    from pathlib import Path
+
+    if args.mode:
+        cfg.OUTPUT_STAGE_FILTER = args.mode
+    if args.data_root:
+        cfg.DATA_ROOT_DIR = Path(args.data_root)
+    if args.output_root:
+        cfg.OUTPUT_ROOT_DIR = Path(args.output_root)
     if args.class_name:
         cfg.CLASS_NAMES = tuple(args.class_name)
     if args.split:

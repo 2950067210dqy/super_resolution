@@ -141,7 +141,7 @@ def _build_sr_generator(inner_chanel: int) -> nn.Module:
     """
     根据 ABLATION_MODE 创建 SR 生成器。
 
-    - 默认 / 模式 1~4、6、7：使用 PIV_A_Esrgan 的双帧感知生成器，保留 previous/next 特征交互；
+    - 默认 / 模式 1~4、6、7、8：使用 PIV_A_Esrgan 的双帧感知生成器，保留 previous/next 特征交互；
     - 模式 5：使用最基础 ESRGAN 单帧生成器，去掉双帧融合，配合关闭图像一致性损失做干净消融。
     """
     if global_data.esrgan.use_basic_esrgan_generator():
@@ -199,10 +199,14 @@ class ESRuRAFT_PIV(nn.Module):
         # - True: 维持原来的 ESRGAN + RAFT 联合训练；
         # - False: 只做 PIV 图像对超分辨率，完全跳过 RAFT 网络、RAFT loss 和 RAFT 评价指标。
         self.use_raft = bool(global_data.esrgan.USE_RAFT)
+        self.use_gan = global_data.esrgan.use_adversarial_training()
         # 生成器 / 判别器不再硬编码。消融模式在 global_class.apply_ablation_config()
         # 中被翻译为 SR_GENERATOR_TYPE / SR_DISCRIMINATOR_TYPE，这里只按最终配置实例化。
         self.piv_esrgan_generator = _build_sr_generator(inner_chanel=inner_chanel)
         self.piv_esrgan_discriminator = _build_sr_discriminator(inner_chanel=3)
+        # 保留模块及初始化顺序，保持 checkpoint 结构和后续 RAFT 的随机初始化一致。
+        # 无 GAN 模式不调用判别器，也不创建其优化器；参数全程冻结。
+        self._set_requires_grad(self.piv_esrgan_discriminator, self.use_gan)
         self.piv_RAFT = (
             _build_piv_raft(batch_size=batch_size)
             if self.use_raft
@@ -337,6 +341,9 @@ class ESRuRAFT_PIV(nn.Module):
         D_input = cat([prev_gray, next_gray, abs(next_gray - prev_gray)], dim=1)。
         这样 D 会同时约束两帧的颗粒外观和帧间亮度变化，而不是只奖励单帧更像 HR。
         """
+        if not self.use_gan:
+            zero = pred_prev.new_zeros(())
+            return zero, zero, zero
         fake_pair = self._build_temporal_discriminator_input(pred_prev.detach(), pred_next.detach())
         real_pair = self._build_temporal_discriminator_input(target_prev, target_next)
         pred_fake_d = self.piv_esrgan_discriminator(fake_pair)
@@ -376,18 +383,21 @@ class ESRuRAFT_PIV(nn.Module):
             float(global_data.esrgan.LAMBDA_PIXEL_FFT) * pixel_fft
         )
 
-        fake_pair = self._build_temporal_discriminator_input(pred_prev, pred_next)
-        real_pair = self._build_temporal_discriminator_input(input_gr_prev, input_gr_next)
-        pred_fake = self.piv_esrgan_discriminator(fake_pair)
-        pred_real = self.piv_esrgan_discriminator(real_pair)
-        adversarial_loss = perceptual_loss.adversarial(pred_fake, pred_real)
+        if self.use_gan:
+            fake_pair = self._build_temporal_discriminator_input(pred_prev, pred_next)
+            real_pair = self._build_temporal_discriminator_input(input_gr_prev, input_gr_next)
+            pred_fake = self.piv_esrgan_discriminator(fake_pair)
+            pred_real = self.piv_esrgan_discriminator(real_pair)
+            adversarial_loss = perceptual_loss.adversarial(pred_fake, pred_real)
+        else:
+            adversarial_loss = vgg_loss.new_zeros(())
         adversarial_weighted_loss = (
             float(global_data.esrgan.LAMBDA_ADVERSARIAL) * adversarial_loss
-            if is_adversarial else adversarial_loss.new_zeros(())
+            if self.use_gan and is_adversarial else adversarial_loss.new_zeros(())
         )
 
         if global_data.esrgan.use_flow_warp_consistency():
-            # 模式 1~4、6 保留 PIV_A_Esrgan 原有的 GT-flow warp 图像对一致性损失。
+            # 模式 1~4、6、8 保留 PIV_A_Esrgan 原有的 GT-flow warp 图像对一致性损失。
             # 它只约束 SR previous / next 的运动一致性，不等同于 RAFT EPE。
             _, flow_warp_dict = flow_warp_consistency_loss(pred_prev, pred_next, flowl0)
             flow_warp_consistency = flow_warp_dict["flow_warp_consistency_loss"]
@@ -475,7 +485,7 @@ class ESRuRAFT_PIV(nn.Module):
         if global_data.esrgan.use_flow_warp_consistency():
             task_losses.append(sr_outputs["flow_warp_consistency_loss"])
         # 只在联合训练且当前消融模式允许 EPE 限制 Generator 时，才把可反传 EPE 放进 FAMO。
-        # 模式 1~4、6 即使训练 RAFT，也不能让 epe 影响 Generator；模式 5、7 允许这一项。
+        # 模式 1~4、6 即使训练 RAFT，也不能让 epe 影响 Generator；模式 5、7、8 允许这一项。
         if global_data.esrgan.generator_uses_raft_epe() and raft_outputs is not None:
             task_losses.append(raft_outputs["raft_epe_tensor"])
         return task_losses
@@ -525,7 +535,7 @@ class ESRuRAFT_PIV(nn.Module):
 
         if self.generator_famo is None:
             # 模式 1~4、6：RAFT 本身仍训练，但 Generator 不再吃 EPE 的梯度；
-            # 模式 5、7：保留 RAFT_EPE_WEIGHT * EPE，观察 EPE 反馈对各自 Generator 的影响。
+            # 模式 5、7、8：保留 RAFT_EPE_WEIGHT * EPE，观察 EPE 反馈对各自 Generator 的影响。
             if global_data.esrgan.generator_uses_raft_epe():
                 epe_weighted_loss = float(global_data.esrgan.RAFT_EPE_WEIGHT) * raft_outputs["raft_epe_tensor"]
             else:
@@ -669,35 +679,43 @@ class ESRuRAFT_PIV(nn.Module):
                 )
             generator_loss_logs.update(self._update_generator_famo(sr_outputs_famo, None))
 
-        # 判别器阶段重新生成一份 SR 图，并 detach 到 D loss 内部。
-        # 这样 D 只更新自己，不会把判别器 loss 回传到 Generator。
-        self._set_requires_grad(self.piv_esrgan_generator, False)
-        self._set_requires_grad(self.piv_esrgan_discriminator, True)
-        d_optimizer.zero_grad(set_to_none=True)
+        if self.use_gan:
+            # 判别器阶段重新生成一份 SR 图，并 detach 到 D loss 内部。
+            # 这样 D 只更新自己，不会把判别器 loss 回传到 Generator。
+            self._set_requires_grad(self.piv_esrgan_generator, False)
+            self._set_requires_grad(self.piv_esrgan_discriminator, self.use_gan)
+            d_optimizer.zero_grad(set_to_none=True)
 
-        if hasattr(self.piv_esrgan_generator, "forward_pair"):
-            pred_prev_d, pred_next_d = self.piv_esrgan_generator.forward_pair(input_lr_prev, input_lr_next)
+            if hasattr(self.piv_esrgan_generator, "forward_pair"):
+                pred_prev_d, pred_next_d = self.piv_esrgan_generator.forward_pair(input_lr_prev, input_lr_next)
+            else:
+                pred_prev_d = self.piv_esrgan_generator(input_lr_prev)
+                pred_next_d = self.piv_esrgan_generator(input_lr_next)
+
+            discriminator_loss, d_fake_loss, d_real_loss = self._compute_discriminator_loss(
+                pred_prev_d,
+                pred_next_d,
+                input_gr_prev,
+                input_gr_next,
+            )
+
+            if scaler is not None:
+                scaler.scale(discriminator_loss).backward()
+                scaler.step(d_optimizer)
+            else:
+                discriminator_loss.backward()
+                d_optimizer.step()
+
         else:
-            pred_prev_d = self.piv_esrgan_generator(input_lr_prev)
-            pred_next_d = self.piv_esrgan_generator(input_lr_next)
-
-        discriminator_loss, d_fake_loss, d_real_loss = self._compute_discriminator_loss(
-            pred_prev_d,
-            pred_next_d,
-            input_gr_prev,
-            input_gr_next,
-        )
+            # 固定日志列保持为零，不执行 D 前向、反传或额外的 G 前向。
+            zero = sr_outputs["manual_sr_loss"].new_zeros(())
+            discriminator_loss, d_fake_loss, d_real_loss = zero, zero, zero
 
         if scaler is not None:
-            scaler.scale(discriminator_loss).backward()
-            scaler.step(d_optimizer)
             scaler.update()
-        else:
-            discriminator_loss.backward()
-            d_optimizer.step()
 
         self._set_requires_grad(self.piv_esrgan_generator, True)
-        self._set_requires_grad(self.piv_esrgan_discriminator, True)
+        self._set_requires_grad(self.piv_esrgan_discriminator, self.use_gan)
 
         return pred_prev, pred_next, None, {
             "sr_loss": float(sr_outputs["sr_loss"].detach().item()),
@@ -742,7 +760,7 @@ class ESRuRAFT_PIV(nn.Module):
         训练顺序:
             1. 前向计算全部损失项
             2. 使用单次 RAFT forward，同时完成 Generator 与 RAFT 的双 backward
-            3. 开启判别器，更新 Discriminator
+            3. 仅启用 GAN 时更新 Discriminator；模式 8 跳过
             4. 返回本次训练的主要日志
 
         参数:
@@ -752,7 +770,7 @@ class ESRuRAFT_PIV(nn.Module):
             args: RAFT 配置
             generator_optimizer: Generator 的优化器
             raft_optimizer: RAFT 的优化器
-            d_optimizer: Discriminator 的优化器
+            d_optimizer: Discriminator 的优化器；模式 8 可为 None
             scaler: 可选 AMP GradScaler
             flow_init: 可选 RAFT 初始流
             upsample: 上采样模式
@@ -859,37 +877,45 @@ class ESRuRAFT_PIV(nn.Module):
                 )
             generator_loss_logs.update(self._update_generator_famo(sr_outputs_famo, raft_outputs_famo))
 
-        # 第三阶段：只更新 Discriminator，严格只使用 discriminator_loss。
-        self._set_requires_grad(self.piv_esrgan_generator, False)  # 继续冻结 Generator
-        self._set_requires_grad(self.piv_RAFT, False)  # 冻结 RAFT
-        self._set_requires_grad(self.piv_esrgan_discriminator, True)  # 只开启判别器梯度
-        d_optimizer.zero_grad(set_to_none=True)  # 清空判别器梯度
+        if self.use_gan:
+            # 第三阶段：只更新 Discriminator，严格只使用 discriminator_loss。
+            self._set_requires_grad(self.piv_esrgan_generator, False)  # 继续冻结 Generator
+            self._set_requires_grad(self.piv_RAFT, False)  # 冻结 RAFT
+            self._set_requires_grad(self.piv_esrgan_discriminator, self.use_gan)  # 只开启判别器梯度
+            d_optimizer.zero_grad(set_to_none=True)  # 清空判别器梯度
 
-        if hasattr(self.piv_esrgan_generator, "forward_pair"):
-            pred_prev_d, pred_next_d = self.piv_esrgan_generator.forward_pair(input_lr_prev, input_lr_next)
+            if hasattr(self.piv_esrgan_generator, "forward_pair"):
+                pred_prev_d, pred_next_d = self.piv_esrgan_generator.forward_pair(input_lr_prev, input_lr_next)
+            else:
+                pred_prev_d = self.piv_esrgan_generator(input_lr_prev)
+                pred_next_d = self.piv_esrgan_generator(input_lr_next)
+
+            discriminator_loss, d_fake_loss, d_real_loss = self._compute_discriminator_loss(
+                pred_prev_d,
+                pred_next_d,
+                input_gr_prev,
+                input_gr_next,
+            )
+
+            if scaler is not None:
+                scaler.scale(discriminator_loss).backward()
+                scaler.step(d_optimizer)
+            else:
+                discriminator_loss.backward()
+                d_optimizer.step()
+
         else:
-            pred_prev_d = self.piv_esrgan_generator(input_lr_prev)
-            pred_next_d = self.piv_esrgan_generator(input_lr_next)
-
-        discriminator_loss, d_fake_loss, d_real_loss = self._compute_discriminator_loss(
-            pred_prev_d,
-            pred_next_d,
-            input_gr_prev,
-            input_gr_next,
-        )
+            # 固定日志列保持为零，不执行 D 前向、反传或额外的 G 前向。
+            zero = sr_outputs["manual_sr_loss"].new_zeros(())
+            discriminator_loss, d_fake_loss, d_real_loss = zero, zero, zero
 
         if scaler is not None:
-            scaler.scale(discriminator_loss).backward()
-            scaler.step(d_optimizer)
             scaler.update()
-        else:
-            discriminator_loss.backward()
-            d_optimizer.step()
 
-        # 恢复三个子模块的梯度开关，避免影响外部后续逻辑。
         self._set_requires_grad(self.piv_esrgan_generator, True)
         self._set_requires_grad(self.piv_RAFT, True)
-        self._set_requires_grad(self.piv_esrgan_discriminator, True)
+        # 模式 8 的判别器保持冻结。
+        self._set_requires_grad(self.piv_esrgan_discriminator, self.use_gan)
 
         return pred_prev, pred_next, final_flow_prediction, {
             "sr_loss": float(sr_outputs["sr_loss"].detach().item()),  # ESRGAN 原始 SR 总损失（未叠加 raft_epe）

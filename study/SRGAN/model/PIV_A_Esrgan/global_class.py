@@ -69,7 +69,8 @@ class global_data:
         # =========================
         name = "PIV_A_Esrgan"  # 当前实验名（用于输出目录/模型名/wandb run名）
         # DESCRIPTION = "_v_SCALE_8"  # 实验补充描述（可写损失配置、数据版本等）
-        DESCRIPTION = "_v4"  # 实验补充描述（可写损失配置、数据版本等）
+        # DESCRIPTION = "_v4"  # 实验补充描述（可写损失配置、数据版本等）
+        DESCRIPTION = "_v_SCALE_2"  # 实验补充描述（可写损失配置、数据版本等）
         name +=DESCRIPTION
 
         #整体项目注释
@@ -106,6 +107,10 @@ class global_data:
         device = torch.device("cuda")  # 训练设备
         IS_LOAD_EXISTS_MODEL = True  # 是否从已保存模型断点继续训练
         AMP =False #是否开启混合精度训练
+        # 仅 x2 将生成器按 batch 分配到两张可见 GPU；BATCH_SIZE 仍是全局 batch。
+        # 编号相对于 CUDA_VISIBLE_DEVICES；RAFT、判别器及损失仍在主卡计算。
+        X2_MULTI_GPU = True
+        X2_GPU_IDS = (0, 1)
         # =========================
         # 训练模式开关
         # =========================
@@ -132,8 +137,9 @@ class global_data:
         SHUFFLE = True  # 训练集是否打乱 TRAIN_CLASS_MODE=fixed时无效
         TARGET_SIZE = None  # 数据加载时是否统一 resize 到该尺寸
         RANDOM_SEED = 42  # 数据划分随机种子 TRAIN_CLASS_MODE=fixed时无效
-        SCALES = [2] # 生成器上采样倍率（内部两次 PixelShuffle）
-        # SCALES = [math.sqrt(8)]  # 生成器上采样倍率（内部两次 PixelShuffle）
+        # SCALES = [2] # 生成器上采样倍率（内部两次 PixelShuffle） 4x
+        # SCALES = [math.sqrt(8)]  # 生成器上采样倍率（内部两次 PixelShuffle） 8x
+        SCALES = [math.sqrt(2)]  # 生成器上采样倍率（内部两次 PixelShuffle） 2x，2x一张显卡会爆显存，默认开启多显卡
         # =========================
         # RAFT 配置
         # =========================
@@ -343,7 +349,7 @@ class global_data:
         # =========================
         # RAFT256-PIV 风格 TFRecord 测试配置
         # =========================
-        IS_training = False  # 是否执行训练循环；False 时跳过训练，模型构建和后续 evaluate_all/test_all 仍按原流程执行。
+        IS_training = True  # 是否执行训练循环；False 时跳过训练，模型构建和后续 evaluate_all/test_all 仍按原流程执行。
         # 是否执行 evaluate_all 完整验证。
         # 这里恢复为纯手动总开关：无论 DATA_SET 是 class_1 还是 class_2，都由该超参数决定是否执行。
         IS_VALIDATE_ALL = True
@@ -354,7 +360,7 @@ class global_data:
         # 只重算 C-AEE 的快速开关。
         # True 时 evaluate_all/test_all 不重新跑模型、不生成新图像/NPY，只读取已有 metrics CSV，
         # 按当前公共 C-AEE 公式重算并覆盖 VAL_C_AEE / C_AEE / mean_c_aee，适合修改权重后快速更新历史结果。
-        IS_RECALCULATE_C_AEE_ONLY = True
+        IS_RECALCULATE_C_AEE_ONLY = False
         # evaluate_all 最佳样本保存模式。
         # False：保持原行为，是否保存全量验证图像/NPY 仍由 IS_SAVE_VALIDATE_IMAGES 和 IS_SAVE_NPY 控制。
         # True：指标仍计算全部样本，最终每个类别只保留 VAL_AEE/VAL_C_AEE/ESMSE 最优样本的完整 PNG、SVG 和 NPY；

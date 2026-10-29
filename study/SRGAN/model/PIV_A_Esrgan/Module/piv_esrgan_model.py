@@ -150,6 +150,19 @@ class PairAwareFeatureFusion(nn.Module):
         return self._fuse_one(feat_prev, feat_next), self._fuse_one(feat_next, feat_prev)
 
 
+class _GeneratorParallelForward(nn.Module):
+    """临时并行入口，不注册到原模型，保持 checkpoint/optimizer 参数名不变。"""
+
+    def __init__(self, generator):
+        super().__init__()
+        self.generator = generator
+        self.training = generator.training
+
+    def forward(self, prev, next_frame=None):
+        # 副本直接执行本地计算，避免再次进入多卡分发。
+        return self.generator._forward_local(prev, next_frame)
+
+
 class Generator(nn.Module):
     """
     SRGAN 生成器
@@ -173,6 +186,7 @@ class Generator(nn.Module):
 
 
         self.scale = scale
+        self._parallel_gpu_ids = ()
 
         # 第一层卷积:
         # 输入是 RGB 图像，所以 in_channel=3
@@ -319,7 +333,27 @@ class Generator(nn.Module):
         # 解码阶段保持原来的上采样策略，避免这次改动把双帧交互和解码逻辑耦合得太紧。
         return self.conv_out(self.upsample(features))
 
-    def forward_pair(self, prev: torch.Tensor, next_frame: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def configure_x2_multi_gpu(self, enabled=True, device_ids=(0, 1)):
+        """仅为实际 x2 开启生成器数据并行，不改变全局 batch 或损失归约。"""
+        self._parallel_gpu_ids = ()
+        if not enabled or not math.isclose(self.scale * self.scale, 2.0):
+            return
+        ids = tuple(device_ids)
+        if len(ids) < 2 or len(set(ids)) != len(ids) or any(
+            not isinstance(index, int) or index < 0 for index in ids
+        ):
+            raise ValueError("X2_GPU_IDS 必须包含至少两个不重复的非负 GPU 编号")
+        if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+            logger.warning("[PIV_A_Esrgan x2] 未检测到两张可见 GPU，回退单卡；原有 OOM 风险仍存在。")
+            return
+        if any(index >= torch.cuda.device_count() for index in ids):
+            raise ValueError(f"X2_GPU_IDS={ids} 超出可见 GPU 数量 {torch.cuda.device_count()}")
+        self._parallel_gpu_ids = ids
+        logger.info(f"[PIV_A_Esrgan x2] Generator 多卡启用: {ids}；全局 batch 不变，RAFT/D/loss 保持主卡。")
+
+    def _forward_local(self, prev, next_frame=None):
+        if next_frame is None:
+            return self._decode(self._encode(prev))
         # 先分别编码，再做跨帧特征融合，最后各自解码。
         # 这样既保留每一帧自己的外观信息，又显式利用前后帧的运动相关性。
         prev_feat = self._encode(prev)
@@ -327,8 +361,25 @@ class Generator(nn.Module):
         prev_feat, next_feat = self.pair_fusion(prev_feat, next_feat)
         return self._decode(prev_feat), self._decode(next_feat)
 
-    def forward(self, x):
-        return self._decode(self._encode(x))
+    def forward_pair(self, prev: torch.Tensor, next_frame: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if prev.shape[0] != next_frame.shape[0] or prev.device != next_frame.device:
+            raise ValueError("双帧输入必须具有相同 batch size 且位于同一设备")
+        return self(prev, next_frame)
+
+    def forward(self, x, next_frame=None):
+        if self._parallel_gpu_ids and x.is_cuda and x.shape[0] > 1:
+            primary = x.device.index
+            if primary not in self._parallel_gpu_ids:
+                raise ValueError(f"输入主卡 cuda:{primary} 不在 X2_GPU_IDS={self._parallel_gpu_ids} 中")
+            if next(self.parameters()).device != x.device:
+                raise ValueError("Generator 参数与输入必须位于同一主卡")
+            ids = (primary,) + tuple(index for index in self._parallel_gpu_ids if index != primary)
+            ids = ids[:min(len(ids), x.shape[0])]
+            inputs = (x,) if next_frame is None else (x, next_frame)
+            return nn.parallel.data_parallel(
+                _GeneratorParallelForward(self), inputs, device_ids=ids, output_device=primary,
+            )
+        return self._forward_local(x, next_frame)
 
 
 def _maybe_spectral_norm(layer: nn.Module, enabled: bool) -> nn.Module:

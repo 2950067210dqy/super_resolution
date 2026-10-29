@@ -149,6 +149,10 @@ class ESRuRAFT_PIV(nn.Module):
         # - False: 只做 PIV 图像对超分辨率，完全跳过 RAFT 网络、RAFT loss 和 RAFT 评价指标。
         self.use_raft = bool(global_data.esrgan.USE_RAFT)
         self.piv_esrgan_generator = Generator(inner_chanel=inner_chanel,scale =scale)  # 初始化超分生成器，输入 LR 图像对，输出 SR 图像对
+        self.piv_esrgan_generator.configure_x2_multi_gpu(
+            enabled=global_data.esrgan.X2_MULTI_GPU,
+            device_ids=global_data.esrgan.X2_GPU_IDS,
+        )
         self.piv_esrgan_discriminator = Discriminator(
             inner_chanel=inner_chanel,
             base_channels=global_data.esrgan.DISCRIMINATOR_BASE_CHANNELS,

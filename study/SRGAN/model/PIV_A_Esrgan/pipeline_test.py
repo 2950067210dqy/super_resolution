@@ -20,6 +20,7 @@ def _build_model(_scale):
     return ESRuRAFT_PIV(
         inner_chanel=3,
         batch_size=global_data.esrgan.BATCH_SIZE,
+        scale=_scale,
     )
 
 

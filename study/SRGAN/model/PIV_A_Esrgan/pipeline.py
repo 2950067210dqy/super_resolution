@@ -6,7 +6,8 @@ import time
 from datetime import datetime
 
 from pathlib import Path
-
+# 必须在 import torch 之前设置。 PyTorch 显存分配器产生严重碎片，导致虽然总空闲显存看似充足（或 reserved 远大于 allocated），但无法分配连续的小块内存。错误日志明确建议设置 expandable_segments:True。
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 import torch.nn as nn
 

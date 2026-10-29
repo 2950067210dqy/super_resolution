@@ -19,11 +19,17 @@ class global_data:
         DATA_ROOT_DIR = Path(
                 r"/study_datas/train_datas/root/autodl-tmp/train_datas/"
         )
+        # 本地直接运行可发现新增实验；服务器继续使用原挂载目录。
+        WINDOWS_DATA_ROOT_DIR = Path(r"D:\BaiduSyncdisk\AYanJiuSheng\data\train_datas\root\autodl-tmp\train_datas")
+        if WINDOWS_DATA_ROOT_DIR.exists():
+            DATA_ROOT_DIR = WINDOWS_DATA_ROOT_DIR
         # 汇总图默认保存到 all_handle/output，避免覆盖各个原始实验目录中的结果图。
         DEFAULT_OUTPUT_ROOT_DIR = Path(__file__).resolve().parent / "output"
         # 输出根目录覆盖项：保持 None 时仍使用 DEFAULT_OUTPUT_ROOT_DIR；
         # 如果希望把所有结果写到其它位置，就把这里改成 Path(r"你的输出目录") 或字符串路径。
-        OUTPUT_ROOT_DIR =Path(r"/study_datas/train_all_datas/")
+        OUTPUT_ROOT_DIR =Path(r"/study_datas/train_all_datas/nine_experiments/")
+        if WINDOWS_DATA_ROOT_DIR.exists():
+            OUTPUT_ROOT_DIR = DEFAULT_OUTPUT_ROOT_DIR
 
         # 输出目录中的子文件夹名；若后续想把汇总结果按论文图号重排，只需要改这里。
         ENERGY_OUTPUT_DIR_NAME = "01_energy_spectrum"
@@ -34,6 +40,9 @@ class global_data:
         # 对比指标汇总表输出目录。CSV 没有 sheet 概念，所以 pipeline.py 会同时输出：
         # 1）一个扁平总表 CSV；2）每个类别一个 CSV；3）一个真正带类别 sheet 的 xlsx 工作簿。
         METRIC_TABLE_OUTPUT_DIR_NAME = "05_metric_tables"
+        THESIS_GRAPH_OUTPUT_DIR_NAME = "06_thesis_graph"
+        THESIS_GRAPH_REFERENCE_DIR = Path(r"D:\WorkSpace\Thesis_project\paper\word\graphy\bianhao_5")
+        THESIS_GRAPH_DPI = 300
         METRIC_TABLE_FLAT_CSV_NAME = "comparison_metrics.csv"
         METRIC_TABLE_SHEET_CSV_DIR_NAME = "category_csv_sheets"
         METRIC_TABLE_WORKBOOK_NAME = "comparison_metrics.xlsx"
@@ -72,8 +81,11 @@ class global_data:
         # 如果只想在 thesis 白名单下只跑阈值化对比图 + 颗粒统计条形图，
         # 设置 OUTPUT_STAGE_FILTER = "thesis_binary"。
         # OUTPUT_STAGE_FILTER =None
-        OUTPUT_STAGE_FILTER = "thesis_binary"
+        OUTPUT_STAGE_FILTER = "nine_experiments"
         OUTPUT_STAGE_ALIASES = {
+            "nine_experiments": "nine_experiments",
+            "06_thesis_graph": "thesis_graph",
+            "thesis_graph": "thesis_graph",
             "thesis": "thesis",
             "paper": "thesis",
             "paper_figures": "thesis",
@@ -213,6 +225,7 @@ class global_data:
         # key 是内部稳定标识；label 是最终出现在图例上的英文文本，按用户要求统一放在全局变量中。
         # 现在把 PIV_A_Esrgan_v4 明确标成 ESRuRAFT-PIV x4，并新增 PIV_A_Esrgan_v_SCALE_8 作为 ESRuRAFT-PIV x8。
         EXPERIMENT_KEYS = (
+            "esrgan_searaft",
             "bicubic_widim",
             "bicubic_hs",
             "bicubic_raft",
@@ -226,6 +239,7 @@ class global_data:
         # 图例显示顺序单独控制：绘图时可以为了遮挡关系调整绘制顺序，
         # 但 legend 必须始终按这里从上到下排列。
         LEGEND_EXPERIMENT_ORDER = (
+            "esrgan_searaft",
             "bicubic_widim",
             "bicubic_hs",
             "bicubic_raft",
@@ -237,6 +251,7 @@ class global_data:
             "PIV_A_Esrgan_v_SCALE_8",
         )
         EXPERIMENT_LABELS = {
+            "esrgan_searaft": "esrgan-searaft",
             "bicubic_widim": "bicubic-widim",
             "bicubic_hs": "bicubic-hs",
             "bicubic_raft": "bicubic-raft",
@@ -252,6 +267,10 @@ class global_data:
         # 2）eight_experiments_without_widim_hs：去掉 bicubic-widim 和 bicubic-hs 的补充对比图；
         # 3）scale_x4_x8：只比较 ESRuRAFT-PIV x4 与 ESRuRAFT-PIV x8。
         COMPARISON_GROUPS = {
+            "nine_experiments": (
+                "bicubic_widim", "bicubic_hs", "bicubic_raft", "bicubic_searaft",
+                "srgan_raft", "swinir_raft", "esrgan_raft", "esrgan_searaft", "PIV_A_Esrgan_v4",
+            ),
             "eight_experiments": (
                 "bicubic_widim",
                 "bicubic_hs",
@@ -277,12 +296,14 @@ class global_data:
         }
         # 每套对比图的图例顺序；legend 从上到下严格按这里排列。
         COMPARISON_GROUP_LEGEND_ORDER = {
+            "nine_experiments": COMPARISON_GROUPS["nine_experiments"],
             "eight_experiments": COMPARISON_GROUPS["eight_experiments"],
             "eight_experiments_without_widim_hs": COMPARISON_GROUPS["eight_experiments_without_widim_hs"],
             "scale_x4_x8": COMPARISON_GROUPS["scale_x4_x8"],
         }
         # 同一个实验在不同对比组里可以显示不同 label：x4 在八组对比里是 ESRuRAFT-PIV，在倍率对比里是 ESRuRAFT-PIV x4。
         COMPARISON_GROUP_LABELS = {
+            "nine_experiments": {"PIV_A_Esrgan_v4": "ESRuRAFT-PIV"},
             "eight_experiments": {
                 "PIV_A_Esrgan_v4": "ESRuRAFT-PIV",
             },
@@ -296,12 +317,14 @@ class global_data:
         }
         # 最小实验数量限制；倍率对比必须同时找到 x4 与 x8，避免只画单独 x4 的无意义图。
         COMPARISON_GROUP_MIN_EXPERIMENTS = {
+            "nine_experiments": 9,
             "eight_experiments": 1,
             "eight_experiments_without_widim_hs": 1,
             "scale_x4_x8": 2,
         }
         # 实际磁盘目录名与用户口径不完全一致，因此这里显式建立映射；若目录改名，只改这一个位置。
         EXPERIMENT_DIR_NAMES = {
+            "esrgan_searaft": "ESRuRAFT_PIV_Groundv_esrgan_searaft",
             "bicubic_widim": "ESRuRAFT_PIV_Groundv_bicubic_widim",
             "bicubic_hs": "ESRuRAFT_PIV_Groundv_bicubic_hs",
             "bicubic_raft": "ESRuRAFT_PIV_Groundv_bicubic_raft",
@@ -315,6 +338,7 @@ class global_data:
         # 新增实验有时会直接用用户口径的短目录名保存；这里保留备用目录名。
         # pipeline.py 会优先使用 EXPERIMENT_DIR_NAMES，找不到时再尝试这些别名，避免因为目录命名差异漏画。
         EXPERIMENT_DIR_NAME_ALIASES = {
+            "esrgan_searaft": ("esrgan_searaft",),
             "bicubic_widim": ("bicubic_widim",),
             "bicubic_hs": ("bicubic_hs",),
             "bicubic_raft": ("bicubic_raft",),
@@ -325,6 +349,7 @@ class global_data:
         }
         # 大多数实验在 scale_4 目录；x8 消融结果单独保存在 scale_8，所以对每个实验做独立倍率映射。
         EXPERIMENT_SCALE_DIR_NAMES = {
+            "esrgan_searaft": "scale_4",
             "bicubic_widim": "scale_4",
             "bicubic_hs": "scale_4",
             "bicubic_raft": "scale_4",
@@ -339,6 +364,7 @@ class global_data:
         # 按用户要求：ESRuRAFT-PIV（PIV_A_Esrgan_v4）统一使用红色；
         # bicubic-hs 从原来的橙红色改为紫色，避免和 ESRuRAFT-PIV 的红色混淆。
         EXPERIMENT_COLORS = {
+            "esrgan_searaft": "#8C564B",
             "bicubic_widim": "#0072B2",
             "bicubic_hs": "#785EF0",
             "bicubic_raft": "#009E73",
@@ -352,6 +378,7 @@ class global_data:
         # 误差直方图专用调色板：按用户给出的图 1 使用 Matplotlib 默认 tab10 风格颜色。
         # 该配色只影响误差直方图，普通图例仍使用 EXPERIMENT_COLORS。
         EXPERIMENT_HIST_COLORS = {
+            "esrgan_searaft": "#e377c2",
             "bicubic_widim": "#1f77b4",
             "bicubic_hs": "#ff7f0e",
             "bicubic_raft": "#2ca02c",
@@ -843,6 +870,7 @@ class global_data:
         PARTICLE_STATS_GT_BAR_COLOR = "#666666"
         PARTICLE_STATS_LR_BAR_COLOR = "#999999"
         PARTICLE_STATS_EXPERIMENT_BAR_COLORS = {
+            "esrgan_searaft": "#AA4499",
             "__lr__": "#999999",
             "bicubic_widim": "#4477AA",
             "bicubic_hs": "#785EF0",
@@ -962,11 +990,13 @@ class global_data:
         # 八实验对比图如果全部横排会太挤；这类“数值图一行 + 误差图一行”的组合图，
         # 在 eight_experiments 中每块只放 4 个实验，后 4 个实验换到下一块，并从 GT 后面的第二列开始。
         COMPARISON_GROUP_COMPOSITE_WRAP_METHOD_COUNT = {
+            "nine_experiments": 3,
             "eight_experiments": 4,
         }
         # 颗粒阈值对比图包含 GT 和 LR 两个固定列；八组图后半部分从第三列开始对齐实验列。
         # 去掉 widim/hs 的六组补充图按 3+3 分块，同样从第三列开始。
         COMPARISON_GROUP_PARTICLE_BINARY_WRAP_METHOD_COUNT = {
+            "nine_experiments": 3,
             "eight_experiments": 4,
             "eight_experiments_without_widim_hs": 3,
         }

@@ -424,6 +424,7 @@ class AllHandlePipeline:
         # - tbl_twcf_energy_spectrum 只重跑 TBL/TWCF 的能量谱图，便于修正长条流场的横轴显示。
         # 因此 OUTPUT_STAGE_FILTER=None 时不再默认跑它们，只有显式指定时才运行。
         standalone_stages = {
+            "thesis_graph",
             "tbl_profile_overlay",
             "tbl_v_profile_overlay_without_bicubic_hs",
             "tbl_twcf_energy_spectrum",
@@ -448,6 +449,9 @@ class AllHandlePipeline:
         for item in raw_items:
             key = normalize_name(str(item))
             stage = aliases.get(key, key)
+            if stage == "nine_experiments":
+                enabled.update(standard_stages | {"thesis_graph"})
+                continue
             if stage == "thesis":
                 # thesis 是论文精选图模式：本身不是一个绘图函数，而是展开成 01/02/03/04 四个标准阶段；
                 # 类别和样本白名单由 effective_category_filter()/effective_sample_filter() 进一步处理。
@@ -490,7 +494,7 @@ class AllHandlePipeline:
             stage = normalize_name(str(aliases.get(key, key)))
             if stage == target:
                 return True
-            if target == "thesis" and stage in {"thesis_01_03", "thesis_binary"}:
+            if target == "thesis" and stage in {"thesis_01_03", "thesis_binary", "nine_experiments", "thesis_graph"}:
                 return True
         return False
 
@@ -556,7 +560,9 @@ class AllHandlePipeline:
         comparison_filter = getattr(self.cfg, "COMPARISON_FILTER", None)
         if comparison_filter:
             filters.append({normalize_name(value) for value in comparison_filter})
-        if self.thesis_mode_enabled():
+        if self.output_mode_enabled("nine_experiments") or self.output_mode_enabled("thesis_graph"):
+            filters.append({"nine_experiments"})
+        elif self.thesis_mode_enabled():
             filters.append({normalize_name(value) for value in getattr(self.cfg, "THESIS_COMPARISON_FILTER", ())})
         if not filters:
             return None
@@ -1442,7 +1448,7 @@ class AllHandlePipeline:
         comparison_filter = self.effective_comparison_filter()
 
         for comparison_name, experiment_keys in comparison_groups.items():
-            if comparison_filter and normalize_name(comparison_name) not in comparison_filter:
+            if comparison_filter is not None and normalize_name(comparison_name) not in comparison_filter:
                 # thesis 模式下只保留主八组实验，避免把 without_widim_hs 的补充图也跑出来。
                 continue
             experiment_keys = tuple(experiment_keys)
@@ -1583,7 +1589,7 @@ class AllHandlePipeline:
             names.update(sample_map.keys())
 
         allowed = self.effective_sample_filter(group)
-        if allowed:
+        if allowed is not None:
             names = {name for name in names if normalize_name(name) in allowed}
 
         bundles: list[SampleBundle] = []
@@ -1664,7 +1670,7 @@ class AllHandlePipeline:
         enabled_stages = self.enabled_output_stages()
         self.progress(f"discovered {total_groups} groups.")
         self.progress(f"enabled output stages: {', '.join(sorted(enabled_stages))}")
-        plotting_stages = enabled_stages - {"metric_tables"}
+        plotting_stages = enabled_stages - {"metric_tables", "thesis_graph"}
         if plotting_stages:
             for group_index, group in enumerate(groups, start=1):
                 group_start = time.perf_counter()
@@ -1755,6 +1761,12 @@ class AllHandlePipeline:
             self.timing_records.append(
                 {"comparison": "all", "class": "all", "split": "all", "category": "all", "step": "metric_tables", "seconds": metric_elapsed, "duration": self.format_duration(metric_elapsed)}
             )
+        if "thesis_graph" in enabled_stages:
+            try:
+                from .thesis_graph import generate_thesis_graphs
+            except ImportError:
+                from thesis_graph import generate_thesis_graphs
+            generate_thesis_graphs(self, groups)
         self.progress("writing summary.")
         self.write_summary(groups)
         total_elapsed = time.perf_counter() - self.run_started_at if self.run_started_at is not None else 0.0
@@ -7145,6 +7157,12 @@ class AllHandlePipeline:
 
         pred_gray = ensure_2d_image(pred_image)
         gt_gray = ensure_2d_image(gt_image)
+        # PNG fallback can be RGB/RGBA. Alpha is not particle intensity; reduce
+        # only the colour channels before comparing spatial dimensions.
+        if pred_gray.ndim == 3:
+            pred_gray = np.nanmean(pred_gray[..., :3], axis=-1)
+        if gt_gray.ndim == 3:
+            gt_gray = np.nanmean(gt_gray[..., :3], axis=-1)
         common_h = min(int(pred_gray.shape[-2]), int(gt_gray.shape[-2]))
         common_w = min(int(pred_gray.shape[-1]), int(gt_gray.shape[-1]))
         if common_h <= 0 or common_w <= 0:
@@ -7304,11 +7322,24 @@ class AllHandlePipeline:
         try:
             from scipy import ndimage
 
-            _labels, component_count = ndimage.label(binary)
+            _labels, component_count = ndimage.label(binary, structure=np.ones((3, 3), dtype=np.uint8))
             return int(component_count)
         except Exception:
-            # 兜底只保证图能生成；如果环境缺少连通域库，count 会退化成白色像素数。
-            return int(np.count_nonzero(binary))
+            # Do not substitute foreground pixel count for particle count.
+            remaining = set(map(tuple, np.argwhere(binary)))
+            count = 0
+            while remaining:
+                stack = [remaining.pop()]
+                count += 1
+                while stack:
+                    y, x = stack.pop()
+                    for dy in (-1, 0, 1):
+                        for dx in (-1, 0, 1):
+                            neighbour = (y + dy, x + dx)
+                            if neighbour in remaining:
+                                remaining.remove(neighbour)
+                                stack.append(neighbour)
+            return count
 
     def load_particle_stats_raw(self, sample_dir: Path, time_name: str, crop: bool = False) -> dict:
         """读取未映射的颗粒统计字段；crop=True 时读取 TBL 局部统计 npy。"""

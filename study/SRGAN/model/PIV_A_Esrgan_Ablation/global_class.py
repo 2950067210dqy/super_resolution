@@ -66,10 +66,10 @@ class global_data:
         # 消融实验总开关
         # =========================
         # PIV_A_Esrgan_Ablation 是 PIV_A_Esrgan 的独立消融分支，下面用一个全局参数选择
-        # 当前要运行的消融方案。只改这里即可切换 7 组实验，模型构建、RAFT 结构、迁移开关、
+        # 当前要运行的消融方案。只改这里即可切换 8 组实验，模型构建、RAFT 结构、迁移开关、
         # Generator 是否吃 EPE、图像一致性损失是否启用都会在 apply_ablation_config() 中同步。
         #
-        # 7 个模式含义：
+        # 8 个模式含义：
         # 1: PIV_A 生成器 + 基础 ESRGAN 判别器 + RAFT256；不做 RAFT256->RAFT128 迁移；EPE 不限制 G。
         # 2: PIV_A 生成器 + PIV_A 判别器 + RAFT256；不做 RAFT256->RAFT128 迁移；EPE 不限制 G。
         # 3: PIV_A 生成器 + PIV_A 判别器 + 原配置 RAFT；EPE 不限制 G。
@@ -77,9 +77,10 @@ class global_data:
         # 5: 基础 ESRGAN 生成器 + 基础 ESRGAN 判别器 + 原配置 RAFT；去掉图像一致性损失；EPE 限制 G。
         # 6: G+D+R+L_warp：PIV_A 生成器 + PIV_A 判别器 + 原配置 RAFT；仅启用 GT-flow warp，关闭 G 的 EPE。
         # 7: G+D+R+EPE：与模式 6 使用相同 G/D/R；仅启用 RAFT EPE 对 G 的反馈，关闭 GT-flow warp。
+        # 8: 完整模型去掉 GAN 损失及判别器训练；保留重建损失、GT-flow warp、EPE 反馈和原配置 RAFT。
         # 模式 6 与历史模式 3 的训练配置等价，单列编号用于审稿要求的 U 内部机制对照；模式 1~5 保持原语义。
-        ABLATION_MODE = 7
-        ABLATION_MODES = (1, 2, 3, 4, 5, 6, 7)
+        ABLATION_MODE = 8
+        ABLATION_MODES = (1, 2, 3, 4, 5, 6, 7, 8)
         ABLATION_MODE_DESCRIPTIONS = {
             1: "piv_generator_basic_esrgan_discriminator_raft256_no_g_epe",
             2: "piv_generator_piv_discriminator_raft256_no_g_epe",
@@ -88,6 +89,7 @@ class global_data:
             5: "basic_esrgan_generator_basic_esrgan_discriminator_original_raft_with_g_epe_no_flow_warp",
             6: "piv_generator_piv_discriminator_original_raft_with_flow_warp_no_g_epe",
             7: "piv_generator_piv_discriminator_original_raft_with_g_epe_no_flow_warp",
+            8: "piv_generator_original_raft_with_g_epe_with_flow_warp_no_gan",
         }
         # 消融实验默认从头训练，避免架构切换后误加载旧结构 checkpoint，也避免“迁移学习”
         # 污染各组对照。如果确实要续训，可手动改成 False。
@@ -97,6 +99,7 @@ class global_data:
         SR_DISCRIMINATOR_TYPE = "piv_a_attention_unet"
         GENERATOR_RAFT_EPE_LOSS = True
         FLOW_WARP_CONSISTENCY_ENABLED = True
+        GAN_LOSS_ENABLED = True  # 模式 8 关闭对抗损失和整个判别器训练阶段。
         ORIGINAL_ESRGAN_NUM_RRDB = 23
 
         # =========================
@@ -949,6 +952,7 @@ class global_data:
             - RAFT_MODEL_TYPE 和 RAFT128_INIT_FROM_RAFT256 决定 piv_RAFT 的结构与迁移初始化；
             - GENERATOR_RAFT_EPE_LOSS 决定 EPE 是否加入 Generator 反传；
             - FLOW_WARP_CONSISTENCY_ENABLED 决定图像对 warp 一致性项是否加入 SR 损失。
+            - GAN_LOSS_ENABLED 决定是否计算 GAN 损失和训练判别器。
             """
             mode = cls.normalized_ablation_mode()
 
@@ -957,6 +961,7 @@ class global_data:
             cls.SR_DISCRIMINATOR_TYPE = "piv_a_attention_unet"
             cls.GENERATOR_RAFT_EPE_LOSS = True
             cls.FLOW_WARP_CONSISTENCY_ENABLED = True
+            cls.GAN_LOSS_ENABLED = True
 
             if mode == 1:
                 cls.SR_DISCRIMINATOR_TYPE = "basic_esrgan"
@@ -989,6 +994,9 @@ class global_data:
                 # G+D+R+EPE：同一套 G/D/R 及 EPE 权重调度，只移除 GT-flow warp。
                 cls.FLOW_WARP_CONSISTENCY_ENABLED = False
                 cls.GENERATOR_RAFT_EPE_LOSS = True
+            elif mode == 8:
+                # 完整模型的无 GAN 对照；warp 和 EPE 均沿用上面的启用配置。
+                cls.GAN_LOSS_ENABLED = False
 
             # 每个消融模式使用独立输出目录，避免不同结构的 checkpoint / optimizer 混在一起。
             cls.DESCRIPTION = f"_ablation_{mode}"
@@ -998,6 +1006,11 @@ class global_data:
 
             if bool(cls.ABLATION_FORCE_TRAIN_FROM_SCRATCH):
                 cls.IS_LOAD_EXISTS_MODEL = False
+
+            if not cls.use_adversarial_training():
+                cls.LAMBDA_ADVERSARIAL = 0.0
+                cls.ADVERSARIAL_WEIGHT_START = 0.0
+                cls.ADVERSARIAL_WEIGHT_END = 0.0
 
             # 如果当前模式不允许 EPE 约束 Generator，权重也直接清零；RAFT 自身仍然正常训练。
             if not bool(cls.GENERATOR_RAFT_EPE_LOSS):
@@ -1020,8 +1033,14 @@ class global_data:
                 "raft_model_type": cls.RAFT_MODEL_TYPE,
                 "generator_raft_epe_loss": cls.GENERATOR_RAFT_EPE_LOSS,
                 "flow_warp_consistency_enabled": cls.FLOW_WARP_CONSISTENCY_ENABLED,
+                "gan_loss_enabled": cls.GAN_LOSS_ENABLED,
                 "output_dir": cls.OUT_PUT_DIR,
             }
+
+        @classmethod
+        def use_adversarial_training(cls) -> bool:
+            """是否启用 GAN 损失及判别器训练；独立于生成器预训练轮数。"""
+            return bool(cls.GAN_LOSS_ENABLED)
 
         @classmethod
         def use_basic_esrgan_generator(cls) -> bool:
@@ -1127,6 +1146,8 @@ class global_data:
             返回当前 epoch 的生成器对抗损失权重。
             当前配置为：0 -> int(EPOCH_NUMS/2) 从 0.0005 线性增长到 0.02，之后保持 0.02。
             """
+            if not cls.use_adversarial_training():
+                return 0.0
             return cls._get_scheduled_weight(
                 epoch=epoch,
                 start=cls.ADVERSARIAL_WEIGHT_START,
